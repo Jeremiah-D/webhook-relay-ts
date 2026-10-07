@@ -14,6 +14,9 @@ import {
   type BatchOptions,
   type ResolvedBatchOptions,
 } from "./batch.ts";
+import { newTraceId, TRACE_ID_HEADER } from "./trace.ts";
+
+export { TRACE_ID_HEADER };
 
 export type { CircuitBreakerOptions, CircuitState, CircuitStats };
 export type { EncryptedPayload, PayloadEncryptor };
@@ -42,6 +45,14 @@ export interface RetryItem {
   headers: Record<string, string | string[] | undefined>;
   /** Delivery lane; defaults to `"normal"` when unset. */
   priority?: DeliveryPriority;
+  /**
+   * End-to-end trace ID (see `src/trace.ts`): threads the item through
+   * receive → delivery → retries → dead-letter, and appears in every audit
+   * event, delivery event, and the downstream `x-trace-id` header. When
+   * unset, `enqueue()` mints one, so it is always populated on the delivery
+   * path and in dead-letter entries.
+   */
+  traceId?: string;
 }
 
 /** Options for the urgent delivery lane (see {@link DeliveryPriority}). */
@@ -65,6 +76,8 @@ export interface UrgentLaneOptions {
 /** Fired when a delivery's accepted→delivered latency exceeds the SLO budget. */
 export interface SloMissInfo {
   id: string;
+  /** End-to-end trace ID of the slow delivery. */
+  traceId: string;
   endpoint: string;
   latencyMs: number;
   sloMs: number;
@@ -95,6 +108,8 @@ export type DeliveryEventType = "delivered" | "retrying" | "dead_letter";
 export interface DeliveryEvent {
   type: DeliveryEventType;
   id: string;
+  /** End-to-end trace ID (see `src/trace.ts`), always populated. */
+  traceId: string;
   targetUrl: string;
   /** Attempts consumed so far (including the successful one for `delivered`). */
   attempts: number;
@@ -110,6 +125,12 @@ export interface BatchInfo {
   endpoint: string;
   /** Events merged into this batch. */
   size: number;
+  /**
+   * Trace IDs of the merged member events, in member order. The merged
+   * delivery itself carries a fresh trace ID (see `RetryItem.traceId`), so
+   * this is the correlation key back to the original inbound events.
+   */
+  traceIds: string[];
 }
 
 export type Sender = (item: RetryItem) => Promise<void>;
@@ -576,7 +597,12 @@ export class RetryQueue {
         "x-batch-size": String(items.length),
       },
     });
-    this.onBatch?.({ batchId, endpoint, size: items.length });
+    this.onBatch?.({
+      batchId,
+      endpoint,
+      size: items.length,
+      traceIds: items.map((i) => i.traceId ?? ""),
+    });
   }
 
   /** Items that exhausted all attempts, in dead-letter order. */
@@ -632,20 +658,28 @@ export class RetryQueue {
     if (this.queue.has(item.id) || this.batcher?.has(item.id)) {
       throw new Error(`Duplicate item id: ${item.id}`);
     }
+    // Mint the trace ID up front so even batch-buffered items (which skip
+    // `enqueueNow` until flush) carry one, and `flushBatch` can correlate
+    // the merged delivery back to its members.
+    const traced: RetryItem = { ...item, traceId: item.traceId ?? newTraceId() };
     // The urgent lane is never batched: an urgent delivery must go out
     // immediately, not wait for a batch window.
-    if (this.batcher && item.priority !== "urgent") {
-      this.batcher.add(item);
+    if (this.batcher && traced.priority !== "urgent") {
+      this.batcher.add(traced);
       return;
     }
-    this.enqueueNow(item);
+    this.enqueueNow(traced);
   }
 
   private enqueueNow(item: RetryItem): void {
     if (this.queue.has(item.id)) {
       throw new Error(`Duplicate item id: ${item.id}`);
     }
-    this.queue.set(item.id, { ...item, attempt: 0 });
+    // A defensive second mint: items enqueued through paths that skip
+    // `enqueue()` (replayed dead letters keep their original traceId via
+    // spread, flushed batches arrive here already traced) still land with a
+    // trace ID rather than an undefined one.
+    this.queue.set(item.id, { ...item, traceId: item.traceId ?? newTraceId(), attempt: 0 });
     // Start the latency clock only after the item is really queued — a
     // duplicate-id throw must not leave a stale pending record behind.
     // (Batched items start their clock at flush time, when the merged item
@@ -777,6 +811,9 @@ export class RetryQueue {
   private async deliver(id: string, force = false): Promise<void> {
     const entry = this.queue.get(id);
     if (!entry || (!this.running && !force)) return;
+    // `enqueue()`/`enqueueNow()` guarantee every queued item carries a
+    // trace ID, so it is safe to thread it through all downstream events.
+    const traceId = entry.traceId as string;
     // Per-endpoint quota first: an exhausted budget delays the attempt
     // (rescheduled at the next token refill) instead of burning the retry
     // budget or tripping the circuit against a downstream we are
@@ -829,12 +866,13 @@ export class RetryQueue {
         if (fastLane) this.recordUrgentStat(entry.targetUrl, "delivered");
         const latencyMs = this.latency?.recordDelivered(entry.id, entry.targetUrl);
         if (latencyMs !== undefined && this.latency && latencyMs > this.latency.sloMs) {
-          this.onSloMiss?.({ id: entry.id, endpoint: entry.targetUrl, latencyMs, sloMs: this.latency.sloMs });
+          this.onSloMiss?.({ id: entry.id, traceId, endpoint: entry.targetUrl, latencyMs, sloMs: this.latency.sloMs });
         }
         this.onDelivered?.(entry, entry.attempt + 1);
         this.emitDeliveryEvent({
           type: "delivered",
           id: entry.id,
+          traceId,
           targetUrl: entry.targetUrl,
           attempts: entry.attempt + 1,
           at: new Date().toISOString(),
@@ -851,6 +889,7 @@ export class RetryQueue {
           const encryptedPayload = this.payloadEncryptor?.encrypt(entry.payload);
           this.deadLetter.push({
             id: entry.id,
+            traceId,
             // Sealed at rest when an encryptor is configured; kept in the
             // clear otherwise (existing behavior).
             payload: encryptedPayload ? Buffer.alloc(0) : entry.payload,
@@ -868,6 +907,7 @@ export class RetryQueue {
           this.emitDeliveryEvent({
             type: "dead_letter",
             id: entry.id,
+            traceId,
             targetUrl: entry.targetUrl,
             attempts: entry.attempt,
             at,
@@ -879,6 +919,7 @@ export class RetryQueue {
           this.emitDeliveryEvent({
             type: "retrying",
             id: entry.id,
+            traceId,
             targetUrl: entry.targetUrl,
             attempts: entry.attempt,
             at,
@@ -895,6 +936,7 @@ export class RetryQueue {
           this.emitDeliveryEvent({
             type: "retrying",
             id: entry.id,
+            traceId,
             targetUrl: entry.targetUrl,
             attempts: entry.attempt,
             at,

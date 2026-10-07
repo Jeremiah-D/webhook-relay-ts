@@ -259,6 +259,24 @@ Live-only — no replay of past events; `GET /audit` holds the history.
 machine (dropped, never delivered) while `delivering` items are awaited;
 see Graceful shutdown above.
 
+**Trace IDs:** every event carries an end-to-end `traceId` threading
+`received` → `accepted` → `delivering` → `delivered` / `retrying` /
+`dead_letter` (and `rejected` / `duplicate_suppressed` too). The inbound
+client may supply one via the `x-trace-id` header (kept when it is 1–64
+chars of alnum/dash/underscore, minted fresh otherwise), and the same
+value is:
+
+- echoed in the 202 response body (`{"id", "traceId", "status"}`),
+- written on every audit line (`accepted`, `delivered`, `dead_letter`,
+  `rejected`, `duplicate_suppressed`, `slo_missed`, `batch_flushed`) —
+  `GET /audit?traceId=<id>` pulls one event's whole trail,
+- attached to every SSE delivery event frame,
+- forwarded downstream as the `x-trace-id` header, so the next hop can
+  correlate with this relay's audit trail.
+
+Merged batches get a fresh trace ID of their own; the `batch_flushed`
+audit line carries the members' `traceIds` for the reverse lookup.
+
 ## Run
 
 ```sh

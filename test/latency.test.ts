@@ -147,10 +147,12 @@ describe("latency queue integration", () => {
     assert.equal(misses.length, 1);
     assert.deepEqual(misses[0], {
       id: "l-1",
+      traceId: misses[0].traceId,
       endpoint: ITEM.targetUrl,
       latencyMs: 250,
       sloMs: 100,
     });
+    assert.match(misses[0].traceId, /^[0-9a-f]{32}$/);
     // A fast delivery samples too, without a miss.
     now = 1000;
     q.enqueue({ ...ITEM, id: "l-2" });

@@ -34,6 +34,13 @@ export interface AuditQuery {
    * Must be a positive integer.
    */
   limit?: number;
+  /**
+   * Keep only entries carrying this trace ID (see `src/trace.ts`) — the
+   * correlation key for one event across `accepted` / `delivered` /
+   * `dead_letter` / `rejected` / `duplicate_suppressed` / `slo_missed` /
+   * `batch_flushed` audit lines.
+   */
+  traceId?: string;
 }
 
 /** One indexed JSONL line: its searchable fields plus its byte span. */
@@ -42,6 +49,7 @@ interface IndexEntry {
   tsMs: number;
   event?: string;
   endpoint?: string;
+  traceId?: string;
   offset: number;
   length: number;
 }
@@ -169,6 +177,7 @@ export class AuditLog {
     let matches = this.index.filter((e) => {
       if (events !== undefined && (e.event === undefined || !events.includes(e.event))) return false;
       if (filter.endpoint !== undefined && e.endpoint !== filter.endpoint) return false;
+      if (filter.traceId !== undefined && e.traceId !== filter.traceId) return false;
       // Lines without a parseable `ts` can only match unfiltered time ranges.
       if (!Number.isNaN(sinceMs) && (Number.isNaN(e.tsMs) || e.tsMs < sinceMs)) return false;
       if (!Number.isNaN(untilMs) && (Number.isNaN(e.tsMs) || e.tsMs > untilMs)) return false;
@@ -262,6 +271,7 @@ export class AuditLog {
         : typeof rec.endpoint === "string"
           ? rec.endpoint
           : undefined;
-    this.index.push({ tsMs: ts, event, endpoint, offset, length: line.length });
+    const traceId = typeof rec.traceId === "string" ? rec.traceId : undefined;
+    this.index.push({ tsMs: ts, event, endpoint, traceId, offset, length: line.length });
   }
 }

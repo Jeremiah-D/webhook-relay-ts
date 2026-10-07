@@ -8,6 +8,7 @@ import { installGracefulShutdown } from "./shutdown.ts";
 import type { PayloadEncryptor } from "./encrypt.ts";
 import type { ReplayGuard } from "./replay.ts";
 import { DeliveryDeduplicator, type DedupOptions } from "./dedup.ts";
+import { resolveTraceId, TRACE_ID_HEADER } from "./trace.ts";
 import type { AuditLog } from "./audit.ts";
 
 export interface RelayServerOptions {
@@ -121,6 +122,10 @@ function defaultSender(item: RetryItem): Promise<void> {
     for (const [k, v] of Object.entries(item.headers)) {
       if (v !== undefined) req.setHeader(k, v as string | string[]);
     }
+    // Propagate the trace ID downstream so the next hop can correlate the
+    // delivery with this relay's audit trail (overrides a stale inbound
+    // value, which is identical anyway after `resolveTraceId`).
+    if (item.traceId) req.setHeader(TRACE_ID_HEADER, item.traceId);
     req.setHeader("content-length", item.payload.length);
     req.end(item.payload);
   });
@@ -157,12 +162,19 @@ export function createRelayServer(opts: RelayServerOptions): Server {
         }
       : undefined,
     onDelivered: (item, attempts) => {
-      opts.auditLog.append({ event: "delivered", id: item.id, targetUrl: item.targetUrl, attempts });
+      opts.auditLog.append({
+        event: "delivered",
+        id: item.id,
+        traceId: item.traceId,
+        targetUrl: item.targetUrl,
+        attempts,
+      });
     },
     onDeadLetter: (item, attempts, lastError) => {
       opts.auditLog.append({
         event: "dead_letter",
         id: item.id,
+        traceId: item.traceId,
         targetUrl: item.targetUrl,
         attempts,
         error: lastError instanceof Error ? lastError.message : String(lastError),
@@ -179,6 +191,8 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       opts.auditLog.append({
         event: "batch_flushed",
         batchId: info.batchId,
+        traceId: info.traceIds.length === 1 ? info.traceIds[0] : undefined,
+        traceIds: info.traceIds,
         targetUrl: info.endpoint,
         size: info.size,
       });
@@ -300,6 +314,7 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       try {
         entries = opts.auditLog.query({
           endpoint: params.get("endpoint") ?? undefined,
+          traceId: params.get("traceId") ?? undefined,
           since: params.get("since") ?? undefined,
           until: params.get("until") ?? undefined,
           event: events.length > 0 ? events : undefined,
@@ -363,9 +378,12 @@ export function createRelayServer(opts: RelayServerOptions): Server {
 
     const signatureHeader = req.headers["x-signature"];
     const id = randomUUID();
+    // Resolve the trace ID before verification so even rejections are
+    // traceable; a client-supplied x-trace-id is honored, otherwise fresh.
+    const traceId = resolveTraceId(req.headers[TRACE_ID_HEADER]);
 
     if (!verifier.verify(body, signatureHeader ?? "")) {
-      opts.auditLog.append({ event: "rejected", id, reason: "invalid_signature" });
+      opts.auditLog.append({ event: "rejected", id, traceId, reason: "invalid_signature" });
       res.writeHead(401, { "content-type": "text/plain" }).end("Invalid signature");
       return;
     }
@@ -381,7 +399,7 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       const verdict = opts.replay.check(nonce, timestampMs);
       if (!verdict.ok) {
         const reason = verdict.reason as string;
-        opts.auditLog.append({ event: "rejected", id, reason });
+        opts.auditLog.append({ event: "rejected", id, traceId, reason });
         const status = reason === "duplicate_nonce" ? 409 : 400;
         res.writeHead(status, { "content-type": "text/plain" }).end(`Rejected: ${reason}`);
         return;
@@ -396,10 +414,10 @@ export function createRelayServer(opts: RelayServerOptions): Server {
     if (deduplicator) {
       const payloadHash = DeliveryDeduplicator.hashPayload(body);
       if (deduplicator.check(opts.forwardUrl, payloadHash)) {
-        opts.auditLog.append({ event: "duplicate_suppressed", id, targetUrl: opts.forwardUrl });
+        opts.auditLog.append({ event: "duplicate_suppressed", id, traceId, targetUrl: opts.forwardUrl });
         res
           .writeHead(202, { "content-type": "application/json" })
-          .end(JSON.stringify({ id, status: "accepted", duplicate: true }));
+          .end(JSON.stringify({ id, traceId, status: "accepted", duplicate: true }));
         return;
       }
     }
@@ -421,6 +439,7 @@ export function createRelayServer(opts: RelayServerOptions): Server {
 
     queue.enqueue({
       id,
+      traceId,
       payload: body,
       targetUrl: opts.forwardUrl,
       headers: passthrough,
@@ -429,12 +448,13 @@ export function createRelayServer(opts: RelayServerOptions): Server {
     const acceptedEvent: Record<string, unknown> = {
       event: "accepted",
       id,
+      traceId,
       targetUrl: opts.forwardUrl,
     };
     if (priority) acceptedEvent.priority = priority;
     if (opts.auditPayloads) acceptedEvent.payload = body;
     opts.auditLog.append(acceptedEvent);
-    res.writeHead(202, { "content-type": "application/json" }).end(JSON.stringify({ id, status: "accepted" }));
+    res.writeHead(202, { "content-type": "application/json" }).end(JSON.stringify({ id, traceId, status: "accepted" }));
   });
 
   server.on("close", () => queue.stop());
