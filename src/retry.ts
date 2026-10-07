@@ -184,6 +184,8 @@ export class RetryQueue {
   private readonly timers = new Map<string, Scheduled>();
   private readonly deadLetter: DeadLetterEntry[] = [];
   private readonly limiter: EndpointConcurrencyLimiter;
+  /** Deliveries currently executing (inside `deliver()`), for graceful drain. */
+  private readonly inFlight = new Set<Promise<void>>();
   private running = false;
 
   constructor(opts: RetryQueueOptions = {}) {
@@ -283,6 +285,43 @@ export class RetryQueue {
     }
   }
 
+  /**
+   * Graceful shutdown: stop scheduling new attempts, then wait for the
+   * deliveries already in flight to settle. Items still waiting on a backoff
+   * timer are dropped (they were never delivered); the caller is expected to
+   * exit the process afterwards.
+   *
+   * @param timeoutMs maximum time to wait for in-flight deliveries.
+   * @returns `true` when every in-flight delivery settled within the timeout,
+   * `false` on timeout — in which case the caller should force-exit so a hung
+   * downstream cannot pin the process forever.
+   */
+  async shutdown(timeoutMs = 30_000): Promise<boolean> {
+    this.running = false;
+    for (const [id, s] of this.timers) {
+      this.clearTimer(s.handle);
+      this.timers.delete(id);
+    }
+    if (this.inFlight.size === 0) return true;
+    let timer: { clear(): void } | undefined;
+    try {
+      await Promise.race([
+        Promise.allSettled([...this.inFlight]),
+        new Promise<void>((resolve) => {
+          timer = this.setTimer(resolve, timeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timer) this.clearTimer(timer);
+    }
+    return this.inFlight.size === 0;
+  }
+
+  /** Number of deliveries currently executing (not just scheduled). */
+  inFlightCount(): number {
+    return this.inFlight.size;
+  }
+
   /** Backoff for the *next* retry given the completed attempt index (0-based). */
   delayForAttempt(attempt: number): number {
     const cap = Math.min(this.maxDelayMs, this.baseDelayMs * 2 ** attempt);
@@ -301,7 +340,14 @@ export class RetryQueue {
     }
     const handle = this.setTimer(() => {
       this.timers.delete(id);
-      void this.deliver(id);
+      const p = this.deliver(id);
+      // `deliver` never rejects (sender errors are caught internally), but
+      // track both outcomes so a bug can never leak a hanging shutdown.
+      this.inFlight.add(p);
+      p.then(
+        () => this.inFlight.delete(p),
+        () => this.inFlight.delete(p)
+      );
     }, delayMs);
     this.timers.set(id, { handle });
   }

@@ -75,6 +75,39 @@ reliability primitives that matter for any signed-payload pipeline.
   `GET /audit` (`?endpoint=`, `?event=` repeatable, `?since=`/`?until=` ISO-8601,
   `?limit=`), which queries the audit log through its index — delivery
   forensics per endpoint and time range.
+- `src/shutdown.ts` — `installGracefulShutdown(server, drain, opts)`:
+  one-shot SIGTERM/SIGINT handling. On the first signal the HTTP server stops
+  accepting new connections (idle keep-alives are dropped; in-flight requests
+  still finish), `drain()` runs, then the process exits 0 when drained, 1 on
+  drain timeout. `RetryQueue.shutdown(timeoutMs)` stops scheduling new
+  attempts, cancels pending backoff timers, and waits for in-flight
+  deliveries to settle. Opt in per server with
+  `createRelayServer({ ..., gracefulShutdown: { timeoutMs: 30_000 } })`
+  (off by default; the `exit` hook is overridable for embedding/tests).
+
+## Graceful shutdown
+
+```ts
+const server = createRelayServer({
+  secret, forwardUrl, auditLog,
+  gracefulShutdown: { timeoutMs: 30_000 }, // SIGTERM/SIGINT → drain → exit
+});
+```
+
+Shutdown sequence on the first signal:
+
+1. **Stop accepting** — `server.close()`; idle keep-alive connections are
+   dropped, in-flight requests run to completion.
+2. **Drain deliveries** — `queue.shutdown(timeoutMs)`: no new attempts are
+   scheduled, pending backoff timers are cancelled, and in-flight `sender()`
+   calls are awaited (a delivery parked on a concurrency slot bails out
+   instead of hanging).
+3. **Exit** — 0 when everything settled, 1 when the timeout expired, so a
+   hung downstream cannot pin the process forever.
+
+Items still waiting on a backoff timer are dropped — they were never
+delivered, and the queue is in-memory. For at-least-once across restarts,
+replay the dead-letter list after the process comes back.
 
 ## Run
 
@@ -119,6 +152,15 @@ Requires Node 24+ (runs `.ts` directly via type stripping; zero dependencies).
   backoff and the payload arrives byte-identical (audit records `delivered`
   with `attempts: 3`); an always-500 stub proves exhaustion lands on the
   operator `GET /dead-letter` endpoint with `attempts: 3`.
+- `test/shutdown.test.ts` — graceful shutdown: `RetryQueue.shutdown` waits for
+  an in-flight delivery before resolving `true`, cancels pending backoff
+  timers (no new attempts start), reports `false` on a hung sender after the
+  timeout, and never hangs on a delivery parked on a concurrency slot.
+  `installGracefulShutdown` stops accepting connections, drains, exits 0
+  (events in order: `signal` → `server-closed` → `drained`), exits 1 on drain
+  timeout, lets an in-flight HTTP request finish first, ignores a second
+  signal, and uninstalls cleanly. The server wiring drains a real in-flight
+  delivery on SIGTERM before exiting 0.
 - `test/server.test.ts` — end-to-end against a local stub HTTP server: a
   valid webhook is forwarded byte-for-byte and audited as delivered; an
   invalid signature returns 401 and is never forwarded. Also proves the

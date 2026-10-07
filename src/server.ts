@@ -4,6 +4,7 @@ import type { Server } from "node:http";
 import { randomUUID } from "node:crypto";
 import { HmacSha256Verifier, type Verifier } from "./verify.ts";
 import { RetryQueue, type RetryItem, type Sender } from "./retry.ts";
+import { installGracefulShutdown } from "./shutdown.ts";
 import type { ReplayGuard } from "./replay.ts";
 import type { AuditLog } from "./audit.ts";
 
@@ -39,6 +40,15 @@ export interface RelayServerOptions {
    */
   replay?: ReplayGuard;
   /** Inject queue hooks (e.g. to fail the server fast on dead letters). */
+  /**
+   * Opt-in graceful shutdown on SIGTERM/SIGINT: stop accepting new
+   * connections, wait up to `timeoutMs` (default 30_000) for in-flight
+   * deliveries to settle, then exit the process (0 = drained, 1 = drain
+   * timeout). `exit` overrides `process.exit` — an escape hatch for
+   * embedding the server or asserting the shutdown path in tests.
+   * Off by default so the server stays a pure library component.
+   */
+  gracefulShutdown?: { timeoutMs?: number; exit?: (code: number) => void };
 }
 
 function defaultSender(item: RetryItem): Promise<void> {
@@ -260,5 +270,16 @@ export function createRelayServer(opts: RelayServerOptions): Server {
   });
 
   server.on("close", () => queue.stop());
+
+  if (opts.gracefulShutdown) {
+    const timeoutMs = opts.gracefulShutdown.timeoutMs ?? 30_000;
+    const uninstall = installGracefulShutdown(server, () => queue.shutdown(timeoutMs), {
+      exit: opts.gracefulShutdown.exit,
+    });
+    // Remove the signal listeners once the server is gone so an embedded
+    // server does not leave process-level handlers behind.
+    server.on("close", () => uninstall());
+  }
+
   return server;
 }
