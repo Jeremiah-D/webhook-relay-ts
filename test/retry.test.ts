@@ -140,4 +140,91 @@ describe("retry", () => {
     // Sane configs still construct.
     new RetryQueue({ baseDelayMs: 1, maxDelayMs: 1, maxAttempts: 1, jitterMs: 0 });
   });
+
+  it("dead-letter entries carry attempts, lastError, and a timestamp", async () => {
+    const timer = manualTimer();
+    const q = new RetryQueue({
+      sender: async () => {
+        throw new Error("downstream down");
+      },
+      baseDelayMs: 10,
+      maxAttempts: 3,
+      jitterMs: 0,
+      setTimer: timer.setTimer,
+    });
+    q.start();
+    q.enqueue({ ...ITEM });
+    await timer.run();
+    const dead = q.getDeadLetter();
+    assert.equal(dead.length, 1);
+    assert.equal(dead[0].id, "item-1");
+    assert.equal(dead[0].attempts, 3);
+    assert.equal(dead[0].lastError, "downstream down");
+    assert.ok(!Number.isNaN(Date.parse(dead[0].deadLetteredAt)));
+    // Original payload metadata survives the round trip.
+    assert.equal(dead[0].targetUrl, ITEM.targetUrl);
+    assert.deepEqual(dead[0].payload, ITEM.payload);
+  });
+
+  it("replays a dead-lettered item with a fresh attempt budget", async () => {
+    const timer = manualTimer();
+    let failing = true;
+    let deliveries = 0;
+    const q = new RetryQueue({
+      sender: async () => {
+        deliveries += 1;
+        if (failing) throw new Error("flaky");
+      },
+      baseDelayMs: 10,
+      maxAttempts: 2,
+      jitterMs: 0,
+      setTimer: timer.setTimer,
+    });
+    q.start();
+    q.enqueue({ ...ITEM });
+    await timer.run();
+    assert.equal(deliveries, 2);
+    assert.equal(q.getDeadLetter().length, 1);
+
+    assert.equal(q.replayDeadLetter("unknown-id"), false);
+    assert.equal(q.replayDeadLetter("item-1"), true);
+    assert.equal(q.getDeadLetter().length, 0);
+    assert.equal(q.pendingCount(), 1);
+
+    failing = false;
+    await timer.run();
+    assert.equal(deliveries, 3);
+    assert.equal(q.pendingCount(), 0);
+    assert.equal(q.getDeadLetter().length, 0);
+  });
+
+  it("replayAllDeadLetters replays every entry and returns the count", async () => {
+    const timer = manualTimer();
+    let failing = true;
+    const delivered: string[] = [];
+    const q = new RetryQueue({
+      sender: async (item) => {
+        if (failing) throw new Error("flaky");
+        delivered.push(item.id);
+      },
+      baseDelayMs: 10,
+      maxAttempts: 2,
+      jitterMs: 0,
+      setTimer: timer.setTimer,
+    });
+    q.start();
+    q.enqueue({ ...ITEM, id: "a" });
+    q.enqueue({ ...ITEM, id: "b" });
+    await timer.run();
+    assert.equal(q.getDeadLetter().length, 2);
+
+    assert.equal(q.replayAllDeadLetters(), 2);
+    assert.equal(q.getDeadLetter().length, 0);
+    assert.equal(q.replayAllDeadLetters(), 0);
+
+    failing = false;
+    await timer.run();
+    assert.deepEqual(delivered.sort(), ["a", "b"]);
+    assert.equal(q.pendingCount(), 0);
+  });
 });

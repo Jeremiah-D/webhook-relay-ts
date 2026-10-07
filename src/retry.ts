@@ -20,6 +20,19 @@ export type Sender = (item: RetryItem) => Promise<void>;
  */
 export type JitterStrategy = "additive" | "full";
 
+/**
+ * A dead-lettered delivery: the original {@link RetryItem} plus the
+ * metadata an operator needs to diagnose and replay it.
+ */
+export interface DeadLetterEntry extends RetryItem {
+  /** Attempts consumed before the item was dead-lettered. */
+  attempts: number;
+  /** Last delivery error message. */
+  lastError: string;
+  /** ISO-8601 timestamp when the item entered the dead-letter list. */
+  deadLetteredAt: string;
+}
+
 export interface RetryQueueOptions {
   /** Sender function; defaults to a no-op success sender. Injectable for tests. */
   sender?: Sender;
@@ -77,7 +90,7 @@ export class RetryQueue {
 
   private readonly queue = new Map<string, RetryItem & { attempt: number }>();
   private readonly timers = new Map<string, Scheduled>();
-  private readonly deadLetter: RetryItem[] = [];
+  private readonly deadLetter: DeadLetterEntry[] = [];
   private running = false;
 
   constructor(opts: RetryQueueOptions = {}) {
@@ -119,8 +132,35 @@ export class RetryQueue {
   }
 
   /** Items that exhausted all attempts, in dead-letter order. */
-  getDeadLetter(): RetryItem[] {
+  getDeadLetter(): DeadLetterEntry[] {
     return [...this.deadLetter];
+  }
+
+  /**
+   * Move a dead-lettered item back into the queue with a fresh attempt
+   * budget (attempts reset to 0, scheduled immediately when running).
+   * Returns false when no dead-letter entry matches `id`.
+   */
+  replayDeadLetter(id: string): boolean {
+    const idx = this.deadLetter.findIndex((e) => e.id === id);
+    if (idx < 0) return false;
+    const [entry] = this.deadLetter.splice(idx, 1);
+    const { attempts: _attempts, lastError: _lastError, deadLetteredAt: _ts, ...item } = entry;
+    this.queue.set(item.id, { ...item, attempt: 0 });
+    if (this.running) {
+      this.schedule(item.id, 0);
+    }
+    return true;
+  }
+
+  /** Replay every dead-lettered item. Returns the number replayed. */
+  replayAllDeadLetters(): number {
+    const ids = this.deadLetter.map((e) => e.id);
+    let replayed = 0;
+    for (const id of ids) {
+      if (this.replayDeadLetter(id)) replayed += 1;
+    }
+    return replayed;
   }
 
   enqueue(item: RetryItem): void {
@@ -188,6 +228,9 @@ export class RetryQueue {
           payload: entry.payload,
           targetUrl: entry.targetUrl,
           headers: entry.headers,
+          attempts: entry.attempt,
+          lastError: err instanceof Error ? err.message : String(err),
+          deadLetteredAt: new Date().toISOString(),
         });
         this.onDeadLetter?.(entry, entry.attempt, err);
       } else {

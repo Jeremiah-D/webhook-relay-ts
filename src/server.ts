@@ -22,6 +22,12 @@ export interface RelayServerOptions {
   verifier?: Verifier;
   /** Retry queue tuning, passed through to RetryQueue. */
   retry?: ConstructorParameters<typeof RetryQueue>[0];
+  /**
+   * Bearer token guarding the dead-letter operator endpoints
+   * (`GET /dead-letter`, `POST /dead-letter/:id/replay`). When unset, those
+   * endpoints are disabled and answer 404 (fail closed).
+   */
+  operatorToken?: string;
   /** Inject queue hooks (e.g. to fail the server fast on dead letters). */
 }
 
@@ -96,7 +102,68 @@ export function createRelayServer(opts: RelayServerOptions): Server {
 
   const verifier = opts.verifier ?? new HmacSha256Verifier(opts.secret);
 
+  const respondJson = (
+    res: Parameters<Parameters<typeof createServer>[0]>[1],
+    status: number,
+    body: unknown
+  ): void => {
+    res.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(body));
+  };
+
+  /** Operator surface for the dead-letter queue: list + manual replay. */
+  const handleOperator = (
+    req: Parameters<Parameters<typeof createServer>[0]>[0],
+    res: Parameters<Parameters<typeof createServer>[0]>[1],
+    pathname: string
+  ): void => {
+    if (!opts.operatorToken) {
+      respondJson(res, 404, { error: "operator endpoints disabled" });
+      return;
+    }
+    if (req.headers["authorization"] !== `Bearer ${opts.operatorToken}`) {
+      respondJson(res, 403, { error: "forbidden" });
+      return;
+    }
+    const isList = pathname === "/dead-letter";
+    const replayMatch = /^\/dead-letter\/([^/]+)\/replay$/.exec(pathname);
+    if (!isList && !replayMatch) {
+      respondJson(res, 404, { error: "not found" });
+      return;
+    }
+    if (!((isList && req.method === "GET") || (replayMatch && req.method === "POST"))) {
+      respondJson(res, 405, { error: "method not allowed" });
+      return;
+    }
+    if (isList) {
+      respondJson(
+        res,
+        200,
+        queue.getDeadLetter().map((e) => ({
+          id: e.id,
+          targetUrl: e.targetUrl,
+          attempts: e.attempts,
+          lastError: e.lastError,
+          deadLetteredAt: e.deadLetteredAt,
+          payloadBytes: e.payload.length,
+        }))
+      );
+      return;
+    }
+    const id = decodeURIComponent(replayMatch![1]);
+    if (queue.replayDeadLetter(id)) {
+      opts.auditLog.append({ event: "dead_letter_replayed", id });
+      respondJson(res, 200, { id, replayed: true });
+    } else {
+      respondJson(res, 404, { error: "unknown dead-letter id" });
+    }
+  };
+
   const server = createServer(async (req, res) => {
+    const pathname = new URL(req.url ?? "/", "http://internal").pathname;
+    if (pathname === "/dead-letter" || pathname.startsWith("/dead-letter/")) {
+      handleOperator(req, res, pathname);
+      return;
+    }
     if (req.method !== "POST") {
       res.writeHead(405, { "content-type": "text/plain" }).end("Method not allowed");
       return;
