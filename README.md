@@ -80,6 +80,16 @@ reliability primitives that matter for any signed-payload pipeline.
   Memory-bounded: nonces expire with the window (lazy sweep per check) and a
   `maxEntries` cap evicts oldest-first. Injectable clock for deterministic
   tests.
+- `src/dedup.ts` — idempotent delivery dedup (`DeliveryDeduplicator`): within
+  `windowMs` (default 5 min), a `(targetUrl, sha256(payload))` pair already
+  accepted is answered 202 with `duplicate: true` and never delivered — the
+  payment-callback guard, so an upstream retry of the same event cannot cause
+  a duplicate business action. Same payload to a different endpoint stays a
+  different delivery. Suppressions are audited as `duplicate_suppressed`.
+  Complements `ReplayGuard` (header-based exact replays) with
+  payload-identity dedup across re-ids. Memory-bounded: entries expire out of
+  the window lazily and `maxEntries` (default 10k) evicts oldest-first.
+  Opt-in via `dedup: {...}` (off by default); injectable clock for tests.
 - `src/circuit.ts` — per-endpoint circuit breaker (`EndpointCircuitBreaker`,
   `closed` / `open` / `half_open`): `failureThreshold` (default 5)
   consecutive delivery failures trip the circuit open for `cooldownMs`
@@ -171,6 +181,11 @@ written to the audit log, so the log is the machine's trace.
 - `received` → **`rejected`** (`duplicate_nonce` → HTTP 409, or
   `missing_nonce` / `expired_timestamp` / `future_timestamp` → HTTP 400)
   when replay protection is enabled and the guard says no.
+- `received` → **`duplicate_suppressed`** (HTTP 202 with `duplicate: true`)
+  when idempotent dedup is enabled and the `(endpoint, payload-hash)` pair
+  was already accepted inside the window. The event is acknowledged, not
+  delivered — upstream treats it as handled, so a retried payment callback
+  cannot charge twice.
 - `received` → **`accepted`** (HTTP 202) when the webhook verifies. The item
   is enqueued for delivery.
 
@@ -297,3 +312,11 @@ Requires Node 24+ (runs `.ts` directly via type stripping; zero dependencies).
   configs. Queue integration: accepted→delivered sampling with `onSloMiss`
   firing past the budget, dead-lettered items discarded without sampling,
   and tracking disabled by default.
+- `test/dedup.test.ts` — `DeliveryDeduplicator`: deterministic hashing,
+  repeat-inside-window suppression, payload/endpoint independence, window
+  expiry re-delivering, oldest-first eviction past `maxEntries`, and
+  `RangeError` on invalid configs. Server integration: a repeated payment
+  callback answers 202 `duplicate: true` and is delivered exactly once
+  (audited as `duplicate_suppressed`); a different payload is a different
+  event; dedup stays off by default; signature verification still runs
+  before the dedup check.

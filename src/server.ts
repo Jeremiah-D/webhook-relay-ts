@@ -7,6 +7,7 @@ import { RetryQueue, type DeliveryPriority, type RetryItem, type Sender } from "
 import { installGracefulShutdown } from "./shutdown.ts";
 import type { PayloadEncryptor } from "./encrypt.ts";
 import type { ReplayGuard } from "./replay.ts";
+import { DeliveryDeduplicator, type DedupOptions } from "./dedup.ts";
 import type { AuditLog } from "./audit.ts";
 
 export interface RelayServerOptions {
@@ -40,6 +41,17 @@ export interface RelayServerOptions {
    * unsigned-legacy senders keep working unless the operator opts in.
    */
   replay?: ReplayGuard;
+  /**
+   * Idempotent delivery dedup (see `src/dedup.ts`). When set, an inbound
+   * POST whose (endpoint, payload-hash) pair was already accepted inside
+   * `windowMs` is answered 202 with `duplicate: true` and never delivered —
+   * the suppression is audited as `duplicate_suppressed`. This is the
+   * payment-callback guard: an upstream retry of the same event cannot
+   * trigger a duplicate business action. 202, not 409: upstream should
+   * treat the event as handled. Off by default, so identical payloads keep
+   * the legacy always-deliver behavior unless the operator opts in.
+   */
+  dedup?: DedupOptions;
   /** Inject queue hooks (e.g. to fail the server fast on dead letters). */
   /**
    * Seals dead-letter payloads at rest (see `RetryQueue` `payloadEncryptor`;
@@ -153,6 +165,7 @@ export function createRelayServer(opts: RelayServerOptions): Server {
   queue.start();
 
   const verifier = opts.verifier ?? new HmacSha256Verifier(opts.secret);
+  const deduplicator = opts.dedup ? new DeliveryDeduplicator(opts.dedup) : undefined;
 
   const respondJson = (
     res: Parameters<Parameters<typeof createServer>[0]>[1],
@@ -299,6 +312,22 @@ export function createRelayServer(opts: RelayServerOptions): Server {
         opts.auditLog.append({ event: "rejected", id, reason });
         const status = reason === "duplicate_nonce" ? 409 : 400;
         res.writeHead(status, { "content-type": "text/plain" }).end(`Rejected: ${reason}`);
+        return;
+      }
+    }
+
+    // Payload-hash dedup (WR-14): the same business event re-pushed inside
+    // the window is acknowledged but never delivered — the duplicate
+    // business action (e.g. a repeated payment callback charging twice) is
+    // what we are protecting against. 202, not 409, so upstream treats the
+    // event as handled instead of retrying again.
+    if (deduplicator) {
+      const payloadHash = DeliveryDeduplicator.hashPayload(body);
+      if (deduplicator.check(opts.forwardUrl, payloadHash)) {
+        opts.auditLog.append({ event: "duplicate_suppressed", id, targetUrl: opts.forwardUrl });
+        res
+          .writeHead(202, { "content-type": "application/json" })
+          .end(JSON.stringify({ id, status: "accepted", duplicate: true }));
         return;
       }
     }
