@@ -7,17 +7,37 @@ export interface RetryItem {
 
 export type Sender = (item: RetryItem) => Promise<void>;
 
+/**
+ * Jitter strategy for the retry backoff.
+ *
+ * - `"additive"` (default): uniform(0, `jitterMs`) added on top of the
+ *   exponential term. Preserves the original behavior.
+ * - `"full"`: uniform(0, min(`maxDelayMs`, `baseDelayMs * 2^attempt`)) — the
+ *   AWS-style "full jitter". This is the recommended anti-thundering-herd
+ *   choice: when many deliveries fail at once (e.g. a downstream outage),
+ *   their retry schedules spread across the whole window instead of
+ *   clustering on the exponential grid.
+ */
+export type JitterStrategy = "additive" | "full";
+
 export interface RetryQueueOptions {
   /** Sender function; defaults to a no-op success sender. Injectable for tests. */
   sender?: Sender;
-  /** Base delay in ms for the exponential backoff. Default: 1000. */
+  /** Base delay in ms for the exponential backoff. Default: 1000. Must be > 0. */
   baseDelayMs?: number;
-  /** Maximum delay in ms between attempts. Default: 60000. */
+  /** Maximum delay in ms between attempts. Default: 60000. Must be > 0. */
   maxDelayMs?: number;
-  /** Total attempts per item (initial try + retries). Default: 5. */
+  /** Total attempts per item (initial try + retries). Default: 5. Must be >= 1. */
   maxAttempts?: number;
-  /** Jitter added to each delay in ms (uniform 0..jitterMs). Default: 100. */
+  /** Jitter added to each delay in ms (uniform 0..jitterMs). Default: 100. Must be >= 0. */
   jitterMs?: number;
+  /** Jitter strategy; see {@link JitterStrategy}. Default: "additive". */
+  jitterStrategy?: JitterStrategy;
+  /**
+   * Random source in [0, 1) used for jitter; defaults to `Math.random`.
+   * Injectable so tests can verify jitter bounds deterministically.
+   */
+  random?: () => number;
   /**
    * Scheduler factory; defaults to the real setTimeout. Injectable so tests
    * can run deterministically. Returns a handle with an `unref`-style
@@ -48,6 +68,8 @@ export class RetryQueue {
   private readonly maxDelayMs: number;
   private readonly maxAttempts: number;
   private readonly jitterMs: number;
+  private readonly jitterStrategy: JitterStrategy;
+  private readonly random: () => number;
   private readonly setTimer: (fn: () => void, ms: number) => { clear(): void };
   private readonly clearTimer: (handle: { clear(): void }) => void;
   private readonly onDeadLetter?: (item: RetryItem, attempts: number, lastError: unknown) => void;
@@ -64,6 +86,23 @@ export class RetryQueue {
     this.maxDelayMs = opts.maxDelayMs ?? 60000;
     this.maxAttempts = opts.maxAttempts ?? 5;
     this.jitterMs = opts.jitterMs ?? 100;
+    this.jitterStrategy = opts.jitterStrategy ?? "additive";
+    this.random = opts.random ?? Math.random;
+    if (!Number.isFinite(this.baseDelayMs) || this.baseDelayMs <= 0) {
+      throw new RangeError(`baseDelayMs must be > 0, got ${this.baseDelayMs}`);
+    }
+    if (!Number.isFinite(this.maxDelayMs) || this.maxDelayMs <= 0) {
+      throw new RangeError(`maxDelayMs must be > 0, got ${this.maxDelayMs}`);
+    }
+    if (!Number.isInteger(this.maxAttempts) || this.maxAttempts < 1) {
+      throw new RangeError(`maxAttempts must be an integer >= 1, got ${this.maxAttempts}`);
+    }
+    if (!Number.isFinite(this.jitterMs) || this.jitterMs < 0) {
+      throw new RangeError(`jitterMs must be >= 0, got ${this.jitterMs}`);
+    }
+    if (this.jitterStrategy !== "additive" && this.jitterStrategy !== "full") {
+      throw new RangeError(`jitterStrategy must be "additive" or "full", got ${this.jitterStrategy}`);
+    }
     this.setTimer =
       opts.setTimer ?? ((fn, ms) => {
         const t = setTimeout(fn, ms);
@@ -112,7 +151,11 @@ export class RetryQueue {
 
   /** Backoff for the *next* retry given the completed attempt index (0-based). */
   delayForAttempt(attempt: number): number {
-    const jitter = this.jitterMs > 0 ? Math.random() * this.jitterMs : 0;
+    const cap = Math.min(this.maxDelayMs, this.baseDelayMs * 2 ** attempt);
+    if (this.jitterStrategy === "full") {
+      return this.random() * cap;
+    }
+    const jitter = this.jitterMs > 0 ? this.random() * this.jitterMs : 0;
     return Math.min(this.maxDelayMs, this.baseDelayMs * 2 ** attempt + jitter);
   }
 

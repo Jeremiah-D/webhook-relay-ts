@@ -91,4 +91,53 @@ describe("retry", () => {
     assert.equal(q.delayForAttempt(10), 5000);
     assert.equal(q.delayForAttempt(1), 2000);
   });
+
+  it("additive jitter uses the injected random source", () => {
+    // random() = 0.5, jitterMs = 50 -> delay = base*2^attempt + 25
+    const q = new RetryQueue({
+      baseDelayMs: 100,
+      maxDelayMs: 10000,
+      maxAttempts: 3,
+      jitterMs: 50,
+      random: () => 0.5,
+    });
+    assert.equal(q.delayForAttempt(0), 125);
+    assert.equal(q.delayForAttempt(1), 225);
+    assert.equal(q.delayForAttempt(2), 425);
+  });
+
+  it("full jitter spreads the delay over [0, min(cap, base*2^attempt)]", () => {
+    let r = 0.5;
+    const q = new RetryQueue({
+      baseDelayMs: 100,
+      maxDelayMs: 1000,
+      maxAttempts: 3,
+      jitterStrategy: "full",
+      random: () => r,
+    });
+    assert.equal(q.delayForAttempt(1), 100); // 0.5 * min(1000, 200)
+    r = 0;
+    assert.equal(q.delayForAttempt(3), 0); // full jitter may return 0
+    r = 0.999;
+    assert.equal(q.delayForAttempt(10), 999); // 0.999 * min(1000, 100*2^10)
+    // Never exceeds the cap, even at the extreme of the random range.
+    for (const attempt of [0, 1, 5, 20]) {
+      assert.ok(q.delayForAttempt(attempt) <= 1000, `attempt ${attempt} exceeds cap`);
+    }
+  });
+
+  it("rejects invalid retry configuration", () => {
+    assert.throws(() => new RetryQueue({ baseDelayMs: 0 }), RangeError);
+    assert.throws(() => new RetryQueue({ baseDelayMs: -10 }), RangeError);
+    assert.throws(() => new RetryQueue({ maxDelayMs: 0 }), RangeError);
+    assert.throws(() => new RetryQueue({ maxAttempts: 0 }), RangeError);
+    assert.throws(() => new RetryQueue({ maxAttempts: 1.5 }), RangeError);
+    assert.throws(() => new RetryQueue({ jitterMs: -1 }), RangeError);
+    assert.throws(
+      () => new RetryQueue({ jitterStrategy: "bogus" as never }),
+      RangeError
+    );
+    // Sane configs still construct.
+    new RetryQueue({ baseDelayMs: 1, maxDelayMs: 1, maxAttempts: 1, jitterMs: 0 });
+  });
 });
