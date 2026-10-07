@@ -109,7 +109,16 @@ Requires Node 24+ (runs `.ts` directly via type stripping; zero dependencies).
   `RangeError` on invalid configs. Covers dead-letter replay: entries carry
   attempts/lastError/timestamp, `replayDeadLetter` re-queues with a fresh
   attempt budget (unknown ids return false), and `replayAllDeadLetters`
-  returns the replayed count.
+  returns the replayed count. Covers the concurrency layer:
+  `maxConcurrentPerEndpoint` caps in-flight deliveries per endpoint (FIFO
+  slot queueing, independent budgets per endpoint, `RangeError` on invalid
+  configs, `getConcurrencyStats()` observability), and `stop()` unblocks
+  queued waiters without losing items (restart resumes where it left off).
+- `test/e2e.test.ts` — end-to-end over real HTTP with the default sender: a
+  flaky stub (500, 500, then 200) proves retries happen with visibly growing
+  backoff and the payload arrives byte-identical (audit records `delivered`
+  with `attempts: 3`); an always-500 stub proves exhaustion lands on the
+  operator `GET /dead-letter` endpoint with `attempts: 3`.
 - `test/server.test.ts` — end-to-end against a local stub HTTP server: a
   valid webhook is forwarded byte-for-byte and audited as delivered; an
   invalid signature returns 401 and is never forwarded. Also proves the
