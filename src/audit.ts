@@ -1,4 +1,18 @@
 import { appendFileSync, closeSync, openSync, readFileSync, readSync, statSync } from "node:fs";
+import { isEncryptedPayload, type PayloadEncryptor } from "./encrypt.ts";
+
+export type { PayloadEncryptor };
+
+/** Options for {@link AuditLog}. */
+export interface AuditLogOptions {
+  /**
+   * When set, a `payload` field (Buffer or string) on an appended event is
+   * sealed into an {@link EncryptedPayload} envelope before the line hits
+   * disk, and transparently decrypted back on `readAll`/`query`. Unset by
+   * default: payloads are stored as plain JSON.
+   */
+  payloadEncryptor?: PayloadEncryptor;
+}
 
 /** Filters for {@link AuditLog.query}. All filters are ANDed together. */
 export interface AuditQuery {
@@ -45,17 +59,62 @@ interface IndexEntry {
  */
 export class AuditLog {
   private readonly path: string;
+  private readonly payloadEncryptor?: PayloadEncryptor;
   private index: IndexEntry[] = [];
   /** Byte offset up to which the file has been indexed. */
   private indexedBytes = 0;
 
-  constructor(path: string) {
+  constructor(path: string, opts: AuditLogOptions = {}) {
     this.path = path;
+    this.payloadEncryptor = opts.payloadEncryptor;
+  }
+
+  /** Whether appended `payload` fields are sealed at rest. */
+  hasPayloadEncryptor(): boolean {
+    return this.payloadEncryptor !== undefined;
   }
 
   append(event: object): void {
-    const line = JSON.stringify({ ts: new Date().toISOString(), ...event });
+    const line = JSON.stringify({ ts: new Date().toISOString(), ...this.sealPayload(event) });
     appendFileSync(this.path, line + "\n", "utf8");
+  }
+
+  /**
+   * Seal a Buffer/string `payload` field into an encrypted envelope before
+   * the line hits disk. Non-payload fields pass through untouched.
+   */
+  private sealPayload(event: object): object {
+    if (!this.payloadEncryptor) return event;
+    const rec = event as Record<string, unknown>;
+    const p = rec.payload;
+    const isBuffer = Buffer.isBuffer(p);
+    if (!isBuffer && typeof p !== "string") return event;
+    const plain = isBuffer ? p : Buffer.from(p, "utf8");
+    return {
+      ...rec,
+      payload: this.payloadEncryptor.encrypt(plain),
+      payloadEncrypted: true,
+      payloadEncoding: isBuffer ? "buffer" : "utf8",
+      payloadBytes: plain.length,
+    };
+  }
+
+  /**
+   * Restore a sealed `payload` envelope to the shape an unencrypted append
+   * would have produced (string stays a string; a Buffer comes back as its
+   * `{ type: "Buffer", data: [...] }` JSON form). Crypto failures throw —
+   * a silent wrong-key read would be worse than a loud one.
+   */
+  private openPayload(entry: Record<string, unknown>): Record<string, unknown> {
+    if (!this.payloadEncryptor || entry.payloadEncrypted !== true) return entry;
+    if (!isEncryptedPayload(entry.payload)) {
+      throw new Error("AuditLog: payloadEncrypted entry has a malformed payload envelope");
+    }
+    const plain = this.payloadEncryptor.decrypt(entry.payload);
+    return {
+      ...entry,
+      payload: entry.payloadEncoding === "utf8" ? plain.toString("utf8") : plain.toJSON(),
+    };
   }
 
   readAll(): object[] {
@@ -69,11 +128,15 @@ export class AuditLog {
     for (const line of raw.split("\n")) {
       const trimmed = line.trim();
       if (trimmed.length === 0) continue;
+      let parsed: unknown;
       try {
-        out.push(JSON.parse(trimmed));
+        parsed = JSON.parse(trimmed);
       } catch {
         // Skip malformed lines; never let one bad line break reads.
+        continue;
       }
+      // Crypto failures propagate: a silent wrong-key read is worse than a loud one.
+      out.push(this.openPayload(parsed as Record<string, unknown>));
     }
     return out;
   }
@@ -126,7 +189,7 @@ export class AuditLog {
           if (n === 0) break; // Truncated mid-read; parse what we have.
           read += n;
         }
-        return JSON.parse(buf.subarray(0, read).toString("utf8"));
+        return this.openPayload(JSON.parse(buf.subarray(0, read).toString("utf8")));
       });
     } finally {
       closeSync(fd);

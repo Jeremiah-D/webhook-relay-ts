@@ -1,6 +1,8 @@
 import { EndpointCircuitBreaker, type CircuitBreakerOptions, type CircuitState, type CircuitStats } from "./circuit.ts";
+import type { EncryptedPayload, PayloadEncryptor } from "./encrypt.ts";
 
 export type { CircuitBreakerOptions, CircuitState, CircuitStats };
+export type { EncryptedPayload, PayloadEncryptor };
 
 export interface RetryItem {
   id: string;
@@ -27,6 +29,11 @@ export type JitterStrategy = "additive" | "full";
 /**
  * A dead-lettered delivery: the original {@link RetryItem} plus the
  * metadata an operator needs to diagnose and replay it.
+ *
+ * When the queue is configured with a `payloadEncryptor`, the payload is
+ * sealed at rest: `payload` is empty, `encryptedPayload` holds the envelope,
+ * and `payloadBytes` records the original length (the operator endpoint
+ * never exposes raw payloads either way).
  */
 export interface DeadLetterEntry extends RetryItem {
   /** Attempts consumed before the item was dead-lettered. */
@@ -35,6 +42,10 @@ export interface DeadLetterEntry extends RetryItem {
   lastError: string;
   /** ISO-8601 timestamp when the item entered the dead-letter list. */
   deadLetteredAt: string;
+  /** Original payload byte length (also when encrypted). */
+  payloadBytes: number;
+  /** Sealed payload envelope; present only when `payloadEncryptor` is set. */
+  encryptedPayload?: EncryptedPayload;
 }
 
 export interface RetryQueueOptions {
@@ -88,6 +99,14 @@ export interface RetryQueueOptions {
    * Takes precedence over `circuitBreaker.onStateChange` when both are set.
    */
   onCircuitStateChange?: (endpoint: string, from: CircuitState, to: CircuitState) => void;
+  /**
+   * Seals dead-letter payloads at rest: when set, a dead-lettered item's
+   * `payload` is replaced by an `encryptedPayload` envelope (default
+   * {@link AesGcmEncryptor} via `node:crypto`, zero dependencies) and
+   * `replayDeadLetter` transparently decrypts before re-queueing. Unset by
+   * default, in which case dead-letter payloads are kept in the clear.
+   */
+  payloadEncryptor?: PayloadEncryptor;
 }
 
 interface Scheduled {
@@ -202,6 +221,7 @@ export class RetryQueue {
   private readonly breaker?: EndpointCircuitBreaker;
   /** Attempts parked because the endpoint's circuit was open. */
   private circuitBlocked = 0;
+  private readonly payloadEncryptor?: PayloadEncryptor;
 
   private readonly queue = new Map<string, RetryItem & { attempt: number }>();
   private readonly timers = new Map<string, Scheduled>();
@@ -249,6 +269,7 @@ export class RetryQueue {
           onStateChange: opts.onCircuitStateChange ?? opts.circuitBreaker.onStateChange,
         })
       : undefined;
+    this.payloadEncryptor = opts.payloadEncryptor;
   }
 
   /** Number of items currently pending (queued or awaiting retry). */
@@ -270,8 +291,22 @@ export class RetryQueue {
     const idx = this.deadLetter.findIndex((e) => e.id === id);
     if (idx < 0) return false;
     const [entry] = this.deadLetter.splice(idx, 1);
-    const { attempts: _attempts, lastError: _lastError, deadLetteredAt: _ts, ...item } = entry;
-    this.queue.set(item.id, { ...item, attempt: 0 });
+    const {
+      attempts: _attempts,
+      lastError: _lastError,
+      deadLetteredAt: _ts,
+      encryptedPayload,
+      payloadBytes: _payloadBytes,
+      ...item
+    } = entry;
+    let payload = item.payload;
+    if (encryptedPayload) {
+      if (!this.payloadEncryptor) {
+        throw new Error("replayDeadLetter: entry payload is encrypted but no payloadEncryptor is configured");
+      }
+      payload = this.payloadEncryptor.decrypt(encryptedPayload);
+    }
+    this.queue.set(item.id, { ...item, payload, attempt: 0 });
     if (this.running) {
       this.schedule(item.id, 0);
     }
@@ -417,14 +452,19 @@ export class RetryQueue {
         entry.attempt += 1;
         if (entry.attempt >= this.maxAttempts) {
           this.queue.delete(id);
+          const encryptedPayload = this.payloadEncryptor?.encrypt(entry.payload);
           this.deadLetter.push({
             id: entry.id,
-            payload: entry.payload,
+            // Sealed at rest when an encryptor is configured; kept in the
+            // clear otherwise (existing behavior).
+            payload: encryptedPayload ? Buffer.alloc(0) : entry.payload,
             targetUrl: entry.targetUrl,
             headers: entry.headers,
             attempts: entry.attempt,
             lastError: err instanceof Error ? err.message : String(err),
             deadLetteredAt: new Date().toISOString(),
+            payloadBytes: entry.payload.length,
+            ...(encryptedPayload ? { encryptedPayload } : {}),
           });
           this.onDeadLetter?.(entry, entry.attempt, err);
         } else {

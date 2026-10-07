@@ -74,6 +74,21 @@ reliability primitives that matter for any signed-payload pipeline.
   transition is audited as `circuit_open` / `circuit_half_open` /
   `circuit_closed` with the endpoint. Injectable clock for deterministic
   tests.
+- `src/encrypt.ts` — pluggable payload encryption (`PayloadEncryptor`
+  interface: `encrypt` / `decrypt`, never silently returns garbage).
+  Built in: `AesGcmEncryptor` (AES-256-GCM via `node:crypto`, zero
+  dependencies — fresh random 12-byte IV per encryption, 16-byte auth tag,
+  32-byte key validated at construction, `randomAes256Key()` helper) and
+  `NoopEncryptor` (passthrough for tests/fixtures only). Dead-letter
+  payloads are sealed at rest via `RetryQueue({ payloadEncryptor })` —
+  `replayDeadLetter` decrypts transparently before re-queueing — and
+  `AuditLog(path, { payloadEncryptor })` seals `payload` fields (Buffer or
+  string) into JSON-serializable envelopes before the JSONL line hits disk,
+  decrypting them back on `readAll` / `query` (wrong-key reads throw loudly).
+  `createRelayServer({ payloadEncryptor, auditPayloads: true })` opts the
+  `accepted` audit events into carrying the body; the operator
+  `GET /dead-letter` listing reports `payloadBytes` and `encrypted` without
+  ever exposing raw payloads.
 - `src/server.ts` — a minimal `node:http` receiver: read the raw body, verify
   the `x-signature` header with the injected `verifier` (defaults to
   HMAC-SHA256 with `secret`; pass e.g. `new Ed25519Verifier(pem)` to change
@@ -156,7 +171,9 @@ written to the audit log, so the log is the machine's trace.
 - `delivering` → **`dead_letter`** when `maxAttempts` is exhausted. The
   entry keeps `attempts`, `lastError`, and `deadLetteredAt` — everything an
   operator needs to diagnose it, without the raw payload on the operator
-  endpoint.
+  endpoint. With `payloadEncryptor` configured the payload is additionally
+  sealed at rest (`encryptedPayload` envelope) and transparently decrypted
+  on replay.
 - `dead_letter` → **`delivering`** (fresh attempt budget) when an operator
   replays it via `POST /dead-letter/:id/replay`, audited as
   `dead_letter_replayed`. A replayed item that fails again walks the same

@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { HmacSha256Verifier, type Verifier } from "./verify.ts";
 import { RetryQueue, type RetryItem, type Sender } from "./retry.ts";
 import { installGracefulShutdown } from "./shutdown.ts";
+import type { PayloadEncryptor } from "./encrypt.ts";
 import type { ReplayGuard } from "./replay.ts";
 import type { AuditLog } from "./audit.ts";
 
@@ -40,6 +41,19 @@ export interface RelayServerOptions {
    */
   replay?: ReplayGuard;
   /** Inject queue hooks (e.g. to fail the server fast on dead letters). */
+  /**
+   * Seals dead-letter payloads at rest (see `RetryQueue` `payloadEncryptor`;
+   * default AES-256-GCM via `node:crypto`, zero dependencies). Pair with
+   * `new AuditLog(path, { payloadEncryptor })` to also seal payloads
+   * written to the audit log.
+   */
+  payloadEncryptor?: PayloadEncryptor;
+  /**
+   * Attach the raw request body to `accepted` audit events. Off by default;
+   * when enabled, construct the `AuditLog` with a `payloadEncryptor` unless
+   * plaintext webhook bodies on disk are acceptable.
+   */
+  auditPayloads?: boolean;
   /**
    * Opt-in graceful shutdown on SIGTERM/SIGINT: stop accepting new
    * connections, wait up to `timeoutMs` (default 30_000) for in-flight
@@ -105,6 +119,7 @@ export function createRelayServer(opts: RelayServerOptions): Server {
   const queue = new RetryQueue({
     sender: opts.sender ?? defaultSender,
     ...(opts.retry ?? {}),
+    payloadEncryptor: opts.payloadEncryptor ?? opts.retry?.payloadEncryptor,
     onDelivered: (item, attempts) => {
       opts.auditLog.append({ event: "delivered", id: item.id, targetUrl: item.targetUrl, attempts });
     },
@@ -205,7 +220,8 @@ export function createRelayServer(opts: RelayServerOptions): Server {
           attempts: e.attempts,
           lastError: e.lastError,
           deadLetteredAt: e.deadLetteredAt,
-          payloadBytes: e.payload.length,
+          payloadBytes: e.payloadBytes,
+          encrypted: e.encryptedPayload !== undefined,
         }))
       );
       return;
@@ -271,7 +287,11 @@ export function createRelayServer(opts: RelayServerOptions): Server {
     }
 
     queue.enqueue({ id, payload: body, targetUrl: opts.forwardUrl, headers: passthrough });
-    opts.auditLog.append({ event: "accepted", id, targetUrl: opts.forwardUrl });
+    opts.auditLog.append(
+      opts.auditPayloads
+        ? { event: "accepted", id, targetUrl: opts.forwardUrl, payload: body }
+        : { event: "accepted", id, targetUrl: opts.forwardUrl }
+    );
     res.writeHead(202, { "content-type": "application/json" }).end(JSON.stringify({ id, status: "accepted" }));
   });
 
