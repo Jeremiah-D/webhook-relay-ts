@@ -29,8 +29,9 @@ export interface RelayServerOptions {
   retry?: ConstructorParameters<typeof RetryQueue>[0];
   /**
    * Bearer token guarding the operator endpoints (`GET /dead-letter`,
-   * `POST /dead-letter/:id/replay`, `GET /audit`, `GET /latency`). When
-   * unset, those endpoints are disabled and answer 404 (fail closed).
+   * `POST /dead-letter/:id/replay`, `GET /audit`, `GET /latency`,
+   * `GET /events`, `GET /metrics`). When unset, those endpoints are
+   * disabled and answer 404 (fail closed).
    */
   operatorToken?: string;
   /**
@@ -272,8 +273,9 @@ export function createRelayServer(opts: RelayServerOptions): Server {
     const isAudit = pathname === "/audit";
     const isLatency = pathname === "/latency";
     const isEvents = pathname === "/events";
+    const isMetrics = pathname === "/metrics";
     const replayMatch = /^\/dead-letter\/([^/]+)\/replay$/.exec(pathname);
-    if (!isList && !isAudit && !isLatency && !isEvents && !replayMatch) {
+    if (!isList && !isAudit && !isLatency && !isEvents && !isMetrics && !replayMatch) {
       respondJson(res, 404, { error: "not found" });
       return;
     }
@@ -283,10 +285,19 @@ export function createRelayServer(opts: RelayServerOptions): Server {
         (isAudit && req.method === "GET") ||
         (isLatency && req.method === "GET") ||
         (isEvents && req.method === "GET") ||
+        (isMetrics && req.method === "GET") ||
         (replayMatch && req.method === "POST")
       )
     ) {
       respondJson(res, 405, { error: "method not allowed" });
+      return;
+    }
+    if (isMetrics) {
+      // Prometheus scrapes this; it sits behind the same bearer token as
+      // the other operator endpoints (fail closed without operatorToken).
+      res
+        .writeHead(200, { "content-type": "text/plain; version=0.0.4" })
+        .end(queue.renderMetrics());
       return;
     }
     if (isEvents) {
@@ -359,7 +370,8 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       pathname.startsWith("/dead-letter/") ||
       pathname === "/audit" ||
       pathname === "/latency" ||
-      pathname === "/events"
+      pathname === "/events" ||
+      pathname === "/metrics"
     ) {
       handleOperator(req, res, pathname);
       return;

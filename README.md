@@ -277,6 +277,21 @@ value is:
 Merged batches get a fresh trace ID of their own; the `batch_flushed`
 audit line carries the members' `traceIds` for the reverse lookup.
 
+**Prometheus metrics:** with an `operatorToken` set, `GET /metrics` serves
+the queue's counters in Prometheus text exposition format (hand-written,
+zero dependencies), behind the same bearer token as the other operator
+endpoints (404 when disabled):
+
+- `relay_deliveries_total{endpoint,status}` — `delivered` / `failed`
+  (every failed attempt) / `retried` (failures followed by a scheduled
+  retry) / `dead_letter`,
+- `relay_endpoint_circuit_state{endpoint}` — 0 closed, 1 half_open,
+  2 open (only endpoints that tripped),
+- `relay_delivery_latency_seconds_{bucket,sum,count}{endpoint}` —
+  accepted→delivered latency histogram, only when `retry.latency` is
+  enabled; bucket bounds via `retry.metrics.histogramBucketsMs`
+  (default 50ms…10s).
+
 ## Run
 
 ```sh

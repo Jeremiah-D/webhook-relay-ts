@@ -15,8 +15,16 @@ import {
   type ResolvedBatchOptions,
 } from "./batch.ts";
 import { newTraceId, TRACE_ID_HEADER } from "./trace.ts";
+import {
+  renderPrometheus,
+  type CircuitStateInput,
+  type DeliveryCountersInput,
+  type LatencyHistogramInput,
+} from "./metrics.ts";
 
 export { TRACE_ID_HEADER };
+export { renderPrometheus };
+export type { DeliveryCountersInput, CircuitStateInput, LatencyHistogramInput };
 
 export type { CircuitBreakerOptions, CircuitState, CircuitStats };
 export type { EncryptedPayload, PayloadEncryptor };
@@ -71,6 +79,19 @@ export interface UrgentLaneOptions {
   maxUrgentPerSecond?: number;
   /** Clock in ms; defaults to `Date.now`. Injectable for deterministic tests. */
   now?: () => number;
+}
+
+/** Tuning for the Prometheus metrics surface (`GET /metrics`). */
+export interface MetricsOptions {
+  /**
+   * Histogram bucket upper bounds in ms for accepted→delivered latency
+   * (`relay_delivery_latency_seconds_*`). Default:
+   * `[50, 100, 250, 500, 1000, 2500, 5000, 10000]`. Must be a non-empty
+   * strictly ascending list of finite positive numbers. The histogram is
+   * only emitted when latency tracking is enabled (`latency` option); the
+   * delivery counters and circuit gauges are always collected.
+   */
+  histogramBucketsMs?: number[];
 }
 
 /** Fired when a delivery's accepted→delivered latency exceeds the SLO budget. */
@@ -266,6 +287,15 @@ export interface RetryQueueOptions {
    * `batch_flushed`.
    */
   onBatch?: (info: BatchInfo) => void;
+  /**
+   * Prometheus metrics tuning (see `src/metrics.ts`). Delivery counters
+   * (`relay_deliveries_total`) and circuit gauges
+   * (`relay_endpoint_circuit_state`) are always collected; the latency
+   * histogram needs `latency` enabled too. Served by the operator
+   * `GET /metrics` endpoint; `renderMetrics()` renders the exposition text
+   * for embedding or testing.
+   */
+  metrics?: MetricsOptions;
 }
 
 interface Scheduled {
@@ -451,6 +481,17 @@ export class RetryQueue {
   private readonly onBatch?: (info: BatchInfo) => void;
   /** Per-endpoint flushed-batch counters. */
   private readonly batchStats = new Map<string, { batches: number; events: number }>();
+  /** Prometheus delivery counters per endpoint (see `src/metrics.ts`). */
+  private readonly deliveryCounters = new Map<
+    string,
+    { delivered: number; failed: number; retried: number; deadLetter: number }
+  >();
+  /** Last observed circuit state per endpoint (only endpoints that tripped). */
+  private readonly circuitStates = new Map<string, "closed" | "half_open" | "open">();
+  /** Histogram bucket upper bounds in ms (validated ascending). */
+  private readonly histBucketsMs: number[];
+  /** Per-endpoint latency histogram: per-bucket individual counts + sum. */
+  private readonly latencyHist = new Map<string, { counts: number[]; sumMs: number; count: number }>();
   private readonly deliveryEventListeners = new Set<(e: DeliveryEvent) => void>();
 
   private readonly queue = new Map<string, RetryItem & { attempt: number }>();
@@ -493,10 +534,16 @@ export class RetryQueue {
     this.onDeadLetter = opts.onDeadLetter;
     this.onDelivered = opts.onDelivered;
     this.limiter = new EndpointConcurrencyLimiter(opts.maxConcurrentPerEndpoint);
+    // Wrap the caller's state-change hook so the metrics gauge always sees
+    // the latest circuit state, even when nobody subscribes to the hook.
+    const userOnStateChange = opts.onCircuitStateChange ?? opts.circuitBreaker?.onStateChange;
     this.breaker = opts.circuitBreaker
       ? new EndpointCircuitBreaker({
           ...opts.circuitBreaker,
-          onStateChange: opts.onCircuitStateChange ?? opts.circuitBreaker.onStateChange,
+          onStateChange: (endpoint, from, to) => {
+            this.circuitStates.set(endpoint, to);
+            userOnStateChange?.(endpoint, from, to);
+          },
         })
       : undefined;
     this.payloadEncryptor = opts.payloadEncryptor;
@@ -515,6 +562,17 @@ export class RetryQueue {
         ? new EndpointQuota(opts.quota.deliveriesPerMinute, opts.quota.now ?? Date.now)
         : undefined;
     this.onBatch = opts.onBatch;
+    const histBuckets = opts.metrics?.histogramBucketsMs ?? [50, 100, 250, 500, 1000, 2500, 5000, 10000];
+    if (
+      histBuckets.length === 0 ||
+      histBuckets.some((b) => !Number.isFinite(b) || b <= 0) ||
+      histBuckets.some((b, i) => i > 0 && b <= histBuckets[i - 1])
+    ) {
+      throw new RangeError(
+        `metrics.histogramBucketsMs must be a non-empty strictly ascending list of finite positive numbers, got ${JSON.stringify(histBuckets)}`
+      );
+    }
+    this.histBucketsMs = [...histBuckets];
     if (opts.batch) {
       this.batchResolved = resolveBatchOptions(opts.batch, {
         setTimer: this.setTimer,
@@ -537,6 +595,30 @@ export class RetryQueue {
       this.urgentStats.set(endpoint, s);
     }
     s[kind] += 1;
+  }
+
+  /** Increment one Prometheus delivery counter for `endpoint`. */
+  private recordDelivery(endpoint: string, kind: "delivered" | "failed" | "retried" | "deadLetter"): void {
+    let c = this.deliveryCounters.get(endpoint);
+    if (!c) {
+      c = { delivered: 0, failed: 0, retried: 0, deadLetter: 0 };
+      this.deliveryCounters.set(endpoint, c);
+    }
+    c[kind] += 1;
+  }
+
+  /** Bucket one accepted→delivered sample into the endpoint's latency histogram. */
+  private recordLatencySample(endpoint: string, latencyMs: number): void {
+    let h = this.latencyHist.get(endpoint);
+    if (!h) {
+      h = { counts: new Array(this.histBucketsMs.length).fill(0), sumMs: 0, count: 0 };
+      this.latencyHist.set(endpoint, h);
+    }
+    const idx = this.histBucketsMs.findIndex((b) => latencyMs <= b);
+    // A sample above the last bound lands in +Inf only (the `count` series).
+    if (idx >= 0) h.counts[idx] += 1;
+    h.sumMs += latencyMs;
+    h.count += 1;
   }
 
   /** Number of items currently pending (queued or awaiting retry). */
@@ -863,8 +945,14 @@ export class RetryQueue {
         await this.sender(entry);
         this.breaker?.recordSuccess(entry.targetUrl);
         this.queue.delete(id);
+        this.recordDelivery(entry.targetUrl, "delivered");
         if (fastLane) this.recordUrgentStat(entry.targetUrl, "delivered");
         const latencyMs = this.latency?.recordDelivered(entry.id, entry.targetUrl);
+        if (latencyMs !== undefined) {
+          // The histogram samples the same delivery the JSON latency stats
+          // do — accepted→delivered, dead letters excluded by `discard()`.
+          this.recordLatencySample(entry.targetUrl, latencyMs);
+        }
         if (latencyMs !== undefined && this.latency && latencyMs > this.latency.sloMs) {
           this.onSloMiss?.({ id: entry.id, traceId, endpoint: entry.targetUrl, latencyMs, sloMs: this.latency.sloMs });
         }
@@ -879,11 +967,13 @@ export class RetryQueue {
         });
       } catch (err) {
         this.breaker?.recordFailure(entry.targetUrl);
+        this.recordDelivery(entry.targetUrl, "failed");
         entry.attempt += 1;
         const error = err instanceof Error ? err.message : String(err);
         const at = new Date().toISOString();
         if (entry.attempt >= this.maxAttempts) {
           this.queue.delete(id);
+          this.recordDelivery(entry.targetUrl, "deadLetter");
           // Never delivered: drop the pending clock without sampling.
           this.latency?.discard(entry.id);
           const encryptedPayload = this.payloadEncryptor?.encrypt(entry.payload);
@@ -916,6 +1006,7 @@ export class RetryQueue {
         } else if (fastLane && this.urgentLimiter.take(entry.targetUrl)) {
           // Skip the exponential backoff: fixed fast-lane retry delay.
           this.recordUrgentStat(entry.targetUrl, "retried");
+          this.recordDelivery(entry.targetUrl, "retried");
           this.emitDeliveryEvent({
             type: "retrying",
             id: entry.id,
@@ -933,6 +1024,7 @@ export class RetryQueue {
             this.recordUrgentStat(entry.targetUrl, "throttled");
             entry.priority = "normal";
           }
+          this.recordDelivery(entry.targetUrl, "retried");
           this.emitDeliveryEvent({
             type: "retrying",
             id: entry.id,
@@ -970,6 +1062,48 @@ export class RetryQueue {
    */
   getLatencyStats(endpoint?: string): EndpointLatencyStats[] {
     return this.latency?.stats(endpoint) ?? [];
+  }
+
+  /**
+   * Prometheus text exposition of the collected metrics (see
+   * `src/metrics.ts`): per-endpoint delivery counters
+   * (`relay_deliveries_total`), circuit gauges for endpoints that tripped
+   * (`relay_endpoint_circuit_state`), and the accepted→delivered latency
+   * histogram (`relay_delivery_latency_seconds_*`) when latency tracking
+   * is enabled.
+   */
+  renderMetrics(): string {
+    const deliveries: DeliveryCountersInput[] = [...this.deliveryCounters.entries()].map(
+      ([endpoint, c]) => ({
+        endpoint,
+        delivered: c.delivered,
+        failed: c.failed,
+        retried: c.retried,
+        deadLetter: c.deadLetter,
+      })
+    );
+    const circuits: CircuitStateInput[] = [...this.circuitStates.entries()].map(
+      ([endpoint, state]) => ({ endpoint, state })
+    );
+    const latencyHistograms: LatencyHistogramInput[] = [];
+    if (this.latency) {
+      for (const [endpoint, h] of this.latencyHist) {
+        const bucketCounts: number[] = [];
+        let cumulative = 0;
+        for (const n of h.counts) {
+          cumulative += n;
+          bucketCounts.push(cumulative);
+        }
+        latencyHistograms.push({
+          endpoint,
+          bucketBounds: this.histBucketsMs.map((b) => b / 1000),
+          bucketCounts,
+          sum: h.sumMs / 1000,
+          count: h.count,
+        });
+      }
+    }
+    return renderPrometheus({ deliveries, circuits, latencyHistograms });
   }
 
   /**
