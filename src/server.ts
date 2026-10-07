@@ -4,6 +4,7 @@ import type { Server } from "node:http";
 import { randomUUID } from "node:crypto";
 import { HmacSha256Verifier, type Verifier } from "./verify.ts";
 import { RetryQueue, type RetryItem, type Sender } from "./retry.ts";
+import type { ReplayGuard } from "./replay.ts";
 import type { AuditLog } from "./audit.ts";
 
 export interface RelayServerOptions {
@@ -28,6 +29,15 @@ export interface RelayServerOptions {
    * endpoints are disabled and answer 404 (fail closed).
    */
   operatorToken?: string;
+  /**
+   * Replay protection for inbound webhooks. When set, each accepted POST must
+   * carry a unique `x-nonce` header: a nonce seen inside the guard's window is
+   * rejected with 409 (`duplicate_nonce`), a missing nonce or an `x-timestamp`
+   * (unix seconds) outside the window is rejected with 400. Rejections are
+   * audited as `rejected` with the guard's reason. Off by default, so
+   * unsigned-legacy senders keep working unless the operator opts in.
+   */
+  replay?: ReplayGuard;
   /** Inject queue hooks (e.g. to fail the server fast on dead letters). */
 }
 
@@ -218,6 +228,24 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       opts.auditLog.append({ event: "rejected", id, reason: "invalid_signature" });
       res.writeHead(401, { "content-type": "text/plain" }).end("Invalid signature");
       return;
+    }
+
+    if (opts.replay) {
+      const nonceHeader = req.headers["x-nonce"];
+      const nonce = Array.isArray(nonceHeader) ? nonceHeader[0] : nonceHeader;
+      const tsHeader = req.headers["x-timestamp"];
+      const tsRaw = Array.isArray(tsHeader) ? tsHeader[0] : tsHeader;
+      // x-timestamp is unix seconds (same unit as the `t=` signature field);
+      // the guard works in ms. A non-numeric value fails the window check.
+      const timestampMs = tsRaw === undefined ? undefined : Number(tsRaw) * 1000;
+      const verdict = opts.replay.check(nonce, timestampMs);
+      if (!verdict.ok) {
+        const reason = verdict.reason as string;
+        opts.auditLog.append({ event: "rejected", id, reason });
+        const status = reason === "duplicate_nonce" ? 409 : 400;
+        res.writeHead(status, { "content-type": "text/plain" }).end(`Rejected: ${reason}`);
+        return;
+      }
     }
 
     const passthrough: Record<string, string | string[] | undefined> = {};

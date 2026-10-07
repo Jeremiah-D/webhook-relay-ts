@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRelayServer } from "../src/server.ts";
 import { signSha256, type Verifier } from "../src/verify.ts";
+import { ReplayGuard } from "../src/replay.ts";
 import { AuditLog } from "../src/audit.ts";
 import type { RetryItem } from "../src/retry.ts";
 
@@ -382,6 +383,88 @@ describe("server", () => {
 
       assert.equal((await get(port, "/audit?since=not-a-date", auth)).status, 400);
       assert.equal((await get(port, "/audit?limit=0", auth)).status, 400);
+    } finally {
+      relay.close();
+      await new Promise((r) => relay.once("close", r));
+    }
+  });
+
+  it("enforces replay protection when a ReplayGuard is injected", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-"));
+    const audit = new AuditLog(join(dir, "audit.jsonl"));
+    const relay = createRelayServer({
+      secret: SECRET,
+      forwardUrl: `http://127.0.0.1:${stubPort}/hook`,
+      auditLog: audit,
+      retry: { baseDelayMs: 10, jitterMs: 0, maxAttempts: 3 },
+      replay: new ReplayGuard({ windowSec: 60 }),
+    });
+    const port = await listen(relay);
+    const sig = { "x-signature": signSha256(BODY, SECRET) };
+    try {
+      const before = receivedRaw.length;
+
+      // Signature is still checked before the replay guard.
+      assert.equal((await post(port, "/", BODY, { "x-signature": signSha256(BODY, "wrong") })).status, 401);
+
+      // Missing nonce -> 400.
+      assert.equal((await post(port, "/", BODY, sig)).status, 400);
+
+      // Fresh nonce -> accepted and forwarded.
+      const ok = await post(port, "/", BODY, { ...sig, "x-nonce": "nonce-1" });
+      assert.equal(ok.status, 202);
+
+      // Same nonce again -> 409 replay, never forwarded twice.
+      const replayed = await post(port, "/", BODY, { ...sig, "x-nonce": "nonce-1" });
+      assert.equal(replayed.status, 409);
+
+      // Stale and far-future timestamps -> 400.
+      const stale = Math.floor(Date.now() / 1000) - 3600;
+      assert.equal((await post(port, "/", BODY, { ...sig, "x-nonce": "nonce-2", "x-timestamp": `${stale}` })).status, 400);
+      const future = Math.floor(Date.now() / 1000) + 3600;
+      assert.equal((await post(port, "/", BODY, { ...sig, "x-nonce": "nonce-3", "x-timestamp": `${future}` })).status, 400);
+      // A non-numeric timestamp also fails the window check.
+      assert.equal((await post(port, "/", BODY, { ...sig, "x-nonce": "nonce-4", "x-timestamp": "soon" })).status, 400);
+
+      // A fresh timestamp inside the window is accepted.
+      const nowSec = Math.floor(Date.now() / 1000);
+      const fresh = await post(port, "/", BODY, { ...sig, "x-nonce": "nonce-5", "x-timestamp": `${nowSec}` });
+      assert.equal(fresh.status, 202);
+
+      // Only the two accepted deliveries were forwarded.
+      const deadline = Date.now() + 5000;
+      while (receivedRaw.length < before + 2 && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      assert.equal(receivedRaw.length, before + 2);
+
+      const events = audit.readAll() as Array<Record<string, unknown>>;
+      const rejected = events.filter((e) => e.event === "rejected");
+      const reasons = rejected.map((e) => e.reason);
+      assert.ok(reasons.includes("duplicate_nonce"), "replay must be audited");
+      assert.ok(reasons.includes("missing_nonce"));
+      assert.ok(reasons.filter((r) => r === "expired_timestamp").length >= 2);
+      assert.ok(reasons.includes("future_timestamp"));
+    } finally {
+      relay.close();
+      await new Promise((r) => relay.once("close", r));
+    }
+  });
+
+  it("leaves the receiver unchanged when no ReplayGuard is injected", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-"));
+    const audit = new AuditLog(join(dir, "audit.jsonl"));
+    const relay = createRelayServer({
+      secret: SECRET,
+      forwardUrl: `http://127.0.0.1:${stubPort}/hook`,
+      auditLog: audit,
+      retry: { baseDelayMs: 10, jitterMs: 0, maxAttempts: 3 },
+    });
+    const port = await listen(relay);
+    try {
+      // Legacy unsigned-nonce senders keep working: no nonce required.
+      const res = await post(port, "/", BODY, { "x-signature": signSha256(BODY, SECRET) });
+      assert.equal(res.status, 202);
     } finally {
       relay.close();
       await new Promise((r) => relay.once("close", r));

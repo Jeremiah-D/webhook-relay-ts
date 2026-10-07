@@ -49,11 +49,21 @@ reliability primitives that matter for any signed-payload pipeline.
   `endpoint` fields and byte span, so only matching lines are read back from
   disk; appends are indexed incrementally and truncation/rotation rebuilds the
   index. Malformed lines are skipped by the index.
+- `src/replay.ts` — `ReplayGuard`: nonce + timestamp-window replay protection
+  for inbound webhooks. A unique `x-nonce` per delivery is remembered for the
+  window (`windowSec`, default 300s); resends are rejected as `duplicate_nonce`,
+  a missing nonce or an `x-timestamp` (unix seconds) outside ±window is
+  rejected as `missing_nonce` / `expired_timestamp` / `future_timestamp`.
+  Memory-bounded: nonces expire with the window (lazy sweep per check) and a
+  `maxEntries` cap evicts oldest-first. Injectable clock for deterministic
+  tests.
 - `src/server.ts` — a minimal `node:http` receiver: read the raw body, verify
   the `x-signature` header with the injected `verifier` (defaults to
   HMAC-SHA256 with `secret`; pass e.g. `new Ed25519Verifier(pem)` to change
-  schemes), enqueue for forwarding to `forwardUrl`, audit accept / delivered /
-  dead-letter events. A failed verification returns 401 + audit entry.
+  schemes), optionally enforce replay protection (`replay: new ReplayGuard()`
+  — replays answer 409, bad/missing nonces and out-of-window timestamps
+  answer 400, all audited as `rejected`), enqueue for forwarding to
+  `forwardUrl`, audit accept / delivered / dead-letter events. A failed verification returns 401 + audit entry.
   Operator endpoints `GET /dead-letter` (list dead letters with
   attempts/lastError/timestamp metadata, no raw payloads) and
   `POST /dead-letter/:id/replay` (manually re-queue a dead letter, audited as
@@ -84,6 +94,11 @@ Requires Node 24+ (runs `.ts` directly via type stripping; zero dependencies).
   `HmacSha256Verifier` parity with `verifySignature`, `Ed25519Verifier`
   accept/reject/wrong-key/malformed, registry dispatch (unknown names fail
   closed), and `verifyWith` never throwing on misbehaving verifiers.
+- `test/replay.test.ts` — `ReplayGuard`: fresh nonce accepted, replay rejected
+  as `duplicate_nonce`; missing/empty nonce, stale and far-future timestamps
+  (with window-edge inclusivity), non-numeric timestamps, nonce expiry after
+  the window, oldest-first eviction beyond `maxEntries`, and `RangeError` on
+  invalid configs.
 - `test/retry.test.ts` — a flaky sender (fails twice, then succeeds) delivers
   on the third attempt with increasing backoff; a permanently failing sender
   ends in the dead-letter list. Covers the jitter layer: additive jitter with
@@ -100,4 +115,8 @@ Requires Node 24+ (runs `.ts` directly via type stripping; zero dependencies).
   `operatorToken`, require the bearer token when set, and support listing plus
   manual replay of dead letters (audited as `dead_letter_replayed`). Also
   covers `GET /audit`: fail-closed without the token, endpoint/event/time-range
-  filters, `limit`, and 400 on invalid query parameters.
+  filters, `limit`, and 400 on invalid query parameters. Also covers replay
+  protection: replays answer 409 and are never forwarded twice, missing
+  nonces and out-of-window timestamps answer 400, all rejections are audited
+  with machine-readable reasons, and the receiver stays backward-compatible
+  when no guard is injected.
