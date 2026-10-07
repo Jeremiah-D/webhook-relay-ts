@@ -6,11 +6,20 @@ import {
   type LatencyTrackerOptions,
 } from "./latency.ts";
 import { EndpointQuota, type QuotaOptions, type QuotaStats } from "./quota.ts";
+import {
+  BatchCollector,
+  newBatchId,
+  resolveBatchOptions,
+  type BatchEnvelopeInput,
+  type BatchOptions,
+  type ResolvedBatchOptions,
+} from "./batch.ts";
 
 export type { CircuitBreakerOptions, CircuitState, CircuitStats };
 export type { EncryptedPayload, PayloadEncryptor };
 export type { EndpointLatencyStats, LatencyTrackerOptions };
 export type { QuotaOptions, QuotaStats };
+export type { BatchEnvelopeInput, BatchOptions };
 
 /**
  * Delivery priority of an item.
@@ -93,6 +102,14 @@ export interface DeliveryEvent {
   at: string;
   /** Failure message; present for `retrying` and `dead_letter`. */
   error?: string;
+}
+
+/** Fired every time a batch is flushed (one merged item enqueued). */
+export interface BatchInfo {
+  batchId: string;
+  endpoint: string;
+  /** Events merged into this batch. */
+  size: number;
 }
 
 export type Sender = (item: RetryItem) => Promise<void>;
@@ -214,6 +231,20 @@ export interface RetryQueueOptions {
    * the circuit breaker. Disabled (unlimited) by default.
    */
   quota?: QuotaOptions;
+  /**
+   * Batch delivery merging (see `src/batch.ts`). When set, normal-priority
+   * items for the same endpoint are held for `windowMs` and merged into a
+   * single delivery with a JSON envelope (uniform contract: even a lone
+   * item is wrapped). Urgent items bypass batching and go out immediately.
+   * Disabled by default.
+   */
+  batch?: BatchOptions;
+  /**
+   * Called every time a batch is flushed — i.e. a group of buffered events
+   * became one merged delivery item. The server audits this as
+   * `batch_flushed`.
+   */
+  onBatch?: (info: BatchInfo) => void;
 }
 
 interface Scheduled {
@@ -394,6 +425,11 @@ export class RetryQueue {
   private readonly quota?: EndpointQuota;
   /** Attempts rescheduled because the endpoint's quota bucket was empty. */
   private readonly quotaStats = new Map<string, number>();
+  private readonly batcher?: BatchCollector;
+  private readonly batchResolved?: ResolvedBatchOptions;
+  private readonly onBatch?: (info: BatchInfo) => void;
+  /** Per-endpoint flushed-batch counters. */
+  private readonly batchStats = new Map<string, { batches: number; events: number }>();
   private readonly deliveryEventListeners = new Set<(e: DeliveryEvent) => void>();
 
   private readonly queue = new Map<string, RetryItem & { attempt: number }>();
@@ -457,6 +493,16 @@ export class RetryQueue {
       opts.quota?.deliveriesPerMinute !== undefined
         ? new EndpointQuota(opts.quota.deliveriesPerMinute, opts.quota.now ?? Date.now)
         : undefined;
+    this.onBatch = opts.onBatch;
+    if (opts.batch) {
+      this.batchResolved = resolveBatchOptions(opts.batch, {
+        setTimer: this.setTimer,
+        clearTimer: this.clearTimer,
+      });
+      this.batcher = new BatchCollector(this.batchResolved, (endpoint, items) =>
+        this.flushBatch(endpoint, items)
+      );
+    }
   }
 
   private recordQuotaStat(endpoint: string): void {
@@ -492,6 +538,45 @@ export class RetryQueue {
 
   private emitDeliveryEvent(event: DeliveryEvent): void {
     for (const listener of this.deliveryEventListeners) listener(event);
+  }
+
+  /**
+   * Per-endpoint batch counters: batches flushed, events merged, and items
+   * still sitting inside a batch window. Empty when batching is disabled.
+   */
+  getBatchStats(): Array<{ endpoint: string; batches: number; events: number; buffered: number }> {
+    if (!this.batcher) return [];
+    const endpoints = new Set([...this.batchStats.keys(), ...this.batcher.endpoints()]);
+    return [...endpoints].map((endpoint) => ({
+      endpoint,
+      batches: this.batchStats.get(endpoint)?.batches ?? 0,
+      events: this.batchStats.get(endpoint)?.events ?? 0,
+      buffered: this.batcher!.bufferedCount(endpoint),
+    }));
+  }
+
+  /** Merge a flushed batch window into one delivery item and queue it. */
+  private flushBatch(endpoint: string, items: RetryItem[]): void {
+    const batchId = newBatchId();
+    const body = this.batchResolved!.envelope({ batchId, items });
+    let s = this.batchStats.get(endpoint);
+    if (!s) {
+      s = { batches: 0, events: 0 };
+      this.batchStats.set(endpoint, s);
+    }
+    s.batches += 1;
+    s.events += items.length;
+    this.enqueueNow({
+      id: batchId,
+      payload: body,
+      targetUrl: endpoint,
+      headers: {
+        "content-type": "application/json",
+        "x-batch-id": batchId,
+        "x-batch-size": String(items.length),
+      },
+    });
+    this.onBatch?.({ batchId, endpoint, size: items.length });
   }
 
   /** Items that exhausted all attempts, in dead-letter order. */
@@ -544,12 +629,27 @@ export class RetryQueue {
   }
 
   enqueue(item: RetryItem): void {
+    if (this.queue.has(item.id) || this.batcher?.has(item.id)) {
+      throw new Error(`Duplicate item id: ${item.id}`);
+    }
+    // The urgent lane is never batched: an urgent delivery must go out
+    // immediately, not wait for a batch window.
+    if (this.batcher && item.priority !== "urgent") {
+      this.batcher.add(item);
+      return;
+    }
+    this.enqueueNow(item);
+  }
+
+  private enqueueNow(item: RetryItem): void {
     if (this.queue.has(item.id)) {
       throw new Error(`Duplicate item id: ${item.id}`);
     }
     this.queue.set(item.id, { ...item, attempt: 0 });
     // Start the latency clock only after the item is really queued — a
     // duplicate-id throw must not leave a stale pending record behind.
+    // (Batched items start their clock at flush time, when the merged item
+    // is queued: the batching delay is by design, not lateness.)
     this.latency?.recordAccepted(item.id);
     if (this.running) {
       this.schedule(item.id, 0);
@@ -570,6 +670,11 @@ export class RetryQueue {
       this.clearTimer(s.handle);
       this.timers.delete(id);
     }
+    // A batch window is not a delivery: flush pending batches into the queue
+    // so accepted events are never silently dropped by a stop. They stay
+    // queued (unscheduled) until the next start(), like backoff-waiting
+    // items.
+    this.batcher?.flushAll();
   }
 
   /**
@@ -584,10 +689,34 @@ export class RetryQueue {
    * downstream cannot pin the process forever.
    */
   async shutdown(timeoutMs = 30_000): Promise<boolean> {
+    // Buffered batches were accepted (202) but never queued: flush them now
+    // and give each merged batch one immediate delivery attempt, so a
+    // deploy landing inside a batch window does not silently strand them.
+    // A forced attempt that needs to reschedule (retry, quota/circuit park)
+    // stays queued instead — `schedule()` is a no-op once the queue is
+    // stopped — the same contract as backoff-waiting items.
+    const batchIds: string[] = [];
+    if (this.batcher && this.batcher.bufferedCount() > 0) {
+      const before = new Set(this.queue.keys());
+      this.batcher.flushAll();
+      for (const id of this.queue.keys()) {
+        if (!before.has(id)) batchIds.push(id);
+      }
+    }
     this.running = false;
     for (const [id, s] of this.timers) {
       this.clearTimer(s.handle);
       this.timers.delete(id);
+    }
+    for (const id of batchIds) {
+      const p = this.deliver(id, true);
+      // `deliver` never rejects (sender errors are caught internally), but
+      // track both outcomes so a bug can never leak a hanging shutdown.
+      this.inFlight.add(p);
+      p.then(
+        () => this.inFlight.delete(p),
+        () => this.inFlight.delete(p)
+      );
     }
     if (this.inFlight.size === 0) return true;
     let timer: { clear(): void } | undefined;
@@ -639,9 +768,15 @@ export class RetryQueue {
     this.timers.set(id, { handle });
   }
 
-  private async deliver(id: string): Promise<void> {
+  /**
+   * @param force bypass the `running` checks: used by `shutdown()` for the
+   * one immediate attempt it grants flushed batches. A forced delivery that
+   * needs to reschedule (retry, quota/circuit park) stays queued instead —
+   * `schedule()` is a no-op once the queue is stopped.
+   */
+  private async deliver(id: string, force = false): Promise<void> {
     const entry = this.queue.get(id);
-    if (!entry || !this.running) return;
+    if (!entry || (!this.running && !force)) return;
     // Per-endpoint quota first: an exhausted budget delays the attempt
     // (rescheduled at the next token refill) instead of burning the retry
     // budget or tripping the circuit against a downstream we are
@@ -683,7 +818,7 @@ export class RetryQueue {
       // The queue may have stopped, or the item may have been settled, while
       // we waited for a concurrency slot. Bail out; the release cascades to
       // the next waiter so nobody hangs.
-      if (!this.running || !this.queue.has(id)) {
+      if ((!this.running && !force) || !this.queue.has(id)) {
         if (probe) this.breaker?.cancelProbe(entry.targetUrl);
         return;
       }

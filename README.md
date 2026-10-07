@@ -234,6 +234,19 @@ written to the audit log, so the log is the machine's trace.
   `dead_letter_replayed`. A replayed item that fails again walks the same
   `delivering` → `retrying` → `dead_letter` path.
 
+**Batching:** when `retry.batch` is enabled, `accepted` →
+**`batching`** instead of straight to `delivering`: normal-priority items
+for the same endpoint are held for `windowMs` (or until `maxBatchSize` is
+reached) and merged into one delivery whose payload is a JSON envelope
+(`batch_id`, `batched_at`, `events[]` with base64 payloads and each event's
+own headers — so per-event `x-signature`s stay verifiable downstream).
+The merged batch is one delivery unit: retries and dead-lettering apply to
+the whole batch, and every flush is audited as `batch_flushed` with its
+size. Urgent items skip batching entirely (the fast lane must not wait).
+`stop()` flushes pending batches into the queue unscheduled (a later
+`start()` delivers them); `shutdown()` flushes them and grants each batch
+one immediate attempt before draining in-flight deliveries.
+
 **Live event stream:** with an `operatorToken` set, `GET /events` opens a
 Server-Sent Events stream pushing `delivered` / `retrying` / `dead_letter`
 frames as JSON in real time (`event: delivery`), so an operator can watch
@@ -354,3 +367,14 @@ Requires Node 24+ (runs `.ts` directly via type stripping; zero dependencies).
   on persistent failure; heartbeat comments arrive on idle connections; a
   disconnected client stops receiving without breaking the server for the
   remaining subscribers.
+- `test/batch.test.ts` — batch delivery merging: same-endpoint items inside
+  the window merge into one delivery with the JSON envelope (arrival order,
+  base64 payloads, per-event headers preserved); endpoints stay separate;
+  `maxBatchSize` flushes early; urgent items bypass batching and go out raw;
+  custom envelopes plug in; a failed batch retries as one unit with an
+  identical body; a dead-lettered batch keeps the envelope for replay;
+  `RangeError` on invalid configs; duplicate ids rejected while buffered;
+  `stop()` flushes pending batches into the queue; `shutdown()` grants each
+  buffered batch one immediate attempt before draining. Server integration:
+  three inbound webhooks become one downstream request, audited as
+  `batch_flushed`.

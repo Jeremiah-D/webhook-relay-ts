@@ -174,6 +174,16 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       opts.auditLog.append({ event, endpoint, from, to });
       opts.retry?.onCircuitStateChange?.(endpoint, from, to);
     },
+    // Wrap the caller's onBatch so every flushed batch is audited, not just observed.
+    onBatch: (info) => {
+      opts.auditLog.append({
+        event: "batch_flushed",
+        batchId: info.batchId,
+        targetUrl: info.endpoint,
+        size: info.size,
+      });
+      opts.retry?.onBatch?.(info);
+    },
   });
   queue.start();
 
