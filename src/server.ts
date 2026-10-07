@@ -117,6 +117,12 @@ export function createRelayServer(opts: RelayServerOptions): Server {
         error: lastError instanceof Error ? lastError.message : String(lastError),
       });
     },
+    onCircuitStateChange: (endpoint, from, to) => {
+      const event =
+        to === "open" ? "circuit_open" : to === "half_open" ? "circuit_half_open" : "circuit_closed";
+      opts.auditLog.append({ event, endpoint, from, to });
+      opts.retry?.onCircuitStateChange?.(endpoint, from, to);
+    },
   });
   queue.start();
 

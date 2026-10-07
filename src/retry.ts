@@ -1,3 +1,7 @@
+import { EndpointCircuitBreaker, type CircuitBreakerOptions, type CircuitState, type CircuitStats } from "./circuit.ts";
+
+export type { CircuitBreakerOptions, CircuitState, CircuitStats };
+
 export interface RetryItem {
   id: string;
   payload: Buffer;
@@ -68,6 +72,22 @@ export interface RetryQueueOptions {
   onDeadLetter?: (item: RetryItem, attempts: number, lastError: unknown) => void;
   /** Callback when an item is successfully delivered. */
   onDelivered?: (item: RetryItem, attempts: number) => void;
+  /**
+   * Per-endpoint circuit breaker (see `src/circuit.ts`). When set,
+   * `failureThreshold` consecutive delivery failures trip the endpoint's
+   * circuit open for `cooldownMs`: attempts made while the circuit is open
+   * are parked — rescheduled without consuming the retry budget — instead
+   * of hammering a down endpoint. After the cooldown a single half-open
+   * probe is let through; its success closes the circuit, its failure
+   * re-opens it and restarts the cooldown. Disabled by default.
+   */
+  circuitBreaker?: CircuitBreakerOptions;
+  /**
+   * Called on every circuit state transition
+   * (closed->open, open->half_open, half_open->closed, half_open->open).
+   * Takes precedence over `circuitBreaker.onStateChange` when both are set.
+   */
+  onCircuitStateChange?: (endpoint: string, from: CircuitState, to: CircuitState) => void;
 }
 
 interface Scheduled {
@@ -179,6 +199,9 @@ export class RetryQueue {
   private readonly clearTimer: (handle: { clear(): void }) => void;
   private readonly onDeadLetter?: (item: RetryItem, attempts: number, lastError: unknown) => void;
   private readonly onDelivered?: (item: RetryItem, attempts: number) => void;
+  private readonly breaker?: EndpointCircuitBreaker;
+  /** Attempts parked because the endpoint's circuit was open. */
+  private circuitBlocked = 0;
 
   private readonly queue = new Map<string, RetryItem & { attempt: number }>();
   private readonly timers = new Map<string, Scheduled>();
@@ -220,6 +243,12 @@ export class RetryQueue {
     this.onDeadLetter = opts.onDeadLetter;
     this.onDelivered = opts.onDelivered;
     this.limiter = new EndpointConcurrencyLimiter(opts.maxConcurrentPerEndpoint);
+    this.breaker = opts.circuitBreaker
+      ? new EndpointCircuitBreaker({
+          ...opts.circuitBreaker,
+          onStateChange: opts.onCircuitStateChange ?? opts.circuitBreaker.onStateChange,
+        })
+      : undefined;
   }
 
   /** Number of items currently pending (queued or awaiting retry). */
@@ -355,17 +384,36 @@ export class RetryQueue {
   private async deliver(id: string): Promise<void> {
     const entry = this.queue.get(id);
     if (!entry || !this.running) return;
+    let probe = false;
+    if (this.breaker) {
+      const verdict = this.breaker.shouldAllow(entry.targetUrl);
+      if (!verdict.allowed) {
+        // Circuit open (or its probe slot busy): park the attempt until the
+        // cooldown elapses instead of burning the retry budget against a
+        // known-down endpoint. A little jitter keeps many parked items from
+        // re-checking in lockstep.
+        this.circuitBlocked += 1;
+        this.schedule(id, this.breaker.retryInMs(entry.targetUrl) + this.random() * 100);
+        return;
+      }
+      probe = verdict.probe;
+    }
     const release = await this.limiter.acquire(entry.targetUrl);
     try {
       // The queue may have stopped, or the item may have been settled, while
       // we waited for a concurrency slot. Bail out; the release cascades to
       // the next waiter so nobody hangs.
-      if (!this.running || !this.queue.has(id)) return;
+      if (!this.running || !this.queue.has(id)) {
+        if (probe) this.breaker?.cancelProbe(entry.targetUrl);
+        return;
+      }
       try {
         await this.sender(entry);
+        this.breaker?.recordSuccess(entry.targetUrl);
         this.queue.delete(id);
         this.onDelivered?.(entry, entry.attempt + 1);
       } catch (err) {
+        this.breaker?.recordFailure(entry.targetUrl);
         entry.attempt += 1;
         if (entry.attempt >= this.maxAttempts) {
           this.queue.delete(id);
@@ -391,5 +439,18 @@ export class RetryQueue {
   /** Per-endpoint concurrency snapshot: in-flight and queued deliveries. */
   getConcurrencyStats(): Array<{ endpoint: string; inFlight: number; queued: number }> {
     return this.limiter.stats();
+  }
+
+  /**
+   * Per-endpoint circuit state (`state`, `consecutiveFailures`, `trips`).
+   * Empty when the circuit breaker is disabled.
+   */
+  getCircuitStats(): CircuitStats[] {
+    return this.breaker?.stats() ?? [];
+  }
+
+  /** Attempts parked because the endpoint's circuit was open. */
+  circuitBlockedCount(): number {
+    return this.circuitBlocked;
   }
 }

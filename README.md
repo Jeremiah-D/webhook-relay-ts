@@ -60,6 +60,20 @@ reliability primitives that matter for any signed-payload pipeline.
   Memory-bounded: nonces expire with the window (lazy sweep per check) and a
   `maxEntries` cap evicts oldest-first. Injectable clock for deterministic
   tests.
+- `src/circuit.ts` — per-endpoint circuit breaker (`EndpointCircuitBreaker`,
+  `closed` / `open` / `half_open`): `failureThreshold` (default 5)
+  consecutive delivery failures trip the circuit open for `cooldownMs`
+  (default 30s); attempts made while open are parked — rescheduled without
+  consuming the retry budget — instead of hammering a down endpoint. After
+  the cooldown a single half-open probe is let through (one in flight at a
+  time): success closes the circuit, failure re-opens it and restarts the
+  cooldown. A success on a closed circuit resets the failure count. Wired
+  into `RetryQueue` via `retry: { circuitBreaker: {...} }` (off by default);
+  `getCircuitStats()` reports per-endpoint `state` / `consecutiveFailures` /
+  `trips`, `circuitBlockedCount()` counts parked attempts, and every
+  transition is audited as `circuit_open` / `circuit_half_open` /
+  `circuit_closed` with the endpoint. Injectable clock for deterministic
+  tests.
 - `src/server.ts` — a minimal `node:http` receiver: read the raw body, verify
   the `x-signature` header with the injected `verifier` (defaults to
   HMAC-SHA256 with `secret`; pass e.g. `new Ed25519Verifier(pem)` to change
@@ -135,7 +149,10 @@ written to the audit log, so the log is the machine's trace.
 - `delivering` → **`retrying`** when the attempt fails (non-2xx, timeout,
   or connection error). The next attempt is scheduled after
   `baseDelayMs * 2^attempt` plus jitter, capped at `maxDelayMs`, then the
-  item goes back to `delivering`.
+  item goes back to `delivering`. When the circuit breaker is enabled and
+  the endpoint's circuit is open, the attempt is *parked* instead: it is
+  rescheduled after the remaining cooldown without consuming the retry
+  budget (still `delivering`, audited via `circuit_open` on the trip).
 - `delivering` → **`dead_letter`** when `maxAttempts` is exhausted. The
   entry keeps `attempts`, `lastError`, and `deadLetteredAt` — everything an
   operator needs to diagnose it, without the raw payload on the operator
