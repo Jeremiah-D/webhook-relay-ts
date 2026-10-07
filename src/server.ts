@@ -27,8 +27,8 @@ export interface RelayServerOptions {
   retry?: ConstructorParameters<typeof RetryQueue>[0];
   /**
    * Bearer token guarding the operator endpoints (`GET /dead-letter`,
-   * `POST /dead-letter/:id/replay`, `GET /audit`). When unset, those
-   * endpoints are disabled and answer 404 (fail closed).
+   * `POST /dead-letter/:id/replay`, `GET /audit`, `GET /latency`). When
+   * unset, those endpoints are disabled and answer 404 (fail closed).
    */
   operatorToken?: string;
   /**
@@ -116,10 +116,21 @@ function readRawBody(req: Parameters<Parameters<typeof createServer>[0]>[0]): Pr
  * Both accepted deliveries and signature rejections are written to the audit log.
  */
 export function createRelayServer(opts: RelayServerOptions): Server {
+  const latencyOpts = opts.retry?.latency;
   const queue = new RetryQueue({
     sender: opts.sender ?? defaultSender,
     ...(opts.retry ?? {}),
     payloadEncryptor: opts.payloadEncryptor ?? opts.retry?.payloadEncryptor,
+    // Wrap the caller's onSloMiss so every SLO miss is audited, not just observed.
+    latency: latencyOpts
+      ? {
+          ...latencyOpts,
+          onSloMiss: (info) => {
+            opts.auditLog.append({ event: "slo_missed", ...info });
+            latencyOpts.onSloMiss?.(info);
+          },
+        }
+      : undefined,
     onDelivered: (item, attempts) => {
       opts.auditLog.append({ event: "delivered", id: item.id, targetUrl: item.targetUrl, attempts });
     },
@@ -167,8 +178,9 @@ export function createRelayServer(opts: RelayServerOptions): Server {
     }
     const isList = pathname === "/dead-letter";
     const isAudit = pathname === "/audit";
+    const isLatency = pathname === "/latency";
     const replayMatch = /^\/dead-letter\/([^/]+)\/replay$/.exec(pathname);
-    if (!isList && !isAudit && !replayMatch) {
+    if (!isList && !isAudit && !isLatency && !replayMatch) {
       respondJson(res, 404, { error: "not found" });
       return;
     }
@@ -176,10 +188,16 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       !(
         (isList && req.method === "GET") ||
         (isAudit && req.method === "GET") ||
+        (isLatency && req.method === "GET") ||
         (replayMatch && req.method === "POST")
       )
     ) {
       respondJson(res, 405, { error: "method not allowed" });
+      return;
+    }
+    if (isLatency) {
+      const params = new URL(req.url ?? "/latency", "http://internal").searchParams;
+      respondJson(res, 200, queue.getLatencyStats(params.get("endpoint") ?? undefined));
       return;
     }
     if (isAudit) {
@@ -237,7 +255,12 @@ export function createRelayServer(opts: RelayServerOptions): Server {
 
   const server = createServer(async (req, res) => {
     const pathname = new URL(req.url ?? "/", "http://internal").pathname;
-    if (pathname === "/dead-letter" || pathname.startsWith("/dead-letter/") || pathname === "/audit") {
+    if (
+      pathname === "/dead-letter" ||
+      pathname.startsWith("/dead-letter/") ||
+      pathname === "/audit" ||
+      pathname === "/latency"
+    ) {
       handleOperator(req, res, pathname);
       return;
     }

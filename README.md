@@ -56,6 +56,16 @@ reliability primitives that matter for any signed-payload pipeline.
   instead of dropping it, which is the lane's abuse guard.
   `getUrgentStats()` reports per-endpoint `delivered` / `retried` /
   `throttled` counters.
+- `src/latency.ts` — accepted→delivered latency SLO tracking
+  (`LatencyTracker`): `enqueue()` starts each delivery's clock, a successful
+  delivery samples it into a bounded per-endpoint rolling window (default
+  1024 samples), and dead-lettered items are discarded without sampling.
+  `getLatencyStats()` — also served to operators at `GET /latency`
+  (bearer-guarded, optional `?endpoint=` filter) — exposes per-endpoint
+  count/min/max/mean plus nearest-rank p50/p95/p99 and the SLO attainment
+  rate (`withinSlo / count` against `sloMs`, default 5000ms). Deliveries
+  slower than the budget fire `onSloMiss` and are audited as `slo_missed`.
+  The clock is injectable for deterministic tests.
 - `src/audit.ts` — append-only JSONL audit log (`append` / `readAll`) plus an
   indexed query (`query({ event, endpoint, since, until, limit })`): a lazily
   maintained line-offset index maps each complete line to its `ts`/`event`/
@@ -175,7 +185,10 @@ written to the audit log, so the log is the machine's trace.
   token bucket degrades it back to this normal path (still `delivering`,
   never dropped).
 - `delivering` → **`delivered`** when the downstream answers 2xx. Done —
-  audited with the total attempt count.
+  audited with the total attempt count. When latency tracking is enabled
+  (`retry.latency`), the accepted→delivered delay is sampled into the
+  endpoint's distribution, and a delivery slower than `sloMs` is additionally
+  audited as `slo_missed` with the measured `latencyMs`.
 - `delivering` → **`retrying`** when the attempt fails (non-2xx, timeout,
   or connection error). The next attempt is scheduled after
   `baseDelayMs * 2^attempt` plus jitter, capped at `maxDelayMs`, then the
@@ -265,6 +278,9 @@ Requires Node 24+ (runs `.ts` directly via type stripping; zero dependencies).
   when no guard is injected. Also covers the urgent lane: `x-priority: urgent`
   (case-insensitive) is mapped onto the fast lane and recorded on the
   `accepted` audit event, while requests without the header stay normal.
+  Also covers `GET /latency`: the operator-token guard, per-endpoint
+  percentile stats with `?endpoint=` filtering, and `slo_missed` audit
+  events when a delivery exceeds the latency budget.
 - `test/urgent.test.ts` — the fast lane: `UrgentRateLimiter`
   burst/refill/per-endpoint isolation and `RangeError` on non-positive
   rates; urgent retries use the fixed delay instead of exponential backoff;
@@ -274,3 +290,10 @@ Requires Node 24+ (runs `.ts` directly via type stripping; zero dependencies).
   replayed dead-letter items keep their priority (this caught a real bug —
   the dead-letter push dropped `priority`); normal items are unaffected;
   invalid configs throw.
+- `test/latency.test.ts` — `LatencyTracker`: percentiles and SLO attainment
+  over known samples, per-endpoint isolation and filtering, bounded rolling
+  window eviction, discard/unknown-id no-ops, re-accept restarts the clock,
+  backward clock jumps clamped to zero, and `RangeError` on invalid
+  configs. Queue integration: accepted→delivered sampling with `onSloMiss`
+  firing past the budget, dead-lettered items discarded without sampling,
+  and tracking disabled by default.

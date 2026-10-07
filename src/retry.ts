@@ -1,8 +1,14 @@
 import { EndpointCircuitBreaker, type CircuitBreakerOptions, type CircuitState, type CircuitStats } from "./circuit.ts";
 import type { EncryptedPayload, PayloadEncryptor } from "./encrypt.ts";
+import {
+  LatencyTracker,
+  type EndpointLatencyStats,
+  type LatencyTrackerOptions,
+} from "./latency.ts";
 
 export type { CircuitBreakerOptions, CircuitState, CircuitStats };
 export type { EncryptedPayload, PayloadEncryptor };
+export type { EndpointLatencyStats, LatencyTrackerOptions };
 
 /**
  * Delivery priority of an item.
@@ -45,7 +51,19 @@ export interface UrgentLaneOptions {
   now?: () => number;
 }
 
+/** Fired when a delivery's accepted→delivered latency exceeds the SLO budget. */
+export interface SloMissInfo {
+  id: string;
+  endpoint: string;
+  latencyMs: number;
+  sloMs: number;
+}
 
+/** {@link LatencyTrackerOptions} plus the SLO-miss hook. */
+export interface LatencyOptions extends LatencyTrackerOptions {
+  /** Called once per delivery whose accepted→delivered latency exceeds `sloMs`. */
+  onSloMiss?: (info: SloMissInfo) => void;
+}
 
 export type Sender = (item: RetryItem) => Promise<void>;
 
@@ -150,6 +168,14 @@ export interface RetryQueueOptions {
    * retries, 100 urgent attempts/sec per endpoint).
    */
   urgent?: UrgentLaneOptions;
+  /**
+   * Accepted→delivered latency SLO tracking (see `src/latency.ts`). When
+   * set, `enqueue()` starts each delivery's clock, a successful `deliver()`
+   * samples it into the endpoint's rolling window, dead-lettered items are
+   * discarded without sampling, and `onSloMiss` fires per delivery slower
+   * than `sloMs`. Disabled by default.
+   */
+  latency?: LatencyOptions;
 }
 
 interface Scheduled {
@@ -325,6 +351,8 @@ export class RetryQueue {
   private readonly urgentRetryDelayMs: number;
   private readonly urgentLimiter: UrgentRateLimiter;
   private readonly urgentStats = new Map<string, { delivered: number; retried: number; throttled: number }>();
+  private readonly latency?: LatencyTracker;
+  private readonly onSloMiss?: (info: SloMissInfo) => void;
 
   private readonly queue = new Map<string, RetryItem & { attempt: number }>();
   private readonly timers = new Map<string, Scheduled>();
@@ -381,6 +409,8 @@ export class RetryQueue {
       opts.urgent?.maxUrgentPerSecond ?? 100,
       opts.urgent?.now ?? Date.now
     );
+    this.latency = opts.latency ? new LatencyTracker(opts.latency) : undefined;
+    this.onSloMiss = opts.latency?.onSloMiss;
   }
 
   private recordUrgentStat(endpoint: string, kind: "delivered" | "retried" | "throttled"): void {
@@ -427,6 +457,9 @@ export class RetryQueue {
       payload = this.payloadEncryptor.decrypt(encryptedPayload);
     }
     this.queue.set(item.id, { ...item, payload, attempt: 0 });
+    // A replay starts a fresh delivery cycle: restart the latency clock so
+    // the sample measures the replayed attempt, not the original one.
+    this.latency?.recordAccepted(item.id);
     if (this.running) {
       this.schedule(item.id, 0);
     }
@@ -448,6 +481,9 @@ export class RetryQueue {
       throw new Error(`Duplicate item id: ${item.id}`);
     }
     this.queue.set(item.id, { ...item, attempt: 0 });
+    // Start the latency clock only after the item is really queued — a
+    // duplicate-id throw must not leave a stale pending record behind.
+    this.latency?.recordAccepted(item.id);
     if (this.running) {
       this.schedule(item.id, 0);
     }
@@ -579,12 +615,18 @@ export class RetryQueue {
         this.breaker?.recordSuccess(entry.targetUrl);
         this.queue.delete(id);
         if (fastLane) this.recordUrgentStat(entry.targetUrl, "delivered");
+        const latencyMs = this.latency?.recordDelivered(entry.id, entry.targetUrl);
+        if (latencyMs !== undefined && this.latency && latencyMs > this.latency.sloMs) {
+          this.onSloMiss?.({ id: entry.id, endpoint: entry.targetUrl, latencyMs, sloMs: this.latency.sloMs });
+        }
         this.onDelivered?.(entry, entry.attempt + 1);
       } catch (err) {
         this.breaker?.recordFailure(entry.targetUrl);
         entry.attempt += 1;
         if (entry.attempt >= this.maxAttempts) {
           this.queue.delete(id);
+          // Never delivered: drop the pending clock without sampling.
+          this.latency?.discard(entry.id);
           const encryptedPayload = this.payloadEncryptor?.encrypt(entry.payload);
           this.deadLetter.push({
             id: entry.id,
@@ -632,6 +674,15 @@ export class RetryQueue {
    */
   getUrgentStats(): UrgentStats[] {
     return [...this.urgentStats.entries()].map(([endpoint, s]) => ({ endpoint, ...s }));
+  }
+
+  /**
+   * Per-endpoint accepted→delivered latency distribution (p50/p95/p99) plus
+   * SLO attainment. Empty when latency tracking is disabled or no delivery
+   * has completed yet. With `endpoint` set, only that endpoint is returned.
+   */
+  getLatencyStats(endpoint?: string): EndpointLatencyStats[] {
+    return this.latency?.stats(endpoint) ?? [];
   }
 
   /**

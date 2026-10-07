@@ -512,5 +512,100 @@ describe("server", () => {
       await new Promise((r) => relay.once("close", r));
     }
   });
+
+  it("exposes per-endpoint latency percentiles on the operator GET /latency endpoint", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-"));
+    const audit = new AuditLog(join(dir, "audit.jsonl"));
+    const forwardUrl = `http://127.0.0.1:${stubPort}/hook`;
+    const relay = createRelayServer({
+      secret: SECRET,
+      forwardUrl,
+      auditLog: audit,
+      operatorToken: "op-token",
+      retry: { baseDelayMs: 10, jitterMs: 0, maxAttempts: 2, latency: { sloMs: 60000 } },
+    });
+    const port = await listen(relay);
+    try {
+      assert.equal(
+        (await post(port, "/", BODY, { "x-signature": signSha256(BODY, SECRET) })).status,
+        202
+      );
+      // Wait until the delivery samples into the latency tracker.
+      const deadline = Date.now() + 5000;
+      let stats: Array<Record<string, unknown>> = [];
+      while (Date.now() < deadline) {
+        const res = await get(port, "/latency", { authorization: "Bearer op-token" });
+        assert.equal(res.status, 200);
+        stats = JSON.parse(res.text) as Array<Record<string, unknown>>;
+        if (stats.length > 0) break;
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      assert.equal(stats.length, 1);
+      const s = stats[0];
+      assert.equal(s.endpoint, forwardUrl);
+      assert.equal(s.count, 1);
+      assert.ok(typeof s.p50 === "number" && (s.p50 as number) >= 0);
+      assert.equal(s.p95, s.p50);
+      assert.equal(s.p99, s.p50);
+      assert.equal(s.sloMs, 60000);
+      assert.equal(s.withinSlo, 1);
+      assert.equal(s.sloAttainment, 1);
+      // Endpoint filter narrows the result; unknown endpoints come back empty.
+      const filtered = await get(port, "/latency?endpoint=" + encodeURIComponent(forwardUrl), {
+        authorization: "Bearer op-token",
+      });
+      assert.equal(JSON.parse(filtered.text).length, 1);
+      const missing = await get(port, "/latency?endpoint=" + encodeURIComponent("http://nope/"), {
+        authorization: "Bearer op-token",
+      });
+      assert.deepEqual(JSON.parse(missing.text), []);
+      // Guarded by the shared operator-token check (403 without/with a wrong
+      // bearer; 404 when no operatorToken is configured at all — the same
+      // fail-closed guard as the other operator endpoints).
+      assert.equal((await get(port, "/latency")).status, 403);
+      assert.equal((await get(port, "/latency", { authorization: "Bearer wrong" })).status, 403);
+    } finally {
+      relay.close();
+      await new Promise((r) => relay.once("close", r));
+    }
+  });
+
+  it("audits an slo_missed event when a delivery exceeds the latency budget", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-"));
+    const audit = new AuditLog(join(dir, "audit.jsonl"));
+    const relay = createRelayServer({
+      secret: SECRET,
+      forwardUrl: "http://127.0.0.1:1/unused",
+      auditLog: audit,
+      // A slow downstream: every delivery takes ~60ms against a 5ms budget.
+      sender: async () => {
+        await new Promise((r) => setTimeout(r, 60));
+      },
+      retry: { latency: { sloMs: 5 } },
+    });
+    const port = await listen(relay);
+    try {
+      assert.equal(
+        (await post(port, "/", BODY, { "x-signature": signSha256(BODY, SECRET) })).status,
+        202
+      );
+      const deadline = Date.now() + 5000;
+      let missed: Array<Record<string, unknown>> = [];
+      while (Date.now() < deadline) {
+        missed = (audit.readAll() as Array<Record<string, unknown>>).filter(
+          (e) => e.event === "slo_missed"
+        );
+        if (missed.length > 0) break;
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      assert.equal(missed.length, 1);
+      assert.ok((missed[0].latencyMs as number) > 5);
+      assert.equal(missed[0].sloMs, 5);
+      assert.equal(typeof missed[0].id, "string");
+    } finally {
+      relay.close();
+      await new Promise((r) => relay.once("close", r));
+    }
+  });
 });
 
