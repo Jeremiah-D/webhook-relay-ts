@@ -301,5 +301,91 @@ describe("server", () => {
       await new Promise((r) => relay.once("close", r));
     }
   });
+
+  it("disables the audit query endpoint when no operatorToken is set", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-"));
+    const audit = new AuditLog(join(dir, "audit.jsonl"));
+    const relay = createRelayServer({
+      secret: SECRET,
+      forwardUrl: `http://127.0.0.1:${stubPort}/hook`,
+      auditLog: audit,
+      retry: { baseDelayMs: 10, jitterMs: 0, maxAttempts: 3 },
+    });
+    const port = await listen(relay);
+    try {
+      assert.equal((await get(port, "/audit")).status, 404);
+      assert.equal((await get(port, "/audit", { authorization: "Bearer x" })).status, 404);
+    } finally {
+      relay.close();
+      await new Promise((r) => relay.once("close", r));
+    }
+  });
+
+  it("queries the audit log behind the operator token", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-"));
+    const audit = new AuditLog(join(dir, "audit.jsonl"));
+    const forwardUrl = `http://127.0.0.1:${stubPort}/hook`;
+    const relay = createRelayServer({
+      secret: SECRET,
+      forwardUrl,
+      auditLog: audit,
+      retry: { baseDelayMs: 10, jitterMs: 0, maxAttempts: 3 },
+      operatorToken: "op-secret",
+    });
+    const port = await listen(relay);
+    const auth = { authorization: "Bearer op-secret" };
+    try {
+      assert.equal((await get(port, "/audit")).status, 403);
+      assert.equal((await get(port, "/audit", { authorization: "Bearer wrong" })).status, 403);
+      assert.equal((await post(port, "/audit", Buffer.alloc(0), auth)).status, 405);
+
+      const res = await post(port, "/", BODY, { "x-signature": signSha256(BODY, SECRET) });
+      assert.equal(res.status, 202);
+
+      // Wait for the delivery to be audited, via the endpoint itself.
+      let delivered: Array<Record<string, unknown>> = [];
+      const deadline = Date.now() + 5000;
+      while (Date.now() < deadline) {
+        const q = await get(port, "/audit?event=delivered", auth);
+        assert.equal(q.status, 200);
+        delivered = JSON.parse(q.text) as Array<Record<string, unknown>>;
+        if (delivered.length === 1) break;
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      assert.equal(delivered.length, 1);
+      assert.equal(delivered[0].targetUrl, forwardUrl);
+
+      const all = JSON.parse((await get(port, "/audit", auth)).text) as Array<Record<string, unknown>>;
+      assert.ok(all.some((e) => e.event === "accepted"));
+      assert.ok(all.some((e) => e.event === "delivered"));
+
+      const byEndpoint = JSON.parse(
+        (await get(port, `/audit?endpoint=${encodeURIComponent(forwardUrl)}`, auth)).text
+      ) as Array<Record<string, unknown>>;
+      assert.ok(byEndpoint.length >= 2);
+
+      const none = JSON.parse(
+        (await get(port, "/audit?endpoint=http://127.0.0.1:1/nowhere", auth)).text
+      ) as Array<unknown>;
+      assert.deepEqual(none, []);
+
+      const future = JSON.parse(
+        (await get(port, "/audit?since=2999-01-01T00:00:00.000Z", auth)).text
+      ) as Array<unknown>;
+      assert.deepEqual(future, []);
+
+      const limited = JSON.parse((await get(port, "/audit?limit=1", auth)).text) as Array<
+        Record<string, unknown>
+      >;
+      assert.equal(limited.length, 1);
+      assert.equal(limited[0].event, "delivered"); // most recent match kept
+
+      assert.equal((await get(port, "/audit?since=not-a-date", auth)).status, 400);
+      assert.equal((await get(port, "/audit?limit=0", auth)).status, 400);
+    } finally {
+      relay.close();
+      await new Promise((r) => relay.once("close", r));
+    }
+  });
 });
 

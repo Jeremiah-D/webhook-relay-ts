@@ -43,7 +43,12 @@ reliability primitives that matter for any signed-payload pipeline.
   `RangeError`. Dead-lettered items carry `attempts`, `lastError`, and
   `deadLetteredAt`, and can be re-queued with a fresh attempt budget via
   `replayDeadLetter(id)` / `replayAllDeadLetters()`.
-- `src/audit.ts` — append-only JSONL audit log (`append` / `readAll`).
+- `src/audit.ts` — append-only JSONL audit log (`append` / `readAll`) plus an
+  indexed query (`query({ event, endpoint, since, until, limit })`): a lazily
+  maintained line-offset index maps each complete line to its `ts`/`event`/
+  `endpoint` fields and byte span, so only matching lines are read back from
+  disk; appends are indexed incrementally and truncation/rotation rebuilds the
+  index. Malformed lines are skipped by the index.
 - `src/server.ts` — a minimal `node:http` receiver: read the raw body, verify
   the `x-signature` header with the injected `verifier` (defaults to
   HMAC-SHA256 with `secret`; pass e.g. `new Ed25519Verifier(pem)` to change
@@ -53,7 +58,10 @@ reliability primitives that matter for any signed-payload pipeline.
   attempts/lastError/timestamp metadata, no raw payloads) and
   `POST /dead-letter/:id/replay` (manually re-queue a dead letter, audited as
   `dead_letter_replayed`) are guarded by an `operatorToken` bearer token and
-  disabled (404, fail closed) when it is unset.
+  disabled (404, fail closed) when it is unset. The same guard protects
+  `GET /audit` (`?endpoint=`, `?event=` repeatable, `?since=`/`?until=` ISO-8601,
+  `?limit=`), which queries the audit log through its index — delivery
+  forensics per endpoint and time range.
 
 ## Run
 
@@ -67,6 +75,10 @@ Requires Node 24+ (runs `.ts` directly via type stripping; zero dependencies).
 
 `npm test` runs the `node:test` suites in `test/`:
 
+- `test/audit.test.ts` — the indexed query: endpoint + event + time-range
+  filters, malformed-line skipping, missing-file behavior, `limit` keeping the
+  most recent matches, index rebuild after truncation, and invalid parameters
+  throwing.
 - `test/verify.test.ts` — valid signatures pass; tampered body, wrong secret,
   expired timestamp, and missing headers fail. Covers the pluggable layer:
   `HmacSha256Verifier` parity with `verifySignature`, `Ed25519Verifier`
@@ -86,4 +98,6 @@ Requires Node 24+ (runs `.ts` directly via type stripping; zero dependencies).
   injected `verifier` option is honored (accept-all / reject-all). Also covers
   the dead-letter operator surface: endpoints are disabled without
   `operatorToken`, require the bearer token when set, and support listing plus
-  manual replay of dead letters (audited as `dead_letter_replayed`).
+  manual replay of dead letters (audited as `dead_letter_replayed`). Also
+  covers `GET /audit`: fail-closed without the token, endpoint/event/time-range
+  filters, `limit`, and 400 on invalid query parameters.

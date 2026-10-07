@@ -23,8 +23,8 @@ export interface RelayServerOptions {
   /** Retry queue tuning, passed through to RetryQueue. */
   retry?: ConstructorParameters<typeof RetryQueue>[0];
   /**
-   * Bearer token guarding the dead-letter operator endpoints
-   * (`GET /dead-letter`, `POST /dead-letter/:id/replay`). When unset, those
+   * Bearer token guarding the operator endpoints (`GET /dead-letter`,
+   * `POST /dead-letter/:id/replay`, `GET /audit`). When unset, those
    * endpoints are disabled and answer 404 (fail closed).
    */
   operatorToken?: string;
@@ -110,7 +110,7 @@ export function createRelayServer(opts: RelayServerOptions): Server {
     res.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(body));
   };
 
-  /** Operator surface for the dead-letter queue: list + manual replay. */
+  /** Operator surface: dead-letter queue + audit-log queries. */
   const handleOperator = (
     req: Parameters<Parameters<typeof createServer>[0]>[0],
     res: Parameters<Parameters<typeof createServer>[0]>[1],
@@ -125,13 +125,48 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       return;
     }
     const isList = pathname === "/dead-letter";
+    const isAudit = pathname === "/audit";
     const replayMatch = /^\/dead-letter\/([^/]+)\/replay$/.exec(pathname);
-    if (!isList && !replayMatch) {
+    if (!isList && !isAudit && !replayMatch) {
       respondJson(res, 404, { error: "not found" });
       return;
     }
-    if (!((isList && req.method === "GET") || (replayMatch && req.method === "POST"))) {
+    if (
+      !(
+        (isList && req.method === "GET") ||
+        (isAudit && req.method === "GET") ||
+        (replayMatch && req.method === "POST")
+      )
+    ) {
       respondJson(res, 405, { error: "method not allowed" });
+      return;
+    }
+    if (isAudit) {
+      const params = new URL(req.url ?? "/audit", "http://internal").searchParams;
+      const events = params.getAll("event");
+      const limitRaw = params.get("limit");
+      let limit: number | undefined;
+      if (limitRaw !== null) {
+        limit = Number(limitRaw);
+        if (!Number.isInteger(limit) || limit < 1) {
+          respondJson(res, 400, { error: "invalid limit" });
+          return;
+        }
+      }
+      let entries: object[];
+      try {
+        entries = opts.auditLog.query({
+          endpoint: params.get("endpoint") ?? undefined,
+          since: params.get("since") ?? undefined,
+          until: params.get("until") ?? undefined,
+          event: events.length > 0 ? events : undefined,
+          limit,
+        });
+      } catch {
+        respondJson(res, 400, { error: "invalid query parameters" });
+        return;
+      }
+      respondJson(res, 200, entries);
       return;
     }
     if (isList) {
@@ -160,7 +195,7 @@ export function createRelayServer(opts: RelayServerOptions): Server {
 
   const server = createServer(async (req, res) => {
     const pathname = new URL(req.url ?? "/", "http://internal").pathname;
-    if (pathname === "/dead-letter" || pathname.startsWith("/dead-letter/")) {
+    if (pathname === "/dead-letter" || pathname.startsWith("/dead-letter/") || pathname === "/audit") {
       handleOperator(req, res, pathname);
       return;
     }
