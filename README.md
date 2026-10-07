@@ -56,6 +56,15 @@ reliability primitives that matter for any signed-payload pipeline.
   instead of dropping it, which is the lane's abuse guard.
   `getUrgentStats()` reports per-endpoint `delivered` / `retried` /
   `throttled` counters.
+- `src/quota.ts` — per-endpoint delivery quota (`EndpointQuota`): a token
+  bucket sized to one minute of budget (`deliveriesPerMinute`), refilled
+  lazily. An attempt that finds an empty bucket is rescheduled for the next
+  token refill — never dropped, and never counted against the retry budget
+  or the circuit breaker — so one tenant's flood auto-throttles instead of
+  hammering the downstream. Wired into `RetryQueue` via
+  `retry: { quota: { deliveriesPerMinute } }` (unlimited by default);
+  `getQuotaStats()` reports per-endpoint `delayed` counts. Injectable clock
+  for deterministic tests.
 - `src/latency.ts` — accepted→delivered latency SLO tracking
   (`LatencyTracker`): `enqueue()` starts each delivery's clock, a successful
   delivery samples it into a bounded per-endpoint rolling window (default
@@ -193,12 +202,15 @@ written to the audit log, so the log is the machine's trace.
 
 - `accepted` → **`delivering`**: the first attempt starts (a delivery may
   park briefly on a per-endpoint concurrency slot first — still
-  `delivering`, just waiting its turn). When the inbound request carried
-  `x-priority: urgent`, the item takes the **fast lane** instead: it starts
-  immediately without queueing for a concurrency slot, and its retries use
-  a fixed delay rather than the exponential backoff below; an empty urgent
-  token bucket degrades it back to this normal path (still `delivering`,
-  never dropped).
+  `delivering`, just waiting its turn). When the per-endpoint delivery
+  quota is enabled and the endpoint's budget is exhausted, the attempt
+  waits for the next token refill instead of sending — still `delivering`,
+  never dropped, never counted against the retry budget. When the inbound
+  request carried `x-priority: urgent`, the item takes the **fast lane**
+  instead: it starts immediately without queueing for a concurrency slot,
+  and its retries use a fixed delay rather than the exponential backoff
+  below; an empty urgent token bucket degrades it back to this normal path
+  (still `delivering`, never dropped).
 - `delivering` → **`delivered`** when the downstream answers 2xx. Done —
   audited with the total attempt count. When latency tracking is enabled
   (`retry.latency`), the accepted→delivered delay is sampled into the
@@ -320,3 +332,10 @@ Requires Node 24+ (runs `.ts` directly via type stripping; zero dependencies).
   (audited as `duplicate_suppressed`); a different payload is a different
   event; dedup stays off by default; signature verification still runs
   before the dedup check.
+- `test/quota.test.ts` — `EndpointQuota`: full-bucket start, lazy refill,
+  per-endpoint isolation, backward-clock clamping, and `RangeError` on
+  invalid configs. Queue integration: over-budget attempts are delayed
+  (rescheduled at the refill, never dropped) and counted in
+  `getQuotaStats()`; a delayed item still burns no retry budget (a
+  `maxAttempts: 1` flood delivers everything exactly once); budgets stay
+  isolated per endpoint; quota is unlimited by default.

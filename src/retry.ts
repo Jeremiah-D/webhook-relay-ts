@@ -5,10 +5,12 @@ import {
   type EndpointLatencyStats,
   type LatencyTrackerOptions,
 } from "./latency.ts";
+import { EndpointQuota, type QuotaOptions, type QuotaStats } from "./quota.ts";
 
 export type { CircuitBreakerOptions, CircuitState, CircuitStats };
 export type { EncryptedPayload, PayloadEncryptor };
 export type { EndpointLatencyStats, LatencyTrackerOptions };
+export type { QuotaOptions, QuotaStats };
 
 /**
  * Delivery priority of an item.
@@ -176,6 +178,14 @@ export interface RetryQueueOptions {
    * than `sloMs`. Disabled by default.
    */
   latency?: LatencyOptions;
+  /**
+   * Per-endpoint delivery quota (see `src/quota.ts`). When set, each send
+   * attempt costs one token from the endpoint's per-minute bucket; an
+   * attempt that finds an empty bucket is rescheduled for the next token
+   * refill — never dropped, and never counted against the retry budget or
+   * the circuit breaker. Disabled (unlimited) by default.
+   */
+  quota?: QuotaOptions;
 }
 
 interface Scheduled {
@@ -353,6 +363,9 @@ export class RetryQueue {
   private readonly urgentStats = new Map<string, { delivered: number; retried: number; throttled: number }>();
   private readonly latency?: LatencyTracker;
   private readonly onSloMiss?: (info: SloMissInfo) => void;
+  private readonly quota?: EndpointQuota;
+  /** Attempts rescheduled because the endpoint's quota bucket was empty. */
+  private readonly quotaStats = new Map<string, number>();
 
   private readonly queue = new Map<string, RetryItem & { attempt: number }>();
   private readonly timers = new Map<string, Scheduled>();
@@ -411,6 +424,14 @@ export class RetryQueue {
     );
     this.latency = opts.latency ? new LatencyTracker(opts.latency) : undefined;
     this.onSloMiss = opts.latency?.onSloMiss;
+    this.quota =
+      opts.quota?.deliveriesPerMinute !== undefined
+        ? new EndpointQuota(opts.quota.deliveriesPerMinute, opts.quota.now ?? Date.now)
+        : undefined;
+  }
+
+  private recordQuotaStat(endpoint: string): void {
+    this.quotaStats.set(endpoint, (this.quotaStats.get(endpoint) ?? 0) + 1);
   }
 
   private recordUrgentStat(endpoint: string, kind: "delivered" | "retried" | "throttled"): void {
@@ -575,6 +596,16 @@ export class RetryQueue {
   private async deliver(id: string): Promise<void> {
     const entry = this.queue.get(id);
     if (!entry || !this.running) return;
+    // Per-endpoint quota first: an exhausted budget delays the attempt
+    // (rescheduled at the next token refill) instead of burning the retry
+    // budget or tripping the circuit against a downstream we are
+    // voluntarily throttling. A little jitter keeps many delayed items
+    // from re-checking in lockstep.
+    if (this.quota && !this.quota.take(entry.targetUrl)) {
+      this.recordQuotaStat(entry.targetUrl);
+      this.schedule(id, this.quota.msUntilToken(entry.targetUrl) + this.random() * 50);
+      return;
+    }
     let probe = false;
     if (this.breaker) {
       const verdict = this.breaker.shouldAllow(entry.targetUrl);
@@ -696,5 +727,13 @@ export class RetryQueue {
   /** Attempts parked because the endpoint's circuit was open. */
   circuitBlockedCount(): number {
     return this.circuitBlocked;
+  }
+
+  /**
+   * Per-endpoint quota counters (`delayed`). Empty when the quota is
+   * disabled or no attempt has been delayed yet.
+   */
+  getQuotaStats(): QuotaStats[] {
+    return [...this.quotaStats.entries()].map(([endpoint, delayed]) => ({ endpoint, delayed }));
   }
 }
