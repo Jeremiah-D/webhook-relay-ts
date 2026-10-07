@@ -2,7 +2,7 @@ import { createServer, request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import type { Server } from "node:http";
 import { randomUUID } from "node:crypto";
-import { verifySignature } from "./verify.ts";
+import { HmacSha256Verifier, type Verifier } from "./verify.ts";
 import { RetryQueue, type RetryItem, type Sender } from "./retry.ts";
 import type { AuditLog } from "./audit.ts";
 
@@ -15,6 +15,11 @@ export interface RelayServerOptions {
   auditLog: AuditLog;
   /** Injectable delivery function; defaults to a node:http(s) POST. */
   sender?: Sender;
+  /**
+   * Signature verifier; defaults to HMAC-SHA256 with `secret`.
+   * Inject e.g. `new Ed25519Verifier(pem)` to change schemes.
+   */
+  verifier?: Verifier;
   /** Retry queue tuning, passed through to RetryQueue. */
   retry?: ConstructorParameters<typeof RetryQueue>[0];
   /** Inject queue hooks (e.g. to fail the server fast on dead letters). */
@@ -89,6 +94,8 @@ export function createRelayServer(opts: RelayServerOptions): Server {
   });
   queue.start();
 
+  const verifier = opts.verifier ?? new HmacSha256Verifier(opts.secret);
+
   const server = createServer(async (req, res) => {
     if (req.method !== "POST") {
       res.writeHead(405, { "content-type": "text/plain" }).end("Method not allowed");
@@ -105,7 +112,7 @@ export function createRelayServer(opts: RelayServerOptions): Server {
     const signatureHeader = req.headers["x-signature"];
     const id = randomUUID();
 
-    if (!verifySignature(body, signatureHeader ?? "", opts.secret)) {
+    if (!verifier.verify(body, signatureHeader ?? "")) {
       opts.auditLog.append({ event: "rejected", id, reason: "invalid_signature" });
       res.writeHead(401, { "content-type": "text/plain" }).end("Invalid signature");
       return;

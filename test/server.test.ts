@@ -5,7 +5,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRelayServer } from "../src/server.ts";
-import { signSha256 } from "../src/verify.ts";
+import { signSha256, type Verifier } from "../src/verify.ts";
 import { AuditLog } from "../src/audit.ts";
 import type { RetryItem } from "../src/retry.ts";
 
@@ -120,4 +120,57 @@ describe("server", () => {
       await new Promise((r) => relay.once("close", r));
     }
   });
+
+  it("honors an injected accept-all verifier (unsigned request accepted)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-"));
+    const audit = new AuditLog(join(dir, "audit.jsonl"));
+    const acceptAll: Verifier = { name: "accept-all", verify: () => true };
+    const relay = createRelayServer({
+      secret: SECRET,
+      forwardUrl: `http://127.0.0.1:${stubPort}/hook`,
+      auditLog: audit,
+      retry: { baseDelayMs: 10, jitterMs: 0, maxAttempts: 3 },
+      verifier: acceptAll,
+    });
+    const port = await listen(relay);
+    try {
+      const before = receivedRaw.length;
+      const res = await post(port, "/", BODY, {}); // no x-signature at all
+      assert.equal(res.status, 202);
+      const deadline = Date.now() + 5000;
+      while (receivedRaw.length === before && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      assert.equal(receivedRaw.length, before + 1);
+      assert.deepEqual(receivedRaw[receivedRaw.length - 1], BODY);
+    } finally {
+      relay.close();
+      await new Promise((r) => relay.once("close", r));
+    }
+  });
+
+  it("honors an injected reject-all verifier (valid HMAC signature refused)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-"));
+    const audit = new AuditLog(join(dir, "audit.jsonl"));
+    const rejectAll: Verifier = { name: "reject-all", verify: () => false };
+    const relay = createRelayServer({
+      secret: SECRET,
+      forwardUrl: `http://127.0.0.1:${stubPort}/hook`,
+      auditLog: audit,
+      retry: { baseDelayMs: 10, jitterMs: 0, maxAttempts: 3 },
+      verifier: rejectAll,
+    });
+    const port = await listen(relay);
+    try {
+      const before = receivedRaw.length;
+      const res = await post(port, "/", BODY, { "x-signature": signSha256(BODY, SECRET) });
+      assert.equal(res.status, 401);
+      await new Promise((r) => setTimeout(r, 300));
+      assert.equal(receivedRaw.length, before);
+    } finally {
+      relay.close();
+      await new Promise((r) => relay.once("close", r));
+    }
+  });
 });
+

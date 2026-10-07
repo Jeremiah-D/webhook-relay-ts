@@ -4,9 +4,10 @@
 > webhook-signature verification and delivery-reliability engineering. It is
 > not employer production code and re-implements no proprietary system.
 
-A dependency-free TypeScript webhook relay: verify an incoming webhook with
-HMAC-SHA256, enqueue it into a retry queue with exponential backoff, forward
-it to a downstream URL, and record everything in an append-only audit log.
+A dependency-free TypeScript webhook relay: verify an incoming webhook through
+a pluggable verifier interface (HMAC-SHA256 default, Ed25519 included),
+enqueue it into a retry queue with exponential backoff, forward it to a
+downstream URL, and record everything in an append-only audit log.
 
 ## Inspiration
 
@@ -23,17 +24,23 @@ reliability primitives that matter for any signed-payload pipeline.
 
 ## What it does
 
-- `src/verify.ts` — parse and verify signature headers in two formats:
-  `sha256=<hex>` and `t=<unix_ts>,v1=<hex>` (signature covers `<ts>.<rawBody>`).
-  Uses `crypto.timingSafeEqual` and enforces a timestamp tolerance window
-  (default 300s).
+- `src/verify.ts` — pluggable signature verification. The `Verifier` interface
+  (`verify(rawBody, header, opts)`, never throws) plus a name registry
+  (`registerVerifier` / `getVerifier` / `verifyWith`) lets you add schemes
+  without touching the server. Built in: `HmacSha256Verifier` (default —
+  `sha256=<hex>` and `t=<unix_ts>,v1=<hex>` formats, the timestamped one
+  covers `<ts>.<rawBody>`), and `Ed25519Verifier` (`ed25519=<hex>` over the
+  raw body, PEM public key). Uses `crypto.timingSafeEqual` on the HMAC path
+  and enforces a timestamp tolerance window (default 300s).
 - `src/retry.ts` — `RetryQueue` with exponential backoff (`base * 2^attempt`)
   plus jitter, a `maxDelay` cap, a dead-letter list after `maxAttempts`, and an
   injectable sender/timer for deterministic testing.
 - `src/audit.ts` — append-only JSONL audit log (`append` / `readAll`).
 - `src/server.ts` — a minimal `node:http` receiver: read the raw body, verify
-  the `x-signature` header (401 + audit entry on failure), enqueue for
-  forwarding to `forwardUrl`, audit accept / delivered / dead-letter events.
+  the `x-signature` header with the injected `verifier` (defaults to
+  HMAC-SHA256 with `secret`; pass e.g. `new Ed25519Verifier(pem)` to change
+  schemes), enqueue for forwarding to `forwardUrl`, audit accept / delivered /
+  dead-letter events. A failed verification returns 401 + audit entry.
 
 ## Run
 
@@ -48,10 +55,14 @@ Requires Node 24+ (runs `.ts` directly via type stripping; zero dependencies).
 `npm test` runs the `node:test` suites in `test/`:
 
 - `test/verify.test.ts` — valid signatures pass; tampered body, wrong secret,
-  expired timestamp, and missing headers fail.
+  expired timestamp, and missing headers fail. Covers the pluggable layer:
+  `HmacSha256Verifier` parity with `verifySignature`, `Ed25519Verifier`
+  accept/reject/wrong-key/malformed, registry dispatch (unknown names fail
+  closed), and `verifyWith` never throwing on misbehaving verifiers.
 - `test/retry.test.ts` — a flaky sender (fails twice, then succeeds) delivers
   on the third attempt with increasing backoff; a permanently failing sender
   ends in the dead-letter list.
 - `test/server.test.ts` — end-to-end against a local stub HTTP server: a
   valid webhook is forwarded byte-for-byte and audited as delivered; an
-  invalid signature returns 401 and is never forwarded.
+  invalid signature returns 401 and is never forwarded. Also proves the
+  injected `verifier` option is honored (accept-all / reject-all).
