@@ -4,12 +4,48 @@ import type { EncryptedPayload, PayloadEncryptor } from "./encrypt.ts";
 export type { CircuitBreakerOptions, CircuitState, CircuitStats };
 export type { EncryptedPayload, PayloadEncryptor };
 
+/**
+ * Delivery priority of an item.
+ *
+ * - `"normal"` (default): the standard lane — exponential backoff with
+ *   jitter, bounded by the per-endpoint concurrency limiter.
+ * - `"urgent"`: the fast lane — skips the exponential backoff (a fixed
+ *   `urgent.retryDelayMs` between attempts) and bypasses the per-endpoint
+ *   concurrency limiter, so an urgent delivery never waits behind queued
+ *   normal deliveries. Each urgent attempt costs one token from the
+ *   endpoint's bucket (`urgent.maxUrgentPerSecond`); when the bucket is
+ *   empty the item degrades to the normal lane instead of being dropped.
+ */
+export type DeliveryPriority = "normal" | "urgent";
+
 export interface RetryItem {
   id: string;
   payload: Buffer;
   targetUrl: string;
   headers: Record<string, string | string[] | undefined>;
+  /** Delivery lane; defaults to `"normal"` when unset. */
+  priority?: DeliveryPriority;
 }
+
+/** Options for the urgent delivery lane (see {@link DeliveryPriority}). */
+export interface UrgentLaneOptions {
+  /**
+   * Fixed delay in ms between urgent retries — the fast lane skips the
+   * exponential backoff entirely. Default: 0 (immediate). Must be >= 0.
+   */
+  retryDelayMs?: number;
+  /**
+   * Maximum urgent attempts per second per endpoint (token bucket; burst
+   * capacity is one full second of tokens). The abuse guard for the fast
+   * lane: without it a flood of `urgent` items could hammer a downstream.
+   * Default: 100. Must be > 0.
+   */
+  maxUrgentPerSecond?: number;
+  /** Clock in ms; defaults to `Date.now`. Injectable for deterministic tests. */
+  now?: () => number;
+}
+
+
 
 export type Sender = (item: RetryItem) => Promise<void>;
 
@@ -107,6 +143,13 @@ export interface RetryQueueOptions {
    * default, in which case dead-letter payloads are kept in the clear.
    */
   payloadEncryptor?: PayloadEncryptor;
+  /**
+   * Urgent delivery lane for items with `priority: "urgent"` (see
+   * {@link DeliveryPriority}). The lane is always available when an item is
+   * marked urgent; these options only tune it (defaults are sane: immediate
+   * retries, 100 urgent attempts/sec per endpoint).
+   */
+  urgent?: UrgentLaneOptions;
 }
 
 interface Scheduled {
@@ -202,6 +245,63 @@ export class EndpointConcurrencyLimiter {
 }
 
 /**
+ * Per-endpoint token bucket guarding the urgent lane: `ratePerSecond`
+ * tokens refill every second, and the bucket holds at most one second of
+ * tokens (burst == rate). Refills lazily on each `take`, so idle endpoints
+ * cost nothing. A monotonic-ish clock is assumed; backward jumps are
+ * clamped to zero refill rather than granting extra tokens.
+ */
+export class UrgentRateLimiter {
+  private readonly ratePerSecond: number;
+  private readonly buckets = new Map<string, { tokens: number; updatedMs: number }>();
+  private readonly now: () => number;
+
+  constructor(ratePerSecond: number, now: () => number = Date.now) {
+    if (!Number.isFinite(ratePerSecond) || ratePerSecond <= 0) {
+      throw new RangeError(`maxUrgentPerSecond must be > 0, got ${ratePerSecond}`);
+    }
+    this.ratePerSecond = ratePerSecond;
+    this.now = now;
+  }
+
+  /**
+   * Consume one token for `endpoint`. Returns false when the bucket is
+   * empty — the caller should degrade to the normal lane, never drop.
+   */
+  take(endpoint: string): boolean {
+    const at = this.now();
+    let b = this.buckets.get(endpoint);
+    if (!b) {
+      b = { tokens: this.ratePerSecond, updatedMs: at };
+      this.buckets.set(endpoint, b);
+    } else {
+      const elapsedMs = Math.max(0, at - b.updatedMs);
+      b.tokens = Math.min(this.ratePerSecond, b.tokens + (elapsedMs * this.ratePerSecond) / 1000);
+      b.updatedMs = at;
+    }
+    if (b.tokens < 1) return false;
+    b.tokens -= 1;
+    return true;
+  }
+
+  /** Tokens currently available for `endpoint` (0 when the endpoint is unknown). */
+  available(endpoint: string): number {
+    return this.buckets.get(endpoint)?.tokens ?? 0;
+  }
+}
+
+/** Per-endpoint fast-lane counters. */
+export interface UrgentStats {
+  endpoint: string;
+  /** Urgent deliveries that succeeded on the fast lane. */
+  delivered: number;
+  /** Retries scheduled on the fast lane (fixed delay, no backoff). */
+  retried: number;
+  /** Urgent attempts that found an empty bucket and degraded to the normal lane. */
+  throttled: number;
+}
+
+/**
  * RetryQueue holds outbound deliveries and retries them with exponential
  * backoff + jitter. Items that exhaust `maxAttempts` are moved to an
  * in-memory dead-letter list for later inspection.
@@ -222,6 +322,9 @@ export class RetryQueue {
   /** Attempts parked because the endpoint's circuit was open. */
   private circuitBlocked = 0;
   private readonly payloadEncryptor?: PayloadEncryptor;
+  private readonly urgentRetryDelayMs: number;
+  private readonly urgentLimiter: UrgentRateLimiter;
+  private readonly urgentStats = new Map<string, { delivered: number; retried: number; throttled: number }>();
 
   private readonly queue = new Map<string, RetryItem & { attempt: number }>();
   private readonly timers = new Map<string, Scheduled>();
@@ -270,6 +373,23 @@ export class RetryQueue {
         })
       : undefined;
     this.payloadEncryptor = opts.payloadEncryptor;
+    this.urgentRetryDelayMs = opts.urgent?.retryDelayMs ?? 0;
+    if (!Number.isFinite(this.urgentRetryDelayMs) || this.urgentRetryDelayMs < 0) {
+      throw new RangeError(`urgent.retryDelayMs must be >= 0, got ${opts.urgent?.retryDelayMs}`);
+    }
+    this.urgentLimiter = new UrgentRateLimiter(
+      opts.urgent?.maxUrgentPerSecond ?? 100,
+      opts.urgent?.now ?? Date.now
+    );
+  }
+
+  private recordUrgentStat(endpoint: string, kind: "delivered" | "retried" | "throttled"): void {
+    let s = this.urgentStats.get(endpoint);
+    if (!s) {
+      s = { delivered: 0, retried: 0, throttled: 0 };
+      this.urgentStats.set(endpoint, s);
+    }
+    s[kind] += 1;
   }
 
   /** Number of items currently pending (queued or awaiting retry). */
@@ -433,7 +553,19 @@ export class RetryQueue {
       }
       probe = verdict.probe;
     }
-    const release = await this.limiter.acquire(entry.targetUrl);
+    // Fast-lane admission: every urgent attempt costs one token from the
+    // endpoint's bucket. An empty bucket degrades the item to the normal
+    // lane — the delivery still happens, just with exponential backoff —
+    // so the lane can never be used to flood a downstream.
+    if (entry.priority === "urgent" && !this.urgentLimiter.take(entry.targetUrl)) {
+      this.recordUrgentStat(entry.targetUrl, "throttled");
+      entry.priority = "normal";
+    }
+    const fastLane = entry.priority === "urgent";
+    // The fast lane bypasses the per-endpoint concurrency limiter entirely:
+    // an urgent delivery never waits behind queued normal deliveries. Its
+    // own bound is the token bucket above.
+    const release = fastLane ? undefined : await this.limiter.acquire(entry.targetUrl);
     try {
       // The queue may have stopped, or the item may have been settled, while
       // we waited for a concurrency slot. Bail out; the release cascades to
@@ -446,6 +578,7 @@ export class RetryQueue {
         await this.sender(entry);
         this.breaker?.recordSuccess(entry.targetUrl);
         this.queue.delete(id);
+        if (fastLane) this.recordUrgentStat(entry.targetUrl, "delivered");
         this.onDelivered?.(entry, entry.attempt + 1);
       } catch (err) {
         this.breaker?.recordFailure(entry.targetUrl);
@@ -460,6 +593,8 @@ export class RetryQueue {
             payload: encryptedPayload ? Buffer.alloc(0) : entry.payload,
             targetUrl: entry.targetUrl,
             headers: entry.headers,
+            // Kept so a replayed item re-enters the same delivery lane.
+            priority: entry.priority,
             attempts: entry.attempt,
             lastError: err instanceof Error ? err.message : String(err),
             deadLetteredAt: new Date().toISOString(),
@@ -467,18 +602,36 @@ export class RetryQueue {
             ...(encryptedPayload ? { encryptedPayload } : {}),
           });
           this.onDeadLetter?.(entry, entry.attempt, err);
+        } else if (fastLane && this.urgentLimiter.take(entry.targetUrl)) {
+          // Skip the exponential backoff: fixed fast-lane retry delay.
+          this.recordUrgentStat(entry.targetUrl, "retried");
+          this.schedule(id, this.urgentRetryDelayMs);
         } else {
+          if (fastLane) {
+            // Fast-lane retry would exceed the endpoint's urgent rate:
+            // degrade to normal backoff instead of dropping the delivery.
+            this.recordUrgentStat(entry.targetUrl, "throttled");
+            entry.priority = "normal";
+          }
           this.schedule(id, this.delayForAttempt(entry.attempt));
         }
       }
     } finally {
-      release();
+      release?.();
     }
   }
 
   /** Per-endpoint concurrency snapshot: in-flight and queued deliveries. */
   getConcurrencyStats(): Array<{ endpoint: string; inFlight: number; queued: number }> {
     return this.limiter.stats();
+  }
+
+  /**
+   * Per-endpoint urgent-lane counters (`delivered` / `retried` /
+   * `throttled`). Empty when no urgent delivery has been attempted.
+   */
+  getUrgentStats(): UrgentStats[] {
+    return [...this.urgentStats.entries()].map(([endpoint, s]) => ({ endpoint, ...s }));
   }
 
   /**

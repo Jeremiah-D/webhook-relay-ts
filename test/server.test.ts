@@ -470,5 +470,47 @@ describe("server", () => {
       await new Promise((r) => relay.once("close", r));
     }
   });
+
+  it("maps x-priority: urgent onto the fast lane and defaults to normal", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "audit-"));
+    const audit = new AuditLog(join(dir, "audit.jsonl"));
+    const seen: RetryItem[] = [];
+    const relay = createRelayServer({
+      secret: SECRET,
+      forwardUrl: "http://127.0.0.1:1/unused",
+      auditLog: audit,
+      sender: async (item) => {
+        seen.push(item);
+      },
+      retry: { baseDelayMs: 10, jitterMs: 0, maxAttempts: 2 },
+    });
+    const port = await listen(relay);
+    try {
+      const sig = { "x-signature": signSha256(BODY, SECRET) };
+      assert.equal((await post(port, "/", BODY, { ...sig, "x-priority": "urgent" })).status, 202);
+      assert.equal((await post(port, "/", BODY, sig)).status, 202);
+      assert.equal(
+        (await post(port, "/", BODY, { ...sig, "x-priority": "Urgent" })).status,
+        202
+      ); // case-insensitive
+      const deadline = Date.now() + 5000;
+      while (seen.length < 3 && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      assert.equal(seen.length, 3);
+      const byPriority = (p: string | undefined) => seen.filter((i) => i.priority === p).length;
+      assert.equal(byPriority("urgent"), 2);
+      assert.equal(byPriority(undefined), 1);
+
+      const events = audit.readAll() as Array<Record<string, unknown>>;
+      const accepted = events.filter((e) => e.event === "accepted");
+      assert.equal(accepted.length, 3);
+      assert.equal(accepted.filter((e) => e.priority === "urgent").length, 2);
+      assert.ok(accepted.every((e) => e.priority === undefined || e.priority === "urgent"));
+    } finally {
+      relay.close();
+      await new Promise((r) => relay.once("close", r));
+    }
+  });
 });
 

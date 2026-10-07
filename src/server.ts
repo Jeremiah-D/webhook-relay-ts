@@ -3,7 +3,7 @@ import { request as httpsRequest } from "node:https";
 import type { Server } from "node:http";
 import { randomUUID } from "node:crypto";
 import { HmacSha256Verifier, type Verifier } from "./verify.ts";
-import { RetryQueue, type RetryItem, type Sender } from "./retry.ts";
+import { RetryQueue, type DeliveryPriority, type RetryItem, type Sender } from "./retry.ts";
 import { installGracefulShutdown } from "./shutdown.ts";
 import type { PayloadEncryptor } from "./encrypt.ts";
 import type { ReplayGuard } from "./replay.ts";
@@ -286,12 +286,30 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       passthrough[k] = v;
     }
 
-    queue.enqueue({ id, payload: body, targetUrl: opts.forwardUrl, headers: passthrough });
-    opts.auditLog.append(
-      opts.auditPayloads
-        ? { event: "accepted", id, targetUrl: opts.forwardUrl, payload: body }
-        : { event: "accepted", id, targetUrl: opts.forwardUrl }
-    );
+    // `x-priority: urgent` opts the delivery into the fast lane: it skips
+    // the exponential backoff and the per-endpoint concurrency limiter, and
+    // is instead bounded by the per-endpoint urgent token bucket
+    // (`retry.urgent`, defaults: immediate retries, 100/sec per endpoint).
+    const priorityHeader = req.headers["x-priority"];
+    const priorityValue = Array.isArray(priorityHeader) ? priorityHeader[0] : priorityHeader;
+    const priority: DeliveryPriority | undefined =
+      priorityValue?.toLowerCase() === "urgent" ? "urgent" : undefined;
+
+    queue.enqueue({
+      id,
+      payload: body,
+      targetUrl: opts.forwardUrl,
+      headers: passthrough,
+      ...(priority ? { priority } : {}),
+    });
+    const acceptedEvent: Record<string, unknown> = {
+      event: "accepted",
+      id,
+      targetUrl: opts.forwardUrl,
+    };
+    if (priority) acceptedEvent.priority = priority;
+    if (opts.auditPayloads) acceptedEvent.payload = body;
+    opts.auditLog.append(acceptedEvent);
     res.writeHead(202, { "content-type": "application/json" }).end(JSON.stringify({ id, status: "accepted" }));
   });
 

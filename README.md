@@ -46,6 +46,16 @@ reliability primitives that matter for any signed-payload pipeline.
   is capped with `maxConcurrentPerEndpoint` (default unlimited): at most N
   deliveries in flight to the same `targetUrl`, excess waits FIFO for a slot,
   and `getConcurrencyStats()` reports in-flight/queued counts per endpoint.
+  Urgent deliveries (`priority: "urgent"`, mapped from the inbound
+  `x-priority: urgent` header) take an independent fast lane: they skip the
+  exponential backoff (a fixed `urgent.retryDelayMs`, default 0) and bypass
+  the per-endpoint concurrency limiter, so an urgent delivery never waits
+  behind queued normal deliveries. Each urgent attempt costs one token from
+  a per-endpoint bucket (`urgent.maxUrgentPerSecond`, default 100/s, burst
+  of one second) — an empty bucket degrades the item to the normal lane
+  instead of dropping it, which is the lane's abuse guard.
+  `getUrgentStats()` reports per-endpoint `delivered` / `retried` /
+  `throttled` counters.
 - `src/audit.ts` — append-only JSONL audit log (`append` / `readAll`) plus an
   indexed query (`query({ event, endpoint, since, until, limit })`): a lazily
   maintained line-offset index maps each complete line to its `ts`/`event`/
@@ -158,7 +168,12 @@ written to the audit log, so the log is the machine's trace.
 
 - `accepted` → **`delivering`**: the first attempt starts (a delivery may
   park briefly on a per-endpoint concurrency slot first — still
-  `delivering`, just waiting its turn).
+  `delivering`, just waiting its turn). When the inbound request carried
+  `x-priority: urgent`, the item takes the **fast lane** instead: it starts
+  immediately without queueing for a concurrency slot, and its retries use
+  a fixed delay rather than the exponential backoff below; an empty urgent
+  token bucket degrades it back to this normal path (still `delivering`,
+  never dropped).
 - `delivering` → **`delivered`** when the downstream answers 2xx. Done —
   audited with the total attempt count.
 - `delivering` → **`retrying`** when the attempt fails (non-2xx, timeout,
@@ -247,4 +262,15 @@ Requires Node 24+ (runs `.ts` directly via type stripping; zero dependencies).
   protection: replays answer 409 and are never forwarded twice, missing
   nonces and out-of-window timestamps answer 400, all rejections are audited
   with machine-readable reasons, and the receiver stays backward-compatible
-  when no guard is injected.
+  when no guard is injected. Also covers the urgent lane: `x-priority: urgent`
+  (case-insensitive) is mapped onto the fast lane and recorded on the
+  `accepted` audit event, while requests without the header stay normal.
+- `test/urgent.test.ts` — the fast lane: `UrgentRateLimiter`
+  burst/refill/per-endpoint isolation and `RangeError` on non-positive
+  rates; urgent retries use the fixed delay instead of exponential backoff;
+  an urgent delivery completes while a normal one still holds the only
+  concurrency slot; an empty token bucket degrades the item to normal
+  backoff (never drops); admission without a token degrades immediately;
+  replayed dead-letter items keep their priority (this caught a real bug —
+  the dead-letter push dropped `priority`); normal items are unaffected;
+  invalid configs throw.
