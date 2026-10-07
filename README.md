@@ -109,6 +109,46 @@ Items still waiting on a backoff timer are dropped — they were never
 delivered, and the queue is in-memory. For at-least-once across restarts,
 replay the dead-letter list after the process comes back.
 
+## Delivery lifecycle
+
+Every accepted webhook walks the same state machine; each transition is
+written to the audit log, so the log is the machine's trace.
+
+**Inbound (receiver side):**
+
+- `received` → the raw body is read and the `x-signature` header is checked.
+- `received` → **`rejected`** (`invalid_signature`, HTTP 401) when
+  verification fails. The payload is never forwarded.
+- `received` → **`rejected`** (`duplicate_nonce` → HTTP 409, or
+  `missing_nonce` / `expired_timestamp` / `future_timestamp` → HTTP 400)
+  when replay protection is enabled and the guard says no.
+- `received` → **`accepted`** (HTTP 202) when the webhook verifies. The item
+  is enqueued for delivery.
+
+**Outbound (delivery side):**
+
+- `accepted` → **`delivering`**: the first attempt starts (a delivery may
+  park briefly on a per-endpoint concurrency slot first — still
+  `delivering`, just waiting its turn).
+- `delivering` → **`delivered`** when the downstream answers 2xx. Done —
+  audited with the total attempt count.
+- `delivering` → **`retrying`** when the attempt fails (non-2xx, timeout,
+  or connection error). The next attempt is scheduled after
+  `baseDelayMs * 2^attempt` plus jitter, capped at `maxDelayMs`, then the
+  item goes back to `delivering`.
+- `delivering` → **`dead_letter`** when `maxAttempts` is exhausted. The
+  entry keeps `attempts`, `lastError`, and `deadLetteredAt` — everything an
+  operator needs to diagnose it, without the raw payload on the operator
+  endpoint.
+- `dead_letter` → **`delivering`** (fresh attempt budget) when an operator
+  replays it via `POST /dead-letter/:id/replay`, audited as
+  `dead_letter_replayed`. A replayed item that fails again walks the same
+  `delivering` → `retrying` → `dead_letter` path.
+
+**Shutdown:** SIGTERM moves every `retrying` item straight out of the
+machine (dropped, never delivered) while `delivering` items are awaited;
+see Graceful shutdown above.
+
 ## Run
 
 ```sh
