@@ -228,3 +228,139 @@ describe("retry", () => {
     assert.equal(q.pendingCount(), 0);
   });
 });
+
+describe("concurrency", () => {
+  const URL = "http://localhost:9999/hook";
+
+  /** Sender that blocks every delivery on one shared gate. */
+  function gatedSender() {
+    const inFlight = new Set<string>();
+    let maxObserved = 0;
+    let open!: () => void;
+    const gate = new Promise<void>((r) => {
+      open = r;
+    });
+    const sender: Sender = async (item) => {
+      inFlight.add(item.id);
+      maxObserved = Math.max(maxObserved, inFlight.size);
+      await gate;
+      inFlight.delete(item.id);
+    };
+    return { sender, inFlight, maxObserved: () => maxObserved, open: () => open() };
+  }
+
+  async function drainUntil(q: RetryQueue, done: () => boolean): Promise<void> {
+    for (let i = 0; i < 200 && !done(); i++) {
+      await new Promise((r) => setImmediate(r));
+    }
+    assert.ok(done(), "deliveries did not finish in time");
+  }
+
+  it("caps concurrent in-flight deliveries per endpoint", async () => {
+    const timer = manualTimer();
+    const g = gatedSender();
+    const q = new RetryQueue({
+      sender: g.sender,
+      baseDelayMs: 10,
+      maxAttempts: 1,
+      jitterMs: 0,
+      maxConcurrentPerEndpoint: 2,
+      setTimer: timer.setTimer,
+    });
+    q.start();
+    for (let i = 0; i < 5; i++) q.enqueue({ ...ITEM, id: `c-${i}`, targetUrl: URL });
+    await timer.run();
+    assert.equal(g.maxObserved(), 2);
+    assert.equal(g.inFlight.size, 2);
+    assert.deepEqual(q.getConcurrencyStats(), [{ endpoint: URL, inFlight: 2, queued: 3 }]);
+    g.open();
+    await drainUntil(q, () => q.pendingCount() === 0);
+    // The remaining deliveries drained through the same 2-slot budget.
+    assert.equal(g.maxObserved(), 2);
+    assert.equal(q.getDeadLetter().length, 0);
+    assert.deepEqual(q.getConcurrencyStats(), []);
+  });
+
+  it("queued deliveries start in FIFO order with limit 1", async () => {
+    const timer = manualTimer();
+    const started: string[] = [];
+    const q = new RetryQueue({
+      sender: async (item) => {
+        started.push(item.id);
+      },
+      baseDelayMs: 10,
+      maxAttempts: 1,
+      jitterMs: 0,
+      maxConcurrentPerEndpoint: 1,
+      setTimer: timer.setTimer,
+    });
+    q.start();
+    q.enqueue({ ...ITEM, id: "a", targetUrl: URL });
+    q.enqueue({ ...ITEM, id: "b", targetUrl: URL });
+    q.enqueue({ ...ITEM, id: "c", targetUrl: URL });
+    await timer.run();
+    assert.deepEqual(started, ["a", "b", "c"]);
+    assert.equal(q.pendingCount(), 0);
+  });
+
+  it("applies the limit independently per endpoint", async () => {
+    const timer = manualTimer();
+    const g = gatedSender();
+    const q = new RetryQueue({
+      sender: g.sender,
+      baseDelayMs: 10,
+      maxAttempts: 1,
+      jitterMs: 0,
+      maxConcurrentPerEndpoint: 1,
+      setTimer: timer.setTimer,
+    });
+    q.start();
+    q.enqueue({ ...ITEM, id: "e1", targetUrl: "http://a/hook" });
+    q.enqueue({ ...ITEM, id: "e2", targetUrl: "http://b/hook" });
+    await timer.run();
+    // One slot per endpoint: both deliver at once despite limit 1.
+    assert.equal(g.maxObserved(), 2);
+    assert.equal(g.inFlight.size, 2);
+    g.open();
+    await drainUntil(q, () => q.pendingCount() === 0);
+    assert.equal(q.getDeadLetter().length, 0);
+  });
+
+  it("rejects invalid maxConcurrentPerEndpoint", () => {
+    for (const v of [0, -1, 1.5, NaN]) {
+      assert.throws(() => new RetryQueue({ maxConcurrentPerEndpoint: v }), RangeError);
+    }
+    // Sane configs still construct; the default is unlimited.
+    new RetryQueue({ maxConcurrentPerEndpoint: 1 });
+    new RetryQueue({ maxConcurrentPerEndpoint: Infinity });
+    new RetryQueue();
+  });
+
+  it("stop() unblocks queued waiters without losing items", async () => {
+    const timer = manualTimer();
+    const g = gatedSender();
+    const q = new RetryQueue({
+      sender: g.sender,
+      baseDelayMs: 10,
+      maxAttempts: 1,
+      jitterMs: 0,
+      maxConcurrentPerEndpoint: 1,
+      setTimer: timer.setTimer,
+    });
+    q.start();
+    q.enqueue({ ...ITEM, id: "s-a", targetUrl: URL });
+    q.enqueue({ ...ITEM, id: "s-b", targetUrl: URL });
+    await timer.run();
+    assert.equal(g.inFlight.size, 1); // s-a in flight, s-b queued for the slot
+    q.stop();
+    g.open();
+    await drainUntil(q, () => g.inFlight.size === 0);
+    // s-a delivered; s-b bailed out of the wait and is still queued.
+    assert.equal(q.pendingCount(), 1);
+    // A restart picks up where it left off.
+    q.start();
+    await timer.run();
+    await drainUntil(q, () => q.pendingCount() === 0);
+    assert.equal(q.getDeadLetter().length, 0);
+  });
+});

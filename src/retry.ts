@@ -58,6 +58,12 @@ export interface RetryQueueOptions {
    */
   setTimer?: (fn: () => void, ms: number) => { clear(): void };
   clearTimer?: (handle: { clear(): void }) => void;
+  /**
+   * Maximum concurrent in-flight deliveries per endpoint (`targetUrl`).
+   * Deliveries beyond the limit wait in FIFO order for a slot. Default:
+   * `Infinity` (no limit). Must be a positive integer or `Infinity`.
+   */
+  maxConcurrentPerEndpoint?: number;
   /** Callback when an item exhausts all attempts and moves to dead-letter. */
   onDeadLetter?: (item: RetryItem, attempts: number, lastError: unknown) => void;
   /** Callback when an item is successfully delivered. */
@@ -69,6 +75,92 @@ interface Scheduled {
 }
 
 const noopSender: Sender = async () => {};
+
+/**
+ * Per-endpoint concurrency gate: at most `max` deliveries in flight to the
+ * same endpoint (`targetUrl`) at once; excess acquisitions wait in FIFO
+ * order. This keeps one slow or rate-limited downstream from being hammered
+ * by parallel redeliveries, while other endpoints keep their own budget.
+ *
+ * Callers must check their own liveness after `acquire()` resolves (the
+ * queue may have stopped while they waited) and must always call the
+ * returned release function exactly once, even when bailing out — releases
+ * cascade to the next waiter, so no one hangs.
+ */
+export class EndpointConcurrencyLimiter {
+  private readonly max: number;
+  private readonly inFlight = new Map<string, number>();
+  private readonly waiters = new Map<string, Array<() => void>>();
+
+  constructor(maxConcurrentPerEndpoint: number = Infinity) {
+    if (
+      !(
+        maxConcurrentPerEndpoint === Infinity ||
+        (Number.isInteger(maxConcurrentPerEndpoint) && maxConcurrentPerEndpoint >= 1)
+      )
+    ) {
+      throw new RangeError(
+        `maxConcurrentPerEndpoint must be a positive integer or Infinity, got ${maxConcurrentPerEndpoint}`
+      );
+    }
+    this.max = maxConcurrentPerEndpoint;
+  }
+
+  /**
+   * Resolve when a slot for `endpoint` is free. Always call the returned
+   * function exactly once to hand the slot on.
+   */
+  acquire(endpoint: string): Promise<() => void> {
+    const n = this.inFlight.get(endpoint) ?? 0;
+    if (n < this.max) {
+      this.inFlight.set(endpoint, n + 1);
+      return Promise.resolve(() => this.release(endpoint));
+    }
+    return new Promise<() => void>((resolve) => {
+      const wake = (): void => {
+        // Slot transfers from the releaser to this waiter; the in-flight
+        // count is unchanged (no increment here).
+        resolve(() => this.release(endpoint));
+      };
+      const q = this.waiters.get(endpoint);
+      if (q) q.push(wake);
+      else this.waiters.set(endpoint, [wake]);
+    });
+  }
+
+  private release(endpoint: string): void {
+    const q = this.waiters.get(endpoint);
+    const next = q?.shift();
+    if (q && q.length === 0) this.waiters.delete(endpoint);
+    if (next) {
+      next(); // slot transfers to the waiter; in-flight count unchanged
+      return;
+    }
+    const n = (this.inFlight.get(endpoint) ?? 1) - 1;
+    if (n <= 0) this.inFlight.delete(endpoint);
+    else this.inFlight.set(endpoint, n);
+  }
+
+  /** Current in-flight delivery count for `endpoint`. */
+  inFlightCount(endpoint: string): number {
+    return this.inFlight.get(endpoint) ?? 0;
+  }
+
+  /** Deliveries currently queued waiting for a slot on `endpoint`. */
+  queuedCount(endpoint: string): number {
+    return this.waiters.get(endpoint)?.length ?? 0;
+  }
+
+  /** Snapshot of every endpoint with in-flight or queued deliveries. */
+  stats(): Array<{ endpoint: string; inFlight: number; queued: number }> {
+    const endpoints = new Set([...this.inFlight.keys(), ...this.waiters.keys()]);
+    return [...endpoints].map((endpoint) => ({
+      endpoint,
+      inFlight: this.inFlightCount(endpoint),
+      queued: this.queuedCount(endpoint),
+    }));
+  }
+}
 
 /**
  * RetryQueue holds outbound deliveries and retries them with exponential
@@ -91,6 +183,7 @@ export class RetryQueue {
   private readonly queue = new Map<string, RetryItem & { attempt: number }>();
   private readonly timers = new Map<string, Scheduled>();
   private readonly deadLetter: DeadLetterEntry[] = [];
+  private readonly limiter: EndpointConcurrencyLimiter;
   private running = false;
 
   constructor(opts: RetryQueueOptions = {}) {
@@ -124,6 +217,7 @@ export class RetryQueue {
     this.clearTimer = opts.clearTimer ?? ((h) => h.clear());
     this.onDeadLetter = opts.onDeadLetter;
     this.onDelivered = opts.onDelivered;
+    this.limiter = new EndpointConcurrencyLimiter(opts.maxConcurrentPerEndpoint);
   }
 
   /** Number of items currently pending (queued or awaiting retry). */
@@ -215,27 +309,41 @@ export class RetryQueue {
   private async deliver(id: string): Promise<void> {
     const entry = this.queue.get(id);
     if (!entry || !this.running) return;
+    const release = await this.limiter.acquire(entry.targetUrl);
     try {
-      await this.sender(entry);
-      this.queue.delete(id);
-      this.onDelivered?.(entry, entry.attempt + 1);
-    } catch (err) {
-      entry.attempt += 1;
-      if (entry.attempt >= this.maxAttempts) {
+      // The queue may have stopped, or the item may have been settled, while
+      // we waited for a concurrency slot. Bail out; the release cascades to
+      // the next waiter so nobody hangs.
+      if (!this.running || !this.queue.has(id)) return;
+      try {
+        await this.sender(entry);
         this.queue.delete(id);
-        this.deadLetter.push({
-          id: entry.id,
-          payload: entry.payload,
-          targetUrl: entry.targetUrl,
-          headers: entry.headers,
-          attempts: entry.attempt,
-          lastError: err instanceof Error ? err.message : String(err),
-          deadLetteredAt: new Date().toISOString(),
-        });
-        this.onDeadLetter?.(entry, entry.attempt, err);
-      } else {
-        this.schedule(id, this.delayForAttempt(entry.attempt));
+        this.onDelivered?.(entry, entry.attempt + 1);
+      } catch (err) {
+        entry.attempt += 1;
+        if (entry.attempt >= this.maxAttempts) {
+          this.queue.delete(id);
+          this.deadLetter.push({
+            id: entry.id,
+            payload: entry.payload,
+            targetUrl: entry.targetUrl,
+            headers: entry.headers,
+            attempts: entry.attempt,
+            lastError: err instanceof Error ? err.message : String(err),
+            deadLetteredAt: new Date().toISOString(),
+          });
+          this.onDeadLetter?.(entry, entry.attempt, err);
+        } else {
+          this.schedule(id, this.delayForAttempt(entry.attempt));
+        }
       }
+    } finally {
+      release();
     }
+  }
+
+  /** Per-endpoint concurrency snapshot: in-flight and queued deliveries. */
+  getConcurrencyStats(): Array<{ endpoint: string; inFlight: number; queued: number }> {
+    return this.limiter.stats();
   }
 }

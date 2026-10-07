@@ -42,7 +42,10 @@ reliability primitives that matter for any signed-payload pipeline.
   (non-positive base/cap, `maxAttempts < 1`, negative jitter) throw
   `RangeError`. Dead-lettered items carry `attempts`, `lastError`, and
   `deadLetteredAt`, and can be re-queued with a fresh attempt budget via
-  `replayDeadLetter(id)` / `replayAllDeadLetters()`.
+  `replayDeadLetter(id)` / `replayAllDeadLetters()`. Per-endpoint concurrency
+  is capped with `maxConcurrentPerEndpoint` (default unlimited): at most N
+  deliveries in flight to the same `targetUrl`, excess waits FIFO for a slot,
+  and `getConcurrencyStats()` reports in-flight/queued counts per endpoint.
 - `src/audit.ts` — append-only JSONL audit log (`append` / `readAll`) plus an
   indexed query (`query({ event, endpoint, since, until, limit })`): a lazily
   maintained line-offset index maps each complete line to its `ts`/`event`/
