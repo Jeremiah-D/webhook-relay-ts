@@ -234,6 +234,14 @@ written to the audit log, so the log is the machine's trace.
   `dead_letter_replayed`. A replayed item that fails again walks the same
   `delivering` → `retrying` → `dead_letter` path.
 
+**Live event stream:** with an `operatorToken` set, `GET /events` opens a
+Server-Sent Events stream pushing `delivered` / `retrying` / `dead_letter`
+frames as JSON in real time (`event: delivery`), so an operator can watch
+the delivery flow without polling. A `: ping` heartbeat comment goes out
+every `heartbeatMs` (default 15s, unref'd), and a subscriber whose kernel
+buffer exceeds 1 MiB is disconnected instead of buffering without bound.
+Live-only — no replay of past events; `GET /audit` holds the history.
+
 **Shutdown:** SIGTERM moves every `retrying` item straight out of the
 machine (dropped, never delivered) while `delivering` items are awaited;
 see Graceful shutdown above.
@@ -339,3 +347,10 @@ Requires Node 24+ (runs `.ts` directly via type stripping; zero dependencies).
   `getQuotaStats()`; a delayed item still burns no retry budget (a
   `maxAttempts: 1` flood delivers everything exactly once); budgets stay
   isolated per endpoint; quota is unlimited by default.
+- `test/sse.test.ts` — the `GET /events` SSE stream: guarded like the other
+  operator endpoints (404 without `operatorToken`, 403 on a wrong token,
+  405 on non-GET); `delivered` frames carry the delivery id and attempt
+  count; `retrying` then `dead_letter` frames fire with the failure message
+  on persistent failure; heartbeat comments arrive on idle connections; a
+  disconnected client stops receiving without breaking the server for the
+  remaining subscribers.

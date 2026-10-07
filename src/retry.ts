@@ -67,6 +67,34 @@ export interface LatencyOptions extends LatencyTrackerOptions {
   onSloMiss?: (info: SloMissInfo) => void;
 }
 
+/**
+ * Delivery lifecycle event, emitted for operator observability (see
+ * {@link RetryQueue.subscribeDeliveryEvents}). Exactly three kinds:
+ *
+ * - `"delivered"`: a delivery attempt succeeded (`attempts` = total attempts
+ *   used, including the successful one).
+ * - `"retrying"`: an attempt failed and a retry was scheduled (`attempts` =
+ *   attempts consumed so far, `error` = the failure).
+ * - `"dead_letter"`: every attempt was exhausted and the item moved to the
+ *   dead-letter list.
+ *
+ * Parking a delivery because the endpoint's circuit is open or its quota
+ * bucket is empty is *not* a `retrying` event: no attempt was consumed.
+ */
+export type DeliveryEventType = "delivered" | "retrying" | "dead_letter";
+
+export interface DeliveryEvent {
+  type: DeliveryEventType;
+  id: string;
+  targetUrl: string;
+  /** Attempts consumed so far (including the successful one for `delivered`). */
+  attempts: number;
+  /** ISO-8601 timestamp when the event fired. */
+  at: string;
+  /** Failure message; present for `retrying` and `dead_letter`. */
+  error?: string;
+}
+
 export type Sender = (item: RetryItem) => Promise<void>;
 
 /**
@@ -366,6 +394,7 @@ export class RetryQueue {
   private readonly quota?: EndpointQuota;
   /** Attempts rescheduled because the endpoint's quota bucket was empty. */
   private readonly quotaStats = new Map<string, number>();
+  private readonly deliveryEventListeners = new Set<(e: DeliveryEvent) => void>();
 
   private readonly queue = new Map<string, RetryItem & { attempt: number }>();
   private readonly timers = new Map<string, Scheduled>();
@@ -446,6 +475,23 @@ export class RetryQueue {
   /** Number of items currently pending (queued or awaiting retry). */
   pendingCount(): number {
     return this.queue.size;
+  }
+
+  /**
+   * Subscribe to delivery lifecycle events (`delivered` / `retrying` /
+   * `dead_letter`). Returns an unsubscribe function. The server wires this
+   * to its SSE endpoint (`GET /events`); listeners run synchronously on the
+   * delivery path, so keep them fast and non-blocking.
+   */
+  subscribeDeliveryEvents(listener: (e: DeliveryEvent) => void): () => void {
+    this.deliveryEventListeners.add(listener);
+    return () => {
+      this.deliveryEventListeners.delete(listener);
+    };
+  }
+
+  private emitDeliveryEvent(event: DeliveryEvent): void {
+    for (const listener of this.deliveryEventListeners) listener(event);
   }
 
   /** Items that exhausted all attempts, in dead-letter order. */
@@ -651,9 +697,18 @@ export class RetryQueue {
           this.onSloMiss?.({ id: entry.id, endpoint: entry.targetUrl, latencyMs, sloMs: this.latency.sloMs });
         }
         this.onDelivered?.(entry, entry.attempt + 1);
+        this.emitDeliveryEvent({
+          type: "delivered",
+          id: entry.id,
+          targetUrl: entry.targetUrl,
+          attempts: entry.attempt + 1,
+          at: new Date().toISOString(),
+        });
       } catch (err) {
         this.breaker?.recordFailure(entry.targetUrl);
         entry.attempt += 1;
+        const error = err instanceof Error ? err.message : String(err);
+        const at = new Date().toISOString();
         if (entry.attempt >= this.maxAttempts) {
           this.queue.delete(id);
           // Never delivered: drop the pending clock without sampling.
@@ -675,9 +730,25 @@ export class RetryQueue {
             ...(encryptedPayload ? { encryptedPayload } : {}),
           });
           this.onDeadLetter?.(entry, entry.attempt, err);
+          this.emitDeliveryEvent({
+            type: "dead_letter",
+            id: entry.id,
+            targetUrl: entry.targetUrl,
+            attempts: entry.attempt,
+            at,
+            error,
+          });
         } else if (fastLane && this.urgentLimiter.take(entry.targetUrl)) {
           // Skip the exponential backoff: fixed fast-lane retry delay.
           this.recordUrgentStat(entry.targetUrl, "retried");
+          this.emitDeliveryEvent({
+            type: "retrying",
+            id: entry.id,
+            targetUrl: entry.targetUrl,
+            attempts: entry.attempt,
+            at,
+            error,
+          });
           this.schedule(id, this.urgentRetryDelayMs);
         } else {
           if (fastLane) {
@@ -686,6 +757,14 @@ export class RetryQueue {
             this.recordUrgentStat(entry.targetUrl, "throttled");
             entry.priority = "normal";
           }
+          this.emitDeliveryEvent({
+            type: "retrying",
+            id: entry.id,
+            targetUrl: entry.targetUrl,
+            attempts: entry.attempt,
+            at,
+            error,
+          });
           this.schedule(id, this.delayForAttempt(entry.attempt));
         }
       }

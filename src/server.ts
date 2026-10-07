@@ -67,6 +67,19 @@ export interface RelayServerOptions {
    */
   auditPayloads?: boolean;
   /**
+   * Live delivery-event stream (`GET /events`, Server-Sent Events). Emits
+   * `delivered` / `retrying` / `dead_letter` frames as JSON
+   * (`event: delivery`) in real time, so an operator can watch the delivery
+   * flow without polling. A `: ping` heartbeat comment goes out every
+   * `heartbeatMs` (default 15_000) to keep idle connections alive; the
+   * interval is unref'd so it never pins the process. A subscriber whose
+   * kernel buffer exceeds 1 MiB is disconnected instead of buffering
+   * without bound. The stream is live-only — no replay of past events; use
+   * `GET /audit` for history. Like the other operator endpoints, it answers
+   * 404 when no `operatorToken` is configured.
+   */
+  events?: { heartbeatMs?: number };
+  /**
    * Opt-in graceful shutdown on SIGTERM/SIGINT: stop accepting new
    * connections, wait up to `timeoutMs` (default 30_000) for in-flight
    * deliveries to settle, then exit the process (0 = drained, 1 = drain
@@ -175,7 +188,49 @@ export function createRelayServer(opts: RelayServerOptions): Server {
     res.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(body));
   };
 
-  /** Operator surface: dead-letter queue + audit-log queries. */
+  /** SSE live stream of delivery lifecycle events for operators. */
+  const streamDeliveryEvents = (
+    req: Parameters<Parameters<typeof createServer>[0]>[0],
+    res: Parameters<Parameters<typeof createServer>[0]>[1]
+  ): void => {
+    res.writeHead(200, {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache",
+      connection: "keep-alive",
+      // Tell buffering proxies (e.g. nginx) not to hold frames back.
+      "x-accel-buffering": "no",
+    });
+    // A comment frame right away: some clients only consider the stream
+    // open once the first bytes arrive.
+    res.write(": connected\n\n");
+    let closed = false;
+    const heartbeat = setInterval(() => {
+      if (!closed) res.write(": ping\n\n");
+    }, opts.events?.heartbeatMs ?? 15_000);
+    // Never let an idle dashboard pin the process open.
+    (heartbeat as unknown as { unref?: () => unknown }).unref?.();
+    const cleanup = (): void => {
+      if (closed) return;
+      closed = true;
+      clearInterval(heartbeat);
+      unsubscribe();
+    };
+    const unsubscribe = queue.subscribeDeliveryEvents((event) => {
+      if (closed) return;
+      // Slow-consumer guard: a dashboard that cannot keep up gets
+      // disconnected instead of buffering without bound.
+      if (res.writableLength > 1_048_576) {
+        cleanup();
+        res.end();
+        return;
+      }
+      res.write(`event: delivery\ndata: ${JSON.stringify(event)}\n\n`);
+    });
+    req.on("close", cleanup);
+    res.on("close", cleanup);
+  };
+
+  /** Operator surface: dead-letter queue + audit-log queries + live event stream. */
   const handleOperator = (
     req: Parameters<Parameters<typeof createServer>[0]>[0],
     res: Parameters<Parameters<typeof createServer>[0]>[1],
@@ -192,8 +247,9 @@ export function createRelayServer(opts: RelayServerOptions): Server {
     const isList = pathname === "/dead-letter";
     const isAudit = pathname === "/audit";
     const isLatency = pathname === "/latency";
+    const isEvents = pathname === "/events";
     const replayMatch = /^\/dead-letter\/([^/]+)\/replay$/.exec(pathname);
-    if (!isList && !isAudit && !isLatency && !replayMatch) {
+    if (!isList && !isAudit && !isLatency && !isEvents && !replayMatch) {
       respondJson(res, 404, { error: "not found" });
       return;
     }
@@ -202,10 +258,15 @@ export function createRelayServer(opts: RelayServerOptions): Server {
         (isList && req.method === "GET") ||
         (isAudit && req.method === "GET") ||
         (isLatency && req.method === "GET") ||
+        (isEvents && req.method === "GET") ||
         (replayMatch && req.method === "POST")
       )
     ) {
       respondJson(res, 405, { error: "method not allowed" });
+      return;
+    }
+    if (isEvents) {
+      streamDeliveryEvents(req, res);
       return;
     }
     if (isLatency) {
@@ -272,7 +333,8 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       pathname === "/dead-letter" ||
       pathname.startsWith("/dead-letter/") ||
       pathname === "/audit" ||
-      pathname === "/latency"
+      pathname === "/latency" ||
+      pathname === "/events"
     ) {
       handleOperator(req, res, pathname);
       return;
