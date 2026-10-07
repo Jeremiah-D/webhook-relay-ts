@@ -2,7 +2,7 @@ import { createServer, request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import type { Server } from "node:http";
 import { randomUUID } from "node:crypto";
-import { HmacSha256Verifier, type Verifier } from "./verify.ts";
+import { HmacSha256Verifier, RotatingHmacVerifier, type SigningKey, type Verifier } from "./verify.ts";
 import { RetryQueue, type DeliveryPriority, type RetryItem, type Sender } from "./retry.ts";
 import { installGracefulShutdown } from "./shutdown.ts";
 import type { PayloadEncryptor } from "./encrypt.ts";
@@ -23,8 +23,30 @@ export interface RelayServerOptions {
   /**
    * Signature verifier; defaults to HMAC-SHA256 with `secret`.
    * Inject e.g. `new Ed25519Verifier(pem)` to change schemes.
+   * Cannot be combined with `signingKeys`.
    */
   verifier?: Verifier;
+  /**
+   * Signature key rotation (see `RotatingHmacVerifier` in `src/verify.ts`):
+   * several HMAC keys coexist, one primary signs new webhooks, retired
+   * keys stay verifiable inside `keyGraceMs`. Senders name the signing key
+   * with the `x-key-id` header; without it the server tries the primary
+   * key first, then every other still-active key. `accepted` / `rejected`
+   * audit events carry the verifying `keyId` (or `"unknown"`). Cannot be
+   * combined with `verifier`.
+   */
+  signingKeys?: SigningKey[];
+  /**
+   * Grace period in ms during which a retired signing key still verifies.
+   * Default: 86_400_000 (24h). Only meaningful with `signingKeys`.
+   */
+  keyGraceMs?: number;
+  /**
+   * Clock source for signing-key retirement checks; defaults to
+   * `Date.now`. Injectable for deterministic tests. Only meaningful with
+   * `signingKeys`.
+   */
+  keyNowMs?: () => number;
   /** Retry queue tuning, passed through to RetryQueue. */
   retry?: ConstructorParameters<typeof RetryQueue>[0];
   /**
@@ -202,7 +224,19 @@ export function createRelayServer(opts: RelayServerOptions): Server {
   });
   queue.start();
 
-  const verifier = opts.verifier ?? new HmacSha256Verifier(opts.secret);
+  const verifier: Verifier =
+    opts.signingKeys !== undefined
+      ? (() => {
+          if (opts.verifier !== undefined) {
+            throw new Error("createRelayServer: `verifier` and `signingKeys` cannot be combined");
+          }
+          return new RotatingHmacVerifier({
+            keys: opts.signingKeys,
+            graceMs: opts.keyGraceMs,
+            nowMs: opts.keyNowMs,
+          });
+        })()
+      : (opts.verifier ?? new HmacSha256Verifier(opts.secret));
   const deduplicator = opts.dedup ? new DeliveryDeduplicator(opts.dedup) : undefined;
 
   const respondJson = (
@@ -389,13 +423,35 @@ export function createRelayServer(opts: RelayServerOptions): Server {
     }
 
     const signatureHeader = req.headers["x-signature"];
+    const keyIdHeader = req.headers["x-key-id"];
+    const keyIdHint = Array.isArray(keyIdHeader) ? keyIdHeader[0] : keyIdHeader;
     const id = randomUUID();
     // Resolve the trace ID before verification so even rejections are
     // traceable; a client-supplied x-trace-id is honored, otherwise fresh.
     const traceId = resolveTraceId(req.headers[TRACE_ID_HEADER]);
 
-    if (!verifier.verify(body, signatureHeader ?? "")) {
-      opts.auditLog.append({ event: "rejected", id, traceId, reason: "invalid_signature" });
+    // With key rotation, learn which key id verified so it can go on the
+    // audit trail; otherwise keep the legacy boolean contract.
+    let verified = false;
+    let verifiedKeyId: string | undefined;
+    const rotating = verifier instanceof RotatingHmacVerifier;
+    if (rotating) {
+      const detail = verifier.verifyDetailed(body, signatureHeader ?? "", { keyId: keyIdHint });
+      verified = detail.ok;
+      verifiedKeyId = detail.keyId;
+    } else {
+      verified = verifier.verify(body, signatureHeader ?? "");
+    }
+
+    if (!verified) {
+      const rejectedEvent: Record<string, unknown> = {
+        event: "rejected",
+        id,
+        traceId,
+        reason: "invalid_signature",
+      };
+      if (rotating) rejectedEvent.keyId = "unknown";
+      opts.auditLog.append(rejectedEvent);
       res.writeHead(401, { "content-type": "text/plain" }).end("Invalid signature");
       return;
     }
@@ -463,6 +519,7 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       traceId,
       targetUrl: opts.forwardUrl,
     };
+    if (rotating) acceptedEvent.keyId = verifiedKeyId ?? "unknown";
     if (priority) acceptedEvent.priority = priority;
     if (opts.auditPayloads) acceptedEvent.payload = body;
     opts.auditLog.append(acceptedEvent);

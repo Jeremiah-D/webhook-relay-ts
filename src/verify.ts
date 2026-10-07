@@ -151,6 +151,148 @@ export function signEd25519(rawBody: Buffer, privateKeyPem: string): string {
   return `ed25519=${sig.toString("hex")}`;
 }
 
+/** One HMAC key in a rotation set. */
+export interface SigningKey {
+  /** Stable identifier, surfaced in audit events and the `x-key-id` header hint. */
+  id: string;
+  /** The HMAC secret itself. */
+  secret: string;
+  /** The key used to sign new webhooks. When unset, the first key is primary. */
+  primary?: boolean;
+  /**
+   * Millisecond epoch at which this key was rotated out. A retired key
+   * still verifies inside the grace window; outside it, its signatures are
+   * rejected. Undefined means the key is still in service.
+   */
+  retiredAtMs?: number;
+}
+
+/** Options for {@link RotatingHmacVerifier}. */
+export interface RotationConfig {
+  /** The key set: at least one key, ids unique, secrets non-empty. */
+  keys: SigningKey[];
+  /**
+   * Grace period in ms during which a retired key still verifies.
+   * Default: 86_400_000 (24h).
+   */
+  graceMs?: number;
+  /** Clock source for retirement checks; defaults to Date.now. Injectable for tests. */
+  nowMs?: () => number;
+}
+
+/** Options accepted by {@link RotatingHmacVerifier.verifyDetailed}. */
+export interface VerifyDetailOptions extends VerifyOptions {
+  /**
+   * Hint naming the signing key (carried by the `x-key-id` header). When
+   * set, only that key is tried — no fallback to other keys.
+   */
+  keyId?: string;
+}
+
+/** Rich result of {@link RotatingHmacVerifier.verifyDetailed}. Never throws. */
+export interface VerifyDetail {
+  ok: boolean;
+  /** Id of the key whose signature matched; undefined when `ok` is false. */
+  keyId?: string;
+}
+
+/** Default grace period for retired keys: 24h. */
+export const DEFAULT_KEY_GRACE_MS = 86_400_000;
+
+/**
+ * HMAC-SHA256 verifier with key rotation: several keys coexist, one is the
+ * primary for new signatures, and retired keys stay verifiable inside a
+ * grace window. Verification tries the primary key first, then the other
+ * still-active keys — unless the caller names a key (via the `x-key-id`
+ * header hint), in which case only that key is tried.
+ *
+ * `verify` keeps the plain {@link Verifier} contract (boolean); use
+ * {@link verifyDetailed} to learn which key id verified, for audit trails.
+ * Never throws from verification paths.
+ */
+export class RotatingHmacVerifier implements Verifier {
+  readonly name = "hmac-sha256-rotating";
+
+  private readonly keys: { id: string; verifier: HmacSha256Verifier; retiredAtMs?: number }[];
+  private readonly primaryId: string;
+  private readonly graceMs: number;
+  private readonly nowMs: () => number;
+
+  constructor(config: RotationConfig) {
+    const keys = config?.keys;
+    if (!Array.isArray(keys) || keys.length === 0) {
+      throw new Error("RotatingHmacVerifier: `keys` must be a non-empty array");
+    }
+    const seen = new Set<string>();
+    let primaries = 0;
+    this.keys = keys.map((k, i) => {
+      if (!k || typeof k.id !== "string" || k.id === "") {
+        throw new Error(`RotatingHmacVerifier: key[${i}] needs a non-empty id`);
+      }
+      if (typeof k.secret !== "string" || k.secret === "") {
+        throw new Error(`RotatingHmacVerifier: key[${i}] (${k.id}) needs a non-empty secret`);
+      }
+      if (seen.has(k.id)) {
+        throw new Error(`RotatingHmacVerifier: duplicate key id "${k.id}"`);
+      }
+      seen.add(k.id);
+      if (k.retiredAtMs !== undefined && (!Number.isFinite(k.retiredAtMs) || k.retiredAtMs < 0)) {
+        throw new Error(`RotatingHmacVerifier: key "${k.id}" has an invalid retiredAtMs`);
+      }
+      if (k.primary === true) primaries++;
+      return { id: k.id, verifier: new HmacSha256Verifier(k.secret), retiredAtMs: k.retiredAtMs };
+    });
+    if (primaries > 1) {
+      throw new Error("RotatingHmacVerifier: at most one key may be primary");
+    }
+    const primary = keys.find((k) => k.primary === true) ?? keys[0];
+    this.primaryId = primary.id;
+
+    const graceMs = config.graceMs ?? DEFAULT_KEY_GRACE_MS;
+    if (!Number.isFinite(graceMs) || graceMs < 0) {
+      throw new Error("RotatingHmacVerifier: `graceMs` must be a non-negative number");
+    }
+    this.graceMs = graceMs;
+    this.nowMs = config.nowMs ?? Date.now;
+  }
+
+  /** Whether the key is still in service or retired within the grace window. */
+  private isActive(key: { retiredAtMs?: number }): boolean {
+    if (key.retiredAtMs === undefined) return true;
+    return this.nowMs() - key.retiredAtMs <= this.graceMs;
+  }
+
+  /** Try order: primary first, then the remaining keys in config order. */
+  private tryOrder(): { id: string; verifier: HmacSha256Verifier; retiredAtMs?: number }[] {
+    const primary = this.keys.find((k) => k.id === this.primaryId);
+    return [primary!, ...this.keys.filter((k) => k.id !== this.primaryId)];
+  }
+
+  verifyDetailed(rawBody: Buffer, header: string, opts: VerifyDetailOptions = {}): VerifyDetail {
+    try {
+      const hint = typeof opts.keyId === "string" && opts.keyId.trim() !== "" ? opts.keyId : undefined;
+      if (hint !== undefined) {
+        const key = this.keys.find((k) => k.id === hint);
+        if (!key || !this.isActive(key)) return { ok: false };
+        return key.verifier.verify(rawBody, header, opts) ? { ok: true, keyId: key.id } : { ok: false };
+      }
+      for (const key of this.tryOrder()) {
+        if (!this.isActive(key)) continue;
+        if (key.verifier.verify(rawBody, header, opts)) {
+          return { ok: true, keyId: key.id };
+        }
+      }
+      return { ok: false };
+    } catch {
+      return { ok: false };
+    }
+  }
+
+  verify(rawBody: Buffer, header: string, opts: VerifyOptions = {}): boolean {
+    return this.verifyDetailed(rawBody, header, opts).ok;
+  }
+}
+
 const verifierRegistry = new Map<string, Verifier>();
 
 /**

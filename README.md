@@ -32,6 +32,10 @@ reliability primitives that matter for any signed-payload pipeline.
   covers `<ts>.<rawBody>`), and `Ed25519Verifier` (`ed25519=<hex>` over the
   raw body, PEM public key). Uses `crypto.timingSafeEqual` on the HMAC path
   and enforces a timestamp tolerance window (default 300s).
+  `RotatingHmacVerifier` (also in `src/verify.ts`) layers key rotation on
+  top: several HMAC keys coexist with one primary for new signatures,
+  retired keys stay verifiable inside a grace window (default 24h), and
+  `verifyDetailed` reports which key id verified for the audit trail.
 - `src/retry.ts` — `RetryQueue` with exponential backoff (`base * 2^attempt`)
   plus jitter, a `maxDelay` cap, a dead-letter list after `maxAttempts`, and an
   injectable sender/timer for deterministic testing. Jitter is configurable:
@@ -131,7 +135,10 @@ reliability primitives that matter for any signed-payload pipeline.
 - `src/server.ts` — a minimal `node:http` receiver: read the raw body, verify
   the `x-signature` header with the injected `verifier` (defaults to
   HMAC-SHA256 with `secret`; pass e.g. `new Ed25519Verifier(pem)` to change
-  schemes), optionally enforce replay protection (`replay: new ReplayGuard()`
+  schemes), or opt into key rotation with `signingKeys` (primary + retired
+  keys, grace via `keyGraceMs`, senders name their key with the `x-key-id`
+  header; accepted/rejected audit events carry the verifying `keyId`),
+  optionally enforce replay protection (`replay: new ReplayGuard()`
   — replays answer 409, bad/missing nonces and out-of-window timestamps
   answer 400, all audited as `rejected`), enqueue for forwarding to
   `forwardUrl`, audit accept / delivered / dead-letter events. A failed verification returns 401 + audit entry.
