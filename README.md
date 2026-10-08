@@ -113,6 +113,23 @@ reliability primitives that matter for any signed-payload pipeline.
   (off by default); over-budget requests are answered 429 with `retry-after`
   and audited as `rejected` (reason `rate_limited`). Injectable clock for
   deterministic tests.
+- Inbound request body limit (`maxBodyBytes`, `DEFAULT_MAX_BODY_BYTES` = 1 MiB):
+  a POST whose body exceeds the budget is answered 413 and audited as
+  `rejected` (reason `body_too_large`). Two lines of defense: the declared
+  `content-length` is checked before a single body byte is read, and
+  chunked or lying bodies are capped while streaming — the response closes
+  the connection (`connection: close`) so a flood cannot keep streaming
+  into a dead request. Invalid values throw `RangeError` at startup.
+- Outbound request signing (`outboundSigning`, off by default): every delivery
+  made by the default sender stamps `x-relay-signature: sha256=<hex>` — the
+  HMAC-SHA256 of the forwarded body — plus `x-relay-key-id` when a `keyId`
+  is given, so the downstream can prove the request really came from this
+  relay (verify with `verifySignature(body, header, secret)` from
+  `src/verify.ts`). Inbound `x-relay-signature` / `x-relay-key-id` headers
+  are always stripped from the forwarded header set, so a sender can never
+  smuggle a forged relay signature downstream. The config applies to the
+  default sender only — an injected sender signs (or doesn't) on its own.
+  Invalid values throw `RangeError` at startup.
 - `src/circuit.ts` — per-endpoint circuit breaker (`EndpointCircuitBreaker`,
   `closed` / `open` / `half_open`): `failureThreshold` (default 5)
   consecutive delivery failures trip the circuit open for `cooldownMs`
@@ -170,7 +187,8 @@ reliability primitives that matter for any signed-payload pipeline.
   poisoned-socket guard. `getStats()` exposes per-origin created / reused /
   reaped counters plus live socket counts. Enabled by default
   (`createRelayServer({ outboundKeepAlive })`, `createDefaultSender(pins,
-  keepAlive)`); pass `false` for one fresh connection per delivery (the legacy
+  keepAlive, outboundSigning)`); pass `false` for one fresh connection per
+  delivery (the legacy
   opt-out; note Node 24's global agent pools by default, so the opt-out passes
   `agent: false` explicitly). Pooled connections close with the server
   (`close` → `queue.stop()` → pool `destroy()`), covering the
