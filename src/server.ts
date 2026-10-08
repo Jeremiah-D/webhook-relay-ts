@@ -3,9 +3,12 @@ import { request as httpsRequest } from "node:https";
 import type { Server } from "node:http";
 import { randomUUID } from "node:crypto";
 import {
+  assertValidEndpointVerifierRules,
   HmacSha256Verifier,
   RotatingHmacVerifier,
+  selectEndpointVerifier,
   signSha256,
+  type EndpointVerifierRule,
   type SigningKey,
   type Verifier,
 } from "./verify.ts";
@@ -64,6 +67,19 @@ export interface RelayServerOptions {
   keyNowMs?: () => number;
   /** Retry queue tuning, passed through to RetryQueue. */
   retry?: ConstructorParameters<typeof RetryQueue>[0];
+  /**
+   * Per-endpoint signature verifier selection (WR-29): inbound request
+   * paths can each trust a different verifier — e.g. Ed25519 for
+   * `/hooks/solana-program` and HMAC-SHA256 everywhere else. Rules are
+   * tried in config order and the first match wins; paths with no match
+   * fall back to the global `verifier` (or `signingKeys` / `secret`
+   * default). Patterns are exact (`/hooks/stripe`) or prefix
+   * (`/hooks/*`). A signature mismatch on a per-endpoint verifier is
+   * answered 401 and audited as `rejected` like any other bad signature —
+   * it never enqueues, so it never touches the circuit breaker. Invalid
+   * rules throw `RangeError` at startup.
+   */
+  endpointVerifiers?: EndpointVerifierRule[];
   /**
    * Outbound TLS certificate pinning (see `src/pinning.ts`): per-endpoint
    * SPKI fingerprint whitelist, keyed by exact delivery `targetUrl`.
@@ -596,6 +612,9 @@ export function createRelayServer(opts: RelayServerOptions): Server {
           });
         })()
       : (opts.verifier ?? new HmacSha256Verifier(opts.secret));
+  // Per-endpoint verifier rules are validated once at startup so a bad
+  // pattern or verifier can never fail a request mid-flight.
+  assertValidEndpointVerifierRules(opts.endpointVerifiers);
   const deduplicator = opts.dedup ? new DeliveryDeduplicator(opts.dedup) : undefined;
   const rateLimiter = opts.rateLimit ? new InboundRateLimiter(opts.rateLimit) : undefined;
 
@@ -934,17 +953,24 @@ export function createRelayServer(opts: RelayServerOptions): Server {
     const keyIdHeader = req.headers["x-key-id"];
     const keyIdHint = Array.isArray(keyIdHeader) ? keyIdHeader[0] : keyIdHeader;
 
+    // Per-endpoint verifier selection (WR-29): the request path picks the
+    // trusted verifier; anything unmatched falls back to the global one.
+    // A mismatch here is answered 401 below and never enqueues, so it can
+    // never trip the downstream circuit breaker.
+    const activeVerifier = selectEndpointVerifier(pathname, opts.endpointVerifiers) ?? verifier;
+    const perEndpointVerifier = activeVerifier !== verifier;
+
     // With key rotation, learn which key id verified so it can go on the
     // audit trail; otherwise keep the legacy boolean contract.
     let verified = false;
     let verifiedKeyId: string | undefined;
-    const rotating = verifier instanceof RotatingHmacVerifier;
+    const rotating = activeVerifier instanceof RotatingHmacVerifier;
     if (rotating) {
-      const detail = verifier.verifyDetailed(body, signatureHeader ?? "", { keyId: keyIdHint });
+      const detail = activeVerifier.verifyDetailed(body, signatureHeader ?? "", { keyId: keyIdHint });
       verified = detail.ok;
       verifiedKeyId = detail.keyId;
     } else {
-      verified = verifier.verify(body, signatureHeader ?? "");
+      verified = activeVerifier.verify(body, signatureHeader ?? "");
     }
 
     if (!verified) {
@@ -955,6 +981,9 @@ export function createRelayServer(opts: RelayServerOptions): Server {
         reason: "invalid_signature",
       };
       if (rotating) rejectedEvent.keyId = "unknown";
+      // Name the verifier that rejected, so a multi-scheme relay's audit
+      // trail shows which trust rule fired.
+      if (perEndpointVerifier) rejectedEvent.verifier = activeVerifier.name;
       opts.auditLog.append(rejectedEvent);
       res.writeHead(401, { "content-type": "text/plain" }).end("Invalid signature");
       return;
@@ -1029,6 +1058,7 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       targetUrl: opts.forwardUrl,
     };
     if (rotating) acceptedEvent.keyId = verifiedKeyId ?? "unknown";
+    if (perEndpointVerifier) acceptedEvent.verifier = activeVerifier.name;
     if (priority) acceptedEvent.priority = priority;
     if (opts.auditPayloads) acceptedEvent.payload = body;
     opts.auditLog.append(acceptedEvent);

@@ -36,6 +36,11 @@ reliability primitives that matter for any signed-payload pipeline.
   top: several HMAC keys coexist with one primary for new signatures,
   retired keys stay verifiable inside a grace window (default 24h), and
   `verifyDetailed` reports which key id verified for the audit trail.
+  `selectEndpointVerifier` / `assertValidEndpointVerifierRules` implement
+  per-endpoint verifier selection: inbound paths match `{ pattern,
+  verifier }` rules (exact `/hooks/stripe` or prefix `/hooks/*`, first
+  match wins, unmatched paths fall back to the global verifier), so one
+  relay can trust Ed25519 for one upstream and HMAC-SHA256 for another.
 - `src/retry.ts` — `RetryQueue` with exponential backoff (`base * 2^attempt`)
   plus jitter, a `maxDelay` cap, a dead-letter list after `maxAttempts`, and an
   injectable sender/timer for deterministic testing. Jitter is configurable:
@@ -247,6 +252,11 @@ reliability primitives that matter for any signed-payload pipeline.
   schemes), or opt into key rotation with `signingKeys` (primary + retired
   keys, grace via `keyGraceMs`, senders name their key with the `x-key-id`
   header; accepted/rejected audit events carry the verifying `keyId`),
+  or select the verifier per inbound path with `endpointVerifiers:
+  [{ pattern: "/hooks/solana", verifier: new Ed25519Verifier(pem) }]` —
+  first matching rule wins, unmatched paths fall back to the global
+  verifier, mismatches answer 401 and never touch the circuit breaker,
+  and accepted/rejected audit events name the verifier that decided,
   optionally enforce replay protection (`replay: new ReplayGuard()`
   — replays answer 409, bad/missing nonces and out-of-window timestamps
   answer 400, all audited as `rejected`), and optionally rate-limit the

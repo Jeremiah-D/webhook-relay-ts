@@ -367,3 +367,67 @@ export function signTimestamped(
   const signed = Buffer.concat([Buffer.from(`${timestamp}.`, "utf8"), rawBody]);
   return `t=${timestamp},v1=${hmacSha256(secret, signed).toString("hex")}`;
 }
+
+/**
+ * One per-endpoint verifier rule (WR-29): inbound requests whose path
+ * matches `pattern` are verified with `verifier` instead of the server's
+ * global verifier. Patterns are exact (`/hooks/stripe`) or prefix
+ * (`/hooks/*`, which also matches `/hooks` itself); the first matching
+ * rule in config order wins. One relay can therefore front several
+ * upstreams that sign differently — e.g. Ed25519 for a Solana program's
+ * callbacks and HMAC-SHA256 for a legacy PSP — without weakening any of
+ * them, and unmatched paths fall back to the global verifier.
+ */
+export interface EndpointVerifierRule {
+  /** Request path pattern: exact (`/hooks/stripe`) or prefix (`/hooks/*`). */
+  pattern: string;
+  /** The verifier trusted for this endpoint. */
+  verifier: Verifier;
+}
+
+/**
+ * Validate endpoint verifier rules at startup. Throws RangeError on a
+ * non-array, a pattern that is not a `/`-rooted path, or a verifier
+ * without a usable name/verify — fail fast, never mid-request.
+ */
+export function assertValidEndpointVerifierRules(rules: EndpointVerifierRule[] | undefined): void {
+  if (rules === undefined) return;
+  if (!Array.isArray(rules)) {
+    throw new RangeError("endpointVerifiers: expected an array of { pattern, verifier } rules");
+  }
+  rules.forEach((rule, i) => {
+    const where = `endpointVerifiers[${i}]`;
+    if (!rule || typeof rule.pattern !== "string" || rule.pattern === "" || !rule.pattern.startsWith("/")) {
+      throw new RangeError(
+        `${where}: pattern must be a path starting with "/" (exact) or ending with "/*" (prefix)`
+      );
+    }
+    const v = rule.verifier;
+    if (!v || typeof v.name !== "string" || v.name === "" || typeof v.verify !== "function") {
+      throw new RangeError(`${where}: verifier needs a non-empty name and a verify method`);
+    }
+  });
+}
+
+/**
+ * Select the verifier for an inbound request path: the first matching
+ * rule's verifier, or `undefined` when nothing matches (the caller falls
+ * back to the global verifier). Never throws.
+ */
+export function selectEndpointVerifier(
+  pathname: string,
+  rules: EndpointVerifierRule[] | undefined
+): Verifier | undefined {
+  if (rules === undefined) return undefined;
+  for (const rule of rules) {
+    if (rule.pattern.endsWith("/*")) {
+      const prefix = rule.pattern.slice(0, -2);
+      if (pathname === prefix || pathname.startsWith(prefix + "/")) {
+        return rule.verifier;
+      }
+    } else if (pathname === rule.pattern) {
+      return rule.verifier;
+    }
+  }
+  return undefined;
+}
