@@ -132,6 +132,20 @@ reliability primitives that matter for any signed-payload pipeline.
   `accepted` audit events into carrying the body; the operator
   `GET /dead-letter` listing reports `payloadBytes` and `encrypted` without
   ever exposing raw payloads.
+- `src/pinning.ts` — outbound TLS certificate pinning: a per-endpoint SPKI
+  fingerprint whitelist (`tlsPins: { "<exact targetUrl>": ["sha256/<base64>", ...] }`,
+  also accepts `sha256:<base64>` and bare base64 spellings). When pins are
+  configured for an endpoint, the whitelist *replaces* the PKI chain
+  verification — the pin is the trust anchor, which stops a MITM holding a
+  valid-but-unexpected certificate and also works for self-signed / private-CA
+  downstreams. The peer certificate's SPKI is verified on the socket's
+  `secureConnect` *before* a single payload byte is written (a mismatch cannot
+  even observe the request body); a mismatch destroys the request with
+  `TlsPinMismatchError`, fails the delivery attempt, and the attempt follows
+  the normal retry / dead-letter path — the mismatch is audited as
+  `dead_letter` with the pin error. Endpoints without pins keep Node's default
+  TLS verification. Empty whitelists and malformed pins throw `RangeError` at
+  startup, never mid-delivery. Zero dependencies (`node:crypto` only).
 - `src/server.ts` — a minimal `node:http` receiver: read the raw body, verify
   the `x-signature` header with the injected `verifier` (defaults to
   HMAC-SHA256 with `secret`; pass e.g. `new Ed25519Verifier(pem)` to change

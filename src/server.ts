@@ -9,6 +9,8 @@ import type { PayloadEncryptor } from "./encrypt.ts";
 import type { ReplayGuard } from "./replay.ts";
 import { DeliveryDeduplicator, type DedupOptions } from "./dedup.ts";
 import { resolveTraceId, TRACE_ID_HEADER } from "./trace.ts";
+import type { TLSSocket } from "node:tls";
+import { assertValidPins, normalizePin, spkiFingerprint, TlsPinMismatchError } from "./pinning.ts";
 import type { AuditLog } from "./audit.ts";
 
 export interface RelayServerOptions {
@@ -49,6 +51,23 @@ export interface RelayServerOptions {
   keyNowMs?: () => number;
   /** Retry queue tuning, passed through to RetryQueue. */
   retry?: ConstructorParameters<typeof RetryQueue>[0];
+  /**
+   * Outbound TLS certificate pinning (see `src/pinning.ts`): per-endpoint
+   * SPKI fingerprint whitelist, keyed by exact delivery `targetUrl`.
+   * When pins are configured for an endpoint, the pin check *replaces* the
+   * default PKI chain verification for that endpoint — the pin is the trust
+   * anchor, which is what stops a MITM holding a valid-but-unexpected
+   * certificate. The peer certificate is verified on the socket's
+   * `secureConnect` before a single payload byte is written, so a mismatch
+   * cannot even observe the request body. A mismatch fails the delivery
+   * attempt (`TlsPinMismatchError`); the attempt then follows the normal
+   * retry / dead-letter path and the mismatch is visible in the audit
+   * trail (`dead_letter` with the pin error). Endpoints without pins keep
+   * the default Node TLS verification. Pin format: `"sha256/<base64>"`,
+   * `"sha256:<base64>"`, or bare base64 of the 32-byte digest. Empty
+   * whitelists and malformed pins throw `RangeError` at startup.
+   */
+  tlsPins?: Record<string, string[]>;
   /**
    * Bearer token guarding the operator endpoints (`GET /dead-letter`,
    * `POST /dead-letter/:id/replay`, `GET /audit`, `GET /latency`,
@@ -114,44 +133,102 @@ export interface RelayServerOptions {
   gracefulShutdown?: { timeoutMs?: number; exit?: (code: number) => void };
 }
 
-function defaultSender(item: RetryItem): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const url = new URL(item.targetUrl);
-    const req =
-      url.protocol === "https:"
-        ? httpsRequest(url, { method: "POST" }, (res) => {
-            res.resume();
-            res.on("end", () => {
-              if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
-                resolve();
-              } else {
-                reject(new Error(`Forward failed with status ${res.statusCode}`));
-              }
-            });
-            res.on("error", reject);
-          })
-        : httpRequest(url, { method: "POST" }, (res) => {
-            res.resume();
-            res.on("end", () => {
-              if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
-                resolve();
-              } else {
-                reject(new Error(`Forward failed with status ${res.statusCode}`));
-              }
-            });
-            res.on("error", reject);
-          });
-    req.on("error", reject);
-    for (const [k, v] of Object.entries(item.headers)) {
-      if (v !== undefined) req.setHeader(k, v as string | string[]);
+/**
+ * The default delivery function: a `node:http(s)` POST of the item's
+ * payload and headers. Exported so tests (and embedders) can exercise the
+ * exact outbound path, including TLS pinning.
+ *
+ * `tlsPins` is the per-endpoint SPKI whitelist (see the `tlsPins` server
+ * option); it is validated once, up front.
+ */
+export function createDefaultSender(tlsPins?: Record<string, string[]>): Sender {
+  if (tlsPins !== undefined) {
+    for (const [endpoint, pins] of Object.entries(tlsPins)) {
+      try {
+        assertValidPins(pins);
+      } catch (err) {
+        throw new RangeError(
+          `createDefaultSender: invalid TLS pins for ${endpoint}: ${(err as Error).message}`
+        );
+      }
     }
-    // Propagate the trace ID downstream so the next hop can correlate the
-    // delivery with this relay's audit trail (overrides a stale inbound
-    // value, which is identical anyway after `resolveTraceId`).
-    if (item.traceId) req.setHeader(TRACE_ID_HEADER, item.traceId);
-    req.setHeader("content-length", item.payload.length);
-    req.end(item.payload);
-  });
+  }
+  return function defaultSender(item: RetryItem): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const url = new URL(item.targetUrl);
+      // Pinning is per endpoint (exact targetUrl match). When pins are
+      // configured for the endpoint, the whitelist is the trust anchor: it
+      // replaces Node's PKI chain verification, and the peer certificate is
+      // verified on `secureConnect` before a single payload byte is written
+      // (a MITM must not even see the request body). See `src/pinning.ts`
+      // for why `checkServerIdentity` cannot do this job.
+      const pins = url.protocol === "https:" ? tlsPins?.[item.targetUrl] : undefined;
+      const onResponse = (res: Parameters<Parameters<typeof httpsRequest>[2]>[0]): void => {
+        res.resume();
+        res.on("end", () => {
+          if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+            resolve();
+          } else {
+            reject(new Error(`Forward failed with status ${res.statusCode}`));
+          }
+        });
+        res.on("error", reject);
+      };
+      const req =
+        url.protocol === "https:"
+          ? httpsRequest(url, { method: "POST", ...(pins ? { rejectUnauthorized: false } : {}) }, onResponse)
+          : httpRequest(url, { method: "POST" }, onResponse);
+      req.on("error", reject);
+
+      const writePayload = (): void => {
+        for (const [k, v] of Object.entries(item.headers)) {
+          if (v !== undefined) req.setHeader(k, v as string | string[]);
+        }
+        // Propagate the trace ID downstream so the next hop can correlate the
+        // delivery with this relay's audit trail (overrides a stale inbound
+        // value, which is identical anyway after `resolveTraceId`).
+        if (item.traceId) req.setHeader(TRACE_ID_HEADER, item.traceId);
+        req.setHeader("content-length", item.payload.length);
+        req.end(item.payload);
+      };
+
+      if (pins === undefined) {
+        writePayload();
+        return;
+      }
+      // Normalized once, up front, so the per-handshake path is a plain compare.
+      const allowed = pins.map(normalizePin);
+      let verified = false;
+      const verifyPin = (socket: TLSSocket): void => {
+        if (verified) return;
+        verified = true;
+        let presented: string;
+        try {
+          const raw = (socket.getPeerCertificate() as { raw?: unknown }).raw;
+          presented = spkiFingerprint(Buffer.from(raw as Buffer));
+        } catch {
+          presented = "<unreadable certificate>";
+        }
+        if (allowed.includes(presented)) {
+          writePayload();
+        } else {
+          // Fail the delivery attempt: it follows the normal retry /
+          // dead-letter path and the mismatch lands in the audit trail.
+          req.destroy(new TlsPinMismatchError(item.targetUrl, presented));
+        }
+      };
+      req.on("socket", (socket) => {
+        const tlsSocket = socket as TLSSocket;
+        const already = tlsSocket.getPeerCertificate() as { raw?: unknown };
+        if (already && already.raw) {
+          // Defensive: a reused agent socket may already be secure.
+          verifyPin(tlsSocket);
+        } else {
+          tlsSocket.once("secureConnect", () => verifyPin(tlsSocket));
+        }
+      });
+    });
+  };
 }
 
 function readRawBody(req: Parameters<Parameters<typeof createServer>[0]>[0]): Promise<Buffer> {
@@ -171,7 +248,7 @@ function readRawBody(req: Parameters<Parameters<typeof createServer>[0]>[0]): Pr
 export function createRelayServer(opts: RelayServerOptions): Server {
   const latencyOpts = opts.retry?.latency;
   const queue = new RetryQueue({
-    sender: opts.sender ?? defaultSender,
+    sender: opts.sender ?? createDefaultSender(opts.tlsPins),
     ...(opts.retry ?? {}),
     payloadEncryptor: opts.payloadEncryptor ?? opts.retry?.payloadEncryptor,
     // Wrap the caller's onSloMiss so every SLO miss is audited, not just observed.
@@ -414,6 +491,11 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       res.writeHead(405, { "content-type": "text/plain" }).end("Method not allowed");
       return;
     }
+    const id = randomUUID();
+    // Resolve the trace ID up front so even rejections are traceable; a
+    // client-supplied x-trace-id is honored, otherwise fresh.
+    const traceId = resolveTraceId(req.headers[TRACE_ID_HEADER]);
+
     let body: Buffer;
     try {
       body = await readRawBody(req);
@@ -425,10 +507,6 @@ export function createRelayServer(opts: RelayServerOptions): Server {
     const signatureHeader = req.headers["x-signature"];
     const keyIdHeader = req.headers["x-key-id"];
     const keyIdHint = Array.isArray(keyIdHeader) ? keyIdHeader[0] : keyIdHeader;
-    const id = randomUUID();
-    // Resolve the trace ID before verification so even rejections are
-    // traceable; a client-supplied x-trace-id is honored, otherwise fresh.
-    const traceId = resolveTraceId(req.headers[TRACE_ID_HEADER]);
 
     // With key rotation, learn which key id verified so it can go on the
     // audit trail; otherwise keep the legacy boolean contract.
