@@ -187,13 +187,34 @@ reliability primitives that matter for any signed-payload pipeline.
   poisoned-socket guard. `getStats()` exposes per-origin created / reused /
   reaped counters plus live socket counts. Enabled by default
   (`createRelayServer({ outboundKeepAlive })`, `createDefaultSender(pins,
-  keepAlive, outboundSigning)`); pass `false` for one fresh connection per
+  keepAlive, outboundSigning, proxies)`); pass `false` for one fresh connection per
   delivery (the legacy
   opt-out; note Node 24's global agent pools by default, so the opt-out passes
   `agent: false` explicitly). Pooled connections close with the server
   (`close` → `queue.stop()` → pool `destroy()`), covering the
   graceful-shutdown drain path. Invalid option values throw `RangeError` at
   startup.
+- `src/proxy.ts` — outbound HTTP(S) proxy support: per-endpoint proxy URLs
+  (`proxies: { "<exact targetUrl>": "http://user:pass@proxy:8080" }`, also
+  exposed as `createRelayServer({ proxies })` and the fourth
+  `createDefaultSender(pins, keepAlive, outboundSigning, proxies)` argument).
+  Endpoints without an entry fall back to `HTTPS_PROXY` / `HTTP_PROXY` /
+  `ALL_PROXY` (lowercase variants honored, `NO_PROXY` bypasses the env
+  fallback only — an explicit entry always wins), read per delivery so proxy
+  rotation needs no restart. Deliveries ride a `CONNECT` tunnel — proxy
+  basic-auth credentials come from the proxy URL's userinfo, and only
+  plain-HTTP proxies are supported (proxy-over-TLS is rejected at
+  validation). For `https:` targets the TLS handshake runs over the tunnel,
+  so end-to-end encryption and `tlsPins` verification behave exactly as
+  without a proxy: the proxy sees only the CONNECT line, never the payload.
+  Tunneled sockets join the keep-alive pool keyed per (proxy, origin, pins),
+  so one CONNECT serves many deliveries and a tunnel through proxy A can
+  never serve an endpoint routed through proxy B; with pooling disabled each
+  delivery opens its own tunnel. A failed CONNECT (`ProxyConnectError`,
+  carrying the proxy's status — e.g. 407 on bad credentials) fails the
+  delivery through the normal retry / dead-letter path and lands in the audit
+  trail. Invalid proxy URLs throw `RangeError` at startup. Zero dependencies
+  (`node:net` + `node:tls`).
 - `bench/keepalive-bench.ts` (`npm run bench:keepalive`) — sequential
   deliveries to a localhost stub, before/after numbers (50 warmup deliveries
   per scenario; connection counts include warmup). Measured 2026-10-08,

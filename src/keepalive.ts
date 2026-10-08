@@ -3,6 +3,7 @@ import { Agent as HttpsAgent } from "node:https";
 import type { Socket } from "node:net";
 import { createHash } from "node:crypto";
 import { normalizePin } from "./pinning.ts";
+import { createProxiedAgent, proxyPoolKeyFragment } from "./proxy.ts";
 
 /**
  * Outbound keep-alive connection pool (WR-24).
@@ -112,7 +113,10 @@ export function resolveKeepAlivePoolOptions(
 
 /** Per-endpoint pool state snapshot. */
 export interface PoolEndpointStats {
-  /** Pool key: `<scheme>//<host>:<port>`, plus `|pins:<hash>` when pinned. */
+  /**
+   * Pool key: `<scheme>//<host>:<port>`, plus `|proxy:<hash>` when routed
+   * through an outbound proxy and `|pins:<hash>` when pinned.
+   */
   key: string;
   scheme: "http" | "https";
   host: string;
@@ -186,9 +190,13 @@ export class OutboundConnectionPool {
    * The agent serving `url`. Agents are created lazily, one per
    * `(scheme, host, port)`; endpoints with a TLS pin whitelist get a
    * dedicated agent keyed by a hash of the normalized pins, so a
-   * connection pinned for one whitelist can never serve another.
+   * connection pinned for one whitelist can never serve another. When
+   * `proxyUrl` is set the agent's sockets are CONNECT tunnels through
+   * that proxy (see `src/proxy.ts`) and the pool key binds the proxy too,
+   * so a tunneled connection can never serve an endpoint routed through a
+   * different proxy (or no proxy).
    */
-  agentFor(url: URL, pins?: readonly string[]): HttpAgent {
+  agentFor(url: URL, pins?: readonly string[], proxyUrl?: string): HttpAgent {
     if (url.protocol !== "http:" && url.protocol !== "https:") {
       throw new Error(`OutboundConnectionPool: unsupported protocol ${url.protocol}`);
     }
@@ -196,6 +204,7 @@ export class OutboundConnectionPool {
     const host = url.hostname;
     const port = url.port === "" ? (scheme === "https" ? 443 : 80) : Number(url.port);
     let key = `${scheme}//${host}:${port}`;
+    if (proxyUrl !== undefined) key += proxyPoolKeyFragment(proxyUrl);
     const pinned = pins !== undefined && pins.length > 0;
     if (pinned) {
       const digest = createHash("sha256")
@@ -217,7 +226,11 @@ export class OutboundConnectionPool {
         freeSocketTimeout: 0,
       };
       const agent: HttpAgent =
-        scheme === "https" ? new HttpsAgent(agentOpts) : new HttpAgent(agentOpts);
+        proxyUrl !== undefined
+          ? createProxiedAgent(scheme, proxyUrl, agentOpts)
+          : scheme === "https"
+            ? new HttpsAgent(agentOpts)
+            : new HttpAgent(agentOpts);
       entry = { key, scheme, host, port, pinned, agent, seen: new WeakSet(), created: 0, reused: 0, reaped: 0 };
       this.entries.set(key, entry);
       this.byAgent.set(agent, entry);

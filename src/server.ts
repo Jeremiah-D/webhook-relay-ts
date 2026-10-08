@@ -1,4 +1,4 @@
-import { createServer, request as httpRequest } from "node:http";
+import { Agent as HttpAgent, createServer, request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import type { Server } from "node:http";
 import { randomUUID } from "node:crypto";
@@ -19,6 +19,11 @@ import { resolveTraceId, TRACE_ID_HEADER } from "./trace.ts";
 import type { TLSSocket } from "node:tls";
 import { assertValidPins, normalizePin, spkiFingerprint, TlsPinMismatchError } from "./pinning.ts";
 import { OutboundConnectionPool, type KeepAlivePoolOptions } from "./keepalive.ts";
+import {
+  assertValidProxyUrl,
+  createProxiedAgent,
+  resolveProxyUrl,
+} from "./proxy.ts";
 import type { AuditLog } from "./audit.ts";
 
 export interface RelayServerOptions {
@@ -92,6 +97,24 @@ export interface RelayServerOptions {
    * `RangeError` at startup.
    */
   outboundKeepAlive?: KeepAlivePoolOptions | false;
+  /**
+   * Outbound HTTP(S) proxy (see `src/proxy.ts`): per-endpoint proxy URLs,
+   * keyed by exact delivery `targetUrl`. Deliveries to a configured
+   * endpoint ride a `CONNECT` tunnel through the proxy — proxy basic-auth
+   * credentials come from the proxy URL's userinfo
+   * (`http://user:pass@proxy:8080`); only plain-HTTP proxies are
+   * supported (proxy-over-TLS is rejected). Endpoints without an explicit
+   * entry fall back to the environment (`HTTPS_PROXY` / `HTTP_PROXY` /
+   * `ALL_PROXY`, lowercase variants honored, `NO_PROXY` bypasses), read
+   * per delivery so proxy rotation needs no restart. Tunneled sockets join
+   * the keep-alive pool keyed per (proxy, origin, pins), so one CONNECT
+   * serves many deliveries; with pooling disabled each delivery opens its
+   * own tunnel. For `https:` targets the TLS handshake runs over the
+   * tunnel, so end-to-end encryption and `tlsPins` verification behave
+   * exactly as without a proxy — the proxy sees only the CONNECT line,
+   * never the payload. Invalid URLs throw `RangeError` at startup.
+   */
+  proxies?: Record<string, string>;
   /**
    * Inbound request body size limit (WR-25). A POST whose body exceeds this
    * is answered 413 and audited as `rejected` (reason `body_too_large`):
@@ -210,6 +233,14 @@ export interface RelayServerOptions {
  * forwarded body) plus `x-relay-key-id` when a `keyId` is given, so the
  * downstream can prove the request really came from this relay. Invalid
  * values throw `RangeError` at startup.
+ *
+ * `proxies` is the per-endpoint outbound proxy map (see `src/proxy.ts` and
+ * the `proxies` server option): `{ "<exact targetUrl>": "<proxyUrl>" }`.
+ * Deliveries to a configured endpoint ride a `CONNECT` tunnel through the
+ * proxy; endpoints without an entry fall back to `HTTPS_PROXY` /
+ * `HTTP_PROXY` / `ALL_PROXY` (lowercase honored, `NO_PROXY` bypasses the
+ * env fallback only — an explicit entry always wins), read per delivery.
+ * Invalid proxy URLs throw `RangeError` at startup.
  */
 export interface PooledSender extends Sender {
   /** The keep-alive pool, or `undefined` when pooling is disabled. */
@@ -221,7 +252,8 @@ export interface PooledSender extends Sender {
 export function createDefaultSender(
   tlsPins?: Record<string, string[]>,
   keepAlive?: KeepAlivePoolOptions | false,
-  outboundSigning?: OutboundSigningConfig
+  outboundSigning?: OutboundSigningConfig,
+  proxies?: Record<string, string>
 ): PooledSender {
   if (tlsPins !== undefined) {
     for (const [endpoint, pins] of Object.entries(tlsPins)) {
@@ -230,6 +262,17 @@ export function createDefaultSender(
       } catch (err) {
         throw new RangeError(
           `createDefaultSender: invalid TLS pins for ${endpoint}: ${(err as Error).message}`
+        );
+      }
+    }
+  }
+  if (proxies !== undefined) {
+    for (const [endpoint, proxyUrl] of Object.entries(proxies)) {
+      try {
+        assertValidProxyUrl(proxyUrl);
+      } catch (err) {
+        throw new RangeError(
+          `createDefaultSender: invalid proxy URL for ${endpoint}: ${(err as Error).message}`
         );
       }
     }
@@ -257,10 +300,34 @@ export function createDefaultSender(
       // (a MITM must not even see the request body). See `src/pinning.ts`
       // for why `checkServerIdentity` cannot do this job.
       const pins = url.protocol === "https:" ? tlsPins?.[item.targetUrl] : undefined;
+      // Outbound proxy for this endpoint: explicit per-endpoint config
+      // first, then the environment (read per delivery, so proxy rotation
+      // needs no restart; `NO_PROXY` bypasses the env fallback only — an
+      // explicit entry always wins). An invalid *environment* value throws
+      // here and fails the delivery through the normal retry path; explicit
+      // values were validated at startup.
+      const proxyUrl = resolveProxyUrl(item.targetUrl, proxies);
+      if (proxyUrl === undefined && proxies?.[item.targetUrl] !== undefined) {
+        reject(
+          new Error(`outbound proxy: proxy configured for non-HTTP(S) target ${item.targetUrl}`)
+        );
+        return;
+      }
       // Pooled keep-alive agent for this origin (dedicated agent per pin
-      // whitelist, so a connection pinned for one endpoint can never serve
-      // another endpoint's whitelist).
-      const agent = pool?.agentFor(url, pins);
+      // whitelist and per proxy, so a connection pinned or tunneled for
+      // one endpoint can never serve another's). With pooling disabled but
+      // a proxy configured, each delivery gets a one-off tunneled agent —
+      // fresh tunnel per delivery, destroyed when the request settles.
+      let oneOffAgent: HttpAgent | undefined;
+      const agent =
+        pool?.agentFor(url, pins, proxyUrl) ??
+        (proxyUrl !== undefined
+          ? (oneOffAgent = createProxiedAgent(
+              url.protocol === "https:" ? "https" : "http",
+              proxyUrl,
+              { keepAlive: false, maxSockets: 1, maxFreeSockets: 0 }
+            ))
+          : undefined);
       const onResponse = (res: Parameters<Parameters<typeof httpsRequest>[2]>[0]): void => {
         res.resume();
         res.on("end", () => {
@@ -292,6 +359,10 @@ export function createDefaultSender(
         // process exit. Deferred one tick — the agent frees the socket
         // just before 'close' fires.
         req.on("close", () => setImmediate(() => pool.markIdle(agent)));
+      }
+      if (oneOffAgent !== undefined) {
+        // No pooling: the tunneled socket must not outlive the delivery.
+        req.on("close", () => oneOffAgent?.destroy());
       }
 
       const writePayload = (): void => {
@@ -456,7 +527,7 @@ export function createRelayServer(opts: RelayServerOptions): Server {
   // the default sender only; an injected sender signs on its own.
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning)
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies)
       : undefined;
   const queue = new RetryQueue({
     sender: opts.sender ?? defaultSender,
