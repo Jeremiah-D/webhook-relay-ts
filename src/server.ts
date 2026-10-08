@@ -8,6 +8,7 @@ import { installGracefulShutdown } from "./shutdown.ts";
 import type { PayloadEncryptor } from "./encrypt.ts";
 import type { ReplayGuard } from "./replay.ts";
 import { DeliveryDeduplicator, type DedupOptions } from "./dedup.ts";
+import { InboundRateLimiter, type InboundRateLimitOptions } from "./ratelimit.ts";
 import { resolveTraceId, TRACE_ID_HEADER } from "./trace.ts";
 import type { TLSSocket } from "node:tls";
 import { assertValidPins, normalizePin, spkiFingerprint, TlsPinMismatchError } from "./pinning.ts";
@@ -95,6 +96,16 @@ export interface RelayServerOptions {
    * the legacy always-deliver behavior unless the operator opts in.
    */
   dedup?: DedupOptions;
+  /**
+   * Inbound rate limiting (see `src/ratelimit.ts`): dual-dimension token
+   * buckets — per-sender IP and per-endpoint — guarding the webhook intake.
+   * A request exceeding either budget is answered 429 with a `retry-after`
+   * header and audited as `rejected` with reason `rate_limited` (plus the
+   * `dimension`: `"ip"` or `"endpoint"`). The check runs before signature
+   * verification, so a flood of invalid requests still costs almost
+   * nothing. Disabled by default.
+   */
+  rateLimit?: InboundRateLimitOptions;
   /** Inject queue hooks (e.g. to fail the server fast on dead letters). */
   /**
    * Seals dead-letter payloads at rest (see `RetryQueue` `payloadEncryptor`;
@@ -315,6 +326,7 @@ export function createRelayServer(opts: RelayServerOptions): Server {
         })()
       : (opts.verifier ?? new HmacSha256Verifier(opts.secret));
   const deduplicator = opts.dedup ? new DeliveryDeduplicator(opts.dedup) : undefined;
+  const rateLimiter = opts.rateLimit ? new InboundRateLimiter(opts.rateLimit) : undefined;
 
   const respondJson = (
     res: Parameters<Parameters<typeof createServer>[0]>[1],
@@ -492,9 +504,36 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       return;
     }
     const id = randomUUID();
-    // Resolve the trace ID up front so even rejections are traceable; a
-    // client-supplied x-trace-id is honored, otherwise fresh.
+    // Resolve the trace ID before any admission decision so even rejections
+    // are traceable; a client-supplied x-trace-id is honored, otherwise fresh.
     const traceId = resolveTraceId(req.headers[TRACE_ID_HEADER]);
+
+    // Inbound rate limiting (WR-22): per-sender-IP + per-endpoint buckets.
+    // Checked before the body is even read and before signature
+    // verification, so a flood costs us almost nothing. Rejections are
+    // audited like every other rejection, with the exhausted dimension.
+    if (rateLimiter) {
+      const ip = req.socket.remoteAddress ?? "unknown";
+      const verdict = rateLimiter.take(ip, opts.forwardUrl);
+      if (!verdict.ok) {
+        opts.auditLog.append({
+          event: "rejected",
+          id,
+          traceId,
+          reason: "rate_limited",
+          dimension: verdict.dimension,
+          retryAfterMs: verdict.retryAfterMs,
+        });
+        res
+          .writeHead(429, {
+            "content-type": "text/plain",
+            // Ceiling seconds, minimum 1: a Retry-After of 0 is meaningless.
+            "retry-after": String(Math.max(1, Math.ceil(verdict.retryAfterMs / 1000))),
+          })
+          .end("Too many requests");
+        return;
+      }
+    }
 
     let body: Buffer;
     try {

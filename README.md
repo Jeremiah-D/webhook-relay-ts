@@ -103,6 +103,16 @@ reliability primitives that matter for any signed-payload pipeline.
   payload-identity dedup across re-ids. Memory-bounded: entries expire out of
   the window lazily and `maxEntries` (default 10k) evicts oldest-first.
   Opt-in via `dedup: {...}` (off by default); injectable clock for tests.
+- `src/ratelimit.ts` — inbound rate limiting (`InboundRateLimiter`):
+  dual-dimension token buckets — per-sender IP and per-endpoint — guarding
+  the webhook intake. Each dimension is a per-second bucket refilled lazily
+  (burst = one second of budget, clock-skew clamped at zero so a backward
+  clock never grants extra budget); a request must hold a token in *both*
+  buckets, and the check is peek-then-consume so a rejection never burns the
+  other dimension's token. Wired into the server via `rateLimit: {...}`
+  (off by default); over-budget requests are answered 429 with `retry-after`
+  and audited as `rejected` (reason `rate_limited`). Injectable clock for
+  deterministic tests.
 - `src/circuit.ts` — per-endpoint circuit breaker (`EndpointCircuitBreaker`,
   `closed` / `open` / `half_open`): `failureThreshold` (default 5)
   consecutive delivery failures trip the circuit open for `cooldownMs`
@@ -154,7 +164,13 @@ reliability primitives that matter for any signed-payload pipeline.
   header; accepted/rejected audit events carry the verifying `keyId`),
   optionally enforce replay protection (`replay: new ReplayGuard()`
   — replays answer 409, bad/missing nonces and out-of-window timestamps
-  answer 400, all audited as `rejected`), enqueue for forwarding to
+  answer 400, all audited as `rejected`), and optionally rate-limit the
+  intake (`rateLimit: { perIpPerSecond, perEndpointPerSecond }` — dual
+  token-bucket admission, per-sender IP + per-endpoint; over-budget requests
+  are answered 429 with a `retry-after` header and audited as `rejected`
+  with reason `rate_limited` and the exhausted `dimension`. The check runs
+  before the body is read and before signature verification, so a flood
+  costs almost nothing), enqueue for forwarding to
   `forwardUrl`, audit accept / delivered / dead-letter events. A failed verification returns 401 + audit entry.
   Operator endpoints `GET /dead-letter` (list dead letters with
   attempts/lastError/timestamp metadata, no raw payloads) and
