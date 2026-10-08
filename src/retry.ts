@@ -1,6 +1,13 @@
 import { EndpointCircuitBreaker, type CircuitBreakerOptions, type CircuitState, type CircuitStats } from "./circuit.ts";
 import type { EncryptedPayload, PayloadEncryptor } from "./encrypt.ts";
 import {
+  HttpDeliveryError,
+  classifyFailure,
+  parseRetryAfterMs,
+  type ClassifiedFailure,
+  type FailureClass,
+} from "./failure.ts";
+import {
   LatencyTracker,
   type EndpointLatencyStats,
   type LatencyTrackerOptions,
@@ -25,6 +32,8 @@ import {
 export { TRACE_ID_HEADER };
 export { renderPrometheus };
 export type { DeliveryCountersInput, CircuitStateInput, LatencyHistogramInput };
+export { HttpDeliveryError, classifyFailure, parseRetryAfterMs };
+export type { FailureClass, ClassifiedFailure };
 
 export type { CircuitBreakerOptions, CircuitState, CircuitStats };
 export type { EncryptedPayload, PayloadEncryptor };
@@ -183,6 +192,14 @@ export interface DeadLetterEntry extends RetryItem {
   attempts: number;
   /** Last delivery error message. */
   lastError: string;
+  /**
+   * Classification of the final failure (see `src/failure.ts`):
+   * `"non_retryable"` means the item was dead-lettered immediately —
+   * a poison payload that would never succeed — without burning the
+   * rest of the retry budget; `"retryable"` means every attempt was
+   * genuinely spent against a transient failure.
+   */
+  failureClass: FailureClass;
   /** ISO-8601 timestamp when the item entered the dead-letter list. */
   deadLetteredAt: string;
   /** Original payload byte length (also when encrypted). */
@@ -268,8 +285,13 @@ export interface RetryQueueOptions {
    * `Infinity` (no limit). Must be a positive integer or `Infinity`.
    */
   maxConcurrentPerEndpoint?: number;
-  /** Callback when an item exhausts all attempts and moves to dead-letter. */
-  onDeadLetter?: (item: RetryItem, attempts: number, lastError: unknown) => void;
+  /**
+   * Callback when an item exhausts all attempts and moves to dead-letter —
+   * or is dead-lettered immediately as non-retryable. `failureClass` is
+   * the classification of the final failure (see `src/failure.ts`); it is
+   * an optional fourth parameter so existing callbacks keep compiling.
+   */
+  onDeadLetter?: (item: RetryItem, attempts: number, lastError: unknown, failureClass?: FailureClass) => void;
   /** Callback when an item is successfully delivered. */
   onDelivered?: (item: RetryItem, attempts: number) => void;
   /**
@@ -508,7 +530,7 @@ export class RetryQueue {
   private readonly random: () => number;
   private readonly setTimer: (fn: () => void, ms: number) => { clear(): void };
   private readonly clearTimer: (handle: { clear(): void }) => void;
-  private readonly onDeadLetter?: (item: RetryItem, attempts: number, lastError: unknown) => void;
+  private readonly onDeadLetter?: (item: RetryItem, attempts: number, lastError: unknown, failureClass?: FailureClass) => void;
   private readonly onDelivered?: (item: RetryItem, attempts: number) => void;
   private readonly breaker?: EndpointCircuitBreaker;
   /** Attempts parked because the endpoint's circuit was open. */
@@ -1112,63 +1134,47 @@ export class RetryQueue {
           at: new Date().toISOString(),
         });
       } catch (err) {
+        const classified = classifyFailure(err);
+        const error = err instanceof Error ? err.message : String(err);
+        const at = new Date().toISOString();
+        if (classified.failureClass === "non_retryable") {
+          // Poison payload (e.g. a 400 from the downstream): retrying can
+          // never succeed, so dead-letter immediately instead of burning
+          // the rest of the retry budget and the backoff clock. The
+          // endpoint is *not* sick — it answered, it just said no — so the
+          // circuit records a success rather than a failure (this also
+          // settles a half-open probe exactly once, as the breaker
+          // requires).
+          this.breaker?.recordSuccess(entry.targetUrl);
+          this.recordDelivery(entry.targetUrl, "failed");
+          entry.attempt += 1;
+          this.moveToDeadLetter(entry, id, err, classified, at, traceId);
+          return;
+        }
         this.breaker?.recordFailure(entry.targetUrl);
         this.recordDelivery(entry.targetUrl, "failed");
         entry.attempt += 1;
-        const error = err instanceof Error ? err.message : String(err);
-        const at = new Date().toISOString();
         if (entry.attempt >= this.maxAttempts) {
-          this.queue.delete(id);
-          this.recordDelivery(entry.targetUrl, "deadLetter");
-          // Never delivered: drop the pending clock without sampling.
-          this.latency?.discard(entry.id);
-          const encryptedPayload = this.payloadEncryptor?.encrypt(entry.payload);
-          this.deadLetter.push({
-            id: entry.id,
-            traceId,
-            // Sealed at rest when an encryptor is configured; kept in the
-            // clear otherwise (existing behavior).
-            payload: encryptedPayload ? Buffer.alloc(0) : entry.payload,
-            targetUrl: entry.targetUrl,
-            headers: entry.headers,
-            // Kept so a replayed item re-enters the same delivery lane.
-            priority: entry.priority,
-            attempts: entry.attempt,
-            lastError: err instanceof Error ? err.message : String(err),
-            deadLetteredAt: new Date().toISOString(),
-            payloadBytes: entry.payload.length,
-            ...(encryptedPayload ? { encryptedPayload } : {}),
-          });
-          this.onDeadLetter?.(entry, entry.attempt, err);
-          this.emitDeliveryEvent({
-            type: "dead_letter",
-            id: entry.id,
-            traceId,
-            targetUrl: entry.targetUrl,
-            attempts: entry.attempt,
-            at,
-            error,
-          });
-        } else if (fastLane && this.urgentLimiter.take(entry.targetUrl)) {
-          // Skip the exponential backoff: fixed fast-lane retry delay.
-          this.recordUrgentStat(entry.targetUrl, "retried");
-          this.recordDelivery(entry.targetUrl, "retried");
-          this.emitDeliveryEvent({
-            type: "retrying",
-            id: entry.id,
-            traceId,
-            targetUrl: entry.targetUrl,
-            attempts: entry.attempt,
-            at,
-            error,
-          });
-          this.schedule(id, this.urgentRetryDelayMs);
+          this.moveToDeadLetter(entry, id, err, classified, at, traceId);
         } else {
-          if (fastLane) {
-            // Fast-lane retry would exceed the endpoint's urgent rate:
-            // degrade to normal backoff instead of dropping the delivery.
-            this.recordUrgentStat(entry.targetUrl, "throttled");
-            entry.priority = "normal";
+          // A downstream-supplied `Retry-After` (429/503) wins over every
+          // lane's own delay: ignoring the backpressure signal the
+          // downstream explicitly sent would be perverse.
+          let retryDelayMs = classified.retryAfterMs;
+          if (retryDelayMs === undefined) {
+            if (fastLane && this.urgentLimiter.take(entry.targetUrl)) {
+              // Skip the exponential backoff: fixed fast-lane retry delay.
+              this.recordUrgentStat(entry.targetUrl, "retried");
+              retryDelayMs = this.urgentRetryDelayMs;
+            } else {
+              if (fastLane) {
+                // Fast-lane retry would exceed the endpoint's urgent rate:
+                // degrade to normal backoff instead of dropping the delivery.
+                this.recordUrgentStat(entry.targetUrl, "throttled");
+                entry.priority = "normal";
+              }
+              retryDelayMs = this.delayForAttempt(entry.attempt);
+            }
           }
           this.recordDelivery(entry.targetUrl, "retried");
           this.emitDeliveryEvent({
@@ -1180,12 +1186,62 @@ export class RetryQueue {
             at,
             error,
           });
-          this.schedule(id, this.delayForAttempt(entry.attempt));
+          this.schedule(id, retryDelayMs);
         }
       }
     } finally {
       release?.();
     }
+  }
+
+  /**
+   * Move `entry` to the dead-letter list, recording the failure
+   * classification so operators can tell poison payloads (`"non_retryable"`,
+   * dead-lettered on the first attempt) from exhausted transient failures
+   * (`"retryable"`). Shared by the poison fast path and the
+   * budget-exhausted path above.
+   */
+  private moveToDeadLetter(
+    entry: RetryItem & { attempt: number },
+    id: string,
+    err: unknown,
+    classified: ClassifiedFailure,
+    at: string,
+    traceId: string
+  ): void {
+    const error = err instanceof Error ? err.message : String(err);
+    this.queue.delete(id);
+    this.recordDelivery(entry.targetUrl, "deadLetter");
+    // Never delivered: drop the pending clock without sampling.
+    this.latency?.discard(entry.id);
+    const encryptedPayload = this.payloadEncryptor?.encrypt(entry.payload);
+    this.deadLetter.push({
+      id: entry.id,
+      traceId,
+      // Sealed at rest when an encryptor is configured; kept in the
+      // clear otherwise (existing behavior).
+      payload: encryptedPayload ? Buffer.alloc(0) : entry.payload,
+      targetUrl: entry.targetUrl,
+      headers: entry.headers,
+      // Kept so a replayed item re-enters the same delivery lane.
+      priority: entry.priority,
+      attempts: entry.attempt,
+      lastError: error,
+      failureClass: classified.failureClass,
+      deadLetteredAt: new Date().toISOString(),
+      payloadBytes: entry.payload.length,
+      ...(encryptedPayload ? { encryptedPayload } : {}),
+    });
+    this.onDeadLetter?.(entry, entry.attempt, err, classified.failureClass);
+    this.emitDeliveryEvent({
+      type: "dead_letter",
+      id: entry.id,
+      traceId,
+      targetUrl: entry.targetUrl,
+      attempts: entry.attempt,
+      at,
+      error,
+    });
   }
 
   /** Per-endpoint concurrency snapshot: in-flight and queued deliveries. */

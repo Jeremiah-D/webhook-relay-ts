@@ -371,11 +371,31 @@ written to the audit log, so the log is the machine's trace.
   operator needs to diagnose it, without the raw payload on the operator
   endpoint. With `payloadEncryptor` configured the payload is additionally
   sealed at rest (`encryptedPayload` envelope) and transparently decrypted
-  on replay.
+  on replay. Every dead-letter entry also carries `failure_class` (also
+  audited on the `dead_letter` event): `"retryable"` means every attempt was
+  spent against a transient failure, `"non_retryable"` means the payload was
+  poison and was dead-lettered on the first attempt without burning the
+  retry budget (see *Failure classification* below).
 - `dead_letter` → **`delivering`** (fresh attempt budget) when an operator
   replays it via `POST /dead-letter/:id/replay`, audited as
   `dead_letter_replayed`. A replayed item that fails again walks the same
   `delivering` → `retrying` → `dead_letter` path.
+
+### Failure classification
+
+Not every failed delivery deserves a retry (`src/failure.ts`):
+
+| Failure | Class | Behavior |
+|---|---|---|
+| HTTP 4xx except 408/429 (e.g. 400, 422) | `non_retryable` | Immediate dead letter — one attempt, no backoff waits. A poison payload can never succeed, so the retry budget is not burned on it. The endpoint's circuit is *not* tripped: the downstream answered, it just said no. |
+| HTTP 408, 429, any 5xx | `retryable` | Normal backoff lane. A `429` honors the downstream's `Retry-After` header (delay-seconds or HTTP-date) for the next attempt — on both the normal and urgent lanes — instead of the computed backoff. |
+| Timeouts, DNS failures, TLS/proxy errors | `retryable` | Normal backoff lane. |
+
+The default sender throws a structured `HttpDeliveryError` (status code +
+parsed `Retry-After`) instead of a bare `Error`, so classification never
+parses message strings; custom senders get the same treatment by throwing
+any error with a numeric `statusCode` field. When in doubt the classifier
+retries: an unknown failure is always `"retryable"`.
 
 **Batching:** when `retry.batch` is enabled, `accepted` →
 **`batching`** instead of straight to `delivering`: normal-priority items

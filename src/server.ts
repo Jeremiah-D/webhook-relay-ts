@@ -13,6 +13,7 @@ import {
   type Verifier,
 } from "./verify.ts";
 import { RetryQueue, type DeliveryPriority, type RetryItem, type Sender } from "./retry.ts";
+import { HttpDeliveryError, parseRetryAfterMs } from "./failure.ts";
 import { installGracefulShutdown } from "./shutdown.ts";
 import type { PayloadEncryptor } from "./encrypt.ts";
 import type { ReplayGuard } from "./replay.ts";
@@ -350,7 +351,16 @@ export function createDefaultSender(
           if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
             resolve();
           } else {
-            reject(new Error(`Forward failed with status ${res.statusCode}`));
+            // Structured failure: the retry queue classifies on the status
+            // code (4xx-except-408/429 → immediate dead letter, never
+            // retried) and honors a 429's Retry-After header. The error
+            // message keeps the historical shape.
+            reject(
+              new HttpDeliveryError(
+                res.statusCode ?? 0,
+                parseRetryAfterMs(res.headers["retry-after"])
+              )
+            );
           }
         });
         res.on("error", reject);
@@ -568,7 +578,7 @@ export function createRelayServer(opts: RelayServerOptions): Server {
         attempts,
       });
     },
-    onDeadLetter: (item, attempts, lastError) => {
+    onDeadLetter: (item, attempts, lastError, failureClass) => {
       opts.auditLog.append({
         event: "dead_letter",
         id: item.id,
@@ -576,6 +586,10 @@ export function createRelayServer(opts: RelayServerOptions): Server {
         targetUrl: item.targetUrl,
         attempts,
         error: lastError instanceof Error ? lastError.message : String(lastError),
+        // "non_retryable" = poison payload dead-lettered on the first
+        // attempt (no retry budget burned); "retryable" = every attempt
+        // spent against a transient failure.
+        failure_class: failureClass ?? "retryable",
       });
     },
     onCircuitStateChange: (endpoint, from, to) => {
