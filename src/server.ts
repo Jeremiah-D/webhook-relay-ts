@@ -2,7 +2,13 @@ import { createServer, request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import type { Server } from "node:http";
 import { randomUUID } from "node:crypto";
-import { HmacSha256Verifier, RotatingHmacVerifier, type SigningKey, type Verifier } from "./verify.ts";
+import {
+  HmacSha256Verifier,
+  RotatingHmacVerifier,
+  signSha256,
+  type SigningKey,
+  type Verifier,
+} from "./verify.ts";
 import { RetryQueue, type DeliveryPriority, type RetryItem, type Sender } from "./retry.ts";
 import { installGracefulShutdown } from "./shutdown.ts";
 import type { PayloadEncryptor } from "./encrypt.ts";
@@ -86,6 +92,29 @@ export interface RelayServerOptions {
    * `RangeError` at startup.
    */
   outboundKeepAlive?: KeepAlivePoolOptions | false;
+  /**
+   * Inbound request body size limit (WR-25). A POST whose body exceeds this
+   * is answered 413 and audited as `rejected` (reason `body_too_large`):
+   * the declared `content-length` is checked before a single body byte is
+   * read, and chunked or lying bodies are capped while streaming, so a
+   * flood of giant payloads costs us almost nothing. Default: 1 MiB
+   * (`DEFAULT_MAX_BODY_BYTES`). Invalid values throw `RangeError`.
+   */
+  maxBodyBytes?: number;
+  /**
+   * Outbound request signing (WR-26, see `OutboundSigningConfig`): when set,
+   * every delivery made by the default sender carries
+   * `x-relay-signature: sha256=<hex>` — the HMAC-SHA256 of the forwarded
+   * body — plus `x-relay-key-id` when `keyId` is given, so the downstream
+   * can prove the request really came from this relay (verify with
+   * `verifySignature(body, header, secret)` from `src/verify.ts`). Off by
+   * default; applies to the default sender only — an injected `sender`
+   * signs (or doesn't) on its own. Inbound `x-relay-signature` /
+   * `x-relay-key-id` headers are always stripped from the forwarded header
+   * set, so a sender can never smuggle a forged relay signature
+   * downstream. Invalid values throw `RangeError`.
+   */
+  outboundSigning?: OutboundSigningConfig;
   /**
    * Bearer token guarding the operator endpoints (`GET /dead-letter`,
    * `POST /dead-letter/:id/replay`, `GET /audit`, `GET /latency`,
@@ -175,6 +204,12 @@ export interface RelayServerOptions {
  * pass `false` for one fresh connection per delivery (the legacy
  * behavior). The returned sender carries its pool as `.pool` and closes
  * it via `.destroy()` (a no-op when pooling is disabled).
+ *
+ * `outboundSigning` (see `OutboundSigningConfig`) makes every outbound
+ * request carry `x-relay-signature: sha256=<hex>` (HMAC-SHA256 of the
+ * forwarded body) plus `x-relay-key-id` when a `keyId` is given, so the
+ * downstream can prove the request really came from this relay. Invalid
+ * values throw `RangeError` at startup.
  */
 export interface PooledSender extends Sender {
   /** The keep-alive pool, or `undefined` when pooling is disabled. */
@@ -185,7 +220,8 @@ export interface PooledSender extends Sender {
 
 export function createDefaultSender(
   tlsPins?: Record<string, string[]>,
-  keepAlive?: KeepAlivePoolOptions | false
+  keepAlive?: KeepAlivePoolOptions | false,
+  outboundSigning?: OutboundSigningConfig
 ): PooledSender {
   if (tlsPins !== undefined) {
     for (const [endpoint, pins] of Object.entries(tlsPins)) {
@@ -199,6 +235,17 @@ export function createDefaultSender(
     }
   }
   // RangeError on invalid values, at startup — never mid-delivery.
+  if (outboundSigning !== undefined) {
+    if (typeof outboundSigning.secret !== "string" || outboundSigning.secret === "") {
+      throw new RangeError("createDefaultSender: `outboundSigning.secret` must be a non-empty string");
+    }
+    if (
+      outboundSigning.keyId !== undefined &&
+      (typeof outboundSigning.keyId !== "string" || outboundSigning.keyId === "")
+    ) {
+      throw new RangeError("createDefaultSender: `outboundSigning.keyId` must be a non-empty string");
+    }
+  }
   const pool = keepAlive === false ? undefined : new OutboundConnectionPool(keepAlive);
   const sender = function defaultSender(item: RetryItem): Promise<void> {
     return new Promise((resolve, reject) => {
@@ -255,6 +302,15 @@ export function createDefaultSender(
         // delivery with this relay's audit trail (overrides a stale inbound
         // value, which is identical anyway after `resolveTraceId`).
         if (item.traceId) req.setHeader(TRACE_ID_HEADER, item.traceId);
+        if (outboundSigning !== undefined) {
+          // Stamp AFTER the passthrough headers: a forged inbound
+          // `x-relay-signature` was already stripped from them above, and
+          // this guarantees the relay's own signature always wins.
+          req.setHeader("x-relay-signature", signSha256(item.payload, outboundSigning.secret));
+          if (outboundSigning.keyId !== undefined) {
+            req.setHeader("x-relay-key-id", outboundSigning.keyId);
+          }
+        }
         req.setHeader("content-length", item.payload.length);
         req.end(item.payload);
       };
@@ -323,13 +379,62 @@ export function createDefaultSender(
   return sender;
 }
 
-function readRawBody(req: Parameters<Parameters<typeof createServer>[0]>[0]): Promise<Buffer> {
+/** Default inbound request body size limit: 1 MiB. */
+export const DEFAULT_MAX_BODY_BYTES = 1_048_576;
+
+/** Thrown by `readRawBody` when the streamed body exceeds `maxBytes`. */
+export class BodyTooLargeError extends Error {
+  readonly maxBytes: number;
+  constructor(maxBytes: number) {
+    super(`Request body exceeds ${maxBytes} bytes`);
+    this.name = "BodyTooLargeError";
+    this.maxBytes = maxBytes;
+  }
+}
+
+function readRawBody(
+  req: Parameters<Parameters<typeof createServer>[0]>[0],
+  maxBytes: number
+): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    req.on("data", (c: Buffer) => chunks.push(c));
-    req.on("end", () => resolve(Buffer.concat(chunks)));
+    let total = 0;
+    let failed = false;
+    const onData = (c: Buffer): void => {
+      if (failed) return;
+      total += c.length;
+      if (total > maxBytes) {
+        // Stop buffering immediately — the caller answers 413 and closes
+        // the connection, so the remaining bytes must not pile up here.
+        failed = true;
+        req.removeListener("data", onData);
+        reject(new BodyTooLargeError(maxBytes));
+        return;
+      }
+      chunks.push(c);
+    };
+    req.on("data", onData);
+    req.on("end", () => {
+      if (!failed) resolve(Buffer.concat(chunks));
+    });
     req.on("error", reject);
   });
+}
+
+/**
+ * Signing material for outbound delivery requests (see the
+ * `outboundSigning` server option). When set, every outbound request made
+ * by the default sender carries `x-relay-signature: sha256=<hex>` — the
+ * HMAC-SHA256 of the forwarded body — plus `x-relay-key-id` when `keyId`
+ * is given, so the downstream can prove the request really came from this
+ * relay (verify with `verifySignature(body, header, secret)` from
+ * `src/verify.ts`). Disabled by default.
+ */
+export interface OutboundSigningConfig {
+  /** HMAC secret used to sign forwarded payloads. Non-empty. */
+  secret: string;
+  /** Stable key identifier surfaced in the `x-relay-key-id` header. Optional. */
+  keyId?: string;
 }
 
 /**
@@ -339,10 +444,20 @@ function readRawBody(req: Parameters<Parameters<typeof createServer>[0]>[0]): Pr
  */
 export function createRelayServer(opts: RelayServerOptions): Server {
   const latencyOpts = opts.retry?.latency;
+  // RangeError on invalid values, at startup — never mid-request.
+  const maxBodyBytes = opts.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
+  if (!Number.isInteger(maxBodyBytes) || maxBodyBytes <= 0) {
+    throw new RangeError("createRelayServer: `maxBodyBytes` must be a positive integer");
+  }
   // When the caller does not inject a sender, the server owns the default
   // sender — and with it the keep-alive pool, which is closed on server
-  // close so pooled outbound connections never outlive the server.
-  const defaultSender = opts.sender === undefined ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive) : undefined;
+  // close so pooled outbound connections never outlive the server. The
+  // outbound-signing config (validated by createDefaultSender) applies to
+  // the default sender only; an injected sender signs on its own.
+  const defaultSender =
+    opts.sender === undefined
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning)
+      : undefined;
   const queue = new RetryQueue({
     sender: opts.sender ?? defaultSender,
     ...(opts.retry ?? {}),
@@ -513,9 +628,15 @@ export function createRelayServer(opts: RelayServerOptions): Server {
     if (isBatchReplay) {
       let body: Record<string, unknown>;
       try {
-        const raw = (await readRawBody(req)).toString("utf8");
+        // The body limit applies here too: operator bodies are small, and
+        // an unbounded read on an authenticated endpoint is a cheap DoS.
+        const raw = (await readRawBody(req, maxBodyBytes)).toString("utf8");
         body = raw.trim() === "" ? {} : JSON.parse(raw);
-      } catch {
+      } catch (err) {
+        if (err instanceof BodyTooLargeError) {
+          respondJson(res, 413, { error: "request body too large" });
+          return;
+        }
         respondJson(res, 400, { error: "invalid JSON body" });
         return;
       }
@@ -691,10 +812,49 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       }
     }
 
+    // Inbound body size limit (WR-25), first line of defense: the declared
+    // Content-Length is checked before a single body byte is read, so a
+    // giant payload is rejected without touching memory or the verifier. A
+    // missing or unparseable header falls through to the streaming cap.
+    const declaredLength = req.headers["content-length"];
+    if (typeof declaredLength === "string") {
+      const n = Number(declaredLength);
+      if (Number.isInteger(n) && n > maxBodyBytes) {
+        opts.auditLog.append({
+          event: "rejected",
+          id,
+          traceId,
+          reason: "body_too_large",
+          maxBodyBytes,
+        });
+        // `connection: close` drops the socket after the 413, so the
+        // client cannot keep streaming a flood into a dead request.
+        res
+          .writeHead(413, { "content-type": "text/plain", connection: "close" })
+          .end("Request body too large");
+        return;
+      }
+    }
+
     let body: Buffer;
     try {
-      body = await readRawBody(req);
-    } catch {
+      // Second line of defense: chunked bodies and lying Content-Lengths
+      // are capped while streaming; the body never exceeds the budget.
+      body = await readRawBody(req, maxBodyBytes);
+    } catch (err) {
+      if (err instanceof BodyTooLargeError) {
+        opts.auditLog.append({
+          event: "rejected",
+          id,
+          traceId,
+          reason: "body_too_large",
+          maxBodyBytes,
+        });
+        res
+          .writeHead(413, { "content-type": "text/plain", connection: "close" })
+          .end("Request body too large");
+        return;
+      }
       res.writeHead(400, { "content-type": "text/plain" }).end("Bad request");
       return;
     }
@@ -766,6 +926,11 @@ export function createRelayServer(opts: RelayServerOptions): Server {
     const passthrough: Record<string, string | string[] | undefined> = {};
     for (const [k, v] of Object.entries(req.headers)) {
       if (k === "host" || k === "content-length") continue;
+      // `x-relay-signature` / `x-relay-key-id` are this relay's own
+      // namespace: an inbound client asserting them would impersonate the
+      // relay downstream. Strip them always; when outbound signing is
+      // enabled the sender stamps fresh ones below.
+      if (k === "x-relay-signature" || k === "x-relay-key-id") continue;
       passthrough[k] = v;
     }
 
