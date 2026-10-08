@@ -12,6 +12,7 @@ import { InboundRateLimiter, type InboundRateLimitOptions } from "./ratelimit.ts
 import { resolveTraceId, TRACE_ID_HEADER } from "./trace.ts";
 import type { TLSSocket } from "node:tls";
 import { assertValidPins, normalizePin, spkiFingerprint, TlsPinMismatchError } from "./pinning.ts";
+import { OutboundConnectionPool, type KeepAlivePoolOptions } from "./keepalive.ts";
 import type { AuditLog } from "./audit.ts";
 
 export interface RelayServerOptions {
@@ -69,6 +70,22 @@ export interface RelayServerOptions {
    * whitelists and malformed pins throw `RangeError` at startup.
    */
   tlsPins?: Record<string, string[]>;
+  /**
+   * Outbound keep-alive connection pool (see `src/keepalive.ts`): outbound
+   * deliveries reuse TCP/TLS connections per `(scheme, host, port)` instead
+   * of paying a handshake per attempt. Enabled by default with sane limits
+   * (`maxSocketsPerHost: 64`, idle reaping after 30s); pass `false` to
+   * disable pooling entirely (one fresh connection per delivery, the legacy
+   * behavior), or tune with `KeepAlivePoolOptions`. Endpoints with a TLS pin
+   * whitelist get a dedicated agent per pin set, so a connection pinned for
+   * one whitelist can never serve an endpoint with a different one; the
+   * pin is still verified on `secureConnect` for every new connection.
+   * Pooled connections are closed when the server closes
+   * (`stop()`/`shutdown()` path), and idle sockets are unref'd so a
+   * forgotten pool never pins process exit. Invalid option values throw
+   * `RangeError` at startup.
+   */
+  outboundKeepAlive?: KeepAlivePoolOptions | false;
   /**
    * Bearer token guarding the operator endpoints (`GET /dead-letter`,
    * `POST /dead-letter/:id/replay`, `GET /audit`, `GET /latency`,
@@ -151,8 +168,25 @@ export interface RelayServerOptions {
  *
  * `tlsPins` is the per-endpoint SPKI whitelist (see the `tlsPins` server
  * option); it is validated once, up front.
+ *
+ * `keepAlive` controls the outbound connection pool (see
+ * `src/keepalive.ts` and the `outboundKeepAlive` server option): by default
+ * deliveries reuse keep-alive connections per `(scheme, host, port)`;
+ * pass `false` for one fresh connection per delivery (the legacy
+ * behavior). The returned sender carries its pool as `.pool` and closes
+ * it via `.destroy()` (a no-op when pooling is disabled).
  */
-export function createDefaultSender(tlsPins?: Record<string, string[]>): Sender {
+export interface PooledSender extends Sender {
+  /** The keep-alive pool, or `undefined` when pooling is disabled. */
+  pool: OutboundConnectionPool | undefined;
+  /** Close all pooled connections and stop the idle reaper. Idempotent. */
+  destroy(): void;
+}
+
+export function createDefaultSender(
+  tlsPins?: Record<string, string[]>,
+  keepAlive?: KeepAlivePoolOptions | false
+): PooledSender {
   if (tlsPins !== undefined) {
     for (const [endpoint, pins] of Object.entries(tlsPins)) {
       try {
@@ -164,7 +198,9 @@ export function createDefaultSender(tlsPins?: Record<string, string[]>): Sender 
       }
     }
   }
-  return function defaultSender(item: RetryItem): Promise<void> {
+  // RangeError on invalid values, at startup — never mid-delivery.
+  const pool = keepAlive === false ? undefined : new OutboundConnectionPool(keepAlive);
+  const sender = function defaultSender(item: RetryItem): Promise<void> {
     return new Promise((resolve, reject) => {
       const url = new URL(item.targetUrl);
       // Pinning is per endpoint (exact targetUrl match). When pins are
@@ -174,6 +210,10 @@ export function createDefaultSender(tlsPins?: Record<string, string[]>): Sender 
       // (a MITM must not even see the request body). See `src/pinning.ts`
       // for why `checkServerIdentity` cannot do this job.
       const pins = url.protocol === "https:" ? tlsPins?.[item.targetUrl] : undefined;
+      // Pooled keep-alive agent for this origin (dedicated agent per pin
+      // whitelist, so a connection pinned for one endpoint can never serve
+      // another endpoint's whitelist).
+      const agent = pool?.agentFor(url, pins);
       const onResponse = (res: Parameters<Parameters<typeof httpsRequest>[2]>[0]): void => {
         res.resume();
         res.on("end", () => {
@@ -185,11 +225,27 @@ export function createDefaultSender(tlsPins?: Record<string, string[]>): Sender 
         });
         res.on("error", reject);
       };
+      // `agent: false` opts out of Node's global agent (which pools
+      // keep-alive connections by default since Node 19): each delivery
+      // gets a one-off agent and therefore a fresh connection.
       const req =
         url.protocol === "https:"
-          ? httpsRequest(url, { method: "POST", ...(pins ? { rejectUnauthorized: false } : {}) }, onResponse)
-          : httpRequest(url, { method: "POST" }, onResponse);
+          ? httpsRequest(
+              url,
+              { method: "POST", agent: agent ?? false, ...(pins ? { rejectUnauthorized: false } : {}) },
+              onResponse
+            )
+          : httpRequest(url, { method: "POST", agent: agent ?? false }, onResponse);
       req.on("error", reject);
+
+      if (pool && agent) {
+        req.on("socket", (socket) => pool.noteSocket(agent, socket));
+        // Once the request settles the socket is back in the agent's free
+        // list: stamp it idle and unref it, so a forgotten pool never pins
+        // process exit. Deferred one tick — the agent frees the socket
+        // just before 'close' fires.
+        req.on("close", () => setImmediate(() => pool.markIdle(agent)));
+      }
 
       const writePayload = (): void => {
         for (const [k, v] of Object.entries(item.headers)) {
@@ -209,37 +265,62 @@ export function createDefaultSender(tlsPins?: Record<string, string[]>): Sender 
       }
       // Normalized once, up front, so the per-handshake path is a plain compare.
       const allowed = pins.map(normalizePin);
-      let verified = false;
-      const verifyPin = (socket: TLSSocket): void => {
-        if (verified) return;
-        verified = true;
+      const verifyFreshPin = (tlsSocket: TLSSocket): void => {
         let presented: string;
         try {
-          const raw = (socket.getPeerCertificate() as { raw?: unknown }).raw;
+          const raw = (tlsSocket.getPeerCertificate() as { raw?: unknown }).raw;
           presented = spkiFingerprint(Buffer.from(raw as Buffer));
         } catch {
           presented = "<unreadable certificate>";
         }
         if (allowed.includes(presented)) {
+          // Cache the handshake result on the pooled socket: pinning is
+          // about server identity, and this connection already proved it.
+          pool?.cachePresentedPin(tlsSocket, presented);
           writePayload();
         } else {
           // Fail the delivery attempt: it follows the normal retry /
           // dead-letter path and the mismatch lands in the audit trail.
+          // The socket is destroyed with the request, so a mismatched
+          // peer is never handed to another delivery from the pool.
           req.destroy(new TlsPinMismatchError(item.targetUrl, presented));
         }
       };
       req.on("socket", (socket) => {
         const tlsSocket = socket as TLSSocket;
+        const cached = pool?.presentedPin(socket);
+        if (cached !== undefined) {
+          // Reused pooled connection: the peer was pinned at handshake
+          // time, and the pool key already binds this exact pin whitelist —
+          // a cached fingerprint outside the whitelist means a poisoned
+          // socket, so fail loudly instead of delivering over it.
+          if (allowed.includes(cached)) {
+            writePayload();
+          } else {
+            socket.destroy();
+            req.destroy(new TlsPinMismatchError(item.targetUrl, cached));
+          }
+          return;
+        }
+        let verified = false;
+        const verifyPin = (): void => {
+          if (verified) return;
+          verified = true;
+          verifyFreshPin(tlsSocket);
+        };
         const already = tlsSocket.getPeerCertificate() as { raw?: unknown };
         if (already && already.raw) {
           // Defensive: a reused agent socket may already be secure.
-          verifyPin(tlsSocket);
+          verifyPin();
         } else {
-          tlsSocket.once("secureConnect", () => verifyPin(tlsSocket));
+          tlsSocket.once("secureConnect", verifyPin);
         }
       });
     });
-  };
+  } as PooledSender;
+  sender.pool = pool;
+  sender.destroy = () => pool?.destroy();
+  return sender;
 }
 
 function readRawBody(req: Parameters<Parameters<typeof createServer>[0]>[0]): Promise<Buffer> {
@@ -258,8 +339,12 @@ function readRawBody(req: Parameters<Parameters<typeof createServer>[0]>[0]): Pr
  */
 export function createRelayServer(opts: RelayServerOptions): Server {
   const latencyOpts = opts.retry?.latency;
+  // When the caller does not inject a sender, the server owns the default
+  // sender — and with it the keep-alive pool, which is closed on server
+  // close so pooled outbound connections never outlive the server.
+  const defaultSender = opts.sender === undefined ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive) : undefined;
   const queue = new RetryQueue({
-    sender: opts.sender ?? createDefaultSender(opts.tlsPins),
+    sender: opts.sender ?? defaultSender,
     ...(opts.retry ?? {}),
     payloadEncryptor: opts.payloadEncryptor ?? opts.retry?.payloadEncryptor,
     // Wrap the caller's onSloMiss so every SLO miss is audited, not just observed.
@@ -714,7 +799,15 @@ export function createRelayServer(opts: RelayServerOptions): Server {
     res.writeHead(202, { "content-type": "application/json" }).end(JSON.stringify({ id, traceId, status: "accepted" }));
   });
 
-  server.on("close", () => queue.stop());
+  server.on("close", () => {
+    queue.stop();
+    // Pooled outbound connections must not outlive the server: close them
+    // (and stop the idle reaper) on the same close path that stops the
+    // queue — this covers stop() and the graceful-shutdown drain alike.
+    // Idle pool sockets are unref'd anyway, so even a missed close cannot
+    // pin process exit.
+    defaultSender?.destroy();
+  });
 
   if (opts.gracefulShutdown) {
     const timeoutMs = opts.gracefulShutdown.timeoutMs ?? 30_000;

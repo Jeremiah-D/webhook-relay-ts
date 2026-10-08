@@ -156,6 +156,42 @@ reliability primitives that matter for any signed-payload pipeline.
   `dead_letter` with the pin error. Endpoints without pins keep Node's default
   TLS verification. Empty whitelists and malformed pins throw `RangeError` at
   startup, never mid-delivery. Zero dependencies (`node:crypto` only).
+- `src/keepalive.ts` — outbound keep-alive connection pool: deliveries reuse
+  TCP/TLS connections per `(scheme, host, port)` instead of paying a handshake
+  per attempt. One `http.Agent`/`https.Agent` per origin, with
+  `maxSocketsPerHost` (default 64; extra requests queue FIFO inside the agent)
+  and idle reaping after `idleTimeoutMs` (default 30s) on an unref'd timer —
+  an idle pool never pins process exit, and a failed connection is never
+  handed to another delivery. Endpoints with a TLS pin whitelist get a
+  dedicated agent per pin set (so a connection pinned for one whitelist can
+  never serve another endpoint's), and the pin is still verified on
+  `secureConnect` for every new connection; a reused connection re-checks its
+  cached handshake fingerprint against the request's whitelist as a
+  poisoned-socket guard. `getStats()` exposes per-origin created / reused /
+  reaped counters plus live socket counts. Enabled by default
+  (`createRelayServer({ outboundKeepAlive })`, `createDefaultSender(pins,
+  keepAlive)`); pass `false` for one fresh connection per delivery (the legacy
+  opt-out; note Node 24's global agent pools by default, so the opt-out passes
+  `agent: false` explicitly). Pooled connections close with the server
+  (`close` → `queue.stop()` → pool `destroy()`), covering the
+  graceful-shutdown drain path. Invalid option values throw `RangeError` at
+  startup.
+- `bench/keepalive-bench.ts` (`npm run bench:keepalive`) — sequential
+  deliveries to a localhost stub, before/after numbers (50 warmup deliveries
+  per scenario; connection counts include warmup). Measured 2026-10-08,
+  Node v24.20.0, AMD EPYC 9D25, linux x64:
+
+  | scenario | deliveries | connections | total | mean | p50 | p99 |
+  |---|---|---|---|---|---|---|
+  | HTTP, no pool | 2000 | 2050 | 897 ms | 0.45 ms | 0.32 ms | 2.34 ms |
+  | HTTP, keep-alive pool | 2000 | 1 | 272 ms | 0.14 ms | 0.11 ms | 0.51 ms |
+  | HTTPS+pins, no pool | 400 | 450 | 1537 ms | 3.84 ms | 3.71 ms | 6.55 ms |
+  | HTTPS+pins, keep-alive pool | 400 | 1 | 92 ms | 0.23 ms | 0.19 ms | 0.50 ms |
+
+  A second run gave HTTP 3.0x and HTTPS+pins 9.9x (run-to-run variance: the
+  pooled arm is fast enough that a few slow iterations move p99). Takeaway:
+  the handshake is the whole cost at this scale — ~3x on plain HTTP,
+  ~10–17x when every delivery pays a TLS handshake.
 - `src/server.ts` — a minimal `node:http` receiver: read the raw body, verify
   the `x-signature` header with the injected `verifier` (defaults to
   HMAC-SHA256 with `secret`; pass e.g. `new Ed25519Verifier(pem)` to change
@@ -459,3 +495,15 @@ Requires Node 24+ (runs `.ts` directly via type stripping; zero dependencies).
   buffered batch one immediate attempt before draining. Server integration:
   three inbound webhooks become one downstream request, audited as
   `batch_flushed`.
+- `test/keepalive.test.ts` — the outbound keep-alive pool (12 tests):
+  `RangeError` on invalid pool options (also via `createDefaultSender`);
+  options reaching the underlying agent; sequential deliveries sharing one
+  connection by default (`created: 1`, `reused: 4`) with `getStats()`
+  observability; `keepAlive: false` opening a fresh connection per delivery
+  (the legacy opt-out); `maxSocketsPerHost` capping concurrent connections;
+  idle reaping after `idleTimeoutMs`; a failed connection never reused;
+  separate pools per origin and `destroy()` closing idle connections; TLS
+  pinning over pooled connections — one handshake for three pinned
+  deliveries, every pin-mismatch attempt failing with `TlsPinMismatchError`
+  on a fresh (never pooled) connection, and pinned/unpinned endpoints on the
+  same origin never sharing a pool.
