@@ -191,6 +191,52 @@ export interface DeadLetterEntry extends RetryItem {
   encryptedPayload?: EncryptedPayload;
 }
 
+/** Selector for batch dead-letter replays (see {@link RetryQueue.replayDeadLetters}). */
+export interface DeadLetterReplayFilter {
+  /**
+   * Only entries dead-lettered for this endpoint (exact `targetUrl` match).
+   * Unset: entries for every endpoint are eligible.
+   */
+  endpoint?: string;
+  /**
+   * Only these dead-letter ids — a subset of what the filter would
+   * otherwise match. Unset: every matched entry is replayed.
+   */
+  ids?: string[];
+}
+
+/**
+ * Dry-run preview of the dead letters a batch replay would pick up:
+ * operator metadata only. The payload itself is never exposed here
+ * (not even its encrypted envelope), so a dry run is safe to review in a
+ * reconciliation workflow before any real replay.
+ */
+export interface DeadLetterReplayPreview {
+  id: string;
+  endpoint: string;
+  attempts: number;
+  lastError: string;
+  deadLetteredAt: string;
+  payloadBytes: number;
+}
+
+/** A dead-letter entry that could not be re-queued. */
+export interface DeadLetterReplayFailure {
+  id: string;
+  error: string;
+}
+
+/** Outcome of {@link RetryQueue.replayDeadLetters}. */
+export interface DeadLetterBatchReplayResult {
+  /** Ids successfully re-queued with a fresh attempt budget. */
+  replayed: string[];
+  /**
+   * Entries that could not be re-queued (e.g. a sealed payload that no
+   * longer decrypts); they stay in the dead-letter list untouched.
+   */
+  failed: DeadLetterReplayFailure[];
+}
+
 export interface RetryQueueOptions {
   /** Sender function; defaults to a no-op success sender. Injectable for tests. */
   sender?: Sender;
@@ -695,12 +741,28 @@ export class RetryQueue {
   /**
    * Move a dead-lettered item back into the queue with a fresh attempt
    * budget (attempts reset to 0, scheduled immediately when running).
-   * Returns false when no dead-letter entry matches `id`.
+   * Returns false when no dead-letter entry matches `id`. A replay that
+   * fails (e.g. a sealed payload that no longer decrypts) leaves the entry
+   * in the dead-letter list and rethrows, so the operator can inspect and
+   * retry it again after fixing the cause.
    */
   replayDeadLetter(id: string): boolean {
     const idx = this.deadLetter.findIndex((e) => e.id === id);
     if (idx < 0) return false;
     const [entry] = this.deadLetter.splice(idx, 1);
+    try {
+      this.requeueDeadLetter(entry);
+    } catch (err) {
+      // The entry was already removed from the list: put it back so a
+      // failed replay never loses the dead letter.
+      this.deadLetter.splice(Math.min(idx, this.deadLetter.length), 0, entry);
+      throw err;
+    }
+    return true;
+  }
+
+  /** Re-queue a dead-letter entry that has already been removed from the list. */
+  private requeueDeadLetter(entry: DeadLetterEntry): void {
     const {
       attempts: _attempts,
       lastError: _lastError,
@@ -723,7 +785,6 @@ export class RetryQueue {
     if (this.running) {
       this.schedule(item.id, 0);
     }
-    return true;
   }
 
   /** Replay every dead-lettered item. Returns the number replayed. */
@@ -734,6 +795,91 @@ export class RetryQueue {
       if (this.replayDeadLetter(id)) replayed += 1;
     }
     return replayed;
+  }
+
+  /** Dead-letter entries matching `filter`, in dead-letter order. */
+  private matchDeadLetters(filter: DeadLetterReplayFilter): DeadLetterEntry[] {
+    const ids = filter.ids !== undefined ? new Set(filter.ids) : undefined;
+    return this.deadLetter.filter(
+      (e) =>
+        (filter.endpoint === undefined || e.targetUrl === filter.endpoint) &&
+        (ids === undefined || ids.has(e.id))
+    );
+  }
+
+  /**
+   * Batch replay of dead letters with a dry-run preview mode.
+   *
+   * With `dryRun: true` this returns the dead letters the filter would pick
+   * up as metadata-only previews — no side effects: nothing is re-queued,
+   * nothing is audited, and payloads are never touched (let alone
+   * decrypted). Use it in a payment-reconciliation review before committing
+   * to a real replay.
+   *
+   * A real replay processes the matched entries grouped by endpoint (each
+   * endpoint's backlog together, in dead-letter order) and replays them
+   * with a fresh attempt budget, like {@link RetryQueue.replayDeadLetter}.
+   * Every entry is replayed independently: one failure cannot stop or roll
+   * back the others — failures stay in the dead-letter list and are
+   * reported in `failed` with their error.
+   */
+  replayDeadLetters(
+    filter: DeadLetterReplayFilter,
+    opts: { dryRun: true }
+  ): DeadLetterReplayPreview[];
+  replayDeadLetters(
+    filter?: DeadLetterReplayFilter,
+    opts?: { dryRun?: false }
+  ): DeadLetterBatchReplayResult;
+  replayDeadLetters(
+    filter: DeadLetterReplayFilter = {},
+    opts: { dryRun?: boolean } = {}
+  ): DeadLetterReplayPreview[] | DeadLetterBatchReplayResult {
+    if (opts.dryRun === true) {
+      return this.matchDeadLetters(filter).map((e) => ({
+        id: e.id,
+        endpoint: e.targetUrl,
+        attempts: e.attempts,
+        lastError: e.lastError,
+        deadLetteredAt: e.deadLetteredAt,
+        payloadBytes: e.payloadBytes,
+      }));
+    }
+    // Group by endpoint (first-seen order): each endpoint's backlog is
+    // replayed together so the downstream pressure stays grouped instead
+    // of interleaved across endpoints.
+    const groups = new Map<string, DeadLetterEntry[]>();
+    for (const entry of this.matchDeadLetters(filter)) {
+      const group = groups.get(entry.targetUrl);
+      if (group) group.push(entry);
+      else groups.set(entry.targetUrl, [entry]);
+    }
+    const replayed: string[] = [];
+    const failed: DeadLetterReplayFailure[] = [];
+    const seen = new Set<string>();
+    for (const entries of groups.values()) {
+      for (const entry of entries) {
+        seen.add(entry.id);
+        try {
+          if (this.replayDeadLetter(entry.id)) {
+            replayed.push(entry.id);
+          } else {
+            failed.push({ id: entry.id, error: "dead-letter entry no longer present" });
+          }
+        } catch (err) {
+          failed.push({ id: entry.id, error: err instanceof Error ? err.message : String(err) });
+        }
+      }
+    }
+    // Like the single-item endpoint (which 404s on an unknown id), report
+    // requested ids that match nothing instead of silently ignoring them —
+    // a typo in `ids` should be visible, not invisible.
+    if (filter.ids !== undefined) {
+      for (const id of filter.ids) {
+        if (!seen.has(id)) failed.push({ id, error: "unknown dead-letter id" });
+      }
+    }
+    return { replayed, failed };
   }
 
   enqueue(item: RetryItem): void {

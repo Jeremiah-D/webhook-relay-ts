@@ -379,11 +379,11 @@ export function createRelayServer(opts: RelayServerOptions): Server {
   };
 
   /** Operator surface: dead-letter queue + audit-log queries + live event stream. */
-  const handleOperator = (
+  const handleOperator = async (
     req: Parameters<Parameters<typeof createServer>[0]>[0],
     res: Parameters<Parameters<typeof createServer>[0]>[1],
     pathname: string
-  ): void => {
+  ): Promise<void> => {
     if (!opts.operatorToken) {
       respondJson(res, 404, { error: "operator endpoints disabled" });
       return;
@@ -393,18 +393,28 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       return;
     }
     const isList = pathname === "/dead-letter";
+    const isBatchReplay = pathname === "/dead-letter/replay";
     const isAudit = pathname === "/audit";
     const isLatency = pathname === "/latency";
     const isEvents = pathname === "/events";
     const isMetrics = pathname === "/metrics";
     const replayMatch = /^\/dead-letter\/([^/]+)\/replay$/.exec(pathname);
-    if (!isList && !isAudit && !isLatency && !isEvents && !isMetrics && !replayMatch) {
+    if (
+      !isList &&
+      !isBatchReplay &&
+      !isAudit &&
+      !isLatency &&
+      !isEvents &&
+      !isMetrics &&
+      !replayMatch
+    ) {
       respondJson(res, 404, { error: "not found" });
       return;
     }
     if (
       !(
         (isList && req.method === "GET") ||
+        (isBatchReplay && req.method === "POST") ||
         (isAudit && req.method === "GET") ||
         (isLatency && req.method === "GET") ||
         (isEvents && req.method === "GET") ||
@@ -413,6 +423,58 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       )
     ) {
       respondJson(res, 405, { error: "method not allowed" });
+      return;
+    }
+    if (isBatchReplay) {
+      let body: Record<string, unknown>;
+      try {
+        const raw = (await readRawBody(req)).toString("utf8");
+        body = raw.trim() === "" ? {} : JSON.parse(raw);
+      } catch {
+        respondJson(res, 400, { error: "invalid JSON body" });
+        return;
+      }
+      if (typeof body !== "object" || body === null || Array.isArray(body)) {
+        respondJson(res, 400, { error: "body must be a JSON object" });
+        return;
+      }
+      const { endpoint, ids, dryRun } = body;
+      if (endpoint !== undefined && typeof endpoint !== "string") {
+        respondJson(res, 400, { error: "endpoint must be a string" });
+        return;
+      }
+      if (
+        ids !== undefined &&
+        (!Array.isArray(ids) || ids.some((i) => typeof i !== "string"))
+      ) {
+        respondJson(res, 400, { error: "ids must be an array of strings" });
+        return;
+      }
+      if (dryRun !== undefined && typeof dryRun !== "boolean") {
+        respondJson(res, 400, { error: "dryRun must be a boolean" });
+        return;
+      }
+      const filter = {
+        ...(endpoint !== undefined ? { endpoint } : {}),
+        ...(ids !== undefined ? { ids: ids as string[] } : {}),
+      };
+      if (dryRun === true) {
+        // Dry run: metadata-only preview, zero side effects — nothing is
+        // re-queued, nothing is audited, payloads are never touched.
+        respondJson(res, 200, {
+          dryRun: true,
+          entries: queue.replayDeadLetters(filter, { dryRun: true }),
+        });
+        return;
+      }
+      const result = queue.replayDeadLetters(filter);
+      opts.auditLog.append({
+        event: "dead_letter_batch_replayed",
+        replayed: result.replayed,
+        failed: result.failed,
+        ...(endpoint !== undefined ? { endpoint } : {}),
+      });
+      respondJson(res, 200, { replayed: result.replayed, failed: result.failed });
       return;
     }
     if (isMetrics) {
@@ -496,7 +558,16 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       pathname === "/events" ||
       pathname === "/metrics"
     ) {
-      handleOperator(req, res, pathname);
+      try {
+        await handleOperator(req, res, pathname);
+      } catch {
+        // Never let an operator-endpoint failure crash the process as an
+        // unhandled rejection; the batch replay path rethrows per-item
+        // decrypt errors internally, so this is a last-resort guard.
+        if (!res.headersSent) {
+          respondJson(res, 500, { error: "internal server error" });
+        }
+      }
       return;
     }
     if (req.method !== "POST") {

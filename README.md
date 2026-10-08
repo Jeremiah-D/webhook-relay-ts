@@ -176,7 +176,18 @@ reliability primitives that matter for any signed-payload pipeline.
   attempts/lastError/timestamp metadata, no raw payloads) and
   `POST /dead-letter/:id/replay` (manually re-queue a dead letter, audited as
   `dead_letter_replayed`) are guarded by an `operatorToken` bearer token and
-  disabled (404, fail closed) when it is unset. The same guard protects
+  disabled (404, fail closed) when it is unset. For reconciliation workflows,
+  `POST /dead-letter/replay` batch-replays dead letters: the JSON body takes
+  `{ endpoint?, ids?, dryRun? }` — `endpoint` limits the replay to one
+  downstream, `ids` to an explicit subset, and `dryRun: true` returns only a
+  metadata preview (`{ dryRun: true, entries: [...] }` with
+  id/endpoint/attempts/lastError/deadLetteredAt/payloadBytes, never the
+  payload) with zero side effects: nothing is re-queued, nothing is audited,
+  and sealed payloads are never decrypted. A real replay processes the
+  matched entries grouped by endpoint, each entry independently (one failure
+  cannot stop the others; failures stay dead-lettered), responds
+  `{ replayed: [...], failed: [{ id, error }] }`, and is audited as
+  `dead_letter_batch_replayed`. The same guard protects
   `GET /audit` (`?endpoint=`, `?event=` repeatable, `?since=`/`?until=` ISO-8601,
   `?limit=`), which queries the audit log through its index — delivery
   forensics per endpoint and time range.
