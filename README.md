@@ -184,10 +184,20 @@ reliability primitives that matter for any signed-payload pipeline.
   never serve another endpoint's), and the pin is still verified on
   `secureConnect` for every new connection; a reused connection re-checks its
   cached handshake fingerprint against the request's whitelist as a
-  poisoned-socket guard. `getStats()` exposes per-origin created / reused /
-  reaped counters plus live socket counts. Enabled by default
-  (`createRelayServer({ outboundKeepAlive })`, `createDefaultSender(pins,
-  keepAlive, outboundSigning, proxies)`); pass `false` for one fresh connection per
+  poisoned-socket guard. Health probing (WR-28): every idle socket is probed
+  *before* the agent hands it to a delivery, in the same tick — sockets the
+  kernel already knows are dead (destroyed, closed, or half-closed by the
+  peer) are culled on the spot and never serve a delivery, and on pinned
+  agents the cached SPKI fingerprint is re-verified against the whitelist
+  (a pooled socket without a verified pin is fail-closed). The probe is
+  passive (no bytes sent — an active ping would corrupt HTTP/1.1 framing),
+  so a death the kernel has not observed yet stays with TCP keep-alives
+  and the retry layer. `getStats()` exposes per-origin created / reused /
+  reaped / probeHits / probeMisses counters plus live socket counts.
+  Enabled by default; `healthProbe: false` hands the agent's free list
+  through untouched (`createRelayServer({ outboundKeepAlive })`,
+  `createDefaultSender(pins, keepAlive, outboundSigning, proxies)`); pass
+  `false` for one fresh connection per
   delivery (the legacy
   opt-out; note Node 24's global agent pools by default, so the opt-out passes
   `agent: false` explicitly). Pooled connections close with the server
@@ -546,3 +556,13 @@ Requires Node 24+ (runs `.ts` directly via type stripping; zero dependencies).
   deliveries, every pin-mismatch attempt failing with `TlsPinMismatchError`
   on a fresh (never pooled) connection, and pinned/unpinned endpoints on the
   same origin never sharing a pool.
+- `test/probe.test.ts` — the keep-alive health probe (9 tests):
+  `RangeError` on non-boolean `healthProbe`; `isSocketReusable` unit checks
+  (live socket passes, destroyed and peer half-closed sockets fail);
+  pinned-entry SPKI re-verification (no verified pin → fail-closed);
+  checkout culling a dead idle socket before reuse (`created: 2`,
+  `reused: 0`, `probeMisses >= 1`) and healthy reuse resuming with
+  `probeHits`; a server FIN idle-timeout socket never handed to a delivery;
+  `healthProbe: false` leaving the free list untouched; the background
+  sweep culling a poisoned-pin socket with no traffic; pinned TLS reuse
+  passing the probe.
