@@ -22,6 +22,10 @@
  * - `relay_probe_consecutive_failures{endpoint}`: gauge of the current
  *   consecutive probe-failure streak per endpoint (0 = healthy), present
  *   only when active probing is enabled.
+ * - `relay_starvation_guard_activations{endpoint}`: counter of
+ *   starvation-guard activation episodes (the deficit round-robin lane
+ *   scheduler started deferring urgent dispatches while normal demand was
+ *   backlogged), present only for endpoints where the guard activated.
  *
  * Cardinality note: labels are per endpoint (`targetUrl`), so a relay
  * fanning out to many distinct downstream URLs grows the series count —
@@ -60,6 +64,14 @@ export interface MetricsInput {
   latencyHistograms: LatencyHistogramInput[];
   /** Present only when active downstream probing is enabled. */
   probes?: ProbeMetricsInput[];
+  /** Present only for endpoints where the starvation guard activated. */
+  starvationGuard?: StarvationGuardMetricsInput[];
+}
+
+/** One endpoint's starvation-guard activation count, in Prometheus label order. */
+export interface StarvationGuardMetricsInput {
+  endpoint: string;
+  activations: number;
 }
 
 /** One endpoint's health-probe counters, in Prometheus label order. */
@@ -125,6 +137,17 @@ export function renderPrometheus(input: MetricsInput): string {
       lines.push(`relay_probe_total{endpoint="${ep}",result="success"} ${p.success}`);
       lines.push(`relay_probe_total{endpoint="${ep}",result="failure"} ${p.failure}`);
       lines.push(`relay_probe_consecutive_failures{endpoint="${ep}"} ${p.consecutiveFailures}`);
+    }
+  }
+  if (input.starvationGuard !== undefined && input.starvationGuard.length > 0) {
+    lines.push(
+      "# HELP relay_starvation_guard_activations Starvation-guard activation episodes by endpoint."
+    );
+    lines.push("# TYPE relay_starvation_guard_activations counter");
+    for (const s of input.starvationGuard) {
+      lines.push(
+        `relay_starvation_guard_activations{endpoint="${escapeLabelValue(s.endpoint)}"} ${s.activations}`
+      );
     }
   }
   return lines.join("\n") + "\n";

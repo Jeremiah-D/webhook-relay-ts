@@ -44,11 +44,12 @@ import {
   type DeliveryCountersInput,
   type LatencyHistogramInput,
   type ProbeMetricsInput,
+  type StarvationGuardMetricsInput,
 } from "./metrics.ts";
 
 export { TRACE_ID_HEADER };
 export { renderPrometheus };
-export type { DeliveryCountersInput, CircuitStateInput, LatencyHistogramInput };
+export type { DeliveryCountersInput, CircuitStateInput, LatencyHistogramInput, StarvationGuardMetricsInput };
 export { HttpDeliveryError, classifyFailure, parseRetryAfterMs };
 export type { FailureClass, ClassifiedFailure };
 
@@ -104,6 +105,16 @@ export interface UrgentLaneOptions {
    * Default: 100. Must be > 0.
    */
   maxUrgentPerSecond?: number;
+  /**
+   * WR-35 starvation guard: the minimum share of per-endpoint dispatch
+   * turns guaranteed to the normal lane while normal deliveries are
+   * backlogged for a dispatch slot (deficit round-robin; see
+   * {@link LaneScheduler}). Default: 0.2 (20%). Must be in the open
+   * interval (0, 1) — anything else throws `RangeError` at construction.
+   * Overridable per endpoint via
+   * {@link RetryQueue.setEndpointMinNormalShare}.
+   */
+  minNormalShare?: number;
   /** Clock in ms; defaults to `Date.now`. Injectable for deterministic tests. */
   now?: () => number;
 }
@@ -423,6 +434,15 @@ export interface RetryQueueOptions {
    */
   onBatch?: (info: BatchInfo) => void;
   /**
+   * Called once per starvation-guard activation episode (see
+   * {@link StarvationGuardAuditEvent}): the deficit round-robin lane
+   * scheduler started deferring urgent dispatches while normal deliveries
+   * were backlogged. Edge-triggered — one call when the guard engages,
+   * not one per deferred dispatch. The server audits these as
+   * `starvation_guard_activated`; library users get the hook directly.
+   */
+  onStarvationGuardAudit?: (event: StarvationGuardAuditEvent) => void;
+  /**
    * Prometheus metrics tuning (see `src/metrics.ts`). Delivery counters
    * (`relay_deliveries_total`) and circuit gauges
    * (`relay_endpoint_circuit_state`) are always collected; the latency
@@ -629,6 +649,285 @@ export interface UrgentStats {
 }
 
 /**
+ * Fired once per starvation-guard activation episode: the deficit
+ * round-robin scheduler (WR-35, see {@link LaneScheduler}) started
+ * deferring urgent dispatches because normal deliveries were backlogged
+ * for a dispatch slot. Edge-triggered — a sustained flood produces one
+ * event when the guard engages, not one per deferred dispatch (the same
+ * transition-auditing convention as the circuit breaker). The server
+ * audits these as `starvation_guard_activated`; library users get the
+ * hook directly.
+ */
+export interface StarvationGuardAuditEvent {
+  event: "starvation_guard_activated";
+  /** The endpoint whose lanes the guard rebalanced. */
+  endpoint: string;
+  /** Normal deliveries waiting for a dispatch slot when the guard engaged. */
+  waitingNormal: number;
+  /** Urgent deliveries parked by the guard when it engaged. */
+  waitingUrgent: number;
+  /** Effective minimum normal share of dispatch turns, in (0, 1). */
+  minNormalShare: number;
+}
+
+/** Per-endpoint lane-scheduler counters (WR-35 starvation guard). */
+export interface LaneStats {
+  endpoint: string;
+  /** Effective minimum normal share of dispatch turns, in (0, 1). */
+  minNormalShare: number;
+  /** Dispatch turns granted to the normal lane. */
+  normalTurns: number;
+  /** Dispatch turns granted to the urgent lane. */
+  urgentTurns: number;
+  /** Guard activation episodes (urgent deferred while normal was backlogged). */
+  guardActivations: number;
+}
+
+/** A delivery lane for the deficit round-robin dispatch scheduler. */
+export type Lane = "normal" | "urgent";
+
+/** Shared validation for the starvation-guard share: the open interval (0, 1). */
+function assertMinNormalShare(minNormalShare: number): void {
+  if (!Number.isFinite(minNormalShare) || minNormalShare <= 0 || minNormalShare >= 1) {
+    throw new RangeError(`minNormalShare must be in the open interval (0, 1), got ${minNormalShare}`);
+  }
+}
+
+/** Options for {@link LaneScheduler}. */
+export interface LaneSchedulerOptions {
+  /**
+   * Default minimum normal share of dispatch turns, in (0, 1).
+   * Default: 0.2. Invalid values throw `RangeError`.
+   */
+  minNormalShare?: number;
+  /** Called once per guard-activation episode (edge-triggered). */
+  onActivation?: (event: StarvationGuardAuditEvent) => void;
+}
+
+interface LaneEndpointState {
+  minNormalShare: number;
+  /** Earned-but-unspent urgent dispatch turns. */
+  deficitUrgent: number;
+  /** Parked urgent turn requests, FIFO. */
+  waitersUrgent: Array<() => void>;
+  /**
+   * Normal turns granted but not yet recorded as dispatched. Covers the
+   * handoff between the concurrency limiter granting a slot and the
+   * dispatch actually starting: without it the backlog probe would see a
+   * transient zero (the successor was shifted out of the limiter queue
+   * but hasn't dispatched yet) and work-conservingly release every parked
+   * urgent turn one dispatch early. Actively dispatching (in-flight)
+   * normals are *not* counted — only waiting or imminent demand.
+   */
+  undispatchedNormal: Set<symbol>;
+  /** Whether urgent is currently being deferred (episode latch). */
+  guardActive: boolean;
+  activations: number;
+  turnsNormal: number;
+  turnsUrgent: number;
+}
+
+/**
+ * Deficit round-robin lane gate (WR-35): starvation protection for the
+ * normal lane while the urgent fast lane (WR-12) is under load.
+ *
+ * Both lanes take a dispatch turn here before invoking the sender. The
+ * normal lane is *never* delayed by the gate — its waits stay exactly the
+ * ones it already had (concurrency limiter, quota, circuit, backoff). The
+ * urgent lane is granted immediately whenever no normal demand is
+ * backlogged (work-conserving: a lone lane is never throttled). While
+ * normal deliveries are backlogged for a dispatch slot, every normal
+ * *dispatch* (see {@link LaneScheduler.recordNormalDispatch}) earns the
+ * urgent lane `(1 - minNormalShare) / minNormalShare` turns of deficit,
+ * and urgent turns are granted FIFO only while deficit allows — so over
+ * any sustained contention window the normal lane keeps at least
+ * `minNormalShare` of dispatch turns.
+ *
+ * The gate is ordering-only: it never sheds a delivery, never burns an
+ * urgent token-bucket token, and never consumes retry budget — it composes
+ * with the WR-12 `UrgentRateLimiter` without double rate-limiting (the
+ * bucket still bounds the urgent *rate*; the gate only paces the urgent
+ * *share* while normal is backlogged). Deficit accrues only while urgent
+ * demand is actually backlogged (no retroactive credit for idle periods,
+ * per classic DRR), and resets when the normal backlog drains.
+ */
+export class LaneScheduler {
+  private readonly defaultShare: number;
+  private readonly onActivation?: (event: StarvationGuardAuditEvent) => void;
+  private readonly states = new Map<string, LaneEndpointState>();
+
+  constructor(opts: LaneSchedulerOptions = {}) {
+    const share = opts.minNormalShare ?? 0.2;
+    assertMinNormalShare(share);
+    this.defaultShare = share;
+    this.onActivation = opts.onActivation;
+  }
+
+  private stateFor(endpoint: string): LaneEndpointState {
+    let st = this.states.get(endpoint);
+    if (!st) {
+      st = {
+        minNormalShare: this.defaultShare,
+        deficitUrgent: 0,
+        waitersUrgent: [],
+        undispatchedNormal: new Set(),
+        guardActive: false,
+        activations: 0,
+        turnsNormal: 0,
+        turnsUrgent: 0,
+      };
+      this.states.set(endpoint, st);
+    }
+    return st;
+  }
+
+  /** Effective minimum normal share for `endpoint` (override wins over default). */
+  shareFor(endpoint: string): number {
+    return this.stateFor(endpoint).minNormalShare;
+  }
+
+  /**
+   * Override the minimum normal share for one endpoint at runtime.
+   * Invalid values throw `RangeError` and leave the current share intact.
+   */
+  setEndpointMinNormalShare(endpoint: string, minNormalShare: number): void {
+    assertMinNormalShare(minNormalShare);
+    this.stateFor(endpoint).minNormalShare = minNormalShare;
+    this.pump(endpoint);
+  }
+
+  /**
+   * Normal demand visible to the scheduler: turns granted but not yet
+   * recorded as dispatched. Because the queue takes the turn *before* the
+   * concurrency limiter, this set is exactly the waiting set — the
+   * limiter's FIFO, the limiter-to-dispatch handoff, everything short of
+   * the sender invocation. Actively dispatching (in-flight) normals are
+   * not demand — they're being served.
+   */
+  private backlogOf(st: LaneEndpointState): number {
+    return st.undispatchedNormal.size;
+  }
+
+  /**
+   * Take a dispatch turn for `lane` on `endpoint`. Resolves with a release
+   * function the caller must invoke exactly once when the dispatch
+   * settles — releasing re-runs the scheduler, so parked urgent turns may
+   * become affordable and a drained normal backlog releases them all.
+   *
+   * The normal lane is never delayed here: its waits stay exactly the ones
+   * it already had (concurrency limiter, quota, circuit, backoff). A
+   * granted normal turn is tracked as undispatched until
+   * {@link LaneScheduler.recordNormalDispatch} runs, so the handoff never
+   * looks like a drained backlog.
+   */
+  acquireTurn(endpoint: string, lane: Lane): Promise<() => void> {
+    const st = this.stateFor(endpoint);
+    if (lane === "normal") {
+      st.turnsNormal += 1;
+      const token = Symbol();
+      st.undispatchedNormal.add(token);
+      this.pump(endpoint);
+      return Promise.resolve(() => {
+        // Idempotent: a turn whose dispatch was recorded was already
+        // removed from the undispatched set there.
+        st.undispatchedNormal.delete(token);
+        this.releaseTurn(endpoint);
+      });
+    }
+    return new Promise<() => void>((resolve) => {
+      st.waitersUrgent.push(() => resolve(() => this.releaseTurn(endpoint)));
+      this.pump(endpoint);
+    });
+  }
+
+  /**
+   * Record that a normal dispatch is starting (called after the limiter
+   * granted its slot and the liveness check passed, right before the
+   * sender is invoked). Each dispatch earns the urgent lane
+   * `(1 - minNormalShare) / minNormalShare` turns of deficit — but only
+   * while urgent demand is actually backlogged (classic DRR grants quantum
+   * to backlogged flows only; idle periods earn no retroactive credit).
+   *
+   * The pump runs *before* this dispatch leaves the undispatched set, so
+   * a successor shifted out of the limiter queue mid-handoff still counts
+   * as backlogged demand instead of triggering a work-conserving release.
+   */
+  recordNormalDispatch(endpoint: string): void {
+    const st = this.stateFor(endpoint);
+    if (st.waitersUrgent.length > 0) {
+      st.deficitUrgent += (1 - st.minNormalShare) / st.minNormalShare;
+    }
+    this.pump(endpoint);
+    // Normal dispatches leave the limiter in FIFO order, matching
+    // turn-grant order, so the oldest undispatched turn is this dispatch's.
+    // (Only the set's size feeds the backlog probe; order is bookkeeping.)
+    const oldest = st.undispatchedNormal.values().next().value;
+    if (oldest !== undefined) st.undispatchedNormal.delete(oldest);
+  }
+
+  /** Release a dispatch turn; re-runs the scheduler for the endpoint. */
+  private releaseTurn(endpoint: string): void {
+    // The turn carries no capacity — releasing only re-runs the
+    // scheduler, so a drained normal backlog work-conservingly releases
+    // parked urgent turns.
+    this.pump(endpoint);
+  }
+
+  private pump(endpoint: string): void {
+    const st = this.states.get(endpoint);
+    if (!st) return;
+    const backlog = this.backlogOf(st);
+    if (backlog === 0) {
+      // Work-conserving: no normal demand — every parked urgent turn goes
+      // immediately, and earned deficit resets (no credit is carried
+      // across idle periods).
+      const waiting = st.waitersUrgent.splice(0);
+      st.deficitUrgent = 0;
+      st.turnsUrgent += waiting.length;
+      for (const grant of waiting) grant();
+      st.guardActive = false;
+      return;
+    }
+    // Contention: serve affordable urgent turns FIFO.
+    while (st.waitersUrgent.length > 0 && st.deficitUrgent >= 1) {
+      const grant = st.waitersUrgent.shift()!;
+      st.deficitUrgent -= 1;
+      st.turnsUrgent += 1;
+      grant();
+    }
+    if (st.waitersUrgent.length > 0) {
+      // Urgent dispatches are being deferred while normal demand is
+      // backlogged: the guard is engaged. Edge-triggered — one activation
+      // per episode, not one per deferred dispatch.
+      if (!st.guardActive) {
+        st.guardActive = true;
+        st.activations += 1;
+        this.onActivation?.({
+          event: "starvation_guard_activated",
+          endpoint,
+          waitingNormal: backlog,
+          waitingUrgent: st.waitersUrgent.length,
+          minNormalShare: st.minNormalShare,
+        });
+      }
+    } else {
+      st.guardActive = false;
+    }
+  }
+
+  /** Per-endpoint lane counters, in first-seen endpoint order. */
+  stats(): LaneStats[] {
+    return [...this.states.entries()].map(([endpoint, st]) => ({
+      endpoint,
+      minNormalShare: st.minNormalShare,
+      normalTurns: st.turnsNormal,
+      urgentTurns: st.turnsUrgent,
+      guardActivations: st.activations,
+    }));
+  }
+}
+
+/**
  * RetryQueue holds outbound deliveries and retries them with exponential
  * backoff + jitter. Items that exhaust `maxAttempts` are moved to an
  * in-memory dead-letter list for later inspection.
@@ -659,6 +958,14 @@ export class RetryQueue {
   private readonly urgentRetryDelayMs: number;
   private readonly urgentLimiter: UrgentRateLimiter;
   private readonly urgentStats = new Map<string, { delivered: number; retried: number; throttled: number }>();
+  /**
+   * Deficit round-robin lane gate (WR-35): paces urgent dispatches while
+   * normal deliveries are backlogged, guaranteeing the normal lane its
+   * `minNormalShare` of dispatch turns. Ordering-only — never a second
+   * rate limit on top of the urgent token bucket.
+   */
+  private readonly laneScheduler: LaneScheduler;
+  private readonly onStarvationGuardAudit?: (event: StarvationGuardAuditEvent) => void;
   private readonly latency?: LatencyTracker;
   private readonly onSloMiss?: (info: SloMissInfo) => void;
   private readonly quota?: EndpointQuota;
@@ -747,6 +1054,11 @@ export class RetryQueue {
       opts.urgent?.maxUrgentPerSecond ?? 100,
       opts.urgent?.now ?? Date.now
     );
+    this.onStarvationGuardAudit = opts.onStarvationGuardAudit;
+    this.laneScheduler = new LaneScheduler({
+      minNormalShare: opts.urgent?.minNormalShare ?? 0.2,
+      onActivation: (event) => this.onStarvationGuardAudit?.(event),
+    });
     this.latency = opts.latency ? new LatencyTracker(opts.latency) : undefined;
     this.onSloMiss = opts.latency?.onSloMiss;
     this.quota =
@@ -1374,18 +1686,38 @@ export class RetryQueue {
       entry.priority = "normal";
     }
     const fastLane = entry.priority === "urgent";
+    // WR-35 starvation guard: both lanes take a dispatch turn from the
+    // deficit round-robin scheduler at the actual dispatch point, *before*
+    // the concurrency limiter. Turn-first matters: the granted turn marks
+    // the delivery as backlogged demand (see `undispatchedNormal`) from
+    // grant time, so the scheduler never sees a transient "drained"
+    // backlog while a normal delivery moves from the limiter queue to its
+    // dispatch. The fast lane still bypasses the concurrency limiter below
+    // (its bound stays the token bucket above — the gate adds no second
+    // rate limit), but while normal deliveries are backlogged, urgent
+    // turns are paced so normal keeps at least minNormalShare of dispatch
+    // turns. Work-conserving: with no normal backlog an urgent turn is
+    // granted immediately, and the normal lane is never delayed by the
+    // gate at all.
+    const releaseTurn = await this.laneScheduler.acquireTurn(
+      entry.targetUrl,
+      fastLane ? "urgent" : "normal"
+    );
     // The fast lane bypasses the per-endpoint concurrency limiter entirely:
     // an urgent delivery never waits behind queued normal deliveries. Its
     // own bound is the token bucket above.
     const release = fastLane ? undefined : await this.limiter.acquire(entry.targetUrl);
     try {
       // The queue may have stopped, or the item may have been settled, while
-      // we waited for a concurrency slot. Bail out; the release cascades to
-      // the next waiter so nobody hangs.
+      // we waited for a turn or a concurrency slot. Bail out; the releases
+      // cascade to the next waiters so nobody hangs.
       if ((!this.running && !force) || !this.queue.has(id)) {
         if (probe) this.breaker?.cancelProbe(entry.targetUrl);
         return;
       }
+      // A normal dispatch earns the urgent lane its proportional deficit
+      // (only while urgent demand is backlogged) — the DRR earning event.
+      if (!fastLane) this.laneScheduler.recordNormalDispatch(entry.targetUrl);
       try {
         await this.sender(entry);
         this.breaker?.recordSuccess(entry.targetUrl);
@@ -1467,6 +1799,14 @@ export class RetryQueue {
         }
       }
     } finally {
+      // Released in reverse acquisition order: the turn first, so the
+      // scheduler still sees the limiter-queued successor as backlogged
+      // (no transient dip that would work-conservingly release every
+      // parked urgent turn one dispatch early), then the limiter slot.
+      // Releasing the turn re-runs the lane scheduler: parked urgent
+      // turns may have become affordable, and a drained normal backlog
+      // releases them all (work-conserving).
+      releaseTurn();
       release?.();
     }
   }
@@ -1535,6 +1875,24 @@ export class RetryQueue {
   }
 
   /**
+   * Per-endpoint lane-scheduler counters (WR-35 starvation guard):
+   * effective `minNormalShare`, dispatch turns granted to each lane, and
+   * guard activation episodes. Empty when no delivery has taken a turn yet.
+   */
+  getLaneStats(): LaneStats[] {
+    return this.laneScheduler.stats();
+  }
+
+  /**
+   * Override the starvation-guard minimum normal share for one endpoint at
+   * runtime (WR-35). Invalid values throw `RangeError` and leave the
+   * current share intact.
+   */
+  setEndpointMinNormalShare(endpoint: string, minNormalShare: number): void {
+    this.laneScheduler.setEndpointMinNormalShare(endpoint, minNormalShare);
+  }
+
+  /**
    * Per-endpoint accepted→delivered latency distribution (p50/p95/p99) plus
    * SLO attainment. Empty when latency tracking is disabled or no delivery
    * has completed yet. With `endpoint` set, only that endpoint is returned.
@@ -1551,7 +1909,9 @@ export class RetryQueue {
    * histogram (`relay_delivery_latency_seconds_*`) when latency tracking
    * is enabled, and the downstream health-probe series
    * (`relay_probe_total`, `relay_probe_consecutive_failures`) when
-   * probing is enabled.
+   * probing is enabled, and the starvation-guard activation counter
+   * (`relay_starvation_guard_activations`) for endpoints where the WR-35
+   * lane guard engaged.
    */
   renderMetrics(): string {
     const deliveries: DeliveryCountersInput[] = [...this.deliveryCounters.entries()].map(
@@ -1590,7 +1950,13 @@ export class RetryQueue {
       failure: s.failure,
       consecutiveFailures: s.consecutiveFailures,
     }));
-    return renderPrometheus({ deliveries, circuits, latencyHistograms, probes });
+    // Only endpoints where the guard actually engaged get a series (the
+    // same convention as the circuit-state gauge).
+    const starvationGuard: StarvationGuardMetricsInput[] = this.laneScheduler
+      .stats()
+      .filter((s) => s.guardActivations > 0)
+      .map((s) => ({ endpoint: s.endpoint, activations: s.guardActivations }));
+    return renderPrometheus({ deliveries, circuits, latencyHistograms, probes, starvationGuard });
   }
 
   /**

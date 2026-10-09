@@ -632,6 +632,12 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       opts.auditLog.append(event);
       opts.retry?.onProbeAudit?.(event);
     },
+    // Wrap the caller's hook so every starvation-guard activation is
+    // audited, not just observed.
+    onStarvationGuardAudit: (event) => {
+      opts.auditLog.append(event);
+      opts.retry?.onStarvationGuardAudit?.(event);
+    },
     // Wrap the caller's onSloMiss so every SLO miss is audited, not just observed.
     latency: latencyOpts
       ? {

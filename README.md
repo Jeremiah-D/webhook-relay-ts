@@ -78,7 +78,19 @@ reliability primitives that matter for any signed-payload pipeline.
   of one second) — an empty bucket degrades the item to the normal lane
   instead of dropping it, which is the lane's abuse guard.
   `getUrgentStats()` reports per-endpoint `delivered` / `retried` /
-  `throttled` counters.
+  `throttled` counters. Under sustained urgent load a per-endpoint
+  deficit round-robin scheduler (WR-35, `urgent.minNormalShare`, default
+  20%, per-endpoint overridable via `setEndpointMinNormalShare()`)
+  guarantees the normal lane at least that share of dispatch turns while
+  normal deliveries are backlogged: each normal dispatch earns the urgent
+  lane its proportional turns, and urgent turns beyond that wait. The
+  scheduler is work-conserving (a lone lane is never delayed) and
+  ordering-only — it never sheds, never burns urgent tokens, and never
+  touches the retry budget, so it composes with the token bucket without
+  double rate-limiting. Guard activations are counted in
+  `relay_starvation_guard_activations{endpoint}` and audited as
+  `starvation_guard_activated`; `getLaneStats()` reports per-endpoint
+  turns granted per lane.
 - `src/quota.ts` — per-endpoint delivery quota (`EndpointQuota`): a token
   bucket sized to one minute of budget (`deliveriesPerMinute`), refilled
   lazily. An attempt that finds an empty bucket is rescheduled for the next
@@ -537,7 +549,10 @@ endpoints (404 when disabled):
   outcomes (`success` / `failure`), only when `probe` is configured,
 - `relay_probe_consecutive_failures{endpoint}` — current consecutive
   probe-failure streak per endpoint (0 = healthy), only when `probe` is
-  configured.
+  configured,
+- `relay_starvation_guard_activations{endpoint}` — starvation-guard
+  activation episodes (urgent dispatches deferred while normal demand was
+  backlogged), only for endpoints where the guard engaged.
 
 ### Dead-letter auto-replay
 
@@ -692,6 +707,14 @@ Requires Node 24+ (runs `.ts` directly via type stripping; zero dependencies).
   replayed dead-letter items keep their priority (this caught a real bug —
   the dead-letter push dropped `priority`); normal items are unaffected;
   invalid configs throw.
+- `test/starvation-guard.test.ts` — the WR-35 lane scheduler: `LaneScheduler`
+  deficit round-robin pacing under a deterministic urgent flood (normal
+  keeps ≥ `minNormalShare` of dispatch turns, each urgent batch waits for
+  the next normal dispatch), work-conserving release when the backlog
+  drains, pass-through with no urgent pressure, composition with the
+  urgent token bucket (no double rate-limiting), `RangeError` on invalid
+  shares, per-endpoint share overrides, and activation auditing +
+  `relay_starvation_guard_activations` metrics.
 - `test/latency.test.ts` — `LatencyTracker`: percentiles and SLO attainment
   over known samples, per-endpoint isolation and filtering, bounded rolling
   window eviction, discard/unknown-id no-ops, re-accept restarts the clock,
