@@ -282,7 +282,11 @@ reliability primitives that matter for any signed-payload pipeline.
   matched entries grouped by endpoint, each entry independently (one failure
   cannot stop the others; failures stay dead-lettered), responds
   `{ replayed: [...], failed: [{ id, error }] }`, and is audited as
-  `dead_letter_batch_replayed`. The same guard protects
+  `dead_letter_batch_replayed`. The opt-in `autoReplay` server option
+  (see *Dead-letter auto-replay* below) replays the whole list on a timer
+  with identical fresh-budget semantics, controlled by
+  `POST /dead-letter/auto-replay/pause|resume|trigger` and observed via
+  `GET /dead-letter/auto-replay/status`. The same guard protects
   `GET /audit` (`?endpoint=`, `?event=` repeatable, `?since=`/`?until=` ISO-8601,
   `?limit=`), which queries the audit log through its index — delivery
   forensics per endpoint and time range.
@@ -379,7 +383,9 @@ written to the audit log, so the log is the machine's trace.
 - `dead_letter` → **`delivering`** (fresh attempt budget) when an operator
   replays it via `POST /dead-letter/:id/replay`, audited as
   `dead_letter_replayed`. A replayed item that fails again walks the same
-  `delivering` → `retrying` → `dead_letter` path.
+  `delivering` → `retrying` → `dead_letter` path. The opt-in
+  auto-replay scheduler (see *Dead-letter auto-replay* below) replays the
+  whole list on a timer with identical fresh-budget semantics.
 
 ### Failure classification
 
@@ -455,6 +461,57 @@ endpoints (404 when disabled):
   enabled; bucket bounds via `retry.metrics.histogramBucketsMs`
   (default 50ms…10s).
 
+### Dead-letter auto-replay
+
+Opt-in timed replays of the dead-letter list (`src/autoreplay.ts`): with
+`autoReplay` enabled — `createRelayServer({ ..., autoReplay: { enabled:
+true, intervalMs: 60_000, maxRounds: 10, maxIntervalMs: 3_600_000 } })` (or
+`retry.autoReplay` on a raw queue) — a `DeadLetterAutoReplayer` runs
+rounds that replay the whole dead letter with the **same fresh-budget
+semantics as a manual replay**: a replayed entry re-enters the queue with
+its attempt counter reset to 0 and walks the normal delivery path
+(exponential backoff, circuit breaker, quota, downstream `Retry-After`
+honoring). A replayed item that delivers leaves the dead letter for good;
+one that fails again walks back into the dead letter through the normal
+path. Off by default — nothing is ever replayed automatically unless the
+operator opts in — and invalid option values throw `RangeError`.
+
+**Rounds counting.** `maxRounds` counts *consecutive* rounds with zero
+successfully replayed items; entries that fail to re-queue (e.g. a sealed
+payload with no decryptor configured) do not count as successes. Any
+round replaying >= 1 item resets the counter to 0. Reaching `maxRounds`
+stops the scheduler permanently and audits `dead_letter_auto_replay`
+with `{ reason: "rounds_exhausted", consecutiveEmptyRounds, totalReplayed,
+lastRunAt }`. Between rounds the wait backs off exponentially:
+`min(intervalMs * 2^consecutiveEmptyRounds, maxIntervalMs)` — a backlog
+that keeps replaying stays on the base interval, a persistently empty (or
+poison-only) dead letter stops being polled aggressively.
+
+**Operator controls** (same Bearer <redacted>, fail closed to 404 without
+`operatorToken`):
+
+- `POST /dead-letter/auto-replay/pause` — freeze the schedule; a pending
+  round is cancelled but counters and totals are retained.
+- `POST /dead-letter/auto-replay/resume` — continue where it left off;
+  after an exhaustion stop this is the operator's explicit "try again" and
+  resets the counter to 0, restarting the schedule
+  (`{ paused: false, restarted: true }`).
+- `POST /dead-letter/auto-replay/trigger` — run one round immediately,
+  outside the schedule. It goes through the same accounting as a
+  scheduled round: an empty trigger increments the empty-rounds counter, a
+  successful one resets it, and it can itself trigger the exhaustion stop
+  (audited). It does not unpause a paused scheduler, and a stopped
+  scheduler ignores it.
+- `GET /dead-letter/auto-replay/status` — `{ enabled, paused, stopped,
+  consecutiveEmptyRounds, totalReplayed, lastRunAt, nextRunAt }`. Readable
+  even when the scheduler was never configured (`enabled: false`); the
+  control endpoints answer 404 in that case.
+
+The round timer is unref'd, so a configured scheduler never pins the
+process open, and `RetryQueue.stop()` / `shutdown()` cancel any pending
+round — a round never fires mid-shutdown and re-queues dead letters the
+operator expected to stay parked.
+
 ## Run
 
 ```sh
@@ -481,6 +538,18 @@ Requires Node 24+ (runs `.ts` directly via type stripping; zero dependencies).
   (with window-edge inclusivity), non-numeric timestamps, nonce expiry after
   the window, oldest-first eviction beyond `maxEntries`, and `RangeError` on
   invalid configs.
+- `test/autoreplay.test.ts` — the opt-in dead-letter auto-replay
+  scheduler: `triggerOnce` replays dead letters with fresh-budget semantics
+  (a replayed item leaves the dead letter and delivers on attempt 1),
+  consecutive-empty-round counting with exponential backoff
+  (`intervalMs * 2^n` capped by `maxIntervalMs`), a success resetting the
+  counter, failed re-queues not counting as successes, permanent stop at
+  `maxRounds` with the `dead_letter_auto_replay` audit event (fired exactly
+  once), pause/resume state retention, `RangeError` on invalid configs,
+  shutdown clearing the round timer, and the operator endpoints
+  (`status` / `pause` / `resume` / `trigger`, fail-closed 404 without
+  `operatorToken`, 403 on a wrong bearer, 405 on method mismatch, and an
+  end-to-end trigger replaying a real dead letter).
 - `test/retry.test.ts` — a flaky sender (fails twice, then succeeds) delivers
   on the third attempt with increasing backoff; a permanently failing sender
   ends in the dead-letter list. Covers the jitter layer: additive jitter with

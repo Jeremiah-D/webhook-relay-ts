@@ -13,6 +13,7 @@ import {
   type Verifier,
 } from "./verify.ts";
 import { RetryQueue, type DeliveryPriority, type RetryItem, type Sender } from "./retry.ts";
+import type { AutoReplayOptions } from "./autoreplay.ts";
 import { HttpDeliveryError, parseRetryAfterMs } from "./failure.ts";
 import { installGracefulShutdown } from "./shutdown.ts";
 import type { PayloadEncryptor } from "./encrypt.ts";
@@ -157,11 +158,26 @@ export interface RelayServerOptions {
   outboundSigning?: OutboundSigningConfig;
   /**
    * Bearer token guarding the operator endpoints (`GET /dead-letter`,
-   * `POST /dead-letter/:id/replay`, `GET /audit`, `GET /latency`,
-   * `GET /events`, `GET /metrics`). When unset, those endpoints are
-   * disabled and answer 404 (fail closed).
+   * `POST /dead-letter/:id/replay`, `POST /dead-letter/replay`,
+   * the `/dead-letter/auto-replay/*` controls, `GET /audit`,
+   * `GET /latency`, `GET /events`, `GET /metrics`). When unset, those
+   * endpoints are disabled and answer 404 (fail closed).
    */
   operatorToken?: string;
+  /**
+   * Opt-in dead-letter auto-replay scheduler (see `src/autoreplay.ts` and
+   * the `autoReplay` `RetryQueue` option): timed rounds that replay the
+   * whole dead-letter list with the same fresh-budget semantics as the
+   * manual `POST /dead-letter/replay`. Exponential backoff between
+   * consecutive empty rounds (`intervalMs * 2^n`, capped by
+   * `maxIntervalMs`); after `maxRounds` consecutive empty rounds the
+   * scheduler stops permanently and audits `dead_letter_auto_replay`.
+   * Controlled at runtime by `POST /dead-letter/auto-replay/pause`,
+   * `/resume`, `/trigger` and observed via
+   * `GET /dead-letter/auto-replay/status`. Off by default — manual replay
+   * is the only behavior unless the operator opts in.
+   */
+  autoReplay?: AutoReplayOptions;
   /**
    * Replay protection for inbound webhooks. When set, each accepted POST must
    * carry a unique `x-nonce` header: a nonce seen inside the guard's window is
@@ -559,6 +575,15 @@ export function createRelayServer(opts: RelayServerOptions): Server {
     sender: opts.sender ?? defaultSender,
     ...(opts.retry ?? {}),
     payloadEncryptor: opts.payloadEncryptor ?? opts.retry?.payloadEncryptor,
+    // An explicit server-level `autoReplay` wins over the nested
+    // `retry.autoReplay`; either way the queue owns the scheduler.
+    autoReplay: opts.autoReplay ?? opts.retry?.autoReplay,
+    // Wrap the caller's hook so rounds-exhaustion is always audited, not
+    // just observed.
+    onAutoReplayAudit: (event) => {
+      opts.auditLog.append(event);
+      opts.retry?.onAutoReplayAudit?.(event);
+    },
     // Wrap the caller's onSloMiss so every SLO miss is audited, not just observed.
     latency: latencyOpts
       ? {
@@ -702,6 +727,10 @@ export function createRelayServer(opts: RelayServerOptions): Server {
     const isLatency = pathname === "/latency";
     const isEvents = pathname === "/events";
     const isMetrics = pathname === "/metrics";
+    const isAutoStatus = pathname === "/dead-letter/auto-replay/status";
+    const isAutoPause = pathname === "/dead-letter/auto-replay/pause";
+    const isAutoResume = pathname === "/dead-letter/auto-replay/resume";
+    const isAutoTrigger = pathname === "/dead-letter/auto-replay/trigger";
     const replayMatch = /^\/dead-letter\/([^/]+)\/replay$/.exec(pathname);
     if (
       !isList &&
@@ -710,6 +739,10 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       !isLatency &&
       !isEvents &&
       !isMetrics &&
+      !isAutoStatus &&
+      !isAutoPause &&
+      !isAutoResume &&
+      !isAutoTrigger &&
       !replayMatch
     ) {
       respondJson(res, 404, { error: "not found" });
@@ -723,6 +756,10 @@ export function createRelayServer(opts: RelayServerOptions): Server {
         (isLatency && req.method === "GET") ||
         (isEvents && req.method === "GET") ||
         (isMetrics && req.method === "GET") ||
+        (isAutoStatus && req.method === "GET") ||
+        (isAutoPause && req.method === "POST") ||
+        (isAutoResume && req.method === "POST") ||
+        (isAutoTrigger && req.method === "POST") ||
         (replayMatch && req.method === "POST")
       )
     ) {
@@ -847,6 +884,61 @@ export function createRelayServer(opts: RelayServerOptions): Server {
           encrypted: e.encryptedPayload !== undefined,
         }))
       );
+      return;
+    }
+    if (isAutoStatus || isAutoPause || isAutoResume || isAutoTrigger) {
+      const replayer = queue.getAutoReplayer();
+      if (isAutoStatus) {
+        // Status is readable even when the scheduler was never configured:
+        // `enabled: false` explains why there is nothing to control.
+        respondJson(
+          res,
+          200,
+          replayer
+            ? replayer.status()
+            : {
+                enabled: false,
+                paused: false,
+                stopped: false,
+                consecutiveEmptyRounds: 0,
+                totalReplayed: 0,
+                lastRunAt: null,
+                nextRunAt: null,
+              }
+        );
+        return;
+      }
+      if (!replayer) {
+        respondJson(res, 404, { error: "dead-letter auto-replay is not configured" });
+        return;
+      }
+      if (isAutoPause) {
+        // Pause freezes the schedule with state retained: a pending round
+        // is cancelled, but the rounds counter and totals survive for
+        // resume.
+        replayer.pause();
+        respondJson(res, 200, { paused: true });
+        return;
+      }
+      if (isAutoResume) {
+        // Resuming a rounds-exhausted scheduler is the operator's explicit
+        // "try again": the counter resets to 0 and the schedule restarts.
+        const { restarted } = replayer.resume();
+        respondJson(res, 200, { paused: false, restarted });
+        return;
+      }
+      // isAutoTrigger: one round immediately, outside the schedule. It goes
+      // through the same accounting as a scheduled round — an empty trigger
+      // increments the empty-round counter, a successful one resets it, and
+      // it can itself trigger the rounds-exhausted stop (audited as
+      // `dead_letter_auto_replay`). A stopped scheduler ignores it.
+      const round = replayer.triggerOnce();
+      respondJson(res, 200, {
+        replayed: round.replayed,
+        failed: round.failed,
+        consecutiveEmptyRounds: round.consecutiveEmptyRounds,
+        stopped: round.stopped,
+      });
       return;
     }
     const id = decodeURIComponent(replayMatch![1]);

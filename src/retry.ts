@@ -1,3 +1,8 @@
+import {
+  DeadLetterAutoReplayer,
+  type AutoReplayOptions,
+  type DeadLetterAutoReplayAuditEvent,
+} from "./autoreplay.ts";
 import { EndpointCircuitBreaker, type CircuitBreakerOptions, type CircuitState, type CircuitStats } from "./circuit.ts";
 import type { EncryptedPayload, PayloadEncryptor } from "./encrypt.ts";
 import {
@@ -40,6 +45,7 @@ export type { EncryptedPayload, PayloadEncryptor };
 export type { EndpointLatencyStats, LatencyTrackerOptions };
 export type { QuotaOptions, QuotaStats };
 export type { BatchEnvelopeInput, BatchOptions };
+export type { AutoReplayOptions, DeadLetterAutoReplayAuditEvent };
 
 /**
  * Delivery priority of an item.
@@ -101,6 +107,25 @@ export interface MetricsOptions {
    * delivery counters and circuit gauges are always collected.
    */
   histogramBucketsMs?: number[];
+  /**
+   * Opt-in dead-letter auto-replay scheduler (see `src/autoreplay.ts`):
+   * `DeadLetterAutoReplayer` ticks `intervalMs` apart, replaying the whole
+   * dead-letter list with the same fresh-budget semantics as a manual
+   * replay (`POST /dead-letter/replay`), backing off exponentially between
+   * consecutive empty rounds and stopping permanently after `maxRounds`
+   * consecutive empty rounds (audited as `dead_letter_auto_replay`).
+   * Disabled by default: when unset (or `enabled: false`) nothing is ever
+   * replayed automatically. Invalid values throw `RangeError`. The
+   * scheduler starts on `start()` and stops on `stop()` / `shutdown()`.
+   */
+  autoReplay?: AutoReplayOptions;
+  /**
+   * Called with the `dead_letter_auto_replay` audit event when the
+   * auto-replay scheduler stops on rounds exhaustion. The server wires
+   * this to its audit log; a raw queue without it simply loses the event
+   * (nothing else is affected).
+   */
+  onAutoReplayAudit?: (event: DeadLetterAutoReplayAuditEvent) => void;
 }
 
 /** Fired when a delivery's accepted→delivered latency exceeds the SLO budget. */
@@ -561,6 +586,8 @@ export class RetryQueue {
   /** Per-endpoint latency histogram: per-bucket individual counts + sum. */
   private readonly latencyHist = new Map<string, { counts: number[]; sumMs: number; count: number }>();
   private readonly deliveryEventListeners = new Set<(e: DeliveryEvent) => void>();
+  /** Opt-in dead-letter auto-replay scheduler; undefined when disabled. */
+  private readonly autoReplayer?: DeadLetterAutoReplayer;
 
   private readonly queue = new Map<string, RetryItem & { attempt: number }>();
   private readonly timers = new Map<string, Scheduled>();
@@ -649,6 +676,15 @@ export class RetryQueue {
       this.batcher = new BatchCollector(this.batchResolved, (endpoint, items) =>
         this.flushBatch(endpoint, items)
       );
+    }
+    if (opts.autoReplay !== undefined) {
+      // Constructed even with `enabled: false` so the operator surface can
+      // always report a status; it only ticks when enabled and started.
+      this.autoReplayer = new DeadLetterAutoReplayer({
+        ...opts.autoReplay,
+        replayAll: () => this.replayDeadLetters(),
+        onAudit: opts.onAutoReplayAudit,
+      });
     }
   }
 
@@ -758,6 +794,15 @@ export class RetryQueue {
   /** Items that exhausted all attempts, in dead-letter order. */
   getDeadLetter(): DeadLetterEntry[] {
     return [...this.deadLetter];
+  }
+
+  /**
+   * The opt-in dead-letter auto-replay scheduler, or `undefined` when no
+   * `autoReplay` option was configured. The server exposes it through the
+   * `POST/GET /dead-letter/auto-replay/*` operator endpoints.
+   */
+  getAutoReplayer(): DeadLetterAutoReplayer | undefined {
+    return this.autoReplayer;
   }
 
   /**
@@ -946,9 +991,13 @@ export class RetryQueue {
     for (const id of this.queue.keys()) {
       this.schedule(id, 0);
     }
+    // Opt-in only: undefined when `autoReplay` was never configured, and
+    // a no-op when constructed with `enabled: false`.
+    this.autoReplayer?.start();
   }
 
   stop(): void {
+    this.autoReplayer?.stop();
     this.running = false;
     for (const [id, s] of this.timers) {
       this.clearTimer(s.handle);
@@ -987,13 +1036,17 @@ export class RetryQueue {
         if (!before.has(id)) batchIds.push(id);
       }
     }
+    // An auto-replay timer must not fire mid-shutdown: a round would
+    // re-queue dead letters the operator expected to stay parked. The
+    // timer is unref'd anyway; this is about not doing work, not process
+    // lifetime.
+    this.autoReplayer?.stop();
     this.running = false;
     for (const [id, s] of this.timers) {
       this.clearTimer(s.handle);
       this.timers.delete(id);
     }
-    for (const id of batchIds) {
-      const p = this.deliver(id, true);
+    for (const id of batchIds) {      const p = this.deliver(id, true);
       // `deliver` never rejects (sender errors are caught internally), but
       // track both outcomes so a bug can never leak a hanging shutdown.
       this.inFlight.add(p);
