@@ -746,6 +746,19 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       opts.auditLog.append(event);
       opts.retry?.onStarvationGuardAudit?.(event);
     },
+    // Wrap the caller's hook so every failover switch is audited, not
+    // just observed.
+    onFailoverSwitch: (event) => {
+      opts.auditLog.append({
+        event: "failover_switched",
+        endpoint: event.endpoint,
+        from: event.from,
+        to: event.to,
+        reason: event.reason,
+        at: event.at,
+      });
+      opts.retry?.onFailoverSwitch?.(event);
+    },
     // Wrap the caller's onSloMiss so every SLO miss is audited, not just observed.
     latency: latencyOpts
       ? {

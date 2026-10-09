@@ -40,9 +40,16 @@ import {
   type EndpointConfigPatch,
 } from "./hotreload.ts";
 import {
+  FailoverManager,
+  type FailoverConfig,
+  type FailoverEndpointStats,
+  type FailoverSwitchEvent,
+} from "./failover.ts";
+import {
   renderPrometheus,
   type CircuitStateInput,
   type DeliveryCountersInput,
+  type FailoverMetricsInput,
   type LatencyHistogramInput,
   type ProbeMetricsInput,
   type StarvationGuardMetricsInput,
@@ -53,6 +60,7 @@ export { renderPrometheus };
 export type { DeliveryCountersInput, CircuitStateInput, LatencyHistogramInput, StarvationGuardMetricsInput };
 export { HttpDeliveryError, classifyFailure, parseRetryAfterMs };
 export type { FailureClass, ClassifiedFailure };
+export type { FailoverConfig, FailoverEndpointStats, FailoverSwitchEvent };
 
 export type { CircuitBreakerOptions, CircuitState, CircuitStats };
 export type { EncryptedPayload, PayloadEncryptor };
@@ -344,6 +352,15 @@ export interface DeadLetterEntry extends RetryItem {
   payloadBytes: number;
   /** Sealed payload envelope; present only when `payloadEncryptor` is set. */
   encryptedPayload?: EncryptedPayload;
+  /**
+   * WR-39: the logical endpoint (the configured primary `targetUrl`) when
+   * the entry was dead-lettered on a failover standby. `targetUrl` above
+   * is the physical target the final attempt actually went to; a replay
+   * re-resolves from this field so it follows the *current* active target
+   * instead of pinning to the standby. Absent when failover is not
+   * configured or the primary served the delivery.
+   */
+  failoverEndpoint?: string;
 }
 
 /** Selector for batch dead-letter replays (see {@link RetryQueue.replayDeadLetters}). */
@@ -571,6 +588,31 @@ export interface RetryQueueOptions {
    * for embedding or testing.
    */
   metrics?: MetricsOptions;
+  /**
+   * Per-endpoint active/standby failover (see `src/failover.ts`): a
+   * record of primary `targetUrl` -> `{ standbys, failureThreshold?,
+   * autoFailback?, failbackIntervalMs? }`. When the active target's
+   * circuit opens or it fails `failureThreshold` times in a row,
+   * dispatches move to the next standby (audited as `failover_switched`,
+   * counted in `relay_failover_switches_total`); with `autoFailback`
+   * (default) the primary gets a probationary canary once the quiet
+   * period passes. In-flight deliveries keep the target they were
+   * dispatched with — a switch never cancels or reroutes them. Invalid
+   * configs throw `RangeError` at construction.
+   */
+  failover?: FailoverConfig;
+  /**
+   * Failover clock in ms; defaults to `Date.now`. Injectable for
+   * deterministic tests (drives the failback quiet period).
+   */
+  failoverNow?: () => number;
+  /**
+   * Called on every failover switch (to a standby, failback to the
+   * primary, or manual reset). Edge-triggered — one call per switch, not
+   * one per failed attempt. The server audits these as
+   * `failover_switched`; library users get the hook directly.
+   */
+  onFailoverSwitch?: (event: FailoverSwitchEvent) => void;
 }
 
 interface Scheduled {
@@ -1125,6 +1167,14 @@ export class RetryQueue {
   /** Opt-in dead-letter auto-replay scheduler; undefined when disabled. */
   private readonly autoReplayer?: DeadLetterAutoReplayer;
   private readonly prober?: DownstreamProber;
+  /** WR-39: active/standby target selection; undefined when not configured. */
+  private readonly failover?: FailoverManager;
+  private readonly onFailoverSwitch?: (event: FailoverSwitchEvent) => void;
+  /** `relay_failover_switches_total`, one counter per (endpoint, from, to). */
+  private readonly failoverSwitchCounts = new Map<
+    string,
+    { endpoint: string; from: string; to: string; switches: number }
+  >();
 
   private readonly queue = new Map<string, RetryItem & { attempt: number }>();
   private readonly timers = new Map<string, Scheduled>();
@@ -1189,7 +1239,18 @@ export class RetryQueue {
       opts.urgent?.now ?? Date.now
     );
     this.onStarvationGuardAudit = opts.onStarvationGuardAudit;
-    this.laneScheduler = new LaneScheduler({
+    // WR-39: built after the breaker so the manager can read live circuit
+    // state for the "circuit open" switch trigger. Invalid configs throw
+    // here, at construction — never mid-delivery.
+    this.failover =
+      opts.failover !== undefined
+        ? new FailoverManager(opts.failover, {
+            now: opts.failoverNow ?? Date.now,
+            circuitState: (target) => this.breaker?.state(target) ?? "closed",
+            onSwitch: (event) => this.recordFailoverSwitch(event),
+          })
+        : undefined;
+    this.onFailoverSwitch = opts.onFailoverSwitch;    this.laneScheduler = new LaneScheduler({
       minNormalShare: opts.urgent?.minNormalShare ?? 0.2,
       onActivation: (event) => this.onStarvationGuardAudit?.(event),
     });
@@ -1295,6 +1356,21 @@ export class RetryQueue {
       this.deliveryCounters.set(endpoint, c);
     }
     c[kind] += 1;
+  }
+
+  /** Count one failover switch for `relay_failover_switches_total{endpoint,from,to}` and fan out the hook. */
+  private recordFailoverSwitch(event: FailoverSwitchEvent): void {
+    const key = JSON.stringify([event.endpoint, event.from, event.to]);
+    const prev = this.failoverSwitchCounts.get(key);
+    if (prev) prev.switches += 1;
+    else
+      this.failoverSwitchCounts.set(key, {
+        endpoint: event.endpoint,
+        from: event.from,
+        to: event.to,
+        switches: 1,
+      });
+    this.onFailoverSwitch?.(event);
   }
 
   /** Bucket one accepted→delivered sample into the endpoint's latency histogram. */
@@ -1440,6 +1516,7 @@ export class RetryQueue {
       deadLetteredAt: _ts,
       encryptedPayload,
       payloadBytes: _payloadBytes,
+      failoverEndpoint,
       ...item
     } = entry;
     let payload = item.payload;
@@ -1449,7 +1526,10 @@ export class RetryQueue {
       }
       payload = this.payloadEncryptor.decrypt(encryptedPayload);
     }
-    this.queue.set(item.id, { ...item, payload, attempt: 0 });
+    // WR-39: replays re-enter through the logical endpoint so the next
+    // dispatch resolves the *current* active target instead of pinning to
+    // whatever standby served the dead-lettered attempt.
+    this.queue.set(item.id, { ...item, payload, targetUrl: failoverEndpoint ?? item.targetUrl, attempt: 0 });
     // A replay starts a fresh delivery cycle: restart the latency clock so
     // the sample measures the replayed attempt, not the original one.
     this.latency?.recordAccepted(item.id);
@@ -1473,7 +1553,12 @@ export class RetryQueue {
     const ids = filter.ids !== undefined ? new Set(filter.ids) : undefined;
     return this.deadLetter.filter(
       (e) =>
-        (filter.endpoint === undefined || e.targetUrl === filter.endpoint) &&
+        // WR-39: an entry dead-lettered on a failover standby also matches
+        // its logical endpoint, so operators filter by the endpoint they
+        // configured, not the physical target that happened to serve it.
+        (filter.endpoint === undefined ||
+          e.targetUrl === filter.endpoint ||
+          e.failoverEndpoint === filter.endpoint) &&
         (ids === undefined || ids.has(e.id))
     );
   }
@@ -1816,26 +1901,34 @@ export class RetryQueue {
     // `enqueue()`/`enqueueNow()` guarantee every queued item carries a
     // trace ID, so it is safe to thread it through all downstream events.
     const traceId = entry.traceId as string;
+    // WR-39: the logical endpoint (`entry.targetUrl`, the configured
+    // primary) never changes on the queued item, so replays always
+    // re-resolve against the *current* active target. `target` is the
+    // physical target this attempt goes to; the sender gets a copy pinned
+    // to it, so an in-flight delivery keeps its old target across a
+    // mid-flight switch — switches never cancel or reroute in-flight work.
+    const logicalEndpoint = entry.targetUrl;
+    const target = this.failover?.resolveTarget(logicalEndpoint) ?? logicalEndpoint;
     // Per-endpoint quota first: an exhausted budget delays the attempt
     // (rescheduled at the next token refill) instead of burning the retry
     // budget or tripping the circuit against a downstream we are
     // voluntarily throttling. A little jitter keeps many delayed items
     // from re-checking in lockstep.
-    if (this.quota && !this.quota.take(entry.targetUrl)) {
-      this.recordQuotaStat(entry.targetUrl);
-      this.schedule(id, this.quota.msUntilToken(entry.targetUrl) + this.random() * 50);
+    if (this.quota && !this.quota.take(target)) {
+      this.recordQuotaStat(target);
+      this.schedule(id, this.quota.msUntilToken(target) + this.random() * 50);
       return;
     }
     let probe = false;
     if (this.breaker) {
-      const verdict = this.breaker.shouldAllow(entry.targetUrl);
+      const verdict = this.breaker.shouldAllow(target);
       if (!verdict.allowed) {
         // Circuit open (or its probe slot busy): park the attempt until the
         // cooldown elapses instead of burning the retry budget against a
         // known-down endpoint. A little jitter keeps many parked items from
         // re-checking in lockstep.
         this.circuitBlocked += 1;
-        this.schedule(id, this.breaker.retryInMs(entry.targetUrl) + this.random() * 100);
+        this.schedule(id, this.breaker.retryInMs(target) + this.random() * 100);
         return;
       }
       probe = verdict.probe;
@@ -1844,8 +1937,8 @@ export class RetryQueue {
     // endpoint's bucket. An empty bucket degrades the item to the normal
     // lane — the delivery still happens, just with exponential backoff —
     // so the lane can never be used to flood a downstream.
-    if (entry.priority === "urgent" && !this.urgentLimiter.take(entry.targetUrl)) {
-      this.recordUrgentStat(entry.targetUrl, "throttled");
+    if (entry.priority === "urgent" && !this.urgentLimiter.take(target)) {
+      this.recordUrgentStat(target, "throttled");
       entry.priority = "normal";
     }
     const fastLane = entry.priority === "urgent";
@@ -1863,26 +1956,28 @@ export class RetryQueue {
     // granted immediately, and the normal lane is never delayed by the
     // gate at all.
     const releaseTurn = await this.laneScheduler.acquireTurn(
-      entry.targetUrl,
+      target,
       fastLane ? "urgent" : "normal"
     );
     // The fast lane bypasses the per-endpoint concurrency limiter entirely:
     // an urgent delivery never waits behind queued normal deliveries. Its
     // own bound is the token bucket above.
-    const release = fastLane ? undefined : await this.limiter.acquire(entry.targetUrl);
+    const release = fastLane ? undefined : await this.limiter.acquire(target);
     try {
       // The queue may have stopped, or the item may have been settled, while
       // we waited for a turn or a concurrency slot. Bail out; the releases
       // cascade to the next waiters so nobody hangs.
       if ((!this.running && !force) || !this.queue.has(id)) {
-        if (probe) this.breaker?.cancelProbe(entry.targetUrl);
+        if (probe) this.breaker?.cancelProbe(target);
         return;
       }
       // A normal dispatch earns the urgent lane its proportional deficit
       // (only while urgent demand is backlogged) — the DRR earning event.
-      if (!fastLane) this.laneScheduler.recordNormalDispatch(entry.targetUrl);
+      if (!fastLane) this.laneScheduler.recordNormalDispatch(target);
       try {
-        const response = await this.sender(entry);
+        // Pinned copy: the sender sees the physical target chosen above,
+        // so a failover switch mid-flight cannot reroute this attempt.
+        const response = await this.sender({ ...entry, targetUrl: target });
         // WR-37: the transport succeeded (2xx); the validator decides
         // whether the body actually means success. A failing verdict
         // becomes a SemanticDeliveryError, which the catch below treats
@@ -1890,7 +1985,9 @@ export class RetryQueue {
         // so consecutive semantic failures trip the circuit breaker and
         // the accepted→delivered latency clock keeps running.
         const validator =
-          this.endpointResponseValidators.get(entry.targetUrl) ?? this.globalResponseValidator;
+          this.endpointResponseValidators.get(target) ??
+          this.endpointResponseValidators.get(logicalEndpoint) ??
+          this.globalResponseValidator;
         if (validator !== undefined && response !== undefined) {
           let verdict: boolean | string;
           try {
@@ -1906,25 +2003,27 @@ export class RetryQueue {
             );
           }
         }
-        this.breaker?.recordSuccess(entry.targetUrl);
+        this.breaker?.recordSuccess(target);
+        this.failover?.recordOutcome(logicalEndpoint, target, true);
         this.queue.delete(id);
-        this.recordDelivery(entry.targetUrl, "delivered");
-        if (fastLane) this.recordUrgentStat(entry.targetUrl, "delivered");
-        const latencyMs = this.latency?.recordDelivered(entry.id, entry.targetUrl);
+        this.recordDelivery(target, "delivered");
+        if (fastLane) this.recordUrgentStat(target, "delivered");
+        const latencyMs = this.latency?.recordDelivered(entry.id, target);
         if (latencyMs !== undefined) {
           // The histogram samples the same delivery the JSON latency stats
           // do — accepted→delivered, dead letters excluded by `discard()`.
-          this.recordLatencySample(entry.targetUrl, latencyMs);
+          this.recordLatencySample(target, latencyMs);
         }
         if (latencyMs !== undefined && this.latency && latencyMs > this.latency.sloMs) {
-          this.onSloMiss?.({ id: entry.id, traceId, endpoint: entry.targetUrl, latencyMs, sloMs: this.latency.sloMs });
+          this.onSloMiss?.({ id: entry.id, traceId, endpoint: target, latencyMs, sloMs: this.latency.sloMs });
         }
-        this.onDelivered?.(entry, entry.attempt + 1);
+        // The hooks see the physical target the delivery actually went to.
+        this.onDelivered?.({ ...entry, targetUrl: target }, entry.attempt + 1);
         this.emitDeliveryEvent({
           type: "delivered",
           id: entry.id,
           traceId,
-          targetUrl: entry.targetUrl,
+          targetUrl: target,
           attempts: entry.attempt + 1,
           at: new Date().toISOString(),
         });
@@ -1940,7 +2039,7 @@ export class RetryQueue {
           this.onSemanticFailure?.({
             id: entry.id,
             traceId,
-            endpoint: entry.targetUrl,
+            endpoint: target,
             attempts: entry.attempt + 1,
             reason: err.reason,
           });
@@ -1952,44 +2051,47 @@ export class RetryQueue {
           // endpoint is *not* sick — it answered, it just said no — so the
           // circuit records a success rather than a failure (this also
           // settles a half-open probe exactly once, as the breaker
-          // requires).
-          this.breaker?.recordSuccess(entry.targetUrl);
-          this.recordDelivery(entry.targetUrl, "failed");
+          // requires). Failover agrees: an answering target is a healthy
+          // target.
+          this.breaker?.recordSuccess(target);
+          this.failover?.recordOutcome(logicalEndpoint, target, true);
+          this.recordDelivery(target, "failed");
           entry.attempt += 1;
-          this.moveToDeadLetter(entry, id, err, classified, at, traceId);
+          this.moveToDeadLetter(entry, id, err, classified, at, traceId, target);
           return;
         }
-        this.breaker?.recordFailure(entry.targetUrl);
-        this.recordDelivery(entry.targetUrl, "failed");
+        this.breaker?.recordFailure(target);
+        this.failover?.recordOutcome(logicalEndpoint, target, false);
+        this.recordDelivery(target, "failed");
         entry.attempt += 1;
         if (entry.attempt >= this.maxAttempts) {
-          this.moveToDeadLetter(entry, id, err, classified, at, traceId);
+          this.moveToDeadLetter(entry, id, err, classified, at, traceId, target);
         } else {
           // A downstream-supplied `Retry-After` (429/503) wins over every
           // lane's own delay: ignoring the backpressure signal the
           // downstream explicitly sent would be perverse.
           let retryDelayMs = classified.retryAfterMs;
           if (retryDelayMs === undefined) {
-            if (fastLane && this.urgentLimiter.take(entry.targetUrl)) {
+            if (fastLane && this.urgentLimiter.take(target)) {
               // Skip the exponential backoff: fixed fast-lane retry delay.
-              this.recordUrgentStat(entry.targetUrl, "retried");
+              this.recordUrgentStat(target, "retried");
               retryDelayMs = this.urgentRetryDelayMs;
             } else {
               if (fastLane) {
                 // Fast-lane retry would exceed the endpoint's urgent rate:
                 // degrade to normal backoff instead of dropping the delivery.
-                this.recordUrgentStat(entry.targetUrl, "throttled");
+                this.recordUrgentStat(target, "throttled");
                 entry.priority = "normal";
               }
               retryDelayMs = this.delayForAttempt(entry.attempt);
             }
           }
-          this.recordDelivery(entry.targetUrl, "retried");
+          this.recordDelivery(target, "retried");
           this.emitDeliveryEvent({
             type: "retrying",
             id: entry.id,
             traceId,
-            targetUrl: entry.targetUrl,
+            targetUrl: target,
             attempts: entry.attempt,
             at,
             error,
@@ -2008,7 +2110,7 @@ export class RetryQueue {
             this.onRetryBudgetDepleted?.({
               id: entry.id,
               traceId,
-              endpoint: entry.targetUrl,
+              endpoint: target,
               attempts: entry.attempt,
               waitMs: Math.max(0, Math.round(waitMs)),
             });
@@ -2043,21 +2145,27 @@ export class RetryQueue {
     err: unknown,
     classified: ClassifiedFailure,
     at: string,
-    traceId: string
+    traceId: string,
+    target: string
   ): void {
     const error = err instanceof Error ? err.message : String(err);
     this.queue.delete(id);
-    this.recordDelivery(entry.targetUrl, "deadLetter");
+    this.recordDelivery(target, "deadLetter");
     // Never delivered: drop the pending clock without sampling.
     this.latency?.discard(entry.id);
     const encryptedPayload = this.payloadEncryptor?.encrypt(entry.payload);
+    // The dead letter records the physical target the final attempt went
+    // to; `failoverEndpoint` remembers the logical endpoint so a replay
+    // re-resolves against the *current* active target instead of pinning
+    // to the standby.
+    const logicalEndpoint = entry.targetUrl;
     this.deadLetter.push({
       id: entry.id,
       traceId,
       // Sealed at rest when an encryptor is configured; kept in the
       // clear otherwise (existing behavior).
       payload: encryptedPayload ? Buffer.alloc(0) : entry.payload,
-      targetUrl: entry.targetUrl,
+      targetUrl: target,
       headers: entry.headers,
       // Kept so a replayed item re-enters the same delivery lane.
       priority: entry.priority,
@@ -2067,13 +2175,14 @@ export class RetryQueue {
       deadLetteredAt: new Date().toISOString(),
       payloadBytes: entry.payload.length,
       ...(encryptedPayload ? { encryptedPayload } : {}),
+      ...(logicalEndpoint !== target ? { failoverEndpoint: logicalEndpoint } : {}),
     });
-    this.onDeadLetter?.(entry, entry.attempt, err, classified.failureClass);
+    this.onDeadLetter?.({ ...entry, targetUrl: target }, entry.attempt, err, classified.failureClass);
     this.emitDeliveryEvent({
       type: "dead_letter",
       id: entry.id,
       traceId,
-      targetUrl: entry.targetUrl,
+      targetUrl: target,
       attempts: entry.attempt,
       at,
       error,
@@ -2176,12 +2285,17 @@ export class RetryQueue {
       .stats()
       .filter((s) => s.guardActivations > 0)
       .map((s) => ({ endpoint: s.endpoint, activations: s.guardActivations }));
+    // WR-39: one series per (endpoint, from, to) triple that actually
+    // switched; absent entirely when failover is unconfigured or never
+    // fired.
+    const failover: FailoverMetricsInput[] = [...this.failoverSwitchCounts.values()];
     return renderPrometheus({
       deliveries,
       circuits,
       latencyHistograms,
       probes,
       starvationGuard,
+      failover,
       ...(this.retryBudget !== undefined ? { retryBudgetDepleted: this.retryBudgetDepleted } : {}),
     });
   }
@@ -2192,6 +2306,25 @@ export class RetryQueue {
    */
   getCircuitStats(): CircuitStats[] {
     return this.breaker?.stats() ?? [];
+  }
+
+  /**
+   * WR-39: per-endpoint failover state (`activeTarget`, `targets`,
+   * `switches`, `consecutiveFailures`). Empty when failover is not
+   * configured.
+   */
+  getFailoverStats(): FailoverEndpointStats[] {
+    return this.failover?.stats() ?? [];
+  }
+
+  /**
+   * WR-39: manually return `endpoint` to its primary target (clears a
+   * pending failback canary and the failure count). Returns false when
+   * the endpoint has no failover config. A switch that actually moves
+   * traffic is audited as `failover_switched` with reason `"manual"`.
+   */
+  resetFailover(endpoint: string): boolean {
+    return this.failover?.resetFailover(endpoint) ?? false;
   }
 
   /** Attempts parked because the endpoint's circuit was open. */

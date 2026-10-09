@@ -26,6 +26,9 @@
  *   starvation-guard activation episodes (the deficit round-robin lane
  *   scheduler started deferring urgent dispatches while normal demand was
  *   backlogged), present only for endpoints where the guard activated.
+ * - `relay_failover_switches_total{endpoint,from,to}`: counter of
+ *   active/standby failover switches (WR-39) by logical endpoint,
+ *   present only for (endpoint, from, to) triples that actually switched.
  * - `relay_retry_budget_depleted_total`: counter of retries parked because
  *   the global retry budget (WR-38) was exhausted. Present only when the
  *   budget is enabled. No endpoint label — the budget is global.
@@ -69,6 +72,8 @@ export interface MetricsInput {
   probes?: ProbeMetricsInput[];
   /** Present only for endpoints where the starvation guard activated. */
   starvationGuard?: StarvationGuardMetricsInput[];
+  /** Present only for (endpoint, from, to) triples that actually switched. */
+  failover?: FailoverMetricsInput[];
   /** Present only when the global retry budget (WR-38) is enabled. */
   retryBudgetDepleted?: number;
 }
@@ -77,6 +82,17 @@ export interface MetricsInput {
 export interface StarvationGuardMetricsInput {
   endpoint: string;
   activations: number;
+}
+
+/** One failover switch count, in Prometheus label order. */
+export interface FailoverMetricsInput {
+  /** Logical endpoint (the configured primary `targetUrl`). */
+  endpoint: string;
+  /** Target deliveries were going to before the switch. */
+  from: string;
+  /** Target deliveries go to after the switch. */
+  to: string;
+  switches: number;
 }
 
 /** One endpoint's health-probe counters, in Prometheus label order. */
@@ -152,6 +168,17 @@ export function renderPrometheus(input: MetricsInput): string {
     for (const s of input.starvationGuard) {
       lines.push(
         `relay_starvation_guard_activations{endpoint="${escapeLabelValue(s.endpoint)}"} ${s.activations}`
+      );
+    }
+  }
+  if (input.failover !== undefined && input.failover.length > 0) {
+    lines.push(
+      "# HELP relay_failover_switches_total Failover target switches by logical endpoint (from -> to)."
+    );
+    lines.push("# TYPE relay_failover_switches_total counter");
+    for (const f of input.failover) {
+      lines.push(
+        `relay_failover_switches_total{endpoint="${escapeLabelValue(f.endpoint)}",from="${escapeLabelValue(f.from)}",to="${escapeLabelValue(f.to)}"} ${f.switches}`
       );
     }
   }

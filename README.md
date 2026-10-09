@@ -436,6 +436,56 @@ curl -X POST http://127.0.0.1:PORT/config/endpoint \
 # token · 404 when operator endpoints are disabled (fail closed)
 ```
 
+## Endpoint failover (active/standby)
+
+One logical endpoint (the configured primary `targetUrl`) can own an
+ordered list of physical targets. The queue resolves the active target on
+every dispatch — a switch never touches queued items, and in-flight
+deliveries keep the target they were dispatched with:
+
+```ts
+const server = createRelayServer({
+  secret, forwardUrl, auditLog,
+  retry: {
+    failover: {
+      "https://primary/hook": {
+        standbys: ["https://standby-1/hook", "https://standby-2/hook"],
+        failureThreshold: 3,      // default 5; consecutive failures → switch
+        autoFailback: true,       // default true
+        failbackIntervalMs: 30_000, // default 30s; quiet period before a canary
+      },
+    },
+  },
+});
+```
+
+- **Switch triggers** — the active target's circuit breaker opens, *or* it
+  fails `failureThreshold` times in a row (the manager's own counter, so it
+  works with the breaker disabled). A downstream that *answers* — even with
+  a 4xx — counts as healthy; only retryable failures count. Standbys are
+  tried in order; when every target is down the queue keeps trying the last
+  one and the normal retry / dead-letter machinery owns the outcome.
+- **Failback is a probationary canary, never blind trust** — once the quiet
+  period passes, the next dispatch goes to the primary; its first outcome
+  alone decides (success keeps it, failure re-switches immediately). With
+  `autoFailback: false` the relay stays on the standby until
+  `queue.resetFailover(endpoint)` moves it back manually.
+- **Observability** — every switch is audited as `failover_switched`
+  (`endpoint` = logical endpoint, `from`/`to`, `reason` =
+  `circuit_open`/`failure_threshold`/`failback`/`manual`) and counted in
+  `relay_failover_switches_total{endpoint,from,to}`. Delivery counters,
+  latency histograms, and circuit gauges are keyed by the *physical*
+  target that served the attempt; `queue.getFailoverStats()` shows the
+  current active target per logical endpoint.
+- **Dead letters** record the physical target they died on
+  (`failoverEndpoint` remembers the logical endpoint), so a replay
+  re-resolves against the *current* active target instead of pinning to
+  the standby. A per-endpoint response validator configured for the
+  primary still applies to standby traffic (exact standby match wins).
+- **Invalid configs throw `RangeError` at startup** — empty standby
+  lists, a standby equal to the primary, duplicates, chained primaries,
+  and illegal thresholds.
+
 ## Delivery lifecycle
 
 Every accepted webhook walks the same state machine; each transition is
