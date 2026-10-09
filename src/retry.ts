@@ -4,6 +4,12 @@ import {
   type DeadLetterAutoReplayAuditEvent,
 } from "./autoreplay.ts";
 import { EndpointCircuitBreaker, type CircuitBreakerOptions, type CircuitState, type CircuitStats } from "./circuit.ts";
+import {
+  DownstreamProber,
+  type ProbeAuditEvent,
+  type ProbeEndpointStats,
+  type ProbeOptions,
+} from "./downstream-probe.ts";
 import type { EncryptedPayload, PayloadEncryptor } from "./encrypt.ts";
 import {
   HttpDeliveryError,
@@ -37,6 +43,7 @@ import {
   type CircuitStateInput,
   type DeliveryCountersInput,
   type LatencyHistogramInput,
+  type ProbeMetricsInput,
 } from "./metrics.ts";
 
 export { TRACE_ID_HEADER };
@@ -340,6 +347,29 @@ export interface RetryQueueOptions {
    * Takes precedence over `circuitBreaker.onStateChange` when both are set.
    */
   onCircuitStateChange?: (endpoint: string, from: CircuitState, to: CircuitState) => void;
+  /**
+   * Opt-in active health probing of downstream endpoints (see
+   * `src/downstream-probe.ts`). When set, each listed endpoint gets a timed HEAD (or
+   * GET) request every `intervalMs` on a lightweight path — independent
+   * of the delivery queue, so probes never consume the retry budget and
+   * never touch the latency tracker, quota, or batching. Each probe
+   * outcome is reported to the circuit breaker exactly like a delivery
+   * outcome: `failureThreshold` consecutive probe failures trip the
+   * circuit open *before* real deliveries have to fail, and a success
+   * resets the counter like any success (a success never closes an open
+   * circuit early — recovery still flows through cooldown → half-open).
+   * Probe outcomes are counted in the Prometheus exposition
+   * (`relay_probe_total`, `relay_probe_consecutive_failures`) and audited
+   * via `onProbeAudit`. Disabled by default.
+   */
+  probe?: ProbeOptions;
+  /**
+   * Called for every probe outcome worth auditing: `probe_failed` on each
+   * failed probe (with the current consecutive-failure streak) and
+   * `probe_recovered` when a failing endpoint answers again. The server
+   * routes these into the audit log; library users get the hook directly.
+   */
+  onProbeAudit?: (event: ProbeAuditEvent) => void;
   /**
    * Called after `updateEndpointConfig` applies a hot-reload patch, with
    * the endpoint and the before/after diff of every patched field. The
@@ -653,6 +683,7 @@ export class RetryQueue {
   private readonly deliveryEventListeners = new Set<(e: DeliveryEvent) => void>();
   /** Opt-in dead-letter auto-replay scheduler; undefined when disabled. */
   private readonly autoReplayer?: DeadLetterAutoReplayer;
+  private readonly prober?: DownstreamProber;
 
   private readonly queue = new Map<string, RetryItem & { attempt: number }>();
   private readonly timers = new Map<string, Scheduled>();
@@ -750,6 +781,20 @@ export class RetryQueue {
         ...opts.autoReplay,
         replayAll: () => this.replayDeadLetters(),
         onAudit: opts.onAutoReplayAudit,
+      });
+    }
+    if (opts.probe !== undefined) {
+      // A probe outcome feeds the circuit breaker exactly like a delivery
+      // outcome: consecutive probe failures trip the circuit early, a
+      // success resets the counter. Probes never touch anything else —
+      // no retry budget, no latency samples, no quota.
+      this.prober = new DownstreamProber({
+        ...opts.probe,
+        recordOutcome: (endpoint, ok) => {
+          if (ok) this.breaker?.recordSuccess(endpoint);
+          else this.breaker?.recordFailure(endpoint);
+        },
+        onAudit: opts.onProbeAudit,
       });
     }
   }
@@ -869,6 +914,24 @@ export class RetryQueue {
    */
   getAutoReplayer(): DeadLetterAutoReplayer | undefined {
     return this.autoReplayer;
+  }
+
+  /**
+   * The opt-in downstream health prober, or `undefined` when no `probe`
+   * option was configured. Library users (and tests) can drive
+   * `runRound()` directly; the server runs it on its schedule.
+   */
+  getProber(): DownstreamProber | undefined {
+    return this.prober;
+  }
+
+  /**
+   * Per-endpoint health-probe counters (`success` / `failure` /
+   * `consecutiveFailures` / `lastProbeAtMs`). Empty when probing is
+   * disabled.
+   */
+  getProbeStats(): ProbeEndpointStats[] {
+    return this.prober?.stats() ?? [];
   }
 
   /**
@@ -1060,10 +1123,13 @@ export class RetryQueue {
     // Opt-in only: undefined when `autoReplay` was never configured, and
     // a no-op when constructed with `enabled: false`.
     this.autoReplayer?.start();
+    // Opt-in only: undefined when `probe` was never configured.
+    this.prober?.start();
   }
 
   stop(): void {
     this.autoReplayer?.stop();
+    this.prober?.stop();
     this.running = false;
     for (const [id, s] of this.timers) {
       this.clearTimer(s.handle);
@@ -1107,6 +1173,8 @@ export class RetryQueue {
     // timer is unref'd anyway; this is about not doing work, not process
     // lifetime.
     this.autoReplayer?.stop();
+    // Same for the health prober: no new probe rounds mid-shutdown.
+    this.prober?.stop();
     this.running = false;
     for (const [id, s] of this.timers) {
       this.clearTimer(s.handle);
@@ -1479,9 +1547,11 @@ export class RetryQueue {
    * Prometheus text exposition of the collected metrics (see
    * `src/metrics.ts`): per-endpoint delivery counters
    * (`relay_deliveries_total`), circuit gauges for endpoints that tripped
-   * (`relay_endpoint_circuit_state`), and the accepted→delivered latency
+   * (`relay_endpoint_circuit_state`), the accepted→delivered latency
    * histogram (`relay_delivery_latency_seconds_*`) when latency tracking
-   * is enabled.
+   * is enabled, and the downstream health-probe series
+   * (`relay_probe_total`, `relay_probe_consecutive_failures`) when
+   * probing is enabled.
    */
   renderMetrics(): string {
     const deliveries: DeliveryCountersInput[] = [...this.deliveryCounters.entries()].map(
@@ -1514,7 +1584,13 @@ export class RetryQueue {
         });
       }
     }
-    return renderPrometheus({ deliveries, circuits, latencyHistograms });
+    const probes: ProbeMetricsInput[] = (this.prober?.stats() ?? []).map((s) => ({
+      endpoint: s.endpoint,
+      success: s.success,
+      failure: s.failure,
+      consecutiveFailures: s.consecutiveFailures,
+    }));
+    return renderPrometheus({ deliveries, circuits, latencyHistograms, probes });
   }
 
   /**

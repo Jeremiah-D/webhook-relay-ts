@@ -37,6 +37,7 @@ import {
   type ApiVersionOptions,
   type ApiVersionRoute,
 } from "./version.ts";
+import type { ProbeOptions } from "./downstream-probe.ts";
 
 export interface RelayServerOptions {
   /** HMAC secret used to verify incoming webhooks. */
@@ -106,6 +107,21 @@ export interface RelayServerOptions {
    * Invalid routes throw `RangeError` at startup.
    */
   versions?: ApiVersionOptions;
+  /**
+   * Opt-in active health probing of downstream endpoints (see
+   * `src/downstream-probe.ts` and the `probe` `RetryQueue` option): each listed
+   * endpoint gets a timed HEAD (or GET) request every `intervalMs` on a
+   * lightweight path — no retry queue, no retry budget, no latency
+   * samples, no quota — so probes can never disturb a delivery. Each
+   * probe outcome is reported to the circuit breaker exactly like a
+   * delivery outcome: consecutive probe failures trip the circuit open
+   * *early* (before real deliveries have to fail), a success resets the
+   * counter. Outcomes are audited as `probe_failed` (every failure, with
+   * the streak) / `probe_recovered` (when a failing endpoint answers
+   * again) and counted in the Prometheus exposition (`relay_probe_*`).
+   * Off by default.
+   */
+  probe?: ProbeOptions;
   /**
    * Outbound TLS certificate pinning (see `src/pinning.ts`): per-endpoint
    * SPKI fingerprint whitelist, keyed by exact delivery `targetUrl`.
@@ -607,6 +623,14 @@ export function createRelayServer(opts: RelayServerOptions): Server {
     onAutoReplayAudit: (event) => {
       opts.auditLog.append(event);
       opts.retry?.onAutoReplayAudit?.(event);
+    },
+    // An explicit server-level `probe` wins over the nested `retry.probe`;
+    // either way the queue owns the prober. Wrap the caller's hook so
+    // every probe outcome worth auditing lands in the audit log.
+    probe: opts.probe ?? opts.retry?.probe,
+    onProbeAudit: (event) => {
+      opts.auditLog.append(event);
+      opts.retry?.onProbeAudit?.(event);
     },
     // Wrap the caller's onSloMiss so every SLO miss is audited, not just observed.
     latency: latencyOpts

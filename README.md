@@ -163,6 +163,28 @@ reliability primitives that matter for any signed-payload pipeline.
   transition is audited as `circuit_open` / `circuit_half_open` /
   `circuit_closed` with the endpoint. Injectable clock for deterministic
   tests.
+- `src/downstream-probe.ts` — opt-in *active* downstream health probing
+  (`DownstreamProber`), wired into `RetryQueue` via `retry: { probe: {
+  endpoints, intervalMs, method, timeoutMs } }` (off by default). Each
+  listed endpoint gets a timed `HEAD` (or `GET`) request every
+  `intervalMs` (default 30s) on a lightweight path — raw reachability,
+  no keep-alive pool, no proxy, no TLS pins — so probes never consume the
+  retry budget and never touch the latency tracker, quota, or batching.
+  Each probe outcome is reported to the circuit breaker exactly like a
+  delivery outcome: `failureThreshold` consecutive probe failures trip the
+  circuit open *before* real deliveries have to fail, and a success
+  resets the counter like any success (a success never closes an open
+  circuit early — recovery still flows through cooldown → half-open).
+  Outcomes are audited as `probe_failed` (every failure, with the
+  consecutive-failure streak) / `probe_recovered` (once, when a failing
+  endpoint answers again; steady-state healthy probes stay quiet) and
+  counted as `relay_probe_total{endpoint,result}` /
+  `relay_probe_consecutive_failures{endpoint}`; `getProbeStats()` reports
+  per-endpoint counters. A throwing probe implementation counts as a
+  failure, never a crash. Invalid configs throw `RangeError` at startup.
+  (Not to be confused with the keep-alive pool's *connection* health
+  probing, `OutboundConnectionPool({ healthProbe })`, which culls dead
+  idle sockets before reuse.)
 - `src/encrypt.ts` — pluggable payload encryption (`PayloadEncryptor`
   interface: `encrypt` / `decrypt`, never silently returns garbage).
   Built in: `AesGcmEncryptor` (AES-256-GCM via `node:crypto`, zero
@@ -510,7 +532,12 @@ endpoints (404 when disabled):
   (default 50ms…10s),
 - `relay_inbound_version_total{version,status}` — inbound intake by API
   version (`accepted` / `rejected`; `version="none"` for unversioned
-  requests), only when `versions` is configured.
+  requests), only when `versions` is configured,
+- `relay_probe_total{endpoint,result}` — downstream health-probe
+  outcomes (`success` / `failure`), only when `probe` is configured,
+- `relay_probe_consecutive_failures{endpoint}` — current consecutive
+  probe-failure streak per endpoint (0 = healthy), only when `probe` is
+  configured.
 
 ### Dead-letter auto-replay
 
