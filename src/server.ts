@@ -43,6 +43,15 @@ import {
   type ApiVersionRoute,
 } from "./version.ts";
 import type { ProbeOptions } from "./downstream-probe.ts";
+import {
+  assertValidCompressOutboundConfig,
+  DecompressionFailedError,
+  DecompressionTooLargeError,
+  gunzipCapped,
+  isGzipContentEncoding,
+  maybeCompressOutbound,
+  type CompressOutboundOptions,
+} from "./gzip.ts";
 
 export interface RelayServerOptions {
   /** HMAC secret used to verify incoming webhooks. */
@@ -161,6 +170,20 @@ export interface RelayServerOptions {
    * startup.
    */
   tlsClientCerts?: Record<string, TlsClientCert>;
+  /**
+   * Outbound gzip compression (see `src/gzip.ts`): per-endpoint opt-in,
+   * keyed by exact delivery `targetUrl`. When the payload reaches
+   * `thresholdBytes` (default 1024) it is gzipped, `Content-Encoding:
+   * gzip` is stamped, and `Content-Length` reflects the compressed size;
+   * payloads that do not shrink are sent as-is. The relay signature
+   * (`x-relay-signature`) covers the compressed wire bytes. Inbound,
+   * webhooks posted with `Content-Encoding: gzip` are transparently
+   * decompressed after signature verification (which covers the raw wire
+   * bytes the sender signed) — decompression is streaming and capped at
+   * `maxBodyBytes`, so a gzip bomb is answered 413 like any oversized
+   * body. Invalid values throw `RangeError` at startup.
+   */
+  compressOutbound?: Record<string, CompressOutboundOptions>;
   /**
    * Outbound keep-alive connection pool (see `src/keepalive.ts`): outbound
    * deliveries reuse TCP/TLS connections per `(scheme, host, port)` instead
@@ -361,7 +384,8 @@ export function createDefaultSender(
   keepAlive?: KeepAlivePoolOptions | false,
   outboundSigning?: OutboundSigningConfig,
   proxies?: Record<string, string>,
-  tlsClientCerts?: Record<string, TlsClientCert>
+  tlsClientCerts?: Record<string, TlsClientCert>,
+  compressOutbound?: Record<string, CompressOutboundOptions>
 ): PooledSender {
   if (tlsPins !== undefined) {
     for (const [endpoint, pins] of Object.entries(tlsPins)) {
@@ -394,6 +418,16 @@ export function createDefaultSender(
           `createDefaultSender: invalid TLS client certificate for ${endpoint}: ${(err as Error).message}`
         );
       }
+    }
+  }
+  // RangeError on invalid values, at startup — never mid-delivery.
+  if (compressOutbound !== undefined) {
+    try {
+      assertValidCompressOutboundConfig(compressOutbound);
+    } catch (err) {
+      throw new RangeError(
+        `createDefaultSender: invalid compressOutbound config: ${(err as Error).message}`
+      );
     }
   }
   // RangeError on invalid values, at startup — never mid-delivery.
@@ -554,17 +588,25 @@ export function createDefaultSender(
         // delivery with this relay's audit trail (overrides a stale inbound
         // value, which is identical anyway after `resolveTraceId`).
         if (item.traceId) req.setHeader(TRACE_ID_HEADER, item.traceId);
+        // WR-40: per-endpoint opt-in gzip. Compression happens before
+        // signing so `x-relay-signature` covers the exact wire bytes the
+        // downstream receives.
+        const { body: wireBody, contentEncoding } = maybeCompressOutbound(
+          item.payload,
+          compressOutbound?.[item.targetUrl]
+        );
         if (outboundSigning !== undefined) {
           // Stamp AFTER the passthrough headers: a forged inbound
           // `x-relay-signature` was already stripped from them above, and
           // this guarantees the relay's own signature always wins.
-          req.setHeader("x-relay-signature", signSha256(item.payload, outboundSigning.secret));
+          req.setHeader("x-relay-signature", signSha256(wireBody, outboundSigning.secret));
           if (outboundSigning.keyId !== undefined) {
             req.setHeader("x-relay-key-id", outboundSigning.keyId);
           }
         }
-        req.setHeader("content-length", item.payload.length);
-        req.end(item.payload);
+        if (contentEncoding !== undefined) req.setHeader("content-encoding", contentEncoding);
+        req.setHeader("content-length", wireBody.length);
+        req.end(wireBody);
       };
 
       if (pins === undefined) {
@@ -717,7 +759,7 @@ export function createRelayServer(opts: RelayServerOptions): Server {
   // the default sender only; an injected sender signs on its own.
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts)
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound)
       : undefined;
   const queue = new RetryQueue({
     sender: opts.sender ?? defaultSender,
@@ -1354,6 +1396,44 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       return;
     }
 
+    // Inbound gzip (WR-40): a webhook posted with `Content-Encoding: gzip`
+    // is transparently decompressed. Signature verification above ran on
+    // the raw wire bytes the sender signed; everything below — version
+    // routing, replay guard, dedup, the queue — sees the canonical plain
+    // payload. Decompression is streaming and capped at `maxBodyBytes`
+    // (WR-25 applies to the decompressed size too), so a gzip bomb is
+    // answered 413 exactly like an oversized plain body.
+    let inboundGzip = false;
+    if (isGzipContentEncoding(req.headers["content-encoding"])) {
+      try {
+        body = await gunzipCapped(body, maxBodyBytes);
+        inboundGzip = true;
+      } catch (err) {
+        if (err instanceof DecompressionTooLargeError) {
+          opts.auditLog.append({
+            event: "rejected",
+            id,
+            traceId,
+            reason: "body_too_large",
+            maxBodyBytes,
+          });
+          res
+            .writeHead(413, { "content-type": "text/plain", connection: "close" })
+            .end("Request body too large");
+          return;
+        }
+        opts.auditLog.append({
+          event: "rejected",
+          id,
+          traceId,
+          reason: "decompression_failed",
+          error: err instanceof Error ? err.message : String(err),
+        });
+        res.writeHead(400, { "content-type": "text/plain" }).end("Invalid gzip body");
+        return;
+      }
+    }
+
     // API version routing (WR-33): a version-prefixed path (e.g. /v1/...)
     // runs the *verified* payload through its adapter into the current
     // schema. Signature verification above ran on the raw body the sender
@@ -1422,6 +1502,10 @@ export function createRelayServer(opts: RelayServerOptions): Server {
     const passthrough: Record<string, string | string[] | undefined> = {};
     for (const [k, v] of Object.entries(req.headers)) {
       if (k === "host" || k === "content-length") continue;
+      // WR-40: the payload was decompressed above, so a stale inbound
+      // `content-encoding: gzip` must not travel with the plain bytes —
+      // the downstream would try to gunzip JSON and fail.
+      if (k === "content-encoding" && inboundGzip) continue;
       // `x-relay-signature` / `x-relay-key-id` are this relay's own
       // namespace: an inbound client asserting them would impersonate the
       // relay downstream. Strip them always; when outbound signing is
@@ -1462,6 +1546,7 @@ export function createRelayServer(opts: RelayServerOptions): Server {
     if (rotating) acceptedEvent.keyId = verifiedKeyId ?? "unknown";
     if (perEndpointVerifier) acceptedEvent.verifier = activeVerifier.name;
     if (priority) acceptedEvent.priority = priority;
+    if (inboundGzip) acceptedEvent.contentEncoding = "gzip";
     if (opts.auditPayloads) acceptedEvent.payload = body;
     opts.auditLog.append(acceptedEvent);
     res.writeHead(202, { "content-type": "application/json" }).end(JSON.stringify({ id, traceId, status: "accepted" }));
