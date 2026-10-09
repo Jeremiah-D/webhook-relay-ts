@@ -324,6 +324,40 @@ Items still waiting on a backoff timer are dropped — they were never
 delivered, and the queue is in-memory. For at-least-once across restarts,
 replay the dead-letter list after the process comes back.
 
+## Runtime config hot reload
+
+Delivery policy can be retuned without restarting the process:
+
+```ts
+queue.updateEndpointConfig("https://downstream/hook", {
+  maxConcurrentPerEndpoint: 8,              // per endpoint; raise grants queued waiters now
+  circuitBreaker: { failureThreshold: 3, cooldownMs: 10_000 }, // per endpoint
+  quota: { deliveriesPerMinute: 300 },      // per endpoint
+  retry: { baseDelayMs: 500, maxAttempts: 8 }, // queue-global backoff
+});
+```
+
+- **Atomic validation** — the whole patch is validated first; an illegal
+  value throws `RangeError` and the previous configuration is left
+  completely intact (no partial application). Patching `circuitBreaker` or
+  `quota` while that subsystem is disabled is also a `RangeError`.
+- **In-flight is never touched** — already-scheduled retry timers keep the
+  delay they were scheduled with (backoff is read at schedule time);
+  lowering a concurrency limit below the current in-flight count only gates
+  *new* acquisitions until the count drains.
+- **Audited** — every applied change fires `onConfigChange` with a
+  before/after diff; `createRelayServer` writes it to the audit log as
+  `endpoint_config_updated`, and operators can apply patches over HTTP:
+
+```sh
+curl -X POST http://127.0.0.1:PORT/config/endpoint \
+  -H "Authorization: Bearer $OPERATOR_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"endpoint":"https://downstream/hook","maxConcurrentPerEndpoint":8}'
+# → 200 { endpoint, changes } · 400 on illegal values · 403 without the
+# token · 404 when operator endpoints are disabled (fail closed)
+```
+
 ## Delivery lifecycle
 
 Every accepted webhook walks the same state machine; each transition is
@@ -550,6 +584,17 @@ Requires Node 24+ (runs `.ts` directly via type stripping; zero dependencies).
   (`status` / `pause` / `resume` / `trigger`, fail-closed 404 without
   `operatorToken`, 403 on a wrong bearer, 405 on method mismatch, and an
   end-to-end trigger replaying a real dead letter).
+- `test/hotreload.test.ts` — `updateEndpointConfig` runtime retuning:
+  backoff changes apply to future scheduled retries while already-scheduled
+  timers keep their old delay; raising a concurrency limit immediately grants
+  queued waiters and lowering never revokes in-flight deliveries; circuit
+  threshold/cooldown overrides take effect on the next trip decision and
+  cooldown check; per-endpoint quota budgets update in place; illegal values
+  throw `RangeError` with no partial application (including patching a
+  disabled subsystem); the `POST /config/endpoint` operator endpoint applies
+  patches with bearer auth (400 on illegal values, 403 without the token,
+  404 fail-closed without `operatorToken`) and audits
+  `endpoint_config_updated`.
 - `test/retry.test.ts` — a flaky sender (fails twice, then succeeds) delivers
   on the third attempt with increasing backoff; a permanently failing sender
   ends in the dead-letter list. Covers the jitter layer: additive jitter with

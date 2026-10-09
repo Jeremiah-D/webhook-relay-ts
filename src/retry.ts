@@ -28,6 +28,11 @@ import {
 } from "./batch.ts";
 import { newTraceId, TRACE_ID_HEADER } from "./trace.ts";
 import {
+  assertValidEndpointConfigPatch,
+  type ConfigChange,
+  type EndpointConfigPatch,
+} from "./hotreload.ts";
+import {
   renderPrometheus,
   type CircuitStateInput,
   type DeliveryCountersInput,
@@ -336,6 +341,13 @@ export interface RetryQueueOptions {
    */
   onCircuitStateChange?: (endpoint: string, from: CircuitState, to: CircuitState) => void;
   /**
+   * Called after `updateEndpointConfig` applies a hot-reload patch, with
+   * the endpoint and the before/after diff of every patched field. The
+   * server routes this into the audit log as `endpoint_config_updated`;
+   * library users get the same observability hook directly.
+   */
+  onConfigChange?: (endpoint: string, changes: ConfigChange[]) => void;
+  /**
    * Seals dead-letter payloads at rest: when set, a dead-lettered item's
    * `payload` is replaced by an `encryptedPayload` envelope (default
    * {@link AesGcmEncryptor} via `node:crypto`, zero dependencies) and
@@ -398,6 +410,24 @@ interface Scheduled {
 const noopSender: Sender = async () => {};
 
 /**
+ * Shared validation for concurrency limits: a positive integer, or
+ * `Infinity` for "no limit". Used at construction and at runtime
+ * (WR-32 hot reload) so both paths enforce the same rule.
+ */
+function assertConcurrencyLimit(maxConcurrentPerEndpoint: number): void {
+  if (
+    !(
+      maxConcurrentPerEndpoint === Infinity ||
+      (Number.isInteger(maxConcurrentPerEndpoint) && maxConcurrentPerEndpoint >= 1)
+    )
+  ) {
+    throw new RangeError(
+      `maxConcurrentPerEndpoint must be a positive integer or Infinity, got ${maxConcurrentPerEndpoint}`
+    );
+  }
+}
+
+/**
  * Per-endpoint concurrency gate: at most `max` deliveries in flight to the
  * same endpoint (`targetUrl`) at once; excess acquisitions wait in FIFO
  * order. This keeps one slow or rate-limited downstream from being hammered
@@ -409,22 +439,36 @@ const noopSender: Sender = async () => {};
  * cascade to the next waiter, so no one hangs.
  */
 export class EndpointConcurrencyLimiter {
-  private readonly max: number;
+  private readonly defaultMax: number;
+  /**
+   * Per-endpoint runtime overrides (WR-32 hot reload). Endpoints without
+   * an override use `defaultMax`.
+   */
+  private readonly endpointMax = new Map<string, number>();
   private readonly inFlight = new Map<string, number>();
   private readonly waiters = new Map<string, Array<() => void>>();
 
   constructor(maxConcurrentPerEndpoint: number = Infinity) {
-    if (
-      !(
-        maxConcurrentPerEndpoint === Infinity ||
-        (Number.isInteger(maxConcurrentPerEndpoint) && maxConcurrentPerEndpoint >= 1)
-      )
-    ) {
-      throw new RangeError(
-        `maxConcurrentPerEndpoint must be a positive integer or Infinity, got ${maxConcurrentPerEndpoint}`
-      );
-    }
-    this.max = maxConcurrentPerEndpoint;
+    assertConcurrencyLimit(maxConcurrentPerEndpoint);
+    this.defaultMax = maxConcurrentPerEndpoint;
+  }
+
+  /** Effective concurrency limit for `endpoint` (override wins over default). */
+  maxFor(endpoint: string): number {
+    return this.endpointMax.get(endpoint) ?? this.defaultMax;
+  }
+
+  /**
+   * Override the concurrency limit for one endpoint at runtime.
+   * Raising it immediately grants slots to queued waiters in FIFO order;
+   * lowering it below the current in-flight count never revokes running
+   * deliveries — new acquisitions simply queue until the count drains.
+   * Illegal values throw `RangeError` and leave the current limit intact.
+   */
+  setEndpointMax(endpoint: string, maxConcurrentPerEndpoint: number): void {
+    assertConcurrencyLimit(maxConcurrentPerEndpoint);
+    this.endpointMax.set(endpoint, maxConcurrentPerEndpoint);
+    this.grantWaiting(endpoint);
   }
 
   /**
@@ -433,7 +477,7 @@ export class EndpointConcurrencyLimiter {
    */
   acquire(endpoint: string): Promise<() => void> {
     const n = this.inFlight.get(endpoint) ?? 0;
-    if (n < this.max) {
+    if (n < this.maxFor(endpoint)) {
       this.inFlight.set(endpoint, n + 1);
       return Promise.resolve(() => this.release(endpoint));
     }
@@ -447,6 +491,20 @@ export class EndpointConcurrencyLimiter {
       if (q) q.push(wake);
       else this.waiters.set(endpoint, [wake]);
     });
+  }
+
+  /** Hand newly-freed headroom to queued waiters after a limit raise. */
+  private grantWaiting(endpoint: string): void {
+    const max = this.maxFor(endpoint);
+    let n = this.inFlight.get(endpoint) ?? 0;
+    const q = this.waiters.get(endpoint);
+    while (q && q.length > 0 && n < max) {
+      n += 1;
+      this.inFlight.set(endpoint, n);
+      const wake = q.shift()!;
+      if (q.length === 0) this.waiters.delete(endpoint);
+      wake(); // transfers the newly-created slot; count already incremented
+    }
   }
 
   private release(endpoint: string): void {
@@ -547,17 +605,24 @@ export interface UrgentStats {
  */
 export class RetryQueue {
   private readonly sender: Sender;
-  private readonly baseDelayMs: number;
-  private readonly maxDelayMs: number;
-  private readonly maxAttempts: number;
-  private readonly jitterMs: number;
-  private readonly jitterStrategy: JitterStrategy;
+  /**
+   * Backoff parameters are deliberately *not* readonly: WR-32 hot reload
+   * retunes them at runtime. `delayForAttempt` reads them at schedule
+   * time, so retries scheduled before an update keep their old delay and
+   * only future scheduling sees the new values.
+   */
+  private baseDelayMs: number;
+  private maxDelayMs: number;
+  private maxAttempts: number;
+  private jitterMs: number;
+  private jitterStrategy: JitterStrategy;
   private readonly random: () => number;
   private readonly setTimer: (fn: () => void, ms: number) => { clear(): void };
   private readonly clearTimer: (handle: { clear(): void }) => void;
   private readonly onDeadLetter?: (item: RetryItem, attempts: number, lastError: unknown, failureClass?: FailureClass) => void;
   private readonly onDelivered?: (item: RetryItem, attempts: number) => void;
   private readonly breaker?: EndpointCircuitBreaker;
+  private readonly onConfigChange?: (endpoint: string, changes: ConfigChange[]) => void;
   /** Attempts parked because the endpoint's circuit was open. */
   private circuitBlocked = 0;
   private readonly payloadEncryptor?: PayloadEncryptor;
@@ -628,6 +693,7 @@ export class RetryQueue {
     this.clearTimer = opts.clearTimer ?? ((h) => h.clear());
     this.onDeadLetter = opts.onDeadLetter;
     this.onDelivered = opts.onDelivered;
+    this.onConfigChange = opts.onConfigChange;
     this.limiter = new EndpointConcurrencyLimiter(opts.maxConcurrentPerEndpoint);
     // Wrap the caller's state-change hook so the metrics gauge always sees
     // the latest circuit state, even when nobody subscribes to the hook.
@@ -1083,6 +1149,96 @@ export class RetryQueue {
     }
     const jitter = this.jitterMs > 0 ? this.random() * this.jitterMs : 0;
     return Math.min(this.maxDelayMs, this.baseDelayMs * 2 ** attempt + jitter);
+  }
+
+  /** Current backoff parameters (reflects any hot-reload updates). */
+  retryConfig(): { baseDelayMs: number; maxDelayMs: number; maxAttempts: number; jitterMs: number; jitterStrategy: JitterStrategy } {
+    return {
+      baseDelayMs: this.baseDelayMs,
+      maxDelayMs: this.maxDelayMs,
+      maxAttempts: this.maxAttempts,
+      jitterMs: this.jitterMs,
+      jitterStrategy: this.jitterStrategy,
+    };
+  }
+
+  /**
+   * Hot-reload one endpoint's delivery configuration at runtime (WR-32).
+   *
+   * The whole patch is validated first: an illegal value throws
+   * `RangeError` and the previous configuration is left completely
+   * intact (no partial application). Patching `circuitBreaker` or
+   * `quota` while that subsystem is disabled also throws `RangeError`.
+   *
+   * Applied changes take effect immediately for all *future* scheduling
+   * decisions — already-scheduled retry timers keep the delay they were
+   * scheduled with, and in-flight deliveries are never revoked (a
+   * lowered concurrency limit only gates new acquisitions). Returns the
+   * before/after diff of every patched field, and reports it through
+   * `onConfigChange` (audited by the server as `endpoint_config_updated`).
+   */
+  updateEndpointConfig(endpoint: string, patch: EndpointConfigPatch = {}): ConfigChange[] {
+    if (typeof endpoint !== "string" || endpoint.length === 0) {
+      throw new RangeError("updateEndpointConfig: endpoint must be a non-empty string");
+    }
+    assertValidEndpointConfigPatch(patch);
+    if (patch.circuitBreaker !== undefined && this.breaker === undefined) {
+      throw new RangeError("updateEndpointConfig: circuitBreaker is not enabled; cannot patch circuit thresholds");
+    }
+    if (patch.quota !== undefined && this.quota === undefined) {
+      throw new RangeError("updateEndpointConfig: quota is not enabled; cannot patch quota limits");
+    }
+
+    const changes: ConfigChange[] = [];
+    const rec = (field: string, from: unknown, to: unknown): void => {
+      changes.push({ field, from, to });
+    };
+
+    if (patch.maxConcurrentPerEndpoint !== undefined) {
+      rec("maxConcurrentPerEndpoint", this.limiter.maxFor(endpoint), patch.maxConcurrentPerEndpoint);
+      this.limiter.setEndpointMax(endpoint, patch.maxConcurrentPerEndpoint);
+    }
+    if (patch.circuitBreaker !== undefined) {
+      const before = this.breaker!.thresholdsFor(endpoint);
+      if (patch.circuitBreaker.failureThreshold !== undefined) {
+        rec("circuitBreaker.failureThreshold", before.failureThreshold, patch.circuitBreaker.failureThreshold);
+      }
+      if (patch.circuitBreaker.cooldownMs !== undefined) {
+        rec("circuitBreaker.cooldownMs", before.cooldownMs, patch.circuitBreaker.cooldownMs);
+      }
+      this.breaker!.setEndpointThresholds(endpoint, patch.circuitBreaker);
+    }
+    if (patch.quota !== undefined && patch.quota.deliveriesPerMinute !== undefined) {
+      rec("quota.deliveriesPerMinute", this.quota!.limit(endpoint), patch.quota.deliveriesPerMinute);
+      this.quota!.setEndpointLimit(endpoint, patch.quota.deliveriesPerMinute);
+    }
+    if (patch.retry !== undefined) {
+      const r = patch.retry;
+      const before = this.retryConfig();
+      if (r.baseDelayMs !== undefined) {
+        rec("retry.baseDelayMs", before.baseDelayMs, r.baseDelayMs);
+        this.baseDelayMs = r.baseDelayMs;
+      }
+      if (r.maxDelayMs !== undefined) {
+        rec("retry.maxDelayMs", before.maxDelayMs, r.maxDelayMs);
+        this.maxDelayMs = r.maxDelayMs;
+      }
+      if (r.maxAttempts !== undefined) {
+        rec("retry.maxAttempts", before.maxAttempts, r.maxAttempts);
+        this.maxAttempts = r.maxAttempts;
+      }
+      if (r.jitterMs !== undefined) {
+        rec("retry.jitterMs", before.jitterMs, r.jitterMs);
+        this.jitterMs = r.jitterMs;
+      }
+      if (r.jitterStrategy !== undefined) {
+        rec("retry.jitterStrategy", before.jitterStrategy, r.jitterStrategy);
+        this.jitterStrategy = r.jitterStrategy;
+      }
+    }
+
+    this.onConfigChange?.(endpoint, changes);
+    return changes;
   }
 
   private schedule(id: string, delayMs: number): void {

@@ -73,6 +73,17 @@ export class EndpointCircuitBreaker {
   private readonly nowMs: () => number;
   private readonly onStateChange?: (endpoint: string, from: CircuitState, to: CircuitState) => void;
   private readonly records = new Map<string, CircuitRecord>();
+  /**
+   * Per-endpoint threshold overrides installed at runtime (WR-32 hot
+   * reload). An endpoint without an override uses the constructor
+   * defaults; overrides never touch existing records — a closed circuit
+   * stays closed, an open circuit keeps its `openedAtMs` and only the
+   * *remaining* cooldown is recomputed against the new value.
+   */
+  private readonly endpointOverrides = new Map<
+    string,
+    { failureThreshold?: number; cooldownMs?: number }
+  >();
 
   constructor(opts: CircuitBreakerOptions = {}) {
     this.failureThreshold = opts.failureThreshold ?? 5;
@@ -101,6 +112,46 @@ export class EndpointCircuitBreaker {
   }
 
   /**
+   * Override the trip/cooldown thresholds for one endpoint at runtime.
+   * Takes effect immediately for all future trip decisions and cooldown
+   * math; in-flight probes and parked attempts are untouched. Illegal
+   * values throw `RangeError` and leave the previous thresholds intact.
+   */
+  setEndpointThresholds(
+    endpoint: string,
+    patch: { failureThreshold?: number; cooldownMs?: number }
+  ): void {
+    if (
+      patch.failureThreshold !== undefined &&
+      (!Number.isInteger(patch.failureThreshold) || patch.failureThreshold < 1)
+    ) {
+      throw new RangeError(
+        `failureThreshold must be an integer >= 1, got ${patch.failureThreshold}`
+      );
+    }
+    if (
+      patch.cooldownMs !== undefined &&
+      (!Number.isFinite(patch.cooldownMs) || patch.cooldownMs <= 0)
+    ) {
+      throw new RangeError(`cooldownMs must be > 0, got ${patch.cooldownMs}`);
+    }
+    const prev = this.endpointOverrides.get(endpoint) ?? {};
+    this.endpointOverrides.set(endpoint, { ...prev, ...patch });
+  }
+
+  /**
+   * Effective thresholds for `endpoint`: runtime overrides win over the
+   * constructor defaults.
+   */
+  thresholdsFor(endpoint: string): { failureThreshold: number; cooldownMs: number } {
+    const o = this.endpointOverrides.get(endpoint);
+    return {
+      failureThreshold: o?.failureThreshold ?? this.failureThreshold,
+      cooldownMs: o?.cooldownMs ?? this.cooldownMs,
+    };
+  }
+
+  /**
    * Whether a delivery to `endpoint` may start now. When `allowed` and
    * `probe` are both true, the caller holds the half-open probe slot and
    * must settle it via `recordSuccess` / `recordFailure` / `cancelProbe`.
@@ -111,7 +162,7 @@ export class EndpointCircuitBreaker {
       return { allowed: true, probe: false };
     }
     if (rec.state === "open") {
-      if (this.nowMs() - (rec.openedAtMs ?? 0) < this.cooldownMs) {
+      if (this.nowMs() - (rec.openedAtMs ?? 0) < this.thresholdsFor(endpoint).cooldownMs) {
         return { allowed: false, probe: false };
       }
       this.transition(endpoint, rec, "half_open");
@@ -150,7 +201,7 @@ export class EndpointCircuitBreaker {
     }
     if (rec.state === "open") return; // already open; cooldown keeps running
     rec.consecutiveFailures += 1;
-    if (rec.consecutiveFailures >= this.failureThreshold) {
+    if (rec.consecutiveFailures >= this.thresholdsFor(endpoint).failureThreshold) {
       this.trip(endpoint, rec);
     }
   }
@@ -175,7 +226,7 @@ export class EndpointCircuitBreaker {
     const rec = this.records.get(endpoint);
     if (!rec || rec.state === "closed") return 0;
     if (rec.state === "half_open") return this.halfOpenRetryMs;
-    return Math.max(0, (rec.openedAtMs ?? 0) + this.cooldownMs - this.nowMs());
+    return Math.max(0, (rec.openedAtMs ?? 0) + this.thresholdsFor(endpoint).cooldownMs - this.nowMs());
   }
 
   /** Snapshot of every endpoint the breaker has observed. */

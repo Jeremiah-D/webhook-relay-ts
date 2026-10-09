@@ -30,6 +30,7 @@ import {
   resolveProxyUrl,
 } from "./proxy.ts";
 import type { AuditLog } from "./audit.ts";
+import type { EndpointConfigPatch } from "./hotreload.ts";
 
 export interface RelayServerOptions {
   /** HMAC secret used to verify incoming webhooks. */
@@ -623,6 +624,12 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       opts.auditLog.append({ event, endpoint, from, to });
       opts.retry?.onCircuitStateChange?.(endpoint, from, to);
     },
+    // Wrap the caller's onConfigChange so every runtime config change is
+    // audited, not just observed.
+    onConfigChange: (endpoint, changes) => {
+      opts.auditLog.append({ event: "endpoint_config_updated", endpoint, changes });
+      opts.retry?.onConfigChange?.(endpoint, changes);
+    },
     // Wrap the caller's onBatch so every flushed batch is audited, not just observed.
     onBatch: (info) => {
       opts.auditLog.append({
@@ -731,6 +738,7 @@ export function createRelayServer(opts: RelayServerOptions): Server {
     const isAutoPause = pathname === "/dead-letter/auto-replay/pause";
     const isAutoResume = pathname === "/dead-letter/auto-replay/resume";
     const isAutoTrigger = pathname === "/dead-letter/auto-replay/trigger";
+    const isConfigEndpoint = pathname === "/config/endpoint";
     const replayMatch = /^\/dead-letter\/([^/]+)\/replay$/.exec(pathname);
     if (
       !isList &&
@@ -743,6 +751,7 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       !isAutoPause &&
       !isAutoResume &&
       !isAutoTrigger &&
+      !isConfigEndpoint &&
       !replayMatch
     ) {
       respondJson(res, 404, { error: "not found" });
@@ -760,6 +769,7 @@ export function createRelayServer(opts: RelayServerOptions): Server {
         (isAutoPause && req.method === "POST") ||
         (isAutoResume && req.method === "POST") ||
         (isAutoTrigger && req.method === "POST") ||
+        (isConfigEndpoint && req.method === "POST") ||
         (replayMatch && req.method === "POST")
       )
     ) {
@@ -941,6 +951,47 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       });
       return;
     }
+    if (isConfigEndpoint) {
+      // Runtime endpoint config hot reload (WR-32): body is
+      // `{ endpoint, ...patch }`. The body limit applies to operator
+      // bodies too; a RangeError from updateEndpointConfig (illegal values
+      // or a disabled subsystem) surfaces as a 400 — the queue guarantees
+      // no partial application on validation failure, so a 400 always
+      // means "nothing changed". Applied changes are audited as
+      // `endpoint_config_updated` by the onConfigChange hook.
+      let body: Record<string, unknown>;
+      try {
+        const raw = (await readRawBody(req, maxBodyBytes)).toString("utf8");
+        body = raw.trim() === "" ? {} : JSON.parse(raw);
+      } catch (err) {
+        if (err instanceof BodyTooLargeError) {
+          respondJson(res, 413, { error: "request body too large" });
+          return;
+        }
+        respondJson(res, 400, { error: "invalid JSON body" });
+        return;
+      }
+      if (typeof body !== "object" || body === null || Array.isArray(body)) {
+        respondJson(res, 400, { error: "body must be a JSON object" });
+        return;
+      }
+      const { endpoint, ...patch } = body;
+      if (typeof endpoint !== "string" || endpoint.length === 0) {
+        respondJson(res, 400, { error: "endpoint must be a non-empty string" });
+        return;
+      }
+      try {
+        const changes = queue.updateEndpointConfig(endpoint, patch as EndpointConfigPatch);
+        respondJson(res, 200, { endpoint, changes });
+      } catch (err) {
+        if (err instanceof RangeError) {
+          respondJson(res, 400, { error: err.message });
+          return;
+        }
+        throw err;
+      }
+      return;
+    }
     const id = decodeURIComponent(replayMatch![1]);
     if (queue.replayDeadLetter(id)) {
       opts.auditLog.append({ event: "dead_letter_replayed", id });
@@ -958,7 +1009,8 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       pathname === "/audit" ||
       pathname === "/latency" ||
       pathname === "/events" ||
-      pathname === "/metrics"
+      pathname === "/metrics" ||
+      pathname === "/config/endpoint"
     ) {
       try {
         await handleOperator(req, res, pathname);
