@@ -26,6 +26,9 @@
  *   starvation-guard activation episodes (the deficit round-robin lane
  *   scheduler started deferring urgent dispatches while normal demand was
  *   backlogged), present only for endpoints where the guard activated.
+ * - `relay_retry_budget_depleted_total`: counter of retries parked because
+ *   the global retry budget (WR-38) was exhausted. Present only when the
+ *   budget is enabled. No endpoint label — the budget is global.
  *
  * Cardinality note: labels are per endpoint (`targetUrl`), so a relay
  * fanning out to many distinct downstream URLs grows the series count —
@@ -66,6 +69,8 @@ export interface MetricsInput {
   probes?: ProbeMetricsInput[];
   /** Present only for endpoints where the starvation guard activated. */
   starvationGuard?: StarvationGuardMetricsInput[];
+  /** Present only when the global retry budget (WR-38) is enabled. */
+  retryBudgetDepleted?: number;
 }
 
 /** One endpoint's starvation-guard activation count, in Prometheus label order. */
@@ -149,6 +154,13 @@ export function renderPrometheus(input: MetricsInput): string {
         `relay_starvation_guard_activations{endpoint="${escapeLabelValue(s.endpoint)}"} ${s.activations}`
       );
     }
+  }
+  if (input.retryBudgetDepleted !== undefined) {
+    lines.push(
+      "# HELP relay_retry_budget_depleted_total Retries parked because the global retry budget was exhausted."
+    );
+    lines.push("# TYPE relay_retry_budget_depleted_total counter");
+    lines.push(`relay_retry_budget_depleted_total ${input.retryBudgetDepleted}`);
   }
   return lines.join("\n") + "\n";
 }

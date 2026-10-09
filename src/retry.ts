@@ -24,6 +24,7 @@ import {
   type LatencyTrackerOptions,
 } from "./latency.ts";
 import { EndpointQuota, type QuotaOptions, type QuotaStats } from "./quota.ts";
+import { RetryBudget, type RetryBudgetOptions } from "./retry-budget.ts";
 import {
   BatchCollector,
   newBatchId,
@@ -57,6 +58,8 @@ export type { CircuitBreakerOptions, CircuitState, CircuitStats };
 export type { EncryptedPayload, PayloadEncryptor };
 export type { EndpointLatencyStats, LatencyTrackerOptions };
 export type { QuotaOptions, QuotaStats };
+export type { RetryBudgetOptions } from "./retry-budget.ts";
+export { RetryBudget, DEFAULT_RETRY_BUDGET_PER_MINUTE } from "./retry-budget.ts";
 export type { BatchEnvelopeInput, BatchOptions };
 export type { AutoReplayOptions, DeadLetterAutoReplayAuditEvent };
 
@@ -305,6 +308,14 @@ export interface RetryBudgetDepletedInfo {
  */
 export type JitterStrategy = "additive" | "full";
 
+/** Global retry budget (WR-38) observability. */
+export interface RetryBudgetStats {
+  /** Configured retries-per-minute budget. */
+  retriesPerMinute: number;
+  /** Retries parked because the budget was exhausted. */
+  depleted: number;
+}
+
 /**
  * A dead-lettered delivery: the original {@link RetryItem} plus the
  * metadata an operator needs to diagnose and replay it.
@@ -521,6 +532,21 @@ export interface RetryQueueOptions {
    */
   onSemanticFailure?: (info: SemanticFailureInfo) => void;
   /**
+   * Global retry budget (WR-38; see `src/retry-budget.ts`). Caps scheduled
+   * *retries* — not first attempts — at `retriesPerMinute` per minute,
+   * across all endpoints. When the budget is exhausted, a failed attempt's
+   * retry is parked until the next token refill: never dropped, and the
+   * parking itself consumes neither the item's retry budget nor a circuit
+   * event. Retries resume automatically when the budget recovers.
+   * Disabled by default; a present-but-empty object uses a generous
+   * default budget.
+   */
+  retryBudget?: RetryBudgetOptions;
+  /**
+   * Called once per retry parked by the global retry budget. The server
+   * audits these as `retry_budget_depleted`.
+   */
+  onRetryBudgetDepleted?: (info: RetryBudgetDepletedInfo) => void;
   /**
    * Called every time a batch is flushed — i.e. a group of buffered events
    * became one merged delivery item. The server audits this as
@@ -1074,6 +1100,11 @@ export class RetryQueue {
   private readonly endpointResponseValidators = new Map<string, ResponseValidator>();
   private readonly globalResponseValidator?: ResponseValidator;
   private readonly onSemanticFailure?: (info: SemanticFailureInfo) => void;
+  /** WR-38: global retry budget; undefined when disabled. */
+  private readonly retryBudget?: RetryBudget;
+  private readonly onRetryBudgetDepleted?: (info: RetryBudgetDepletedInfo) => void;
+  /** Retries parked because the global retry budget was exhausted. */
+  private retryBudgetDepleted = 0;
   private readonly batcher?: BatchCollector;
   private readonly batchResolved?: ResolvedBatchOptions;
   private readonly onBatch?: (info: BatchInfo) => void;
@@ -1189,6 +1220,14 @@ export class RetryQueue {
       }
     }
     this.onSemanticFailure = opts.onSemanticFailure;
+    // WR-38: a present-but-empty object means "enabled with the generous
+    // default budget"; absent means disabled. RangeError comes from the
+    // RetryBudget constructor on an illegal budget.
+    this.retryBudget =
+      opts.retryBudget !== undefined
+        ? new RetryBudget(opts.retryBudget.retriesPerMinute, opts.retryBudget.now ?? Date.now)
+        : undefined;
+    this.onRetryBudgetDepleted = opts.onRetryBudgetDepleted;
     this.onBatch = opts.onBatch;
     const histBuckets = opts.metrics?.histogramBucketsMs ?? [50, 100, 250, 500, 1000, 2500, 5000, 10000];
     if (
@@ -1955,7 +1994,27 @@ export class RetryQueue {
             at,
             error,
           });
-          this.schedule(id, retryDelayMs);
+          // WR-38: gate every newly scheduled retry on the global retry
+          // budget. When the budget is exhausted the retry is parked
+          // until the next token refill instead of joining a retry
+          // storm: the failure above was already accounted (attempt +
+          // circuit), and the parking itself is neutral — it consumes
+          // neither another attempt, a budget token, nor a circuit
+          // event. Retries resume automatically when the budget refills.
+          let scheduledDelayMs = retryDelayMs;
+          if (this.retryBudget !== undefined && !this.retryBudget.take()) {
+            const waitMs = this.retryBudget.msUntilToken() + this.random() * 50;
+            this.retryBudgetDepleted += 1;
+            this.onRetryBudgetDepleted?.({
+              id: entry.id,
+              traceId,
+              endpoint: entry.targetUrl,
+              attempts: entry.attempt,
+              waitMs: Math.max(0, Math.round(waitMs)),
+            });
+            scheduledDelayMs = waitMs;
+          }
+          this.schedule(id, scheduledDelayMs);
         }
       }
     } finally {
@@ -2071,7 +2130,8 @@ export class RetryQueue {
    * (`relay_probe_total`, `relay_probe_consecutive_failures`) when
    * probing is enabled, and the starvation-guard activation counter
    * (`relay_starvation_guard_activations`) for endpoints where the WR-35
-   * lane guard engaged.
+   * lane guard engaged, and the global retry-budget depletion counter
+   * (`relay_retry_budget_depleted_total`) when the WR-38 budget is enabled.
    */
   renderMetrics(): string {
     const deliveries: DeliveryCountersInput[] = [...this.deliveryCounters.entries()].map(
@@ -2116,7 +2176,14 @@ export class RetryQueue {
       .stats()
       .filter((s) => s.guardActivations > 0)
       .map((s) => ({ endpoint: s.endpoint, activations: s.guardActivations }));
-    return renderPrometheus({ deliveries, circuits, latencyHistograms, probes, starvationGuard });
+    return renderPrometheus({
+      deliveries,
+      circuits,
+      latencyHistograms,
+      probes,
+      starvationGuard,
+      ...(this.retryBudget !== undefined ? { retryBudgetDepleted: this.retryBudgetDepleted } : {}),
+    });
   }
 
   /**
@@ -2138,5 +2205,16 @@ export class RetryQueue {
    */
   getQuotaStats(): QuotaStats[] {
     return [...this.quotaStats.entries()].map(([endpoint, delayed]) => ({ endpoint, delayed }));
+  }
+
+  /**
+   * Global retry budget (WR-38) snapshot. `undefined` when the budget is
+   * disabled; otherwise the configured per-minute budget and the number
+   * of retries parked because the budget was exhausted.
+   */
+  getRetryBudgetStats(): RetryBudgetStats | undefined {
+    return this.retryBudget === undefined
+      ? undefined
+      : { retriesPerMinute: this.retryBudget.limit(), depleted: this.retryBudgetDepleted };
   }
 }

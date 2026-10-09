@@ -779,6 +779,19 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       });
       opts.retry?.onSemanticFailure?.(info);
     },
+    // Wrap the caller's onRetryBudgetDepleted so every budget-parked retry
+    // is audited, not just observed.
+    onRetryBudgetDepleted: (info) => {
+      opts.auditLog.append({
+        event: "retry_budget_depleted",
+        id: info.id,
+        traceId: info.traceId,
+        targetUrl: info.endpoint,
+        attempts: info.attempts,
+        waitMs: info.waitMs,
+      });
+      opts.retry?.onRetryBudgetDepleted?.(info);
+    },
     onDeadLetter: (item, attempts, lastError, failureClass) => {
       opts.auditLog.append({
         event: "dead_letter",

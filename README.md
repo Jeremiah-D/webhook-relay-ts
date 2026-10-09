@@ -100,6 +100,20 @@ reliability primitives that matter for any signed-payload pipeline.
   `retry: { quota: { deliveriesPerMinute } }` (unlimited by default);
   `getQuotaStats()` reports per-endpoint `delayed` counts. Injectable clock
   for deterministic tests.
+- `src/retry-budget.ts` — *global* retry budget (`RetryBudget`): one token
+  bucket for the whole queue, sized to `retriesPerMinute` per minute
+  (default 6000 — a guard rail, not a throttle). Every *scheduled retry*
+  (first attempts are never gated) costs one token; when the bucket is
+  empty the retry is parked until the next token refill — never dropped,
+  and the parking itself consumes neither the item's attempt budget nor a
+  circuit event. Retries resume automatically on refill, so a fleet-wide
+  downstream outage spreads its retry storm over the refill window instead
+  of stampeding a recovering downstream. Wired into `RetryQueue` via
+  `retry: { retryBudget: { retriesPerMinute } }` (disabled by default);
+  `getRetryBudgetStats()` reports the budget and the `depleted` park count,
+  parkings are audited as `retry_budget_depleted`, and
+  `relay_retry_budget_depleted_total` exposes the count to Prometheus.
+  Injectable clock for deterministic tests.
 - `src/latency.ts` — accepted→delivered latency SLO tracking
   (`LatencyTracker`): `enqueue()` starts each delivery's clock, a successful
   delivery samples it into a bounded per-endpoint rolling window (default
@@ -583,7 +597,10 @@ endpoints (404 when disabled):
   configured,
 - `relay_starvation_guard_activations{endpoint}` — starvation-guard
   activation episodes (urgent dispatches deferred while normal demand was
-  backlogged), only for endpoints where the guard engaged.
+  backlogged), only for endpoints where the guard engaged,
+- `relay_retry_budget_depleted_total` — retries parked because the global
+  retry budget was exhausted (no endpoint label — the budget is global),
+  only when `retry.retryBudget` is enabled.
 
 ### Dead-letter auto-replay
 
