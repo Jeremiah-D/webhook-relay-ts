@@ -165,7 +165,8 @@ export function isSocketReusable(socket: Socket): boolean {
 export interface PoolEndpointStats {
   /**
    * Pool key: `<scheme>//<host>:<port>`, plus `|proxy:<hash>` when routed
-   * through an outbound proxy and `|pins:<hash>` when pinned.
+   * through an outbound proxy, `|pins:<hash>` when pinned, and
+   * `|cert:<hash>` when a client certificate is bound.
    */
   key: string;
   scheme: "http" | "https";
@@ -173,6 +174,8 @@ export interface PoolEndpointStats {
   port: number;
   /** Whether this agent only serves endpoints with one pin whitelist. */
   pinned: boolean;
+  /** Whether this agent only serves endpoints with one client identity. */
+  clientCert: boolean;
   /** Sockets ever created for this endpoint. */
   created: number;
   /** Requests served by an already-open socket. */
@@ -205,6 +208,8 @@ interface PoolEntry {
   host: string;
   port: number;
   pinned: boolean;
+  /** True when this agent is bound to one mTLS client identity. */
+  clientCert: boolean;
   /** Normalized pin whitelist for pinned entries; undefined otherwise. */
   pinWhitelist: string[] | undefined;
   agent: HttpAgent;
@@ -254,9 +259,13 @@ export class OutboundConnectionPool {
    * `proxyUrl` is set the agent's sockets are CONNECT tunnels through
    * that proxy (see `src/proxy.ts`) and the pool key binds the proxy too,
    * so a tunneled connection can never serve an endpoint routed through a
-   * different proxy (or no proxy).
+   * different proxy (or no proxy). `clientCertId` (see
+   * `clientCertIdentity` in `src/mtls.ts`) binds the agent to one client
+   * identity, so a connection authenticated as one identity can never
+   * serve an endpoint configured with a different one — a rotated
+   * identity gets a fresh agent instead of riding a stale connection.
    */
-  agentFor(url: URL, pins?: readonly string[], proxyUrl?: string): HttpAgent {
+  agentFor(url: URL, pins?: readonly string[], proxyUrl?: string, clientCertId?: string): HttpAgent {
     if (url.protocol !== "http:" && url.protocol !== "https:") {
       throw new Error(`OutboundConnectionPool: unsupported protocol ${url.protocol}`);
     }
@@ -274,6 +283,7 @@ export class OutboundConnectionPool {
         .slice(0, 16);
       key += `|pins:${digest}`;
     }
+    if (clientCertId !== undefined) key += `|cert:${clientCertId}`;
     let entry = this.entries.get(key);
     if (entry === undefined) {
       const agentOpts = {
@@ -292,7 +302,7 @@ export class OutboundConnectionPool {
           : scheme === "https"
             ? new HttpsAgent(agentOpts)
             : new HttpAgent(agentOpts);
-      entry = { key, scheme, host, port, pinned, pinWhitelist, agent, seen: new WeakSet(), created: 0, reused: 0, reaped: 0, probeHits: 0, probeMisses: 0 };
+      entry = { key, scheme, host, port, pinned, clientCert: clientCertId !== undefined, pinWhitelist, agent, seen: new WeakSet(), created: 0, reused: 0, reaped: 0, probeHits: 0, probeMisses: 0 };
       this.entries.set(key, entry);
       this.byAgent.set(agent, entry);
       if (this.opts.healthProbe) this.installCheckoutProbe(entry);
@@ -414,6 +424,7 @@ export class OutboundConnectionPool {
       host: e.host,
       port: e.port,
       pinned: e.pinned,
+      clientCert: e.clientCert,
       created: e.created,
       reused: e.reused,
       reaped: e.reaped,

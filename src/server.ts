@@ -23,6 +23,11 @@ import { InboundRateLimiter, type InboundRateLimitOptions } from "./ratelimit.ts
 import { resolveTraceId, TRACE_ID_HEADER } from "./trace.ts";
 import type { TLSSocket } from "node:tls";
 import { assertValidPins, normalizePin, spkiFingerprint, TlsPinMismatchError } from "./pinning.ts";
+import {
+  assertValidClientCert,
+  clientCertIdentity,
+  type TlsClientCert,
+} from "./mtls.ts";
 import { OutboundConnectionPool, type KeepAlivePoolOptions } from "./keepalive.ts";
 import {
   assertValidProxyUrl,
@@ -140,6 +145,23 @@ export interface RelayServerOptions {
    */
   tlsPins?: Record<string, string[]>;
   /**
+   * Outbound mTLS client certificates (see `src/mtls.ts`): per-endpoint
+   * client identity, keyed by exact delivery `targetUrl`. Each entry is a
+   * `{ cert, key, passphrase? }` triple of PEM *strings* held in memory —
+   * no file paths, so rotation is a config change. During the TLS
+   * handshake the relay presents this certificate, proving to the
+   * downstream that the request comes from this relay (the downstream
+   * verifies it, typically with `requestCert: true` and its own CA list).
+   * Off by default: endpoints without an entry send no client certificate.
+   * Composes with `tlsPins` (pins verify the server, the client cert
+   * proves the relay) and with the keep-alive pool (agents are keyed per
+   * `(origin, cert)`, so a connection authenticated as one identity never
+   * serves an endpoint with a different one; a failed handshake's socket
+   * is destroyed and never reused). Invalid values throw `RangeError` at
+   * startup.
+   */
+  tlsClientCerts?: Record<string, TlsClientCert>;
+  /**
    * Outbound keep-alive connection pool (see `src/keepalive.ts`): outbound
    * deliveries reuse TCP/TLS connections per `(scheme, host, port)` instead
    * of paying a handshake per attempt. Enabled by default with sane limits
@@ -149,7 +171,10 @@ export interface RelayServerOptions {
    * whitelist get a dedicated agent per pin set, so a connection pinned for
    * one whitelist can never serve an endpoint with a different one; the
    * pin is still verified on `secureConnect` for every new connection.
-   * Pooled connections are closed when the server closes
+   * Endpoints with an mTLS client identity (`tlsClientCerts`) likewise get
+   * a dedicated agent per `(origin, cert)`, so a connection authenticated
+   * as one identity can never serve an endpoint configured with a
+   * different one. Pooled connections are closed when the server closes
    * (`stop()`/`shutdown()` path), and idle sockets are unref'd so a
    * forgotten pool never pins process exit. Invalid option values throw
    * `RangeError` at startup.
@@ -314,6 +339,15 @@ export interface RelayServerOptions {
  * `HTTP_PROXY` / `ALL_PROXY` (lowercase honored, `NO_PROXY` bypasses the
  * env fallback only — an explicit entry always wins), read per delivery.
  * Invalid proxy URLs throw `RangeError` at startup.
+ *
+ * `tlsClientCerts` is the per-endpoint mTLS client identity (see
+ * `src/mtls.ts` and the `tlsClientCerts` server option):
+ * `{ "<exact targetUrl>": { cert, key, passphrase? } }`, PEM strings held
+ * in memory. The relay presents the certificate during the TLS handshake
+ * so the downstream can verify the request really comes from this relay.
+ * Off by default; composes with `tlsPins` and the keep-alive pool (agents
+ * are keyed per `(origin, cert)`). Invalid values throw `RangeError` at
+ * startup.
  */
 export interface PooledSender extends Sender {
   /** The keep-alive pool, or `undefined` when pooling is disabled. */
@@ -326,7 +360,8 @@ export function createDefaultSender(
   tlsPins?: Record<string, string[]>,
   keepAlive?: KeepAlivePoolOptions | false,
   outboundSigning?: OutboundSigningConfig,
-  proxies?: Record<string, string>
+  proxies?: Record<string, string>,
+  tlsClientCerts?: Record<string, TlsClientCert>
 ): PooledSender {
   if (tlsPins !== undefined) {
     for (const [endpoint, pins] of Object.entries(tlsPins)) {
@@ -346,6 +381,17 @@ export function createDefaultSender(
       } catch (err) {
         throw new RangeError(
           `createDefaultSender: invalid proxy URL for ${endpoint}: ${(err as Error).message}`
+        );
+      }
+    }
+  }
+  if (tlsClientCerts !== undefined) {
+    for (const [endpoint, cert] of Object.entries(tlsClientCerts)) {
+      try {
+        assertValidClientCert(cert, `tlsClientCerts[${endpoint}]`);
+      } catch (err) {
+        throw new RangeError(
+          `createDefaultSender: invalid TLS client certificate for ${endpoint}: ${(err as Error).message}`
         );
       }
     }
@@ -373,6 +419,11 @@ export function createDefaultSender(
       // (a MITM must not even see the request body). See `src/pinning.ts`
       // for why `checkServerIdentity` cannot do this job.
       const pins = url.protocol === "https:" ? tlsPins?.[item.targetUrl] : undefined;
+      // mTLS client identity for this endpoint (exact targetUrl match):
+      // the certificate is presented during the TLS handshake so the
+      // downstream can verify the relay. Off by default — endpoints without
+      // an entry send no client certificate, exactly as before.
+      const clientCert = url.protocol === "https:" ? tlsClientCerts?.[item.targetUrl] : undefined;
       // Outbound proxy for this endpoint: explicit per-endpoint config
       // first, then the environment (read per delivery, so proxy rotation
       // needs no restart; `NO_PROXY` bypasses the env fallback only — an
@@ -387,13 +438,19 @@ export function createDefaultSender(
         return;
       }
       // Pooled keep-alive agent for this origin (dedicated agent per pin
-      // whitelist and per proxy, so a connection pinned or tunneled for
-      // one endpoint can never serve another's). With pooling disabled but
-      // a proxy configured, each delivery gets a one-off tunneled agent —
+      // whitelist, per proxy, and per client identity, so a connection
+      // pinned, tunneled, or authenticated for one endpoint can never serve
+      // another's). With pooling disabled but a proxy configured, each
+      // delivery gets a one-off tunneled agent —
       // fresh tunnel per delivery, destroyed when the request settles.
       let oneOffAgent: HttpAgent | undefined;
       const agent =
-        pool?.agentFor(url, pins, proxyUrl) ??
+        pool?.agentFor(
+          url,
+          pins,
+          proxyUrl,
+          clientCert !== undefined ? clientCertIdentity(clientCert) : undefined
+        ) ??
         (proxyUrl !== undefined
           ? (oneOffAgent = createProxiedAgent(
               url.protocol === "https:" ? "https" : "http",
@@ -428,7 +485,24 @@ export function createDefaultSender(
         url.protocol === "https:"
           ? httpsRequest(
               url,
-              { method: "POST", agent: agent ?? false, ...(pins ? { rejectUnauthorized: false } : {}) },
+              {
+                method: "POST",
+                agent: agent ?? false,
+                ...(pins ? { rejectUnauthorized: false } : {}),
+                // The client certificate rides the TLS handshake (per-request
+                // TLS options apply to connections the pooled agent opens;
+                // the pool key already binds this exact identity, so a
+                // reused socket was authenticated as this same identity).
+                ...(clientCert
+                  ? {
+                      cert: clientCert.cert,
+                      key: clientCert.key,
+                      ...(clientCert.passphrase !== undefined
+                        ? { passphrase: clientCert.passphrase }
+                        : {}),
+                    }
+                  : {}),
+              },
               onResponse
             )
           : httpRequest(url, { method: "POST", agent: agent ?? false }, onResponse);
@@ -609,7 +683,7 @@ export function createRelayServer(opts: RelayServerOptions): Server {
   // the default sender only; an injected sender signs on its own.
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies)
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts)
       : undefined;
   const queue = new RetryQueue({
     sender: opts.sender ?? defaultSender,

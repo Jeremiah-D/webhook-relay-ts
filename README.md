@@ -226,6 +226,22 @@ reliability primitives that matter for any signed-payload pipeline.
   `dead_letter` with the pin error. Endpoints without pins keep Node's default
   TLS verification. Empty whitelists and malformed pins throw `RangeError` at
   startup, never mid-delivery. Zero dependencies (`node:crypto` only).
+- `src/mtls.ts` — outbound mTLS client certificates: a per-endpoint client
+  identity (`tlsClientCerts: { "<exact targetUrl>": { cert, key, passphrase? } }`,
+  also exposed as `createRelayServer({ tlsClientCerts })` and the fifth
+  `createDefaultSender(pins, keepAlive, outboundSigning, proxies, tlsClientCerts)`
+  argument). The `cert`/`key` are PEM *strings* held in memory — no file paths,
+  so rotation is a config change. The relay presents the certificate during the
+  TLS handshake, proving to the downstream that the request comes from this
+  relay (the downstream verifies it, typically with `requestCert: true` and its
+  own CA list). Off by default: endpoints without an entry send no client
+  certificate. Composes with `tlsPins` (pins verify the *server*, the client
+  cert proves the *relay*) and with the keep-alive pool (agents are keyed per
+  `(origin, cert)`, so a connection authenticated as one identity can never
+  serve an endpoint configured with a different one; a handshake that fails
+  destroys the socket, and the checkout probe culls it, so it is never handed
+  to another delivery). Empty cert/key, unparseable PEM, and cert/key mismatch
+  throw `RangeError` at startup. Zero dependencies (`node:crypto` + `node:tls`).
 - `src/keepalive.ts` — outbound keep-alive connection pool: deliveries reuse
   TCP/TLS connections per `(scheme, host, port)` instead of paying a handshake
   per attempt. One `http.Agent`/`https.Agent` per origin, with
