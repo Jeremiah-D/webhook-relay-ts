@@ -31,6 +31,12 @@ import {
 } from "./proxy.ts";
 import type { AuditLog } from "./audit.ts";
 import type { EndpointConfigPatch } from "./hotreload.ts";
+import {
+  ApiVersionRouter,
+  VersionMetrics,
+  type ApiVersionOptions,
+  type ApiVersionRoute,
+} from "./version.ts";
 
 export interface RelayServerOptions {
   /** HMAC secret used to verify incoming webhooks. */
@@ -83,6 +89,23 @@ export interface RelayServerOptions {
    * rules throw `RangeError` at startup.
    */
   endpointVerifiers?: EndpointVerifierRule[];
+  /**
+   * Inbound API version routing (WR-33, see `src/version.ts`): inbound
+   * paths may carry a version prefix (`/v1/...`, `/v2/...`) whose payload
+   * is reshaped into the current schema by a pluggable adapter *after*
+   * signature verification (the signature covers the raw body the sender
+   * signed) and *before* dedup/enqueue — so dedup hashes the adapted
+   * payload and the same business event sent as `v1` and `v2` suppresses
+   * to one delivery. An adapter that throws rejects the request with 400
+   * (audited as `rejected` with reason `version_adapt_failed`). The
+   * matched version is recorded on `accepted` audit events (`version`)
+   * and in the Prometheus exposition
+   * (`relay_inbound_version_total{version,status}`; unversioned requests
+   * count under `version="none"`). Paths without a registered prefix are
+   * untouched — no `version` field anywhere, exactly the legacy behavior.
+   * Invalid routes throw `RangeError` at startup.
+   */
+  versions?: ApiVersionOptions;
   /**
    * Outbound TLS certificate pinning (see `src/pinning.ts`): per-endpoint
    * SPKI fingerprint whitelist, keyed by exact delivery `targetUrl`.
@@ -661,6 +684,10 @@ export function createRelayServer(opts: RelayServerOptions): Server {
   // Per-endpoint verifier rules are validated once at startup so a bad
   // pattern or verifier can never fail a request mid-flight.
   assertValidEndpointVerifierRules(opts.endpointVerifiers);
+  // API version routes are validated once at startup for the same reason.
+  const versionRouter =
+    opts.versions !== undefined ? new ApiVersionRouter(opts.versions.routes) : undefined;
+  const versionMetrics = new VersionMetrics();
   const deduplicator = opts.dedup ? new DeliveryDeduplicator(opts.dedup) : undefined;
   const rateLimiter = opts.rateLimit ? new InboundRateLimiter(opts.rateLimit) : undefined;
 
@@ -837,9 +864,11 @@ export function createRelayServer(opts: RelayServerOptions): Server {
     if (isMetrics) {
       // Prometheus scrapes this; it sits behind the same bearer token as
       // the other operator endpoints (fail closed without operatorToken).
+      // The version-routing counters render "" when versioning was never
+      // configured, keeping the output byte-identical to the legacy shape.
       res
         .writeHead(200, { "content-type": "text/plain; version=0.0.4" })
-        .end(queue.renderMetrics());
+        .end(queue.renderMetrics() + versionMetrics.render());
       return;
     }
     if (isEvents) {
@@ -1147,6 +1176,37 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       return;
     }
 
+    // API version routing (WR-33): a version-prefixed path (e.g. /v1/...)
+    // runs the *verified* payload through its adapter into the current
+    // schema. Signature verification above ran on the raw body the sender
+    // signed; everything below — replay guard, dedup, the queue — sees
+    // the adapted body, so dedup hashes the canonical form and the same
+    // event sent as v1 and v2 suppresses to one delivery. An adapter that
+    // throws rejects the request with 400: an unadaptable payload is a
+    // sender bug, never a delivery problem, so it never touches the queue.
+    let version: string | undefined;
+    if (versionRouter !== undefined) {
+      const route = versionRouter.match(pathname);
+      if (route !== undefined) {
+        version = route.adapter.version;
+        try {
+          body = route.adapter.adapt(body, { version, path: pathname, traceId });
+        } catch (err) {
+          versionMetrics.record(version, "rejected");
+          opts.auditLog.append({
+            event: "rejected",
+            id,
+            traceId,
+            reason: "version_adapt_failed",
+            version,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          res.writeHead(400, { "content-type": "text/plain" }).end("Invalid versioned payload");
+          return;
+        }
+      }
+    }
+
     if (opts.replay) {
       const nonceHeader = req.headers["x-nonce"];
       const nonce = Array.isArray(nonceHeader) ? nonceHeader[0] : nonceHeader;
@@ -1209,12 +1269,18 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       headers: passthrough,
       ...(priority ? { priority } : {}),
     });
+    // Version intake accounting (WR-33): unversioned requests count under
+    // "none" so the version mix is fully visible in the exposition.
+    if (versionRouter !== undefined) {
+      versionMetrics.record(version ?? "none", "accepted");
+    }
     const acceptedEvent: Record<string, unknown> = {
       event: "accepted",
       id,
       traceId,
       targetUrl: opts.forwardUrl,
     };
+    if (version !== undefined) acceptedEvent.version = version;
     if (rotating) acceptedEvent.keyId = verifiedKeyId ?? "unknown";
     if (perEndpointVerifier) acceptedEvent.verifier = activeVerifier.name;
     if (priority) acceptedEvent.priority = priority;

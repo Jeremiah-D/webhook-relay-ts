@@ -41,6 +41,20 @@ reliability primitives that matter for any signed-payload pipeline.
   verifier }` rules (exact `/hooks/stripe` or prefix `/hooks/*`, first
   match wins, unmatched paths fall back to the global verifier), so one
   relay can trust Ed25519 for one upstream and HMAC-SHA256 for another.
+- `src/version.ts` — inbound API version routing (`ApiVersionRouter`).
+  Version prefixes in the inbound path (`/v1/...`, `/v2/...`, segment
+  boundaries only, longest prefix wins) route the payload through a
+  pluggable `ApiVersionAdapter` that reshapes it into the current schema
+  *after* signature verification (the signature covers the raw body the
+  sender signed) and *before* dedup/enqueue — so dedup hashes the
+  adapted payload and the same event sent as `v1` and `v2` suppresses to
+  one delivery. An adapter that throws answers 400 (audited as `rejected`
+  with reason `version_adapt_failed`; it never touches the retry queue).
+  The matched version lands on `accepted` audit events (`version`) and in
+  `relay_inbound_version_total{version,status}` (unversioned requests
+  count under `version="none"`); paths without a registered prefix are
+  untouched — no `version` field anywhere, exactly the legacy behavior.
+  Invalid routes throw `RangeError` at startup.
 - `src/retry.ts` — `RetryQueue` with exponential backoff (`base * 2^attempt`)
   plus jitter, a `maxDelay` cap, a dead-letter list after `maxAttempts`, and an
   injectable sender/timer for deterministic testing. Jitter is configurable:
@@ -493,7 +507,10 @@ endpoints (404 when disabled):
 - `relay_delivery_latency_seconds_{bucket,sum,count}{endpoint}` —
   accepted→delivered latency histogram, only when `retry.latency` is
   enabled; bucket bounds via `retry.metrics.histogramBucketsMs`
-  (default 50ms…10s).
+  (default 50ms…10s),
+- `relay_inbound_version_total{version,status}` — inbound intake by API
+  version (`accepted` / `rejected`; `version="none"` for unversioned
+  requests), only when `versions` is configured.
 
 ### Dead-letter auto-replay
 
