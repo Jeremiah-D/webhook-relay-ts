@@ -211,7 +211,86 @@ export interface BatchInfo {
   traceIds: string[];
 }
 
-export type Sender = (item: RetryItem) => Promise<void>;
+export type Sender = (item: RetryItem) => Promise<DownstreamResponse | void>;
+
+/**
+ * A downstream HTTP response, as observed by the sender. A sender that can
+ * see the response (the default sender always can) returns it on transport
+ * success so {@link ResponseValidator}s can check its semantics; senders
+ * that cannot simply resolve with `undefined`, in which case validation
+ * is skipped for that delivery.
+ */
+export interface DownstreamResponse {
+  /** HTTP status code the downstream returned (2xx on this path). */
+  statusCode: number;
+  /**
+   * Captured response body. The default sender caps the capture at
+   * `RESPONSE_CAPTURE_MAX_BYTES` (64 KiB) — enough for semantic markers
+   * like `{"ok":false}` — and sets `truncated` when it cut bytes off.
+   */
+  body: Buffer;
+  /** True when the body was cut at the sender's capture cap. */
+  truncated: boolean;
+}
+
+/**
+ * Per-endpoint downstream response semantic validator (WR-37). Some
+ * downstreams answer `200 OK` with a body that still means failure —
+ * `{"ok":false}`, an `"error"` field, a payment gateway's error code.
+ * The validator runs after the transport succeeded (2xx) and decides
+ * whether the body actually means success:
+ *
+ * - return `true`: the response is a genuine success;
+ * - return `false`: semantic failure (generic);
+ * - return a `string`: semantic failure with that reason;
+ * - throw: fail-closed — treated as a semantic failure.
+ *
+ * A semantic failure follows the normal retry / dead-letter / circuit
+ * path: it is classified `"retryable"`, consecutive semantic failures
+ * trip the circuit breaker (WR-10), and the accepted→delivered latency
+ * clock keeps running until the item is delivered or dead-lettered
+ * (WR-13). The failure is audited with reason `semantic_failed`.
+ */
+export type ResponseValidator = (response: DownstreamResponse) => boolean | string;
+
+/** Structured delivery failure: the 2xx response failed semantic validation. */
+export class SemanticDeliveryError extends Error {
+  /** The validator's reason, or a generic marker when it returned `false`. */
+  readonly reason: string;
+  constructor(reason: string) {
+    super(`Downstream response failed semantic validation: ${reason}`);
+    this.name = "SemanticDeliveryError";
+    this.reason = reason;
+  }
+}
+
+/** Fired when a delivery attempt fails downstream semantic validation. */
+export interface SemanticFailureInfo {
+  /** Delivery id. */
+  id: string;
+  /** End-to-end trace ID. */
+  traceId: string;
+  /** Downstream endpoint (`targetUrl`). */
+  endpoint: string;
+  /** Attempts consumed so far, including this one. */
+  attempts: number;
+  /** The validator's reason (`"validator returned false"` when it returned `false`). */
+  reason: string;
+}
+
+/** Fired when the global retry budget (WR-38) parks a retry. */
+export interface RetryBudgetDepletedInfo {
+  /** Delivery id. */
+  id: string;
+  /** End-to-end trace ID. */
+  traceId: string;
+  /** Downstream endpoint (`targetUrl`). */
+  endpoint: string;
+  /** Attempts consumed so far (the failed attempt is already counted). */
+  attempts: number;
+  /** Milliseconds the retry was parked for. */
+  waitMs: number;
+}
 
 /**
  * Jitter strategy for the retry backoff.
@@ -427,6 +506,21 @@ export interface RetryQueueOptions {
    * Disabled by default.
    */
   batch?: BatchOptions;
+  /**
+   * Per-endpoint downstream response semantic validators (WR-37; see
+   * {@link ResponseValidator}). Either a single validator applied to every
+   * endpoint, or a record mapping exact `targetUrl` to its validator (the
+   * same exact-match convention as `tlsPins`). Non-function values throw
+   * `TypeError` at construction. Disabled by default.
+   */
+  responseValidators?: ResponseValidator | Record<string, ResponseValidator>;
+  /**
+   * Called once per delivery attempt that fails downstream semantic
+   * validation. The server audits these as `failed` with
+   * `reason: "semantic_failed"`.
+   */
+  onSemanticFailure?: (info: SemanticFailureInfo) => void;
+  /**
   /**
    * Called every time a batch is flushed — i.e. a group of buffered events
    * became one merged delivery item. The server audits this as
@@ -971,6 +1065,15 @@ export class RetryQueue {
   private readonly quota?: EndpointQuota;
   /** Attempts rescheduled because the endpoint's quota bucket was empty. */
   private readonly quotaStats = new Map<string, number>();
+  /**
+   * WR-37: per-endpoint response semantic validators (exact `targetUrl`
+   * match) plus an optional global fallback. Validators run after a 2xx
+   * transport success; a failing verdict becomes a `SemanticDeliveryError`
+   * and follows the normal retry / dead-letter / circuit path.
+   */
+  private readonly endpointResponseValidators = new Map<string, ResponseValidator>();
+  private readonly globalResponseValidator?: ResponseValidator;
+  private readonly onSemanticFailure?: (info: SemanticFailureInfo) => void;
   private readonly batcher?: BatchCollector;
   private readonly batchResolved?: ResolvedBatchOptions;
   private readonly onBatch?: (info: BatchInfo) => void;
@@ -1065,6 +1168,27 @@ export class RetryQueue {
       opts.quota?.deliveriesPerMinute !== undefined
         ? new EndpointQuota(opts.quota.deliveriesPerMinute, opts.quota.now ?? Date.now)
         : undefined;
+    // WR-37: normalize the response validators — either a single global
+    // validator or a record of exact-targetUrl → validator. Bad values
+    // throw at construction, never mid-delivery.
+    const validators = opts.responseValidators;
+    if (validators !== undefined) {
+      if (typeof validators === "function") {
+        this.globalResponseValidator = validators;
+      } else if (validators !== null && typeof validators === "object" && !Array.isArray(validators)) {
+        for (const [endpoint, v] of Object.entries(validators)) {
+          if (typeof v !== "function") {
+            throw new TypeError(
+              `responseValidators[${JSON.stringify(endpoint)}] must be a function, got ${typeof v}`
+            );
+          }
+          this.endpointResponseValidators.set(endpoint, v);
+        }
+      } else {
+        throw new TypeError("responseValidators must be a ResponseValidator or a record of ResponseValidators");
+      }
+    }
+    this.onSemanticFailure = opts.onSemanticFailure;
     this.onBatch = opts.onBatch;
     const histBuckets = opts.metrics?.histogramBucketsMs ?? [50, 100, 250, 500, 1000, 2500, 5000, 10000];
     if (
@@ -1719,7 +1843,30 @@ export class RetryQueue {
       // (only while urgent demand is backlogged) — the DRR earning event.
       if (!fastLane) this.laneScheduler.recordNormalDispatch(entry.targetUrl);
       try {
-        await this.sender(entry);
+        const response = await this.sender(entry);
+        // WR-37: the transport succeeded (2xx); the validator decides
+        // whether the body actually means success. A failing verdict
+        // becomes a SemanticDeliveryError, which the catch below treats
+        // like any retryable delivery failure — classified "retryable",
+        // so consecutive semantic failures trip the circuit breaker and
+        // the accepted→delivered latency clock keeps running.
+        const validator =
+          this.endpointResponseValidators.get(entry.targetUrl) ?? this.globalResponseValidator;
+        if (validator !== undefined && response !== undefined) {
+          let verdict: boolean | string;
+          try {
+            verdict = validator(response);
+          } catch (verr) {
+            // Fail-closed: a throwing validator never accidentally
+            // blesses a response it could not evaluate.
+            throw new SemanticDeliveryError(verr instanceof Error ? verr.message : String(verr));
+          }
+          if (verdict !== true) {
+            throw new SemanticDeliveryError(
+              typeof verdict === "string" && verdict.length > 0 ? verdict : "validator returned false"
+            );
+          }
+        }
         this.breaker?.recordSuccess(entry.targetUrl);
         this.queue.delete(id);
         this.recordDelivery(entry.targetUrl, "delivered");
@@ -1746,6 +1893,19 @@ export class RetryQueue {
         const classified = classifyFailure(err);
         const error = err instanceof Error ? err.message : String(err);
         const at = new Date().toISOString();
+        if (err instanceof SemanticDeliveryError) {
+          // WR-37: the downstream answered 2xx but the body said no.
+          // Audited as `failed` with reason `semantic_failed`; the
+          // failure then follows the normal retry / dead-letter /
+          // circuit path below.
+          this.onSemanticFailure?.({
+            id: entry.id,
+            traceId,
+            endpoint: entry.targetUrl,
+            attempts: entry.attempt + 1,
+            reason: err.reason,
+          });
+        }
         if (classified.failureClass === "non_retryable") {
           // Poison payload (e.g. a 400 from the downstream): retrying can
           // never succeed, so dead-letter immediately instead of burning

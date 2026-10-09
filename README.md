@@ -501,6 +501,21 @@ parses message strings; custom senders get the same treatment by throwing
 any error with a numeric `statusCode` field. When in doubt the classifier
 retries: an unknown failure is always `"retryable"`.
 
+**Response semantic validation:** some downstreams answer `200 OK` with a
+body that still means failure — `{"ok":false}`, an `"error"` field, a
+payment gateway's error code. A per-endpoint `responseValidator` (in
+`retry: { responseValidators }`, either one validator for every endpoint
+or an exact-`targetUrl` record) runs after the 2xx transport success and
+judges the body: `true` means genuinely delivered, `false` a generic
+semantic failure, a `string` a failure with that reason, and a throw is
+fail-closed (treated as a failure). A semantic failure follows the normal
+retry / dead-letter / circuit path (classified `"retryable"`, so
+consecutive semantic failures trip the circuit breaker and the
+accepted→delivered latency clock keeps running) and is audited as
+`failed` with `reason: "semantic_failed"`. The default sender captures up
+to 64 KiB of the response body for the validator (`truncated: true` when
+cut); a custom sender that returns no response skips validation.
+
 **Batching:** when `retry.batch` is enabled, `accepted` →
 **`batching`** instead of straight to `delivering`: normal-priority items
 for the same endpoint are held for `windowMs` (or until `maxBatchSize` is

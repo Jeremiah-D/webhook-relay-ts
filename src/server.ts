@@ -459,10 +459,35 @@ export function createDefaultSender(
             ))
           : undefined);
       const onResponse = (res: Parameters<Parameters<typeof httpsRequest>[2]>[0]): void => {
-        res.resume();
+        // WR-37: capture the response body (capped) so a per-endpoint
+        // responseValidator can check its semantics after a 2xx
+        // transport success. Non-2xx responses still reject on the
+        // status code alone — the validator never sees them.
+        const chunks: Buffer[] = [];
+        let captured = 0;
+        let truncated = false;
+        res.on("data", (chunk: Buffer) => {
+          if (captured < RESPONSE_CAPTURE_MAX_BYTES) {
+            const room = RESPONSE_CAPTURE_MAX_BYTES - captured;
+            if (chunk.length > room) {
+              chunks.push(chunk.subarray(0, room));
+              captured += room;
+              truncated = true;
+            } else {
+              chunks.push(chunk);
+              captured += chunk.length;
+            }
+          } else {
+            truncated = true;
+          }
+        });
         res.on("end", () => {
           if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
-            resolve();
+            resolve({
+              statusCode: res.statusCode,
+              body: Buffer.concat(chunks),
+              truncated,
+            });
           } else {
             // Structured failure: the retry queue classifies on the status
             // code (4xx-except-408/429 → immediate dead letter, never
@@ -609,6 +634,15 @@ export function createDefaultSender(
 /** Default inbound request body size limit: 1 MiB. */
 export const DEFAULT_MAX_BODY_BYTES = 1_048_576;
 
+/**
+ * WR-37: cap on the downstream response body the default sender captures
+ * for semantic validation (64 KiB). Semantic markers (`{"ok":false}`,
+ * gateway error codes) live in the first bytes; beyond the cap the
+ * response is truncated and `DownstreamResponse.truncated` is set, so a
+ * validator can decide whether to trust a cut-off body.
+ */
+export const RESPONSE_CAPTURE_MAX_BYTES = 64 * 1024;
+
 /** Thrown by `readRawBody` when the streamed body exceeds `maxBytes`. */
 export class BodyTooLargeError extends Error {
   readonly maxBytes: number;
@@ -730,6 +764,20 @@ export function createRelayServer(opts: RelayServerOptions): Server {
         targetUrl: item.targetUrl,
         attempts,
       });
+    },
+    // Wrap the caller's onSemanticFailure so every semantic failure is
+    // audited as `failed` with reason `semantic_failed`, not just observed.
+    onSemanticFailure: (info) => {
+      opts.auditLog.append({
+        event: "failed",
+        id: info.id,
+        traceId: info.traceId,
+        targetUrl: info.endpoint,
+        attempts: info.attempts,
+        reason: "semantic_failed",
+        semanticReason: info.reason,
+      });
+      opts.retry?.onSemanticFailure?.(info);
     },
     onDeadLetter: (item, attempts, lastError, failureClass) => {
       opts.auditLog.append({
