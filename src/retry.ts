@@ -304,6 +304,29 @@ export interface RetryBudgetDepletedInfo {
 }
 
 /**
+ * Fired when a delivery attempt fails and a retry is scheduled (WR-43).
+ * The raw material for per-trace delivery snapshots
+ * (`GET /deliveries/:traceId`): every non-terminal failure yields one line
+ * carrying the error and the scheduled delay, so the operator can
+ * reconstruct the retry trajectory instead of guessing it from attempt
+ * counts.
+ */
+export interface AttemptFailedInfo {
+  /** Delivery id. */
+  id: string;
+  /** End-to-end trace ID. */
+  traceId: string;
+  /** Physical downstream target the failed attempt went to. */
+  endpoint: string;
+  /** Attempts consumed so far (the failed attempt is already counted). */
+  attempts: number;
+  /** Failure message of the failed attempt. */
+  error: string;
+  /** Milliseconds until the retry runs (after budget parking, if any). */
+  nextDelayMs: number;
+}
+
+/**
  * Jitter strategy for the retry backoff.
  *
  * - `"additive"` (default): uniform(0, `jitterMs`) added on top of the
@@ -564,6 +587,14 @@ export interface RetryQueueOptions {
    * audits these as `retry_budget_depleted`.
    */
   onRetryBudgetDepleted?: (info: RetryBudgetDepletedInfo) => void;
+  /**
+   * Called once per failed attempt that schedules a retry — i.e. every
+   * non-terminal failure. The server audits these as `retrying` (with the
+   * error and the scheduled delay) so `GET /deliveries/:traceId` can
+   * render the retry trajectory. Failures that dead-letter instead of
+   * retrying go through `onDeadLetter`, not here.
+   */
+  onAttemptFailed?: (info: AttemptFailedInfo) => void;
   /**
    * Called every time a batch is flushed — i.e. a group of buffered events
    * became one merged delivery item. The server audits this as
@@ -1145,6 +1176,7 @@ export class RetryQueue {
   /** WR-38: global retry budget; undefined when disabled. */
   private readonly retryBudget?: RetryBudget;
   private readonly onRetryBudgetDepleted?: (info: RetryBudgetDepletedInfo) => void;
+  private readonly onAttemptFailed?: (info: AttemptFailedInfo) => void;
   /** Retries parked because the global retry budget was exhausted. */
   private retryBudgetDepleted = 0;
   private readonly batcher?: BatchCollector;
@@ -1289,6 +1321,7 @@ export class RetryQueue {
         ? new RetryBudget(opts.retryBudget.retriesPerMinute, opts.retryBudget.now ?? Date.now)
         : undefined;
     this.onRetryBudgetDepleted = opts.onRetryBudgetDepleted;
+    this.onAttemptFailed = opts.onAttemptFailed;
     this.onBatch = opts.onBatch;
     const histBuckets = opts.metrics?.histogramBucketsMs ?? [50, 100, 250, 500, 1000, 2500, 5000, 10000];
     if (
@@ -2116,6 +2149,17 @@ export class RetryQueue {
             });
             scheduledDelayMs = waitMs;
           }
+          // WR-43: report the failure after the final delay is known, so
+          // the audited `retrying` line carries the true scheduled delay
+          // (budget parking included).
+          this.onAttemptFailed?.({
+            id: entry.id,
+            traceId,
+            endpoint: target,
+            attempts: entry.attempt,
+            error,
+            nextDelayMs: Math.max(0, Math.round(scheduledDelayMs)),
+          });
           this.schedule(id, scheduledDelayMs);
         }
       }

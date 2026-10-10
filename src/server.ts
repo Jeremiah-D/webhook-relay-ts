@@ -42,6 +42,7 @@ import {
   type Http2PoolOptions,
 } from "./http2.ts";
 import type { AuditLog } from "./audit.ts";
+import { buildDeliverySnapshot } from "./delivery-status.ts";
 import type { EndpointConfigPatch } from "./hotreload.ts";
 import {
   ApiVersionRouter,
@@ -306,7 +307,8 @@ export interface RelayServerOptions {
    * Bearer token guarding the operator endpoints (`GET /dead-letter`,
    * `POST /dead-letter/:id/replay`, `POST /dead-letter/replay`,
    * the `/dead-letter/auto-replay/*` controls, `GET /audit`,
-   * `GET /latency`, `GET /events`, `GET /metrics`). When unset, those
+   * `GET /latency`, `GET /events`, `GET /metrics`,
+   * `GET /deliveries/:traceId`). When unset, those
    * endpoints are disabled and answer 404 (fail closed).
    */
   operatorToken?: string;
@@ -1001,6 +1003,22 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       });
       opts.retry?.onRetryBudgetDepleted?.(info);
     },
+    // Wrap the caller's onAttemptFailed so every failed attempt that
+    // schedules a retry is audited as `retrying` with its error and the
+    // scheduled delay — the retry trajectory behind
+    // `GET /deliveries/:traceId` (WR-43).
+    onAttemptFailed: (info) => {
+      opts.auditLog.append({
+        event: "retrying",
+        id: info.id,
+        traceId: info.traceId,
+        targetUrl: info.endpoint,
+        attempts: info.attempts,
+        error: info.error,
+        nextDelayMs: info.nextDelayMs,
+      });
+      opts.retry?.onAttemptFailed?.(info);
+    },
     onDeadLetter: (item, attempts, lastError, failureClass) => {
       opts.auditLog.append({
         event: "dead_letter",
@@ -1143,6 +1161,7 @@ export function createRelayServer(opts: RelayServerOptions): Server {
     const isAutoResume = pathname === "/dead-letter/auto-replay/resume";
     const isAutoTrigger = pathname === "/dead-letter/auto-replay/trigger";
     const isConfigEndpoint = pathname === "/config/endpoint";
+    const deliveryMatch = /^\/deliveries\/([^/]+)$/.exec(pathname);
     const replayMatch = /^\/dead-letter\/([^/]+)\/replay$/.exec(pathname);
     if (
       !isList &&
@@ -1156,6 +1175,7 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       !isAutoResume &&
       !isAutoTrigger &&
       !isConfigEndpoint &&
+      !deliveryMatch &&
       !replayMatch
     ) {
       respondJson(res, 404, { error: "not found" });
@@ -1174,6 +1194,7 @@ export function createRelayServer(opts: RelayServerOptions): Server {
         (isAutoResume && req.method === "POST") ||
         (isAutoTrigger && req.method === "POST") ||
         (isConfigEndpoint && req.method === "POST") ||
+        (deliveryMatch && req.method === "GET") ||
         (replayMatch && req.method === "POST")
       )
     ) {
@@ -1284,6 +1305,35 @@ export function createRelayServer(opts: RelayServerOptions): Server {
         return;
       }
       respondJson(res, 200, entries);
+      return;
+    }
+    if (deliveryMatch) {
+      // Per-trace delivery lifecycle snapshot (WR-43): aggregates the
+      // audit trail for one trace ID into {state, timeline, attempts,
+      // lastError, latencyMs, retry trajectory, replay records}. The
+      // aggregation reads through the WR-04 line-offset index — only
+      // matching audit lines are read, never the whole file.
+      const rawTraceId = deliveryMatch[1];
+      let traceId: string;
+      try {
+        traceId = decodeURIComponent(rawTraceId);
+      } catch {
+        respondJson(res, 400, { error: "invalid traceId" });
+        return;
+      }
+      if (traceId.length === 0) {
+        respondJson(res, 404, { error: "not found" });
+        return;
+      }
+      const snapshot = buildDeliverySnapshot(opts.auditLog, traceId);
+      if (snapshot === null) {
+        respondJson(res, 404, {
+          error: "unknown traceId",
+          hint: "query GET /audit?traceId=<id> for the raw audit trail, or check the x-trace-id echoed in the 202 response body",
+        });
+        return;
+      }
+      respondJson(res, 200, snapshot);
       return;
     }
     if (isList) {
@@ -1416,7 +1466,8 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       pathname === "/latency" ||
       pathname === "/events" ||
       pathname === "/metrics" ||
-      pathname === "/config/endpoint"
+      pathname === "/config/endpoint" ||
+      pathname.startsWith("/deliveries/")
     ) {
       try {
         await handleOperator(req, res, pathname);

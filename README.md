@@ -419,9 +419,11 @@ reliability primitives that matter for any signed-payload pipeline.
   costs almost nothing), enqueue for forwarding to
   `forwardUrl`, audit accept / delivered / dead-letter events. A failed verification returns 401 + audit entry.
   Operator endpoints `GET /dead-letter` (list dead letters with
-  attempts/lastError/timestamp metadata, no raw payloads) and
+  attempts/lastError/timestamp metadata, no raw payloads),
   `POST /dead-letter/:id/replay` (manually re-queue a dead letter, audited as
-  `dead_letter_replayed`) are guarded by an `operatorToken` bearer token and
+  `dead_letter_replayed`), and `GET /deliveries/:traceId` (per-trace delivery
+  lifecycle snapshot: state machine timeline, retry trajectory with per-attempt
+  errors, latency, replay records) are guarded by an `operatorToken` bearer token and
   disabled (404, fail closed) when it is unset. For reconciliation workflows,
   `POST /dead-letter/replay` batch-replays dead letters: the JSON body takes
   `{ endpoint?, ids?, dryRun? }` — `endpoint` limits the replay to one
@@ -729,14 +731,57 @@ value is:
 
 - echoed in the 202 response body (`{"id", "traceId", "status"}`),
 - written on every audit line (`accepted`, `delivered`, `dead_letter`,
-  `rejected`, `duplicate_suppressed`, `slo_missed`, `batch_flushed`) —
-  `GET /audit?traceId=<id>` pulls one event's whole trail,
+  `rejected`, `duplicate_suppressed`, `slo_missed`, `batch_flushed`,
+  plus `retrying` — one line per failed attempt, carrying the error and
+  the scheduled delay) — `GET /audit?traceId=<id>` pulls one event's
+  whole trail,
 - attached to every SSE delivery event frame,
 - forwarded downstream as the `x-trace-id` header, so the next hop can
   correlate with this relay's audit trail.
 
 Merged batches get a fresh trace ID of their own; the `batch_flushed`
 audit line carries the members' `traceIds` for the reverse lookup.
+
+**Delivery status snapshot:** `GET /deliveries/:traceId` (same
+`operatorToken` bearer guard, 404 fail-closed when unset) aggregates one
+trace ID's audit trail into a lifecycle snapshot — no full-file scan, the
+builder reads through the audit log's line-offset index, matching only
+lines that carry the trace ID (dead-letter replay records are matched by
+delivery `id` since `dead_letter_replayed` is an operator action, not a
+delivery event). The response:
+
+```json
+{
+  "traceId": "a3f9…",
+  "id": "delivery-uuid",
+  "endpoint": "https://downstream/hook",
+  "state": "delivered",
+  "acceptedAt": "2026-10-10T12:00:00.000Z",
+  "timeline": [
+    { "state": "accepted", "at": "…" },
+    { "state": "retrying", "at": "…", "attempts": 1, "lastError": "…", "nextDelayMs": 100 },
+    { "state": "delivered", "at": "…", "attempts": 2, "latencyMs": 312 }
+  ],
+  "attempts": 2,
+  "retryCount": 1,
+  "lastError": "…",
+  "latencyMs": 312,
+  "signals": [],
+  "replayed": []
+}
+```
+
+`state` is the latest terminal event (`delivered` / `dead_letter` /
+`rejected` / `duplicate_suppressed`), or `delivering` while no terminal
+event exists; `timeline` walks the state machine in order; `signals`
+holds contextual non-state-machine events (`failed` semantic
+validations, `retry_budget_depleted` parks, `slo_missed`); `replayed`
+lists operator dead-letter replays for the delivery. An unknown trace ID
+returns 404 with an `unknown traceId` error plus a hint to query
+`GET /audit?traceId=<id>` for the raw trail. Built for payment-style
+reconciliation: paste a trace ID from a callback dispute and see the
+whole trajectory — every retry's error and delay, the final outcome,
+and any replay — in one call.
 
 **Prometheus metrics:** with an `operatorToken` set, `GET /metrics` serves
 the queue's counters in Prometheus text exposition format (hand-written,
