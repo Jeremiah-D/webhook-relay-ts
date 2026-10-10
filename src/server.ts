@@ -407,6 +407,16 @@ export interface RelayServerOptions {
    */
   auditPayloads?: boolean;
   /**
+   * Durable delivery queue (WR-49; see `src/durable-queue.ts`). Opt-in:
+   * pending and backoff-waiting deliveries plus the dead-letter list are
+   * journaled to `<dir>/queue.jsonl` and restored on restart — retries
+   * resume with their remaining backoff, consumed attempts are preserved,
+   * and a `queue_restored` audit event records what came back. Payloads
+   * are sealed with `payloadEncryptor` when one is configured. Wins over
+   * `retry.durableQueueDir` when both are set.
+   */
+  durableQueueDir?: string;
+  /**
    * Live delivery-event stream (`GET /events`, Server-Sent Events). Emits
    * `delivered` / `retrying` / `dead_letter` frames as JSON
    * (`event: delivery`) in real time, so an operator can watch the delivery
@@ -1038,6 +1048,22 @@ export function createRelayServer(opts: RelayServerOptions): Server {
     sender: opts.sender ?? defaultSender,
     ...(opts.retry ?? {}),
     payloadEncryptor: opts.payloadEncryptor ?? opts.retry?.payloadEncryptor,
+    // WR-49: an explicit server-level `durableQueueDir` wins over the
+    // nested `retry.durableQueueDir`; either way the queue owns the
+    // journal. Wrap the caller's hook so every recovery is audited as
+    // `queue_restored`, not just observed.
+    durableQueueDir: opts.durableQueueDir ?? opts.retry?.durableQueueDir,
+    onQueueRestored: (info) => {
+      opts.auditLog.append({
+        event: "queue_restored",
+        dir: info.dir,
+        restoredItems: info.restoredItems,
+        restoredDeadLetters: info.restoredDeadLetters,
+        restoredRetries: info.restoredRetries,
+        skippedLines: info.skippedLines,
+      });
+      opts.retry?.onQueueRestored?.(info);
+    },
     // An explicit server-level `autoReplay` wins over the nested
     // `retry.autoReplay`; either way the queue owns the scheduler.
     autoReplay: opts.autoReplay ?? opts.retry?.autoReplay,

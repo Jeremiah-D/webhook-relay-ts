@@ -45,6 +45,7 @@ import {
 } from "./callback.ts";
 import { TENANT_ID_HEADER, assertValidTenantId, tenantScopeKey, splitTenantScopeKey } from "./tenant.ts";
 import { newTraceId, TRACE_ID_HEADER } from "./trace.ts";
+import { QueueJournal, type CompactItem, type QueueRestoredInfo } from "./durable-queue.ts";
 import {
   assertValidEndpointConfigPatch,
   type ConfigChange,
@@ -716,6 +717,33 @@ export interface RetryQueueOptions {
    * dead-letter list — a failing callback cannot recurse.
    */
   onCompletionCallbackFailed?: (info: CompletionCallbackFailedInfo) => void;
+  /**
+   * Durable delivery queue (WR-49; see `src/durable-queue.ts`). Opt-in:
+   * when set to a directory path, pending and backoff-waiting deliveries
+   * plus the dead-letter list are journaled to `<dir>/queue.jsonl`
+   * (append-only JSONL, fsync'd per append) and restored on restart —
+   * retries resume with their remaining backoff and consumed attempts are
+   * preserved. Payloads are sealed with the WR-11 `payloadEncryptor`
+   * when one is configured, base64-encoded in the clear otherwise (the
+   * same at-rest rule as the dead-letter list). Unset (or empty) means
+   * disabled: purely in-memory behavior, exactly as before. A set but
+   * invalid value throws `RangeError` at construction; an uncreatable
+   * directory throws (fail-fast: crash recovery that cannot write is a
+   * misconfiguration, not a degradation).
+   */
+  durableQueueDir?: string;
+  /**
+   * Clock (ms epoch) for durable-queue retry resume math; defaults to
+   * `Date.now`. Injectable so tests can verify remaining-backoff resume
+   * deterministically.
+   */
+  durableQueueNow?: () => number;
+  /**
+   * Called once after a journal recovery at construction (only when
+   * `durableQueueDir` is set and recovery ran — even when it restored
+   * nothing). The server audits this as `queue_restored`.
+   */
+  onQueueRestored?: (info: QueueRestoredInfo) => void;
 }
 
 interface Scheduled {
@@ -1342,6 +1370,33 @@ export class RetryQueue {
   private readonly timers = new Map<string, Scheduled>();
   private readonly deadLetter: DeadLetterEntry[] = [];
   /**
+   * WR-49: opt-in durable queue journal (undefined when
+   * `durableQueueDir` is unset). Every state transition with a
+   * crash-recovery meaning — enqueue, retry armed, delivered,
+   * dead-lettered, replayed — is journaled before the in-memory
+   * mutation, so a crash between the two can only redeliver
+   * (at-least-once), never lose.
+   */
+  private readonly durable?: QueueJournal;
+  private readonly durableDir?: string;
+  private readonly durableNow: () => number;
+  /**
+   * Armed retry fire-times per item (ms epoch), tracked so compaction
+   * can rewrite truthful `retry` lines. Cleared when the timer fires,
+   * when the item leaves the queue, and when timers are dropped
+   * (`stop()`/`shutdown()`).
+   */
+  private readonly durablePendingRetry = new Map<string, number>();
+  /**
+   * Pending-retry fire-times recovered from the journal, consumed once by
+   * the first `start()` so restored retries resume with their remaining
+   * backoff instead of firing immediately.
+   */
+  private readonly restoredNextAt = new Map<string, number>();
+  private durableRestoredItems = 0;
+  private durableRestoredDeadLetters = 0;
+  private durableSkippedLines = 0;
+  /**
    * WR-48: per-tenant concurrency limiters, keyed by tenant (`""` =
    * default). Each tenant gets its own per-endpoint in-flight budget, so
    * one tenant's slow downstream cannot starve another's deliveries.
@@ -1533,6 +1588,44 @@ export class RetryQueue {
         },
         onAudit: opts.onProbeAudit,
       });
+    }
+    // WR-49: opt-in durable queue. Recovery runs here, at construction,
+    // so a restarted process resumes delivery from the journal before it
+    // serves anything. Corrupt lines are skipped and counted — a torn
+    // write never prevents recovery of the rest.
+    this.durableNow = opts.durableQueueNow ?? Date.now;
+    if (opts.durableQueueDir !== undefined) {
+      if (typeof opts.durableQueueDir !== "string" || opts.durableQueueDir.length === 0) {
+        throw new RangeError(
+          `durableQueueDir must be a non-empty string, got ${JSON.stringify(opts.durableQueueDir)}`
+        );
+      }
+      this.durableDir = opts.durableQueueDir;
+      this.durable = new QueueJournal(opts.durableQueueDir, this.payloadEncryptor);
+      const rec = this.durable.recover();
+      this.durableSkippedLines = rec.skippedLines;
+      for (const item of rec.items) {
+        this.queue.set(item.id, { ...item, attempt: item.attempt });
+        if (item.nextAt !== undefined) this.restoredNextAt.set(item.id, item.nextAt);
+        // A recovery restarts the accepted→delivered clock: the sample
+        // measures the post-restart delivery, not the pre-crash wait.
+        this.latencyFor(item.tenantId)?.recordAccepted(item.id);
+        this.durableRestoredItems += 1;
+      }
+      for (const entry of rec.deadLetters) {
+        this.deadLetter.push(entry);
+        this.durableRestoredDeadLetters += 1;
+      }
+      opts.onQueueRestored?.({
+        dir: opts.durableQueueDir,
+        restoredItems: this.durableRestoredItems,
+        restoredDeadLetters: this.durableRestoredDeadLetters,
+        restoredRetries: this.restoredNextAt.size,
+        skippedLines: rec.skippedLines,
+      });
+      // Recovery rewrites the journal down to live state: superseded
+      // lines from before the crash never accumulate.
+      this.compactDurable(true);
     }
   }
 
@@ -1791,6 +1884,10 @@ export class RetryQueue {
       this.deadLetter.splice(Math.min(idx, this.deadLetter.length), 0, entry);
       throw err;
     }
+    // WR-49: the re-queued item journaled its own `enqueue` inside
+    // requeueDeadLetter; this line supersedes the `dead_letter` line.
+    this.durable?.appendReplayed(id);
+    this.compactDurable();
     return true;
   }
 
@@ -1815,7 +1912,10 @@ export class RetryQueue {
     // WR-39: replays re-enter through the logical endpoint so the next
     // dispatch resolves the *current* active target instead of pinning to
     // whatever standby served the dead-lettered attempt.
-    this.queue.set(item.id, { ...item, payload, targetUrl: failoverEndpoint ?? item.targetUrl, attempt: 0 });
+    const requeued = { ...item, payload, targetUrl: failoverEndpoint ?? item.targetUrl, attempt: 0 };
+    // WR-49: journal before the in-memory mutation, like enqueueNow.
+    this.durable?.appendEnqueue(requeued);
+    this.queue.set(item.id, requeued);
     // A replay starts a fresh delivery cycle: restart the latency clock so
     // the sample measures the replayed attempt, not the original one.
     // WR-48: the replay keeps the dead letter's tenant, so the clock
@@ -1824,6 +1924,7 @@ export class RetryQueue {
     if (this.running) {
       this.schedule(item.id, 0);
     }
+    this.compactDurable();
   }
 
   /** Replay every dead-lettered item. Returns the number replayed. */
@@ -1951,7 +2052,11 @@ export class RetryQueue {
     // `enqueue()` (replayed dead letters keep their original traceId via
     // spread, flushed batches arrive here already traced) still land with a
     // trace ID rather than an undefined one.
-    this.queue.set(item.id, { ...item, traceId: item.traceId ?? newTraceId(), attempt: 0 });
+    const stored = { ...item, traceId: item.traceId ?? newTraceId(), attempt: 0 };
+    // WR-49: journal before the in-memory mutation — a crash between the
+    // two redelivers (at-least-once), never loses.
+    this.durable?.appendEnqueue(stored);
+    this.queue.set(item.id, stored);
     // Start the latency clock only after the item is really queued — a
     // duplicate-id throw must not leave a stale pending record behind.
     // (Batched items start their clock at flush time, when the merged item
@@ -1961,14 +2066,20 @@ export class RetryQueue {
     if (this.running) {
       this.schedule(item.id, 0);
     }
+    this.compactDurable();
   }
 
   start(): void {
     if (this.running) return;
     this.running = true;
     for (const id of this.queue.keys()) {
-      this.schedule(id, 0);
+      // WR-49: items restored from the journal resume with their
+      // remaining backoff (nextAt - now, floored at 0) instead of firing
+      // immediately; everything else schedules at once, as before.
+      const nextAt = this.restoredNextAt.get(id);
+      this.schedule(id, nextAt === undefined ? 0 : Math.max(0, nextAt - this.durableNow()));
     }
+    this.restoredNextAt.clear();
     // Opt-in only: undefined when `autoReplay` was never configured, and
     // a no-op when constructed with `enabled: false`.
     this.autoReplayer?.start();
@@ -1985,6 +2096,10 @@ export class RetryQueue {
       this.clearTimer(s.handle);
       this.timers.delete(id);
     }
+    // The timers are gone, so no retry fire-time is armed anymore; the
+    // next start() (or a restart, via the journaled enqueue lines)
+    // schedules fresh.
+    this.durablePendingRetry.clear();
     // A batch window is not a delivery: flush pending batches into the queue
     // so accepted events are never silently dropped by a stop. They stay
     // queued (unscheduled) until the next start(), like backoff-waiting
@@ -2030,6 +2145,10 @@ export class RetryQueue {
       this.clearTimer(s.handle);
       this.timers.delete(id);
     }
+    this.durablePendingRetry.clear();
+    // WR-49: leave the journal compact — a shutdown is the natural
+    // checkpoint; the next boot recovers from live state only.
+    this.compactDurable(true);
     for (const id of batchIds) {      const p = this.deliver(id, true);
       // `deliver` never rejects (sender errors are caught internally), but
       // track both outcomes so a bug can never leak a hanging shutdown.
@@ -2176,6 +2295,7 @@ export class RetryQueue {
     }
     const handle = this.setTimer(() => {
       this.timers.delete(id);
+      this.durablePendingRetry.delete(id);
       const p = this.deliver(id);
       // `deliver` never rejects (sender errors are caught internally), but
       // track both outcomes so a bug can never leak a hanging shutdown.
@@ -2186,6 +2306,15 @@ export class RetryQueue {
       );
     }, delayMs);
     this.timers.set(id, { handle });
+    // WR-49: every armed timer is journaled with its absolute fire time,
+    // so a restart resumes the *remaining* backoff instead of restarting
+    // it — and the consumed attempt count travels with it.
+    if (this.durable !== undefined) {
+      const nextAt = this.durableNow() + delayMs;
+      this.durablePendingRetry.set(id, nextAt);
+      this.durable.appendRetry(id, this.queue.get(id)?.attempt ?? 0, nextAt);
+      this.compactDurable();
+    }
   }
 
   /**
@@ -2312,6 +2441,13 @@ export class RetryQueue {
         }
         breaker?.recordSuccess(target);
         this.failover?.recordOutcome(logicalEndpoint, target, true);
+        // WR-49: journal before the in-memory delete — a crash between the
+        // two redelivers (at-least-once), never loses.
+        if (this.durable !== undefined) {
+          this.durable.appendDelivered(id);
+          this.durablePendingRetry.delete(id);
+          this.compactDurable();
+        }
         this.queue.delete(id);
         this.recordDelivery(tenant, target, "delivered");
         if (fastLane) this.recordUrgentStat(target, "delivered");
@@ -2489,17 +2625,13 @@ export class RetryQueue {
     target: string
   ): void {
     const error = err instanceof Error ? err.message : String(err);
-    this.queue.delete(id);
-    this.recordDelivery(entry.tenantId, target, "deadLetter");
-    // Never delivered: drop the pending clock without sampling.
-    this.latencyFor(entry.tenantId)?.discard(entry.id);
     const encryptedPayload = this.payloadEncryptor?.encrypt(entry.payload);
     // The dead letter records the physical target the final attempt went
     // to; `failoverEndpoint` remembers the logical endpoint so a replay
     // re-resolves against the *current* active target instead of pinning
     // to the standby.
     const logicalEndpoint = entry.targetUrl;
-    this.deadLetter.push({
+    const dlEntry: DeadLetterEntry = {
       id: entry.id,
       traceId,
       // Sealed at rest when an encryptor is configured; kept in the
@@ -2519,7 +2651,19 @@ export class RetryQueue {
       payloadBytes: entry.payload.length,
       ...(encryptedPayload ? { encryptedPayload } : {}),
       ...(logicalEndpoint !== target ? { failoverEndpoint: logicalEndpoint } : {}),
-    });
+    };
+    // WR-49: journal before the in-memory mutation — a crash between the
+    // two leaves the dead letter recoverable, never lost.
+    if (this.durable !== undefined) {
+      this.durable.appendDeadLetter(dlEntry);
+      this.durablePendingRetry.delete(id);
+      this.compactDurable();
+    }
+    this.queue.delete(id);
+    this.recordDelivery(entry.tenantId, target, "deadLetter");
+    // Never delivered: drop the pending clock without sampling.
+    this.latencyFor(entry.tenantId)?.discard(entry.id);
+    this.deadLetter.push(dlEntry);
     this.onDeadLetter?.({ ...entry, targetUrl: target }, entry.attempt, err, classified.failureClass);
     this.emitDeliveryEvent({
       type: "dead_letter",
@@ -2763,4 +2907,59 @@ export class RetryQueue {
       ? undefined
       : { retriesPerMinute: this.retryBudget.limit(), depleted: this.retryBudgetDepleted };
   }
+
+  /** Durable delivery queue (WR-49) snapshot. */
+  getDurableQueueStats(): DurableQueueStats {
+    return {
+      enabled: this.durable !== undefined,
+      ...(this.durableDir !== undefined ? { dir: this.durableDir } : {}),
+      liveItems: this.queue.size,
+      deadLetters: this.deadLetter.length,
+      journalAppends: this.durable?.appends ?? 0,
+      journalWriteErrors: this.durable?.errors ?? 0,
+      restoredItems: this.durableRestoredItems,
+      restoredDeadLetters: this.durableRestoredDeadLetters,
+      skippedLines: this.durableSkippedLines,
+    };
+  }
+
+  /**
+   * Rewrite the journal down to live state when superseded lines have
+   * piled up (amortized), or unconditionally with `force`. Builds the
+   * live set from the in-memory queue, so items journaled after the last
+   * recovery are never dropped.
+   */
+  private compactDurable(force = false): void {
+    const d = this.durable;
+    if (d === undefined || (!force && !d.shouldCompact)) return;
+    const items: CompactItem[] = [];
+    for (const entry of this.queue.values()) {
+      const nextAt = this.durablePendingRetry.get(entry.id);
+      items.push({
+        id: entry.id,
+        payload: entry.payload,
+        targetUrl: entry.targetUrl,
+        headers: entry.headers,
+        priority: entry.priority,
+        traceId: entry.traceId,
+        tenantId: entry.tenantId,
+        attempt: entry.attempt,
+        ...(nextAt !== undefined ? { nextAt } : {}),
+      });
+    }
+    d.compact(items, [...this.deadLetter], force);
+  }
+}
+
+/** Durable delivery queue (WR-49) snapshot; see `getDurableQueueStats`. */
+export interface DurableQueueStats {
+  enabled: boolean;
+  dir?: string;
+  liveItems: number;
+  deadLetters: number;
+  journalAppends: number;
+  journalWriteErrors: number;
+  restoredItems: number;
+  restoredDeadLetters: number;
+  skippedLines: number;
 }

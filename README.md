@@ -550,7 +550,50 @@ Shutdown sequence on the first signal:
 
 Items still waiting on a backoff timer are dropped — they were never
 delivered, and the queue is in-memory. For at-least-once across restarts,
-replay the dead-letter list after the process comes back.
+either replay the dead-letter list after the process comes back, or enable
+the durable delivery queue below.
+
+## Durable delivery queue
+
+Opt-in crash recovery for the retry queue (`durableQueueDir`, also
+available as `retry.durableQueueDir`): pending and backoff-waiting
+deliveries plus the dead-letter list are journaled to
+`<dir>/queue.jsonl` (append-only JSONL, fsync'd per append) and restored
+when the process restarts. A restored retry resumes with its *remaining*
+backoff — the journal records each armed timer's absolute fire time — and
+consumed attempts are never reset, so a crash cannot silently grant a
+delivery extra attempts.
+
+```ts
+const server = createRelayServer({
+  secret, forwardUrl, auditLog,
+  durableQueueDir: "/var/lib/relay/queue", // opt-in; unset = in-memory
+  payloadEncryptor,                        // payloads sealed at rest (WR-11)
+});
+```
+
+- **Payload secrecy** follows the dead-letter rule: sealed with the
+  `payloadEncryptor` when one is configured, base64-encoded in the clear
+  otherwise. Configure an encryptor in production.
+- **At-least-once**: journal lines are written *before* the in-memory
+  mutation they describe, so a crash between the two can only redeliver,
+  never lose. Delivered and replayed items are terminal — they are never
+  restored.
+- **Recovery is audited**: every boot with the journal enabled appends a
+  `queue_restored` event (`restoredItems`, `restoredDeadLetters`,
+  `restoredRetries`, `skippedLines`). Corrupt lines (torn writes, payloads
+  whose key was rotated) are skipped and counted, never fatal.
+- **Compaction**: superseded lines are rewritten away amortized (and on
+  every recovery and shutdown), so the journal stays proportional to live
+  state.
+- **Cost**: one fsync'd append per enqueue, per armed retry, and per
+  terminal transition. That is the durability price — leave the option off
+  when you don't need crash recovery.
+- `queue.getDurableQueueStats()` reports the journal (`enabled`, `dir`,
+  `liveItems`, `deadLetters`, `journalAppends`, `journalWriteErrors`,
+  restore counts). Batch-buffered items (inside a `batch` window) are not
+  journaled — the window is sub-second by default and `shutdown()` flushes
+  it into the queue first.
 
 ## Runtime config hot reload
 
