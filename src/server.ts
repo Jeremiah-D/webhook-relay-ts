@@ -42,6 +42,13 @@ import {
   type ApiVersionOptions,
   type ApiVersionRoute,
 } from "./version.ts";
+import {
+  assertValidEndpointSchemaRules,
+  SchemaMetrics,
+  selectEndpointSchema,
+  type EndpointSchemaRule,
+  type PayloadSchema,
+} from "./schema.ts";
 import type { ProbeOptions } from "./downstream-probe.ts";
 import {
   assertValidCompressOutboundConfig,
@@ -121,6 +128,34 @@ export interface RelayServerOptions {
    * Invalid routes throw `RangeError` at startup.
    */
   versions?: ApiVersionOptions;
+  /**
+   * Inbound payload JSON schema registry (WR-41, see `src/schema.ts`):
+   * per-endpoint pluggable payload-shape validation. Rules are tried in
+   * config order and the first matching rule's schema validates the
+   * request — patterns are exact (`/hooks/stripe`) or prefix
+   * (`/hooks/*`); paths with no match skip validation entirely, so
+   * enabling the registry changes nothing for unlisted endpoints. The
+   * check runs *after* signature verification and WR-33 version
+   * adaptation (so a v1 payload reshaped into the current schema
+   * validates against the current schema) and *before* the replay guard
+   * and dedup. A payload that fails validation is answered 400 and
+   * audited as `rejected` with reason `schema_failed` — it never enters
+   * the queue, so it consumes no retry budget, no breaker trips, and no
+   * dedup slots. The schema's name and version ride on `accepted`
+   * (`schema` / `schemaVersion`) and `rejected` audit events, so a schema
+   * version change is visible in the audit trail; intakes also render in
+   * the Prometheus exposition (`relay_inbound_schema_total{schema,status}`).
+   * Schemas validate JSON: a non-JSON body fails validation. Off by
+   * default. Invalid rules throw `RangeError` at startup.
+   *
+   * Composes with `versions` (WR-33): when a version route matched, the
+   * schema rule is first tried against the endpoint path with the version
+   * prefix stripped — one `/hooks/*` rule covers `/v1/hooks/...` and
+   * `/v2/hooks/...` alike, since every version adapts into the current
+   * schema before validation — then against the full inbound path, so
+   * per-version rules (`/v1/admin/*`) still work.
+   */
+  payloadSchemas?: EndpointSchemaRule[];
   /**
    * Opt-in active health probing of downstream endpoints (see
    * `src/downstream-probe.ts` and the `probe` `RetryQueue` option): each listed
@@ -908,6 +943,9 @@ export function createRelayServer(opts: RelayServerOptions): Server {
   const versionRouter =
     opts.versions !== undefined ? new ApiVersionRouter(opts.versions.routes) : undefined;
   const versionMetrics = new VersionMetrics();
+  // Schema registry rules are validated once at startup for the same reason.
+  assertValidEndpointSchemaRules(opts.payloadSchemas);
+  const schemaMetrics = new SchemaMetrics();
   const deduplicator = opts.dedup ? new DeliveryDeduplicator(opts.dedup) : undefined;
   const rateLimiter = opts.rateLimit ? new InboundRateLimiter(opts.rateLimit) : undefined;
 
@@ -1088,7 +1126,7 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       // configured, keeping the output byte-identical to the legacy shape.
       res
         .writeHead(200, { "content-type": "text/plain; version=0.0.4" })
-        .end(queue.renderMetrics() + versionMetrics.render());
+        .end(queue.renderMetrics() + versionMetrics.render() + schemaMetrics.render());
       return;
     }
     if (isEvents) {
@@ -1443,12 +1481,13 @@ export function createRelayServer(opts: RelayServerOptions): Server {
     // throws rejects the request with 400: an unadaptable payload is a
     // sender bug, never a delivery problem, so it never touches the queue.
     let version: string | undefined;
+    let versionRoute: ApiVersionRoute | undefined;
     if (versionRouter !== undefined) {
-      const route = versionRouter.match(pathname);
-      if (route !== undefined) {
-        version = route.adapter.version;
+      versionRoute = versionRouter.match(pathname);
+      if (versionRoute !== undefined) {
+        version = versionRoute.adapter.version;
         try {
-          body = route.adapter.adapt(body, { version, path: pathname, traceId });
+          body = versionRoute.adapter.adapt(body, { version, path: pathname, traceId });
         } catch (err) {
           versionMetrics.record(version, "rejected");
           opts.auditLog.append({
@@ -1460,6 +1499,72 @@ export function createRelayServer(opts: RelayServerOptions): Server {
             error: err instanceof Error ? err.message : String(err),
           });
           res.writeHead(400, { "content-type": "text/plain" }).end("Invalid versioned payload");
+          return;
+        }
+      }
+    }
+
+    // Inbound JSON schema registry (WR-41): a per-endpoint pluggable
+    // payload-shape gate. It runs on the *verified, adapted* body —
+    // signature verification above ran on the raw bytes the sender
+    // signed, and WR-33 version adaptation (when matched) already reshaped
+    // the payload into the current schema — so the schema validates the
+    // canonical form, exactly like dedup hashes it below. Everything
+    // after this point (replay guard, dedup, the queue) only ever sees
+    // schema-valid payloads. A failure is answered 400 and audited as
+    // `rejected` with reason `schema_failed`: it never enters the queue,
+    // so it consumes no retry budget and never trips the breaker. Schemas
+    // validate JSON — a non-JSON body fails validation — and a throwing
+    // validator is fail-closed (rejected, never admitted).
+    let schema: PayloadSchema | undefined;
+    if (opts.payloadSchemas !== undefined) {
+      // Compose with WR-33 version routing (see `src/version.ts`): when a
+      // version route matched, the schema rule is first tried against the
+      // endpoint path with the version prefix stripped — one `/hooks/*`
+      // rule covers `/v1/hooks/...` and `/v2/hooks/...` alike, because
+      // every version adapts into the current schema before validation.
+      // If nothing matches the stripped path, the full inbound path is
+      // tried as a fallback, so per-version rules (`/v1/admin/*`) still
+      // work. Unversioned requests match against the path as-is.
+      const strippedPath =
+        versionRoute === undefined ? pathname : pathname.slice(versionRoute.prefix.length) || "/";
+      const rule =
+        selectEndpointSchema(strippedPath, opts.payloadSchemas) ??
+        (strippedPath === pathname
+          ? undefined
+          : selectEndpointSchema(pathname, opts.payloadSchemas));
+      if (rule !== undefined) {
+        schema = rule.schema;
+        let payload: unknown;
+        let parseError: string | undefined;
+        try {
+          payload = JSON.parse(body.toString("utf8"));
+        } catch {
+          parseError = "body is not valid JSON";
+        }
+        let errors: string[] | undefined;
+        if (parseError !== undefined) {
+          errors = [parseError];
+        } else {
+          try {
+            const check = schema.validate(payload);
+            if (!check.ok) errors = check.errors ?? ["schema validation failed"];
+          } catch (err) {
+            errors = [`schema validator threw: ${err instanceof Error ? err.message : String(err)}`];
+          }
+        }
+        if (errors !== undefined) {
+          schemaMetrics.record(schema.name, "rejected");
+          opts.auditLog.append({
+            event: "rejected",
+            id,
+            traceId,
+            reason: "schema_failed",
+            schema: schema.name,
+            schemaVersion: schema.version,
+            errors: errors.slice(0, 10),
+          });
+          res.writeHead(400, { "content-type": "text/plain" }).end("Schema validation failed");
           return;
         }
       }
@@ -1536,6 +1641,12 @@ export function createRelayServer(opts: RelayServerOptions): Server {
     if (versionRouter !== undefined) {
       versionMetrics.record(version ?? "none", "accepted");
     }
+    // Schema intake accounting (WR-41): only schema-validated requests
+    // were ever counted here — rejected payloads were recorded as
+    // "rejected" at the gate above.
+    if (schema !== undefined) {
+      schemaMetrics.record(schema.name, "accepted");
+    }
     const acceptedEvent: Record<string, unknown> = {
       event: "accepted",
       id,
@@ -1543,6 +1654,10 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       targetUrl: opts.forwardUrl,
     };
     if (version !== undefined) acceptedEvent.version = version;
+    if (schema !== undefined) {
+      acceptedEvent.schema = schema.name;
+      acceptedEvent.schemaVersion = schema.version;
+    }
     if (rotating) acceptedEvent.keyId = verifiedKeyId ?? "unknown";
     if (perEndpointVerifier) acceptedEvent.verifier = activeVerifier.name;
     if (priority) acceptedEvent.priority = priority;

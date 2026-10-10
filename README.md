@@ -55,6 +55,29 @@ reliability primitives that matter for any signed-payload pipeline.
   count under `version="none"`); paths without a registered prefix are
   untouched — no `version` field anywhere, exactly the legacy behavior.
   Invalid routes throw `RangeError` at startup.
+- `src/schema.ts` — inbound payload JSON schema registry
+  (`selectEndpointSchema`). Per-endpoint pluggable shape validation, off
+  by default: inbound paths match `{ pattern, schema }` rules (exact
+  `/hooks/stripe` or prefix `/hooks/*`, first match wins; unmatched paths
+  skip validation entirely). The check runs on the *verified, adapted*
+  body — after signature verification and `src/version.ts` adaptation, so
+  a v1 payload reshaped into the current schema validates against the
+  current schema — and *before* the replay guard and dedup (ordering:
+  verify → version-adapt → schema → replay → dedup → enqueue). A payload
+  that fails is answered 400 and audited as `rejected` with reason
+  `schema_failed`; it never enters the queue, so it burns no retry
+  budget and never trips the breaker. Schemas validate JSON (a non-JSON
+  body fails), and a throwing validator is fail-closed. When a version
+  route matched, rules are first tried against the version-stripped path
+  (one `/hooks/*` rule covers `/v1/hooks/...` and `/v2/hooks/...`), then
+  the full inbound path (so per-version rules like `/v1/admin/*` work).
+  The schema's name and version ride on `accepted`
+  (`schema`/`schemaVersion`) and `rejected` audit events, so version
+  changes are visible in the audit trail, and intakes render as
+  `relay_inbound_schema_total{schema,status}`. Ships a minimal built-in
+  `createRequiredFieldsSchema(name, version, fields)` for the common
+  required-fields gate; bring your own `PayloadSchema` for types, enums,
+  or ranges. Invalid rules throw `RangeError` at startup.
 - `src/retry.ts` — `RetryQueue` with exponential backoff (`base * 2^attempt`)
   plus jitter, a `maxDelay` cap, a dead-letter list after `maxAttempts`, and an
   injectable sender/timer for deterministic testing. Jitter is configurable:
