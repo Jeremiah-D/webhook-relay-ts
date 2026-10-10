@@ -13,6 +13,8 @@ import {
   type Verifier,
 } from "./verify.ts";
 import { RetryQueue, type DeliveryPriority, type DownstreamResponse, type RetryItem, type Sender } from "./retry.ts";
+import type { CompletionCallbackOptions } from "./callback.ts";
+import { createBoundAddressSelfCheck } from "./callback.ts";
 import type { AutoReplayOptions } from "./autoreplay.ts";
 import { HttpDeliveryError, parseRetryAfterMs } from "./failure.ts";
 import { installGracefulShutdown } from "./shutdown.ts";
@@ -349,6 +351,16 @@ export interface RelayServerOptions {
    * is the only behavior unless the operator opts in.
    */
   autoReplay?: AutoReplayOptions;
+  /**
+   * Delivery completion callbacks (WR-47; see `src/callback.ts`). Opt-in:
+   * when a delivery reaches a terminal state (`delivered` or
+   * `dead_letter`), the relay POSTs a signed receipt (traceId,
+   * `x-relay-idempotency-key`, `x-relay-signature`) to the caller's URL —
+   * the active counterpart to the passive `GET /deliveries/:traceId`
+   * query. Exhausted receipts are audited as `callback_failed` and never
+   * enter the retry queue or the dead-letter list. Off by default.
+   */
+  completionCallback?: CompletionCallbackOptions;
   /**
    * Replay protection for inbound webhooks. When set, each accepted POST must
    * carry a unique `x-nonce` header: a nonce seen inside the guard's window is
@@ -1060,6 +1072,25 @@ export function createRelayServer(opts: RelayServerOptions): Server {
         at: event.at,
       });
       opts.retry?.onFailoverSwitch?.(event);
+    },
+    // An explicit server-level `completionCallback` wins over the nested
+    // `retry.completionCallback`; either way the queue owns the sender.
+    // Wrap the caller's hook so every exhausted receipt is audited as
+    // `callback_failed`, not just observed. Receipts never enter the
+    // retry queue or the dead-letter list — a failing callback cannot
+    // recurse into the delivery machinery.
+    completionCallback: opts.completionCallback ?? opts.retry?.completionCallback,
+    onCompletionCallbackFailed: (info) => {
+      opts.auditLog.append({
+        event: "callback_failed",
+        id: info.id,
+        traceId: info.traceId,
+        targetUrl: info.targetUrl,
+        terminalState: info.terminalState,
+        attempts: info.attempts,
+        error: info.error,
+      });
+      opts.retry?.onCompletionCallbackFailed?.(info);
     },
     // Wrap the caller's onSloMiss so every SLO miss is audited, not just observed.
     latency: latencyOpts
@@ -1951,6 +1982,20 @@ export function createRelayServer(opts: RelayServerOptions): Server {
     // pin process exit.
     defaultSender?.destroy();
   });
+
+  // WR-47 runtime loop check: a callback URL that resolves to this relay's
+  // own listener would re-enter intake on every terminal delivery and
+  // ping-pong forever. The configuration-time check (declared
+  // `selfOrigins`) ran at queue construction; this re-checks against the
+  // actually bound address before every receipt POST, so even an
+  // undeclared self-target (e.g. an ephemeral test port) is refused.
+  queue.setCompletionCallbackSelfCheck(
+    createBoundAddressSelfCheck(() => {
+      const addr = server.address();
+      if (addr === null || typeof addr === "string") return addr;
+      return { address: addr.address, port: addr.port };
+    })
+  );
 
   if (opts.gracefulShutdown) {
     const timeoutMs = opts.gracefulShutdown.timeoutMs ?? 30_000;

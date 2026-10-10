@@ -741,6 +741,49 @@ written to the audit log, so the log is the machine's trace.
   auto-replay scheduler (see *Dead-letter auto-replay* below) replays the
   whole list on a timer with identical fresh-budget semantics.
 
+### Completion callbacks
+
+`GET /deliveries/:traceId` is the *passive* way to learn a delivery's
+outcome; completion callbacks are the *active* one. When
+`completionCallback` is set (off by default), every terminal transition —
+`delivering` → `delivered` and `delivering` → `dead_letter` — also POSTs a
+signed receipt to the caller's URL:
+
+```json
+{
+  "id": "evt-1",
+  "traceId": "…",
+  "targetUrl": "https://downstream.example/hook",
+  "terminalState": "delivered",
+  "attempts": 3,
+  "at": "2026-10-10T10:00:00.000Z",
+  "error": "downstream exploded"
+}
+```
+
+(`error` only appears on `dead_letter`.) The receipt carries the same
+trust headers as a normal delivery: `x-trace-id` (the delivery's
+end-to-end trace ID), `x-relay-signature: sha256=<hex>` (HMAC-SHA256 of the
+receipt body under `signingSecret`, so the caller can verify the receipt
+really came from this relay), `x-relay-key-id` (when `keyId` is set), and
+`x-relay-idempotency-key` derived from (delivery id, callback attempt)
+under `idempotencySecret` (WR-44 derivation, so the caller's deduplicator
+collapses retried receipts).
+
+A receipt that fails to land is retried with a short backoff — at most
+`maxAttempts` times (default 3, capped at 3) — then reported once via the
+`onCompletionCallbackFailed` hook and audited as `callback_failed`.
+Receipts never enter the retry queue or the dead-letter list: a failing
+callback cannot recurse into the delivery machinery.
+
+**Loop protection.** A callback URL that resolves to this relay's own
+inbound listener would re-enter intake on every terminal delivery and
+ping-pong forever. The target is checked twice: at configuration time
+against declared `selfOrigins` (a match throws `RangeError` at startup),
+and again before every POST against the actually bound address (so even an
+undeclared self-target is refused). A refused target fails fast and is
+audited as `callback_failed` — it is never POSTed.
+
 ### Failure classification
 
 Not every failed delivery deserves a retry (`src/failure.ts`):

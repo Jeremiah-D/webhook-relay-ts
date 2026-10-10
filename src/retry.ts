@@ -33,6 +33,16 @@ import {
   type BatchOptions,
   type ResolvedBatchOptions,
 } from "./batch.ts";
+import {
+  CompletionCallbacker,
+  createBoundAddressSelfCheck,
+  isSelfCallbackTarget,
+  resolveCompletionCallbackConfig,
+  type CompletionCallbackFailedInfo,
+  type CompletionCallbackOptions,
+  type CompletionReceipt,
+  type TerminalDeliveryState,
+} from "./callback.ts";
 import { newTraceId, TRACE_ID_HEADER } from "./trace.ts";
 import {
   assertValidEndpointConfigPatch,
@@ -61,6 +71,13 @@ export type { DeliveryCountersInput, CircuitStateInput, LatencyHistogramInput, S
 export { HttpDeliveryError, classifyFailure, parseRetryAfterMs };
 export type { FailureClass, ClassifiedFailure };
 export type { FailoverConfig, FailoverEndpointStats, FailoverSwitchEvent };
+export { CompletionCallbacker, createBoundAddressSelfCheck, isSelfCallbackTarget, resolveCompletionCallbackConfig };
+export type {
+  CompletionCallbackFailedInfo,
+  CompletionCallbackOptions,
+  CompletionReceipt,
+  TerminalDeliveryState,
+};
 
 export type { CircuitBreakerOptions, CircuitState, CircuitStats };
 export type { EncryptedPayload, PayloadEncryptor };
@@ -655,6 +672,22 @@ export interface RetryQueueOptions {
    * `failover_switched`; library users get the hook directly.
    */
   onFailoverSwitch?: (event: FailoverSwitchEvent) => void;
+  /**
+   * Delivery completion callbacks (WR-47; see `src/callback.ts`). Opt-in:
+   * when a delivery reaches a terminal state (`delivered` or
+   * `dead_letter`), the relay POSTs a signed receipt (traceId,
+   * WR-44-style idempotency key, WR-26-style `x-relay-signature`) to the
+   * caller's URL — the active counterpart to the passive
+   * `GET /deliveries/:traceId` query. Disabled by default.
+   */
+  completionCallback?: CompletionCallbackOptions;
+  /**
+   * Called once when a completion receipt exhausts its attempts
+   * (`maxAttempts`, at most 3). The server audits these as
+   * `callback_failed`. Receipts never enter the retry queue or the
+   * dead-letter list — a failing callback cannot recurse.
+   */
+  onCompletionCallbackFailed?: (info: CompletionCallbackFailedInfo) => void;
 }
 
 interface Scheduled {
@@ -1218,6 +1251,8 @@ export class RetryQueue {
     string,
     { endpoint: string; from: string; to: string; switches: number }
   >();
+  /** WR-47: completion-receipt sender; undefined when the feature is off. */
+  private readonly callbacker?: CompletionCallbacker;
 
   private readonly queue = new Map<string, RetryItem & { attempt: number }>();
   private readonly timers = new Map<string, Scheduled>();
@@ -1297,6 +1332,17 @@ export class RetryQueue {
       minNormalShare: opts.urgent?.minNormalShare ?? 0.2,
       onActivation: (event) => this.onStarvationGuardAudit?.(event),
     });
+    // WR-47: invalid callback configs throw here, at construction — never
+    // mid-delivery. The runtime loop check (against the actually bound
+    // address) is installed later via `setCompletionCallbackSelfCheck`,
+    // because the server does not know its listen port yet at this point.
+    const callbackConfig = resolveCompletionCallbackConfig(opts.completionCallback);
+    this.callbacker =
+      callbackConfig === undefined
+        ? undefined
+        : new CompletionCallbacker(callbackConfig, {
+            onFailed: (info) => opts.onCompletionCallbackFailed?.(info),
+          });
     this.latency = opts.latency ? new LatencyTracker(opts.latency) : undefined;
     this.onSloMiss = opts.latency?.onSloMiss;
     this.quota =
@@ -1734,6 +1780,7 @@ export class RetryQueue {
   stop(): void {
     this.autoReplayer?.stop();
     this.prober?.stop();
+    this.callbacker?.stop();
     this.running = false;
     for (const [id, s] of this.timers) {
       this.clearTimer(s.handle);
@@ -2071,6 +2118,13 @@ export class RetryQueue {
           attempts: entry.attempt + 1,
           at: new Date().toISOString(),
         });
+        // WR-47: terminal state — fire the completion receipt (opt-in).
+        this.callbacker?.notifyDelivered({
+          id: entry.id,
+          traceId,
+          targetUrl: target,
+          attempts: entry.attempt + 1,
+        });
       } catch (err) {
         const classified = classifyFailure(err);
         const error = err instanceof Error ? err.message : String(err);
@@ -2242,6 +2296,14 @@ export class RetryQueue {
       at,
       error,
     });
+    // WR-47: terminal state — fire the completion receipt (opt-in).
+    this.callbacker?.notifyDeadLetter({
+      id: entry.id,
+      traceId,
+      targetUrl: target,
+      attempts: entry.attempt,
+      error,
+    });
   }
 
   /** Per-endpoint concurrency snapshot: in-flight and queued deliveries. */
@@ -2255,6 +2317,17 @@ export class RetryQueue {
    */
   getUrgentStats(): UrgentStats[] {
     return [...this.urgentStats.entries()].map(([endpoint, s]) => ({ endpoint, ...s }));
+  }
+
+  /**
+   * Install the runtime loop check for completion callbacks (WR-47). The
+   * server derives the predicate from the actually bound listen address,
+   * so a callback URL that resolves to this relay — even one not declared
+   * in `selfOrigins` — is refused before every receipt POST. No-op when
+   * completion callbacks are not configured.
+   */
+  setCompletionCallbackSelfCheck(fn: (url: string) => boolean): void {
+    this.callbacker?.setSelfCheck(fn);
   }
 
   /**
