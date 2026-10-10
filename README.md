@@ -629,6 +629,52 @@ curl -X POST http://127.0.0.1:PORT/config/endpoint \
 # token · 404 when operator endpoints are disabled (fail closed)
 ```
 
+## Endpoint pause/resume (operator switch)
+
+An operator hold on a downstream: while an endpoint is paused, its
+deliveries are parked — queued items stay queued with their attempt
+counts intact, no delivery attempt is scheduled, no retry budget is
+consumed, the circuit breaker is not touched, and nothing moves to
+dead-letter. Newly accepted events for a paused endpoint park as well.
+Resuming re-arms every parked item with its remaining delay, so a
+backoff window interrupted by the pause continues instead of restarting.
+
+```ts
+queue.pauseEndpoint("https://downstream/hook");   // → true on a real transition
+queue.resumeEndpoint("https://downstream/hook");  // parked items resume automatically
+queue.getPausedEndpoints();                        // currently paused, in pause order
+```
+
+```sh
+curl -X POST http://127.0.0.1:PORT/endpoints/pause \
+  -H "Authorization: Bearer $OPERATOR_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"endpoint":"https://downstream/hook"}'
+# → 200 { endpoint, paused: true } · 400 on a bad body · 403 without the
+# token · 404 for an unknown endpoint or when operator endpoints are
+# disabled (fail closed)
+```
+
+- **Orthogonal to the circuit breaker** — pausing never changes breaker
+  state, and breaker transitions never unpause. A pause is keyed by the
+  logical `targetUrl` (it covers failover standbys too) and applies
+  across tenants.
+- **Pre-emptive holds** — `queue.pauseEndpoint` accepts a never-seen
+  endpoint: any future delivery to it parks immediately (useful to hold a
+  downstream before a deploy). The HTTP layer is stricter and answers 404
+  for endpoints the server doesn't know, so a typo is loud, not a silent
+  no-op.
+- **In-flight is never cancelled** — a delivery already past the dispatch
+  point settles normally; only future scheduling is held.
+- **Idempotent and audited** — pausing an already-paused endpoint (or
+  resuming a live one) is a no-op that audits nothing; real transitions
+  fire `onEndpointPaused` / `onEndpointResumed` and are written to the
+  audit log as `endpoint_paused` / `endpoint_resumed` (queryable via
+  `GET /audit?event=endpoint_paused`).
+- **Parked timing is in-memory** — a restart resumes parked items promptly
+  (attempt counts survive through the durable queue; the remaining
+  backoff does not).
+
 ## Endpoint failover (active/standby)
 
 One logical endpoint (the configured primary `targetUrl`) can own an

@@ -744,6 +744,30 @@ export interface RetryQueueOptions {
    * nothing). The server audits this as `queue_restored`.
    */
   onQueueRestored?: (info: QueueRestoredInfo) => void;
+  /**
+   * Called once per endpoint pause-state transition (see
+   * {@link RetryQueue.pauseEndpoint}). Edge-triggered: a pause of an
+   * already-paused endpoint is a no-op and does not fire. The server
+   * audits transitions as `endpoint_paused` / `endpoint_resumed`;
+   * library users get the same hook directly.
+   */
+  onEndpointPaused?: (info: EndpointPauseInfo) => void;
+  /**
+   * Called once per endpoint resume transition (see
+   * {@link RetryQueue.resumeEndpoint}). Edge-triggered like
+   * `onEndpointPaused`.
+   */
+  onEndpointResumed?: (info: EndpointPauseInfo) => void;
+}
+
+/**
+ * Fired on an endpoint pause/resume transition (WR-50). Pause is keyed by
+ * the logical endpoint (`targetUrl` as enqueued) and applies across
+ * tenants — pausing a downstream holds every tenant's deliveries to it.
+ */
+export interface EndpointPauseInfo {
+  /** The paused/resumed endpoint (logical `targetUrl`). */
+  endpoint: string;
 }
 
 interface Scheduled {
@@ -767,6 +791,17 @@ function assertConcurrencyLimit(maxConcurrentPerEndpoint: number): void {
     throw new RangeError(
       `maxConcurrentPerEndpoint must be a positive integer or Infinity, got ${maxConcurrentPerEndpoint}`
     );
+  }
+}
+
+/**
+ * WR-50: shared endpoint-name validation for the pause/resume operator
+ * surface — the same fail-fast rule as `updateEndpointConfig`: a
+ * non-empty string, never a silent no-op on garbage.
+ */
+function assertValidPauseEndpoint(endpoint: string, method: string): void {
+  if (typeof endpoint !== "string" || endpoint.length === 0) {
+    throw new RangeError(`${method}: endpoint must be a non-empty string`);
   }
 }
 
@@ -1286,6 +1321,40 @@ export class RetryQueue {
     tenant?: string
   ) => void;
   private readonly onConfigChange?: (endpoint: string, changes: ConfigChange[]) => void;
+  /** WR-50: operator pause/resume transition hooks (audited by the server). */
+  private readonly onEndpointPaused?: (info: EndpointPauseInfo) => void;
+  private readonly onEndpointResumed?: (info: EndpointPauseInfo) => void;
+  /**
+   * WR-50: operator pause set, keyed by logical endpoint (`targetUrl` as
+   * enqueued). A paused endpoint's deliveries are parked: they stay
+   * queued with their attempt counts intact, no delivery attempt is
+   * scheduled, no retry budget is consumed, the circuit breaker is not
+   * touched, and nothing moves to dead-letter. Orthogonal to the WR-10
+   * circuit: pausing never changes breaker state, and breaker
+   * transitions never unpause.
+   */
+  private readonly pausedEndpoints = new Set<string>();
+  /**
+   * WR-50: parked deliveries — item id → absolute next-dispatch time
+   * (ms epoch). An item lands here instead of getting a timer when
+   * `schedule()` runs for a paused endpoint, when `pauseEndpoint`
+   * disarms an armed timer, or when `deliver()` bails on a mid-wait
+   * pause. `resumeEndpoint` re-arms each entry with its remaining delay
+   * (`nextAt - now`, floored at 0), so a backoff window interrupted by
+   * the pause continues instead of restarting — and attempt counts are
+   * never reset. Parked timing is in-memory only: a restart resumes
+   * parked items promptly (attempt counts survive via the WR-49
+   * journal; the remaining backoff does not).
+   */
+  private readonly parked = new Map<string, number>();
+  /**
+   * WR-50: absolute fire time (ms epoch) of every armed retry timer.
+   * Lets `pauseEndpoint` park an in-backoff item with its *remaining*
+   * delay instead of restarting the backoff on resume. Maintained
+   * alongside `timers`; entries for settled items are dropped where the
+   * queue entry is dropped.
+   */
+  private readonly armedNextAt = new Map<string, number>();
   /** Attempts parked because the endpoint's circuit was open. */
   private circuitBlocked = 0;
   private readonly payloadEncryptor?: PayloadEncryptor;
@@ -1439,6 +1508,8 @@ export class RetryQueue {
     this.onDeadLetter = opts.onDeadLetter;
     this.onDelivered = opts.onDelivered;
     this.onConfigChange = opts.onConfigChange;
+    this.onEndpointPaused = opts.onEndpointPaused;
+    this.onEndpointResumed = opts.onEndpointResumed;
     // WR-48: the limiter is per-tenant now; instances are created lazily
     // by `limiterFor()` so tenants that never appear cost nothing. The
     // limit itself is still validated eagerly, at construction.
@@ -2073,6 +2144,9 @@ export class RetryQueue {
     if (this.running) return;
     this.running = true;
     for (const id of this.queue.keys()) {
+      // WR-50: already-parked items keep their recorded next-dispatch
+      // time across the restart instead of being re-parked as due-now.
+      if (this.parked.has(id)) continue;
       // WR-49: items restored from the journal resume with their
       // remaining backoff (nextAt - now, floored at 0) instead of firing
       // immediately; everything else schedules at once, as before.
@@ -2096,6 +2170,10 @@ export class RetryQueue {
       this.clearTimer(s.handle);
       this.timers.delete(id);
     }
+    // No timer is armed anymore, so no fire-time is meaningful either.
+    // Parked (WR-50) items stay parked: the next start() reschedules
+    // everything in the queue, pause-aware.
+    this.armedNextAt.clear();
     // The timers are gone, so no retry fire-time is armed anymore; the
     // next start() (or a restart, via the journaled enqueue lines)
     // schedules fresh.
@@ -2145,6 +2223,7 @@ export class RetryQueue {
       this.clearTimer(s.handle);
       this.timers.delete(id);
     }
+    this.armedNextAt.clear();
     this.durablePendingRetry.clear();
     // WR-49: leave the journal compact — a shutdown is the natural
     // checkpoint; the next boot recovers from live state only.
@@ -2289,12 +2368,27 @@ export class RetryQueue {
 
   private schedule(id: string, delayMs: number): void {
     if (!this.running || !this.queue.has(id)) return;
+    const entry = this.queue.get(id)!;
+    // WR-50: a paused endpoint parks instead of arming a timer — the
+    // item stays queued with its attempt count intact; `resumeEndpoint`
+    // re-arms it with the recorded delay.
+    if (this.pausedEndpoints.has(entry.targetUrl)) {
+      const existing = this.timers.get(id);
+      if (existing) {
+        this.clearTimer(existing.handle);
+        this.timers.delete(id);
+      }
+      this.armedNextAt.delete(id);
+      this.park(id, delayMs);
+      return;
+    }
     const existing = this.timers.get(id);
     if (existing) {
       this.clearTimer(existing.handle);
     }
     const handle = this.setTimer(() => {
       this.timers.delete(id);
+      this.armedNextAt.delete(id);
       this.durablePendingRetry.delete(id);
       const p = this.deliver(id);
       // `deliver` never rejects (sender errors are caught internally), but
@@ -2306,6 +2400,9 @@ export class RetryQueue {
       );
     }, delayMs);
     this.timers.set(id, { handle });
+    // WR-50: absolute fire time, so a pause mid-backoff can park the
+    // item with its *remaining* delay.
+    this.armedNextAt.set(id, Date.now() + Math.max(0, delayMs));
     // WR-49: every armed timer is journaled with its absolute fire time,
     // so a restart resumes the *remaining* backoff instead of restarting
     // it — and the consumed attempt count travels with it.
@@ -2341,6 +2438,14 @@ export class RetryQueue {
     // mid-flight switch — switches never cancel or reroute in-flight work.
     const logicalEndpoint = entry.targetUrl;
     const target = this.failover?.resolveTarget(logicalEndpoint) ?? logicalEndpoint;
+    // WR-50: the pause lands before any gate is touched — a timer that
+    // fired in the same tick as the pause parks instead of dispatching,
+    // so a paused delivery consumes no quota token, no breaker verdict,
+    // and no urgent-lane token. It was due now, so it resumes promptly.
+    if (this.pausedEndpoints.has(logicalEndpoint)) {
+      this.park(id, 0);
+      return;
+    }
     // Per-endpoint quota first: an exhausted budget delays the attempt
     // (rescheduled at the next token refill) instead of burning the retry
     // budget or tripping the circuit against a downstream we are
@@ -2407,6 +2512,15 @@ export class RetryQueue {
         if (probe) breaker?.cancelProbe(target);
         return;
       }
+      // WR-50: a pause that landed mid-wait parks the delivery instead of
+      // dispatching it — no attempt is made, nothing is consumed, the
+      // item stays queued for `resumeEndpoint`. (In-flight deliveries
+      // are never cancelled; only future scheduling is held.)
+      if (this.pausedEndpoints.has(logicalEndpoint)) {
+        if (probe) breaker?.cancelProbe(target);
+        this.park(id, 0);
+        return;
+      }
       // A normal dispatch earns the urgent lane its proportional deficit
       // (only while urgent demand is backlogged) — the DRR earning event.
       if (!fastLane) this.laneScheduler.recordNormalDispatch(target);
@@ -2449,6 +2563,7 @@ export class RetryQueue {
           this.compactDurable();
         }
         this.queue.delete(id);
+        this.armedNextAt.delete(id);
         this.recordDelivery(tenant, target, "delivered");
         if (fastLane) this.recordUrgentStat(target, "delivered");
         const latency = this.latencyFor(tenant);
@@ -2567,7 +2682,15 @@ export class RetryQueue {
           // neither another attempt, a budget token, nor a circuit
           // event. Retries resume automatically when the budget refills.
           let scheduledDelayMs = retryDelayMs;
-          if (this.retryBudget !== undefined && !this.retryBudget.take()) {
+          // WR-50: a retry for a paused endpoint parks without touching
+          // the global budget — `schedule()` below parks it, and the
+          // parking itself must consume neither a budget token, another
+          // attempt, nor a circuit event.
+          if (
+            this.retryBudget !== undefined &&
+            !this.pausedEndpoints.has(logicalEndpoint) &&
+            !this.retryBudget.take()
+          ) {
             const waitMs = this.retryBudget.msUntilToken() + this.random() * 50;
             this.retryBudgetDepleted += 1;
             this.onRetryBudgetDepleted?.({
@@ -2660,6 +2783,7 @@ export class RetryQueue {
       this.compactDurable();
     }
     this.queue.delete(id);
+    this.armedNextAt.delete(id);
     this.recordDelivery(entry.tenantId, target, "deadLetter");
     // Never delivered: drop the pending clock without sampling.
     this.latencyFor(entry.tenantId)?.discard(entry.id);
@@ -2879,6 +3003,101 @@ export class RetryQueue {
   /** Attempts parked because the endpoint's circuit was open. */
   circuitBlockedCount(): number {
     return this.circuitBlocked;
+  }
+
+  /**
+   * Pause deliveries to `endpoint` (WR-50 operator switch).
+   *
+   * From this point on, deliveries to the endpoint are parked: queued
+   * items stay queued (attempt counts untouched), no delivery attempt is
+   * scheduled, no retry budget is consumed, the circuit breaker is not
+   * touched, and nothing moves to dead-letter. Newly accepted events for
+   * the endpoint park as well. Armed backoff timers are disarmed and
+   * re-parked with their remaining delay; a delivery already in flight
+   * is *not* cancelled — it settles normally.
+   *
+   * The endpoint does not need to be known: pausing a never-seen endpoint
+   * is allowed and pre-emptive — any future delivery to it parks
+   * immediately (useful to hold a downstream before a deploy). Pause is
+   * keyed by the logical `targetUrl` and applies across tenants.
+   *
+   * Idempotent: pausing an already-paused endpoint is a no-op returning
+   * `false` (no duplicate audit event). Returns `true` on a real
+   * transition. An empty/non-string endpoint throws `RangeError`.
+   */
+  pauseEndpoint(endpoint: string): boolean {
+    assertValidPauseEndpoint(endpoint, "pauseEndpoint");
+    if (this.pausedEndpoints.has(endpoint)) return false;
+    this.pausedEndpoints.add(endpoint);
+    // Disarm armed backoff timers and park them with their remaining
+    // delay. Items without an armed timer are either inside `deliver()`
+    // — they park themselves at the pause checks there — or the queue
+    // is stopped, in which case `start()` parks everything pause-aware.
+    // (A delivery already past the pause checks keeps its attempt: the
+    // pause holds future scheduling, it never cancels in-flight work.)
+    for (const [id, t] of this.timers) {
+      const entry = this.queue.get(id);
+      if (entry === undefined || entry.targetUrl !== endpoint) continue;
+      this.clearTimer(t.handle);
+      this.timers.delete(id);
+      // A backoff interrupted mid-window resumes with its *remaining*
+      // delay, not a restarted one.
+      this.parked.set(id, this.armedNextAt.get(id) ?? Date.now());
+      this.armedNextAt.delete(id);
+    }
+    this.onEndpointPaused?.({ endpoint });
+    return true;
+  }
+
+  /**
+   * Resume deliveries to `endpoint` (WR-50 operator switch). Parked items
+   * automatically resume scheduling with their remaining delays and
+   * their original attempt counts — the pause froze their lifecycle, it
+   * did not reset it.
+   *
+   * Idempotent: resuming a non-paused endpoint is a no-op returning
+   * `false`. Returns `true` on a real transition. An empty/non-string
+   * endpoint throws `RangeError`.
+   */
+  resumeEndpoint(endpoint: string): boolean {
+    assertValidPauseEndpoint(endpoint, "resumeEndpoint");
+    if (!this.pausedEndpoints.delete(endpoint)) return false;
+    const now = Date.now();
+    for (const [id, nextAt] of this.parked) {
+      const entry = this.queue.get(id);
+      if (entry === undefined || entry.targetUrl !== endpoint) {
+        // Settled (or another endpoint's) while parked: drop the stale record.
+        if (entry === undefined) this.parked.delete(id);
+        continue;
+      }
+      this.parked.delete(id);
+      if (this.running) {
+        this.schedule(id, Math.max(0, nextAt - now));
+      }
+      // Stopped: `start()` schedules every queued item, so nothing to do.
+    }
+    this.onEndpointResumed?.({ endpoint });
+    return true;
+  }
+
+  /** Currently paused endpoints, in pause order. Empty when nothing is paused. */
+  getPausedEndpoints(): string[] {
+    return [...this.pausedEndpoints];
+  }
+
+  /** True when `endpoint` is currently paused (WR-50). */
+  isEndpointPaused(endpoint: string): boolean {
+    return this.pausedEndpoints.has(endpoint);
+  }
+
+  /**
+   * Park `id` instead of arming a retry timer: record its absolute
+   * next-dispatch time so `resumeEndpoint` can continue the original
+   * backoff window. Any armed timer must already be cleared by the
+   * caller (`pauseEndpoint` disarms; `schedule()` clears-then-parks).
+   */
+  private park(id: string, delayMs: number): void {
+    this.parked.set(id, Date.now() + Math.max(0, delayMs));
   }
 
   /**

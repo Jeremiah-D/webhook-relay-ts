@@ -1044,6 +1044,31 @@ export function createRelayServer(opts: RelayServerOptions): Server {
     opts.sender === undefined
       ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey)
       : undefined;
+  // WR-50: endpoints the operator may pause/resume over HTTP. The server
+  // only ever delivers to these — the intake target plus every
+  // per-endpoint-configured target — so anything else is a typo or a
+  // probe, and pausing it would be a silent no-op. Fail closed with 404.
+  // (Library users hit `queue.pauseEndpoint` directly, which allows any
+  // endpoint, including never-seen ones, as a pre-emptive hold.)
+  const knownEndpoints = new Set<string>([opts.forwardUrl]);
+  {
+    const failoverCfg = opts.retry?.failover;
+    if (failoverCfg) {
+      for (const [primary, cfg] of Object.entries(failoverCfg)) {
+        knownEndpoints.add(primary);
+        for (const standby of cfg.standbys ?? []) knownEndpoints.add(standby);
+      }
+    }
+    const validators = opts.retry?.responseValidators;
+    if (validators !== undefined && typeof validators === "object") {
+      for (const endpoint of Object.keys(validators)) knownEndpoints.add(endpoint);
+    }
+    for (const record of [opts.tlsPins, opts.tlsClientCerts, opts.compressOutbound, opts.proxies]) {
+      if (record) for (const endpoint of Object.keys(record)) knownEndpoints.add(endpoint);
+    }
+    for (const endpoint of opts.retry?.probe?.endpoints ?? []) knownEndpoints.add(endpoint);
+    for (const endpoint of opts.probe?.endpoints ?? []) knownEndpoints.add(endpoint);
+  }
   const queue = new RetryQueue({
     sender: opts.sender ?? defaultSender,
     ...(opts.retry ?? {}),
@@ -1219,6 +1244,18 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       opts.auditLog.append({ event: "endpoint_config_updated", endpoint, changes });
       opts.retry?.onConfigChange?.(endpoint, changes);
     },
+    // Wrap the caller's pause hooks so every pause/resume transition is
+    // audited as `endpoint_paused` / `endpoint_resumed`, not just
+    // observed. Edge-triggered in the queue — idempotent no-ops audit
+    // nothing.
+    onEndpointPaused: ({ endpoint }) => {
+      opts.auditLog.append({ event: "endpoint_paused", endpoint });
+      opts.retry?.onEndpointPaused?.({ endpoint });
+    },
+    onEndpointResumed: ({ endpoint }) => {
+      opts.auditLog.append({ event: "endpoint_resumed", endpoint });
+      opts.retry?.onEndpointResumed?.({ endpoint });
+    },
     // Wrap the caller's onBatch so every flushed batch is audited, not just observed.
     onBatch: (info) => {
       opts.auditLog.append({
@@ -1339,6 +1376,8 @@ export function createRelayServer(opts: RelayServerOptions): Server {
     const isAutoResume = pathname === "/dead-letter/auto-replay/resume";
     const isAutoTrigger = pathname === "/dead-letter/auto-replay/trigger";
     const isConfigEndpoint = pathname === "/config/endpoint";
+    const isEndpointsPause = pathname === "/endpoints/pause";
+    const isEndpointsResume = pathname === "/endpoints/resume";
     const deliveryMatch = /^\/deliveries\/([^/]+)$/.exec(pathname);
     const replayMatch = /^\/dead-letter\/([^/]+)\/replay$/.exec(pathname);
     if (
@@ -1353,6 +1392,8 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       !isAutoResume &&
       !isAutoTrigger &&
       !isConfigEndpoint &&
+      !isEndpointsPause &&
+      !isEndpointsResume &&
       !deliveryMatch &&
       !replayMatch
     ) {
@@ -1372,6 +1413,8 @@ export function createRelayServer(opts: RelayServerOptions): Server {
         (isAutoResume && req.method === "POST") ||
         (isAutoTrigger && req.method === "POST") ||
         (isConfigEndpoint && req.method === "POST") ||
+        (isEndpointsPause && req.method === "POST") ||
+        (isEndpointsResume && req.method === "POST") ||
         (deliveryMatch && req.method === "GET") ||
         (replayMatch && req.method === "POST")
       )
@@ -1655,6 +1698,50 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       }
       return;
     }
+    if (isEndpointsPause || isEndpointsResume) {
+      // WR-50: operator pause/resume switch. Body is `{ endpoint }`.
+      // Pausing parks the endpoint's deliveries (queued items stay
+      // queued, new events park, nothing is attempted, budgeted, or
+      // dead-lettered); resuming re-arms them with their remaining
+      // delays. Transitions are audited as `endpoint_paused` /
+      // `endpoint_resumed` by the queue hooks. Unknown endpoints are a
+      // fail-closed 404 — pausing a typo must be loud, not a silent
+      // no-op (the queue-level API still allows pre-emptive pauses of
+      // never-seen endpoints for library users).
+      let body: Record<string, unknown>;
+      try {
+        const raw = (await readRawBody(req, maxBodyBytes)).toString("utf8");
+        body = raw.trim() === "" ? {} : JSON.parse(raw);
+      } catch (err) {
+        if (err instanceof BodyTooLargeError) {
+          respondJson(res, 413, { error: "request body too large" });
+          return;
+        }
+        respondJson(res, 400, { error: "invalid JSON body" });
+        return;
+      }
+      if (typeof body !== "object" || body === null || Array.isArray(body)) {
+        respondJson(res, 400, { error: "body must be a JSON object" });
+        return;
+      }
+      const { endpoint } = body;
+      if (typeof endpoint !== "string" || endpoint.length === 0) {
+        respondJson(res, 400, { error: "endpoint must be a non-empty string" });
+        return;
+      }
+      if (!knownEndpoints.has(endpoint)) {
+        respondJson(res, 404, { error: "unknown endpoint" });
+        return;
+      }
+      if (isEndpointsPause) {
+        queue.pauseEndpoint(endpoint);
+        respondJson(res, 200, { endpoint, paused: true });
+      } else {
+        queue.resumeEndpoint(endpoint);
+        respondJson(res, 200, { endpoint, paused: false });
+      }
+      return;
+    }
     const id = decodeURIComponent(replayMatch![1]);
     if (queue.replayDeadLetter(id)) {
       opts.auditLog.append({ event: "dead_letter_replayed", id });
@@ -1674,6 +1761,8 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       pathname === "/events" ||
       pathname === "/metrics" ||
       pathname === "/config/endpoint" ||
+      pathname === "/endpoints/pause" ||
+      pathname === "/endpoints/resume" ||
       pathname.startsWith("/deliveries/")
     ) {
       try {
