@@ -3,6 +3,16 @@ import { connect as tlsConnect, type TLSSocket } from "node:tls";
 import { createHash, randomBytes } from "node:crypto";
 import { normalizePin, spkiFingerprint, TlsPinMismatchError } from "./pinning.ts";
 import { HttpDeliveryError } from "./failure.ts";
+import {
+  PERMESSAGE_DEFLATE_OFFER,
+  decompressMessage,
+  maybeCompressMessage,
+  negotiatePerMessageDeflate,
+  resolvePerMessageDeflate,
+  type NegotiatedDeflate,
+  type PerMessageDeflateOptions,
+  type ResolvedPerMessageDeflate,
+} from "./deflate.ts";
 import type { DownstreamResponse } from "./retry.ts";
 
 /**
@@ -42,6 +52,10 @@ import type { DownstreamResponse } from "./retry.ts";
  * - WR-24 keep-alive: connections are pooled per `(scheme, host, port,
  *   pin-whitelist)` and reused across deliveries; idle connections are
  *   ping/pong-probed and reaped, so a dead socket never serves a delivery.
+ * - WR-46 permessage-deflate: opt-in per-pool (`permessageDeflate`
+ *   option); negotiated per connection at handshake, opportunistic per
+ *   message (threshold + never-expand), RSV1-marked frames both ways.
+ *   Negotiation is strict — see `src/deflate.ts`.
  *
  * `x-relay-*` headers (idempotency key, trace, …) ride the upgrade
  * request as plain HTTP headers — the WebSocket handshake *is* an HTTP
@@ -73,6 +87,16 @@ export interface WebSocketPoolOptions {
    * (milliseconds). Default: 60000. Must be a positive integer.
    */
   idleTimeoutMs?: number;
+  /**
+   * WebSocket permessage-deflate (RFC 7692) for downstream deliveries
+   * (WR-46, see `src/deflate.ts`): `true` enables with defaults,
+   * `{ thresholdBytes? }` tunes the payload size at which compression
+   * kicks in (default 1024). Disabled by default. The relay offers
+   * `permessage-deflate` with both no-context-takeover parameters
+   * required; a downstream that answers without them fails the handshake
+   * instead of negotiating parameters the relay cannot honor.
+   */
+  permessageDeflate?: boolean | PerMessageDeflateOptions;
 }
 
 /** Validated {@link WebSocketPoolOptions} with defaults applied. */
@@ -81,6 +105,7 @@ export interface ResolvedWebSocketPoolOptions {
   maxMessageBytes: number;
   pingIntervalMs: number;
   idleTimeoutMs: number;
+  permessageDeflate: ResolvedPerMessageDeflate | undefined;
 }
 
 /** Validate pool options once, at startup — never mid-delivery. */
@@ -99,7 +124,13 @@ export function resolveWebSocketOptions(opts: WebSocketPoolOptions = {}): Resolv
     fail("pingIntervalMs must be a non-negative integer");
   if (!Number.isInteger(idleTimeoutMs) || idleTimeoutMs <= 0)
     fail("idleTimeoutMs must be a positive integer");
-  return { timeoutMs, maxMessageBytes, pingIntervalMs, idleTimeoutMs };
+  let permessageDeflate: ResolvedPerMessageDeflate | undefined;
+  try {
+    permessageDeflate = resolvePerMessageDeflate(opts.permessageDeflate);
+  } catch (err) {
+    fail((err as Error).message);
+  }
+  return { timeoutMs, maxMessageBytes, pingIntervalMs, idleTimeoutMs, permessageDeflate };
 }
 
 // --- RFC 6455 frame codec -------------------------------------------------
@@ -112,19 +143,20 @@ const OP_CONT = 0x0;
 const WS_GUID = "258EAFA5-E91447DA-C5AB0DC85B11";
 
 /** Encode one frame. Client-to-server frames are always masked (RFC 6455 §5.3). */
-export function encodeWsFrame(opcode: number, payload: Buffer, masked: boolean): Buffer {
+export function encodeWsFrame(opcode: number, payload: Buffer, masked: boolean, rsv1 = false): Buffer {
   const len = payload.length;
   let header: Buffer;
+  const b0 = 0x80 | (rsv1 ? 0x40 : 0) | opcode;
   if (len < 126) {
-    header = Buffer.from([0x80 | opcode, (masked ? 0x80 : 0) | len]);
+    header = Buffer.from([b0, (masked ? 0x80 : 0) | len]);
   } else if (len < 65536) {
     header = Buffer.alloc(4);
-    header[0] = 0x80 | opcode;
+    header[0] = b0;
     header[1] = (masked ? 0x80 : 0) | 126;
     header.writeUInt16BE(len, 2);
   } else {
     header = Buffer.alloc(10);
-    header[0] = 0x80 | opcode;
+    header[0] = b0;
     header[1] = (masked ? 0x80 : 0) | 127;
     header.writeBigUInt64BE(BigInt(len), 2);
   }
@@ -138,6 +170,8 @@ export function encodeWsFrame(opcode: number, payload: Buffer, masked: boolean):
 /** One decoded frame (payload already unmasked when the mask bit was set). */
 export interface WsFrame {
   fin: boolean;
+  /** RSV1: set on the first frame of a permessage-deflate message (RFC 7692). */
+  rsv1: boolean;
   opcode: number;
   payload: Buffer;
 }
@@ -158,6 +192,7 @@ export class WsFrameReader {
     const b = this.buf;
     if (b.length < 2) return undefined;
     const fin = (b[0] & 0x80) !== 0;
+    const rsv1 = (b[0] & 0x40) !== 0;
     const opcode = b[0] & 0x0f;
     const masked = (b[1] & 0x80) !== 0;
     let len = b[1] & 0x7f;
@@ -184,7 +219,7 @@ export class WsFrameReader {
       payload = out;
     }
     this.buf = b.subarray(off + maskOff + len);
-    return { fin, opcode, payload };
+    return { fin, rsv1, opcode, payload };
   }
 }
 
@@ -215,6 +250,12 @@ interface PooledWsConnection {
   dead: boolean;
   /** Resolve for an in-flight ping probe, if any. */
   pongWaiter?: () => void;
+  /**
+   * permessage-deflate parameters negotiated on this connection's
+   * handshake (WR-46), or `null` when the downstream did not select the
+   * extension — the connection then carries plain text frames.
+   */
+  deflate: NegotiatedDeflate | null;
 }
 
 /** Observable pool counters. */
@@ -225,6 +266,10 @@ export interface WebSocketPoolStats {
   pingTimeouts: number;
   idle: number;
   busy: number;
+  /** Deliveries sent with RSV1 (permessage-deflate compressed). */
+  deflatedOut: number;
+  /** Deliveries whose reply arrived RSV1-compressed and was inflated. */
+  deflatedIn: number;
 }
 
 /**
@@ -239,7 +284,14 @@ export interface WebSocketPoolStats {
 export class WebSocketPool {
   private readonly opts: ResolvedWebSocketPoolOptions;
   private readonly conns = new Map<string, PooledWsConnection[]>();
-  private readonly stats = { created: 0, reused: 0, destroyed: 0, pingTimeouts: 0 };
+  private readonly stats = {
+    created: 0,
+    reused: 0,
+    destroyed: 0,
+    pingTimeouts: 0,
+    deflatedOut: 0,
+    deflatedIn: 0,
+  };
   private probeTimer?: NodeJS.Timeout;
   private destroyed = false;
 
@@ -368,14 +420,38 @@ export class WebSocketPool {
 
   /**
    * One delivery round trip on an exclusively-held connection: send the
-   * masked text frame, then consume frames until a text message (the
-   * response) or a clean close. Pings are auto-ponged inline.
+   * text frame (RSV1 + permessage-deflate when negotiated and worthwhile,
+   * WR-46), then consume frames until a text message (the response) or a
+   * clean close. Pings are auto-ponged inline.
+   *
+   * Inbound RSV1 marks a compressed reply: it is inflated after the final
+   * fragment arrives. RSV1 on a connection without negotiated deflate, on
+   * a continuation frame, or on a control frame is a protocol violation
+   * and fails the delivery. A compressed reply truncated at
+   * `maxMessageBytes` fails the delivery too — a partial deflate stream
+   * cannot be inflated or truncated safely, so the truncation contract
+   * only applies to plain text.
    */
-  private roundTrip(
+  private async roundTrip(
     conn: PooledWsConnection,
     body: Buffer,
     targetUrl: string
   ): Promise<DownstreamResponse> {
+    // WR-46: opportunistic permessage-deflate on a negotiated connection.
+    // maybeCompressMessage never expands the wire: small or incompressible
+    // payloads go out as plain text with RSV1 clear.
+    let wire = body;
+    let rsv1 = false;
+    if (conn.deflate !== null && this.opts.permessageDeflate !== undefined) {
+      const out = await maybeCompressMessage(
+        body,
+        this.opts.permessageDeflate.thresholdBytes,
+        conn.deflate.windowBits
+      );
+      wire = out.bytes;
+      rsv1 = out.compressed;
+      if (rsv1) this.stats.deflatedOut++;
+    }
     return new Promise<DownstreamResponse>((resolve, reject) => {
       const { socket, reader } = conn;
       const timer = setTimeout(() => {
@@ -389,6 +465,9 @@ export class WebSocketPool {
       let textLen = 0;
       let truncated = false;
       let settled = false;
+      // True once the first frame of the reply carried RSV1: the whole
+      // message is one deflate stream, inflated at FIN.
+      let replyCompressed = false;
 
       const cleanup = (): void => {
         clearTimeout(timer);
@@ -415,7 +494,30 @@ export class WebSocketPool {
         // payload and hung up (fire-and-forget) — a successful delivery
         // with an empty body.
         if (text.length === 0) done({ statusCode: 200, body: Buffer.alloc(0), truncated: false });
-        else done({ statusCode: 200, body: Buffer.concat(text), truncated });
+        else finishText();
+      };
+      /** Complete a text reply: inflate when the message was RSV1-marked. */
+      const finishText = (): void => {
+        const payload = Buffer.concat(text);
+        if (!replyCompressed) {
+          done({ statusCode: 200, body: payload, truncated });
+          return;
+        }
+        if (truncated) {
+          // The wire cap cut a deflate stream mid-way: it cannot be
+          // inflated or truncated safely — fail, don't corrupt.
+          fail(
+            new Error(
+              `websocket: compressed reply from ${targetUrl} exceeded maxMessageBytes ${this.opts.maxMessageBytes}`
+            )
+          );
+          return;
+        }
+        this.stats.deflatedIn++;
+        decompressMessage(payload).then(
+          (plain) => done({ statusCode: 200, body: plain, truncated: false }),
+          (err) => fail(err as Error)
+        );
       };
       const onData = (chunk: Buffer): void => {
         reader.push(chunk);
@@ -429,8 +531,16 @@ export class WebSocketPool {
           }
           if (frame === undefined) break;
           if (frame.opcode === OP_PING) {
+            if (frame.rsv1) {
+              fail(new Error(`websocket: compressed control frame from ${targetUrl}`));
+              return;
+            }
             socket.write(encodeWsFrame(OP_PONG, frame.payload, true));
           } else if (frame.opcode === OP_PONG) {
+            if (frame.rsv1) {
+              fail(new Error(`websocket: compressed control frame from ${targetUrl}`));
+              return;
+            }
             conn.pongWaiter?.();
             conn.pongWaiter = undefined;
           } else if (frame.opcode === OP_TEXT || frame.opcode === OP_CONT) {
@@ -440,6 +550,19 @@ export class WebSocketPool {
             if (frame.opcode === OP_CONT && textLen === 0 && text.length === 0) {
               fail(new Error(`websocket: stray continuation frame from ${targetUrl}`));
               return;
+            }
+            if (frame.rsv1) {
+              // RSV1 is only legal on the first frame of a message, and
+              // only when deflate was negotiated for this connection.
+              if (frame.opcode !== OP_TEXT || text.length !== 0 || textLen !== 0) {
+                fail(new Error(`websocket: RSV1 on non-first frame from ${targetUrl}`));
+                return;
+              }
+              if (conn.deflate === null) {
+                fail(new Error(`websocket: compressed frame without negotiated deflate from ${targetUrl}`));
+                return;
+              }
+              replyCompressed = true;
             }
             const room = this.opts.maxMessageBytes - textLen;
             if (frame.payload.length > room) {
@@ -451,10 +574,14 @@ export class WebSocketPool {
               textLen += frame.payload.length;
             }
             if (frame.fin) {
-              done({ statusCode: 200, body: Buffer.concat(text), truncated });
+              finishText();
               return;
             }
           } else if (frame.opcode === OP_CLOSE) {
+            if (frame.rsv1) {
+              fail(new Error(`websocket: compressed control frame from ${targetUrl}`));
+              return;
+            }
             // Echo the close if the peer is still waiting for one, then
             // treat it like a socket close (handled by onClose).
             if (!socket.destroyed) socket.write(encodeWsFrame(OP_CLOSE, Buffer.alloc(0), true));
@@ -467,7 +594,7 @@ export class WebSocketPool {
       socket.on("data", onData);
       socket.once("error", onError);
       socket.once("close", onClose);
-      socket.write(encodeWsFrame(OP_TEXT, body, true), (err) => {
+      socket.write(encodeWsFrame(OP_TEXT, wire, true, rsv1), (err) => {
         if (err) fail(err);
       });
     });
@@ -618,7 +745,14 @@ export class WebSocketPool {
           })
         : netConnect({ host, port });
       const reader = new WsFrameReader();
-      const conn: PooledWsConnection = { socket, reader, idleSince: Date.now(), busy: false, dead: false };
+      const conn: PooledWsConnection = {
+        socket,
+        reader,
+        idleSince: Date.now(),
+        busy: false,
+        dead: false,
+        deflate: null,
+      };
 
       const verifyPins = (): void => {
         if (pins === undefined) {
@@ -651,6 +785,12 @@ export class WebSocketPool {
           `Sec-WebSocket-Key: ${key}`,
           "Sec-WebSocket-Version: 13",
         ];
+        // WR-46: offer permessage-deflate with both no-context-takeover
+        // parameters required (see src/deflate.ts for the strict
+        // negotiation model).
+        if (this.opts.permessageDeflate !== undefined) {
+          lines.push(`Sec-WebSocket-Extensions: ${PERMESSAGE_DEFLATE_OFFER}`);
+        }
         for (const [name, value] of Object.entries(relayHeaders)) {
           lines.push(`${name}: ${value}`);
         }
@@ -688,6 +828,19 @@ export class WebSocketPool {
           ) {
             fail(new Error(`websocket: bad upgrade response from ${targetUrl}`));
             return;
+          }
+          // WR-46: settle permessage-deflate. No offer was sent → ignore
+          // any extension the server volunteers; offer sent but no
+          // permessage-deflate in the response → plain text connection.
+          // A violating permessage-deflate answer fails the handshake
+          // (plain Error → retryable) rather than mis-negotiating.
+          if (this.opts.permessageDeflate !== undefined) {
+            try {
+              conn.deflate = negotiatePerMessageDeflate(headers["sec-websocket-extensions"]);
+            } catch (err) {
+              fail(err as Error);
+              return;
+            }
           }
           done(conn);
         };

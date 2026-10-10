@@ -471,11 +471,12 @@ export interface RelayServerOptions {
  *
  * `websocket` tunes the WebSocket downstream path (WR-45, see
  * `src/websocket.ts`): `{ timeoutMs?, maxMessageBytes?, pingIntervalMs?,
- * idleTimeoutMs? }`. The pool itself is always created — a `ws:`/`wss:`
- * target just works — the options only tune timeouts and caps. Invalid
- * values throw `RangeError` at startup. The returned sender carries the
- * pool as `.wsPool` and closes it via `.destroy()` alongside the other
- * pools.
+ * idleTimeoutMs?, permessageDeflate? }`. The pool itself is always created
+ * — a `ws:`/`wss:` target just works — the options only tune timeouts,
+ * caps, and the opt-in permessage-deflate extension (WR-46, see
+ * `src/deflate.ts`). Invalid values throw `RangeError` at startup. The
+ * returned sender carries the pool as `.wsPool` and closes it via
+ * `.destroy()` alongside the other pools.
  */
 export interface PooledSender extends Sender {
   /** The keep-alive pool, or `undefined` when pooling is disabled. */

@@ -387,6 +387,33 @@ reliability primitives that matter for any signed-payload pipeline.
   60s), so a dead socket never serves a delivery; `timeoutMs` (default 10s)
   bounds the TCP+TLS+handshake phase and the reply wait separately).
   Invalid option values throw `RangeError` at startup.
+- `src/deflate.ts` — WebSocket permessage-deflate (RFC 7692, WR-46),
+  opt-in per pool via the `permessageDeflate` WebSocket option (`true` for
+  defaults, `{ thresholdBytes? }` to tune the payload size at which
+  compression kicks in, default 1024). When enabled, the upgrade request
+  offers `permessage-deflate` with both no-context-takeover parameters
+  **required** (`client_no_context_takeover; server_no_context_takeover`);
+  a downstream that answers without them fails the handshake (plain
+  `Error` → retryable) instead of negotiating parameters the relay cannot
+  honor — per RFC 7692 §7.1.2.2 a server must not select the extension
+  while rejecting the client's required parameters. Requiring
+  `server_no_context_takeover` keeps decompression to one independent
+  inflate per message: no persistent inflater state rides pooled
+  connections. Compression is opportunistic per message: payloads below
+  the threshold go out untouched, and a payload whose compressed form is
+  not smaller than the original also goes out untouched — deflate never
+  expands the wire. Wire form follows RFC 7692 §7.2.1 exactly (raw DEFLATE
+  + `Z_SYNC_FLUSH`, trailing `00 00 ff ff` stripped, RSV1 set); inbound
+  RSV1 frames are inflated after the final fragment, and RSV1 on a
+  connection without negotiated deflate, on a continuation frame, or on a
+  control frame fails the delivery as a protocol violation. A compressed
+  reply truncated at `maxMessageBytes` fails the delivery — a partial
+  deflate stream can neither be inflated nor truncated safely, so the
+  truncation contract applies to plain text only. `getStats()` exposes
+  `deflatedOut` / `deflatedIn` counters. Covered by
+  `test/websocket-deflate.test.ts` (negotiation matrix, RFC 7692 wire-form
+  round-trips, threshold/never-expand rules, and a raw-socket stub server
+  for the delivery path).
 - `src/proxy.ts` — outbound HTTP(S) proxy support: per-endpoint proxy URLs
   (`proxies: { "<exact targetUrl>": "http://user:pass@proxy:8080" }`, also
   exposed as `createRelayServer({ proxies })` and the fourth
