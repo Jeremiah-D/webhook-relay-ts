@@ -675,6 +675,47 @@ curl -X POST http://127.0.0.1:PORT/endpoints/pause \
   (attempt counts survive through the durable queue; the remaining
   backoff does not).
 
+## Relay-level global concurrency cap
+
+`maxConcurrentPerEndpoint` bounds in-flight deliveries *per downstream*;
+`globalMaxConcurrent` (`retry.globalMaxConcurrent`) bounds them *across
+the whole relay* — at most N deliveries executing concurrently, no matter
+how many endpoints or tenants they fan out to. The two gates compose: a
+dispatch needs a slot from each. When the cap is hit, excess dispatches
+wait FIFO for a slot — never dropped, never burning retry budget, never
+touching the circuit breaker.
+
+```ts
+const queue = new RetryQueue({
+  maxConcurrentPerEndpoint: 8, // per endpoint (WR-06)
+  globalMaxConcurrent: 64,      // relay-wide (WR-51); default Infinity
+});
+queue.getGlobalConcurrencyStats();
+// → { maxConcurrent: 64, inFlight: 12, queuedDepth: 3, waitsTotal: 41 }
+```
+
+- **Dispatch-point placement** — the gate is the last acquisition before
+  the sender is invoked (after the lane turn, the per-endpoint limiter,
+  and the liveness/pause re-check) and is released when the attempt
+  settles (success, failure-scheduled, or dead-lettered). Quota, circuit,
+  and budget verdicts are all settled before a global slot is taken, so
+  waiting on the gate disturbs nothing; lane ordering from the WR-35
+  scheduler is preserved.
+- **The urgent lane bypasses the per-endpoint limiter but not this gate**
+  — the cap is relay-level capacity (sockets, memory, file descriptors),
+  not per-endpoint policy.
+- **Paused endpoints hold no slots** — a paused delivery never reaches
+  the gate (it parks before), so an operator hold can't starve the relay.
+- **Observability** — `getGlobalConcurrencyStats()` reports the cap, the
+  current in-flight count, the FIFO waiter depth, and the cumulative
+  waiter count; the cumulative count is also exported as
+  `relay_global_concurrency_wait_total` (present only when the cap is
+  configured). Invalid values throw `RangeError` at construction.
+- **Shutdown-safe** — the gate is promise-FIFO only (no timers, nothing
+  to unref); `stop()`/`shutdown()` wake every waiter, whose liveness
+  check bails it out instead of dispatching, so a shutdown waits only
+  for genuinely in-flight deliveries.
+
 ## Endpoint failover (active/standby)
 
 One logical endpoint (the configured primary `targetUrl`) can own an

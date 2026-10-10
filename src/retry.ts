@@ -58,6 +58,10 @@ import {
   type FailoverSwitchEvent,
 } from "./failover.ts";
 import {
+  GlobalConcurrencyGate,
+  type GlobalConcurrencyStats,
+} from "./global-concurrency.ts";
+import {
   renderPrometheus,
   type CircuitStateInput,
   type DeliveryCountersInput,
@@ -75,6 +79,8 @@ export { HttpDeliveryError, classifyFailure, parseRetryAfterMs };
 export type { FailureClass, ClassifiedFailure };
 export type { FailoverConfig, FailoverEndpointStats, FailoverSwitchEvent };
 export { CompletionCallbacker, createBoundAddressSelfCheck, isSelfCallbackTarget, resolveCompletionCallbackConfig };
+export { GlobalConcurrencyGate };
+export type { GlobalConcurrencyStats };
 export type {
   CompletionCallbackFailedInfo,
   CompletionCallbackOptions,
@@ -758,6 +764,19 @@ export interface RetryQueueOptions {
    * `onEndpointPaused`.
    */
   onEndpointResumed?: (info: EndpointPauseInfo) => void;
+  /**
+   * Relay-level cap on concurrent in-flight deliveries *across all
+   * endpoints* (see {@link GlobalConcurrencyGate}). Orthogonal to
+   * `maxConcurrentPerEndpoint` (WR-06, per endpoint): both gates compose
+   * — a dispatch needs a slot from each. When the cap is hit, excess
+   * dispatches wait FIFO: never dropped, never burning retry budget,
+   * never touching the circuit breaker. The urgent lane bypasses the
+   * per-endpoint limiter but not this gate — the cap is relay-level
+   * capacity. Default: `Infinity` (unlimited, exactly the pre-WR-51
+   * behavior). Must be a positive integer or `Infinity`; anything else
+   * throws `RangeError` at construction.
+   */
+  globalMaxConcurrent?: number;
 }
 
 /**
@@ -1472,6 +1491,14 @@ export class RetryQueue {
    */
   private readonly limiters = new Map<string, EndpointConcurrencyLimiter>();
   private readonly maxConcurrentPerEndpoint: number;
+  /**
+   * WR-51: relay-level global dispatch gate (one instance — the cap is
+   * relay-wide, across endpoints and tenants). Always constructed; with
+   * the default `Infinity` cap every acquisition grants immediately, so
+   * unconfigured behavior is byte-for-byte the pre-WR-51 behavior.
+   */
+  private readonly globalGate: GlobalConcurrencyGate;
+  private readonly globalMaxConcurrent: number;
   /** Deliveries currently executing (inside `deliver()`), for graceful drain. */
   private readonly inFlight = new Set<Promise<void>>();
   private running = false;
@@ -1515,6 +1542,9 @@ export class RetryQueue {
     // limit itself is still validated eagerly, at construction.
     this.maxConcurrentPerEndpoint = opts.maxConcurrentPerEndpoint ?? Infinity;
     assertConcurrencyLimit(this.maxConcurrentPerEndpoint);
+    // WR-51: invalid values throw here, at construction — never mid-delivery.
+    this.globalMaxConcurrent = opts.globalMaxConcurrent ?? Infinity;
+    this.globalGate = new GlobalConcurrencyGate(this.globalMaxConcurrent);
     // Wrap the caller's state-change hook so the metrics gauge always sees
     // the latest circuit state, even when nobody subscribes to the hook.
     // The wrapper is installed per tenant instance in `breakerFor()`.
@@ -2174,6 +2204,10 @@ export class RetryQueue {
     // Parked (WR-50) items stay parked: the next start() reschedules
     // everything in the queue, pause-aware.
     this.armedNextAt.clear();
+    // WR-51: wake global-gate waiters — with the queue stopped their
+    // liveness check bails them out instead of dispatching, so a stop
+    // never leaves a deliver parked on the gate across a restart.
+    this.globalGate.releaseWaiters();
     // The timers are gone, so no retry fire-time is armed anymore; the
     // next start() (or a restart, via the journaled enqueue lines)
     // schedules fresh.
@@ -2224,6 +2258,10 @@ export class RetryQueue {
       this.timers.delete(id);
     }
     this.armedNextAt.clear();
+    // WR-51: wake global-gate waiters before draining — woken waiters see
+    // the stopped queue and bail out, so shutdown() waits only for
+    // deliveries genuinely in flight instead of hanging on the gate.
+    this.globalGate.releaseWaiters();
     this.durablePendingRetry.clear();
     // WR-49: leave the journal compact — a shutdown is the natural
     // checkpoint; the next boot recovers from live state only.
@@ -2504,6 +2542,12 @@ export class RetryQueue {
     // own bound is the token bucket above. WR-48: the limiter is per
     // (tenant, endpoint).
     const release = fastLane ? undefined : await this.limiterFor(tenant).acquire(target);
+    // WR-51: released by the finally below; undefined until the global
+    // gate is acquired. Declared outside the try on purpose: besides
+    // early bail-outs, Node v24.20.0 has a scope bug where a `const`
+    // declared inside a `try` block is invisible in its `finally`
+    // (ReferenceError, not TDZ) — hoisting is the workaround.
+    let releaseGlobalSlot: (() => void) | undefined;
     try {
       // The queue may have stopped, or the item may have been settled, while
       // we waited for a turn or a concurrency slot. Bail out; the releases
@@ -2524,6 +2568,26 @@ export class RetryQueue {
       // A normal dispatch earns the urgent lane its proportional deficit
       // (only while urgent demand is backlogged) — the DRR earning event.
       if (!fastLane) this.laneScheduler.recordNormalDispatch(target);
+      // WR-51: relay-level global dispatch gate — the last acquisition
+      // before the sender, so quota/circuit/budget verdicts and lane
+      // ordering are all settled before a global slot is taken, and a
+      // paused endpoint (checked above) never holds a slot while parked.
+      // The urgent lane bypasses the per-endpoint limiter but NOT this
+      // gate: the cap is relay-level capacity, not per-endpoint policy.
+      releaseGlobalSlot = await this.globalGate.acquire();
+      // The gate may have woken us via releaseWaiters() during
+      // stop()/shutdown(), or the pause may have landed while we waited:
+      // re-check liveness before touching the sender. The finally below
+      // releases the slot on every path, exactly once.
+      if ((!this.running && !force) || !this.queue.has(id)) {
+        if (probe) breaker?.cancelProbe(target);
+        return;
+      }
+      if (this.pausedEndpoints.has(logicalEndpoint)) {
+        if (probe) breaker?.cancelProbe(target);
+        this.park(id, 0);
+        return;
+      }
       try {
         // Pinned copy: the sender sees the physical target chosen above,
         // so a failover switch mid-flight cannot reroute this attempt.
@@ -2719,6 +2783,13 @@ export class RetryQueue {
         }
       }
     } finally {
+      // WR-51: the global slot brackets the attempt exactly — released
+      // once the attempt has settled (success, failure-scheduled, or
+      // dead-lettered), handing it to the oldest waiter. Outermost
+      // resource first, then the turn and the limiter slot as before.
+      // Undefined when the gate was never acquired (early bail-out):
+      // nothing to release.
+      releaseGlobalSlot?.();
       // Released in reverse acquisition order: the turn first, so the
       // scheduler still sees the limiter-queued successor as backlogged
       // (no transient dip that would work-conservingly release every
@@ -2823,6 +2894,17 @@ export class RetryQueue {
   }
 
   /**
+   * Relay-level global dispatch gate snapshot (WR-51): the configured
+   * cap, current in-flight dispatches, FIFO waiters queued for a slot,
+   * and the cumulative waiter count (also exported as
+   * `relay_global_concurrency_wait_total` in the Prometheus exposition
+   * when the cap is configured).
+   */
+  getGlobalConcurrencyStats(): GlobalConcurrencyStats {
+    return this.globalGate.stats();
+  }
+
+  /**
    * Per-endpoint urgent-lane counters (`delivered` / `retried` /
    * `throttled`). Empty when no urgent delivery has been attempted.
    */
@@ -2889,7 +2971,10 @@ export class RetryQueue {
    * probing is enabled, and the starvation-guard activation counter
    * (`relay_starvation_guard_activations`) for endpoints where the WR-35
    * lane guard engaged, and the global retry-budget depletion counter
-   * (`relay_retry_budget_depleted_total`) when the WR-38 budget is enabled.
+   * (`relay_retry_budget_depleted_total`) when the WR-38 budget is enabled,
+   * and the global-concurrency wait counter
+   * (`relay_global_concurrency_wait_total`) when the WR-51 cap is
+   * configured.
    */
   renderMetrics(): string {
     // WR-48: counters are keyed by (tenant, endpoint); the tenant becomes
@@ -2962,6 +3047,13 @@ export class RetryQueue {
       starvationGuard,
       failover,
       ...(this.retryBudget !== undefined ? { retryBudgetDepleted: this.retryBudgetDepleted } : {}),
+      // WR-51: the wait counter is exposed only when the cap is
+      // configured (finite) — the default unlimited gate never waits,
+      // so the series stays absent exactly like the other opt-in
+      // counters.
+      ...(this.globalMaxConcurrent !== Infinity
+        ? { globalConcurrencyWaits: this.globalGate.waitedTotal() }
+        : {}),
     });
   }
 

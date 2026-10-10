@@ -32,6 +32,10 @@
  * - `relay_retry_budget_depleted_total`: counter of retries parked because
  *   the global retry budget (WR-38) was exhausted. Present only when the
  *   budget is enabled. No endpoint label — the budget is global.
+ * - `relay_global_concurrency_wait_total`: counter of dispatches that had
+ *   to wait for a relay-level global concurrency slot (WR-51). Present
+ *   only when the cap is configured (finite). No endpoint label — the
+ *   cap is relay-wide.
  *
  * Cardinality note: labels are per endpoint (`targetUrl`), so a relay
  * fanning out to many distinct downstream URLs grows the series count —
@@ -82,6 +86,8 @@ export interface MetricsInput {
   failover?: FailoverMetricsInput[];
   /** Present only when the global retry budget (WR-38) is enabled. */
   retryBudgetDepleted?: number;
+  /** Present only when the relay-level global concurrency cap (WR-51) is configured (finite). */
+  globalConcurrencyWaits?: number;
 }
 
 /** One endpoint's starvation-guard activation count, in Prometheus label order. */
@@ -207,6 +213,13 @@ export function renderPrometheus(input: MetricsInput): string {
     );
     lines.push("# TYPE relay_retry_budget_depleted_total counter");
     lines.push(`relay_retry_budget_depleted_total ${input.retryBudgetDepleted}`);
+  }
+  if (input.globalConcurrencyWaits !== undefined) {
+    lines.push(
+      "# HELP relay_global_concurrency_wait_total Dispatches that waited for a relay-level global concurrency slot."
+    );
+    lines.push("# TYPE relay_global_concurrency_wait_total counter");
+    lines.push(`relay_global_concurrency_wait_total ${input.globalConcurrencyWaits}`);
   }
   return lines.join("\n") + "\n";
 }
