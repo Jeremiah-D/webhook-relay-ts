@@ -198,6 +198,21 @@ reliability primitives that matter for any signed-payload pipeline.
   smuggle a forged relay signature downstream. The config applies to the
   default sender only — an injected sender signs (or doesn't) on its own.
   Invalid values throw `RangeError` at startup.
+- Outbound idempotency-key stamping (`outboundIdempotencyKey`, off by default,
+  WR-44): when `enabled`, every delivery made by the default sender carries
+  `x-relay-idempotency-key` — the HMAC-SHA256 of `(event id, attempt)` under
+  the configured `secret`, prefixed with `keyPrefix` (default `""`). The
+  downstream integration contract: use the header as the dedup key in your
+  own idempotency store — the same attempt of the same event always yields
+  the same key (transport-level redeliveries collapse), a new attempt gets a
+  fresh key (genuine retries stay distinguishable), a dead-letter replay
+  restarts at attempt 1 and reproduces the *original* keys (the replay never
+  looks like a new event), and batch deliveries key off the `batch_id`
+  (one key per merged envelope). The key is unforgeable without the relay
+  secret, so a downstream deduplicator can trust it. Inbound
+  `x-relay-idempotency-key` headers are always stripped, so a sender can
+  never smuggle a forged relay-derived key downstream. Applies to the
+  default sender only. Invalid values throw `RangeError` at startup.
 - `src/circuit.ts` — per-endpoint circuit breaker (`EndpointCircuitBreaker`,
   `closed` / `open` / `half_open`): `failureThreshold` (default 5)
   consecutive delivery failures trip the circuit open for `cooldownMs`

@@ -21,6 +21,13 @@ import type { ReplayGuard } from "./replay.ts";
 import { DeliveryDeduplicator, type DedupOptions } from "./dedup.ts";
 import { InboundRateLimiter, type InboundRateLimitOptions } from "./ratelimit.ts";
 import { resolveTraceId, TRACE_ID_HEADER } from "./trace.ts";
+import {
+  deriveIdempotencyKey,
+  IDEMPOTENCY_KEY_HEADER,
+  resolveIdempotencyKeyConfig,
+  type IdempotencyKeyOptions,
+  type ResolvedIdempotencyKeyConfig,
+} from "./idempotency-key.ts";
 import type { TLSSocket } from "node:tls";
 import { assertValidPins, normalizePin, spkiFingerprint, TlsPinMismatchError } from "./pinning.ts";
 import {
@@ -304,6 +311,21 @@ export interface RelayServerOptions {
    */
   outboundSigning?: OutboundSigningConfig;
   /**
+   * Outbound idempotency-key stamping (WR-44, see `IdempotencyKeyOptions`
+   * in `src/idempotency-key.ts`): when `enabled`, every delivery made by
+   * the default sender carries `x-relay-idempotency-key` — the
+   * HMAC-SHA256 of `(event id, attempt)` under the configured `secret`,
+   * prefixed with `keyPrefix` — so the downstream can dedupe retries
+   * and dead-letter replays on it (same attempt → same key; a replay
+   * restarts at attempt 1 and reproduces the original keys; batch
+   * deliveries key off the `batch_id`). Off by default; applies to the
+   * default sender only — an injected `sender` stamps (or doesn't) on
+   * its own. An inbound `x-relay-idempotency-key` is always stripped, so
+   * a sender can never smuggle a forged relay-derived key downstream.
+   * Invalid values throw `RangeError`.
+   */
+  outboundIdempotencyKey?: IdempotencyKeyOptions;
+  /**
    * Bearer token guarding the operator endpoints (`GET /dead-letter`,
    * `POST /dead-letter/:id/replay`, `POST /dead-letter/replay`,
    * the `/dead-letter/auto-replay/*` controls, `GET /audit`,
@@ -437,6 +459,14 @@ export interface RelayServerOptions {
  * Disabled by default. Invalid values throw `RangeError` at startup. The
  * returned sender carries the pool as `.http2Pool` and closes it via
  * `.destroy()` alongside the keep-alive pool.
+ *
+ * `idempotencyKey` is the opt-in outbound idempotency key (WR-44, see
+ * `src/idempotency-key.ts` and the `outboundIdempotencyKey` server
+ * option): `{ enabled: true, secret, keyPrefix? }`. When enabled, every
+ * outbound request carries `x-relay-idempotency-key` — the HMAC-SHA256
+ * of `(event id, attempt)` under `secret`, prefixed with `keyPrefix` —
+ * so the downstream can dedupe retries and dead-letter replays on it.
+ * Off by default. Invalid values throw `RangeError` at startup.
  */
 export interface PooledSender extends Sender {
   /** The keep-alive pool, or `undefined` when pooling is disabled. */
@@ -454,7 +484,8 @@ export function createDefaultSender(
   proxies?: Record<string, string>,
   tlsClientCerts?: Record<string, TlsClientCert>,
   compressOutbound?: Record<string, CompressOutboundOptions>,
-  http2?: Http2PoolOptions
+  http2?: Http2PoolOptions,
+  idempotencyKey?: IdempotencyKeyOptions
 ): PooledSender {
   if (tlsPins !== undefined) {
     for (const [endpoint, pins] of Object.entries(tlsPins)) {
@@ -511,6 +542,14 @@ export function createDefaultSender(
       throw new RangeError("createDefaultSender: `outboundSigning.keyId` must be a non-empty string");
     }
   }
+  // RangeError on invalid values, at startup — never mid-delivery.
+  // `undefined` (feature off) is the common case.
+  let idempotencyKeyCfg: ResolvedIdempotencyKeyConfig | undefined;
+  try {
+    idempotencyKeyCfg = resolveIdempotencyKeyConfig(idempotencyKey);
+  } catch (err) {
+    throw new RangeError(`createDefaultSender: invalid idempotencyKey config: ${(err as Error).message}`);
+  }
   const pool = keepAlive === false ? undefined : new OutboundConnectionPool(keepAlive);
   // RangeError on invalid values, at startup — never mid-delivery.
   const http2Opts = http2 === undefined ? undefined : resolveHttp2PoolOptions(http2);
@@ -523,10 +562,11 @@ export function createDefaultSender(
 
   /**
    * Shared outbound request material: passthrough headers, trace id,
-   * compression, and the relay signature. Both transports stamp the same
-   * wire bytes, so an H2 delivery is indistinguishable downstream from an
-   * HTTP/1.1 one (a forged inbound `x-relay-signature` was already
-   * stripped from the passthrough headers at intake).
+   * compression, the relay signature, and (WR-44) the idempotency key.
+   * Both transports stamp the same wire bytes, so an H2 delivery is
+   * indistinguishable downstream from an HTTP/1.1 one (a forged inbound
+   * `x-relay-signature` was already stripped from the passthrough
+   * headers at intake).
    */
   const buildWireRequest = (
     item: RetryItem
@@ -551,6 +591,21 @@ export function createDefaultSender(
       // own signature always wins.
       headers["x-relay-signature"] = signSha256(wireBody, outboundSigning.secret);
       if (outboundSigning.keyId !== undefined) headers["x-relay-key-id"] = outboundSigning.keyId;
+    }
+    if (idempotencyKeyCfg !== undefined) {
+      // WR-44: derive from (event id, 1-based attempt). The queue stamps
+      // `attempt` (0-based, attempts consumed so far) on the sender-bound
+      // copy; a missing value means a hand-built item, i.e. attempt 1.
+      // Batch deliveries arrive with the batch id as the item id, so the
+      // key covers the whole merged envelope. Deterministic per
+      // (event, attempt): a dead-letter replay restarts at attempt 1 with
+      // the same event id and reproduces the original keys.
+      headers[IDEMPOTENCY_KEY_HEADER] = deriveIdempotencyKey(
+        idempotencyKeyCfg.secret,
+        item.id,
+        (item.attempt ?? 0) + 1,
+        idempotencyKeyCfg.keyPrefix
+      );
     }
     if (contentEncoding !== undefined) headers["content-encoding"] = contentEncoding;
     headers["content-length"] = String(wireBody.length);
@@ -915,7 +970,7 @@ export function createRelayServer(opts: RelayServerOptions): Server {
   // the default sender only; an injected sender signs on its own.
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2)
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey)
       : undefined;
   const queue = new RetryQueue({
     sender: opts.sender ?? defaultSender,
@@ -1781,11 +1836,12 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       // `content-encoding: gzip` must not travel with the plain bytes —
       // the downstream would try to gunzip JSON and fail.
       if (k === "content-encoding" && inboundGzip) continue;
-      // `x-relay-signature` / `x-relay-key-id` are this relay's own
-      // namespace: an inbound client asserting them would impersonate the
-      // relay downstream. Strip them always; when outbound signing is
-      // enabled the sender stamps fresh ones below.
-      if (k === "x-relay-signature" || k === "x-relay-key-id") continue;
+      // `x-relay-signature` / `x-relay-key-id` / `x-relay-idempotency-key`
+      // are this relay's own namespace: an inbound client asserting them
+      // would impersonate the relay downstream. Strip them always; when
+      // outbound signing / idempotency keys are enabled the sender stamps
+      // fresh ones below.
+      if (k === "x-relay-signature" || k === "x-relay-key-id" || k === IDEMPOTENCY_KEY_HEADER) continue;
       passthrough[k] = v;
     }
 

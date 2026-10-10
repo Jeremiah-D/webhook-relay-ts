@@ -100,6 +100,17 @@ export interface RetryItem {
    * path and in dead-letter entries.
    */
   traceId?: string;
+  /**
+   * WR-44: attempts consumed *before* the in-flight dispatch (0-based),
+   * maintained by the queue on its stored entry. The queue hands the
+   * sender a spread copy, so the sender-bound item carries the index of
+   * the attempt about to be dispatched — the 1-based attempt number the
+   * downstream sees is `attempt + 1`. Used to derive the
+   * `x-relay-idempotency-key` header when outbound idempotency keys are
+   * enabled. Unset on items you enqueue yourself; the sender must treat
+   * a missing value as attempt 1 (`(item.attempt ?? 0) + 1`).
+   */
+  attempt?: number;
 }
 
 /** Options for the urgent delivery lane (see {@link DeliveryPriority}). */
