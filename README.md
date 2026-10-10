@@ -354,6 +354,39 @@ reliability primitives that matter for any signed-payload pipeline.
   (`sessionIdleTimeoutMs`, default 60s), and an idle session's socket never
   pins process exit (re-ref'd per stream). Invalid option values throw
   `RangeError` at startup. Zero dependencies (`node:http2` only).
+- `src/websocket.ts` — outbound WebSocket downstream delivery (WR-45):
+  `ws:` / `wss:` targets speak RFC 6455 with zero dependencies
+  (`node:net` + `node:tls` + `node:crypto` only — no `ws` package, so the
+  handshake, masking, and frame codec are hand-rolled and covered by
+  `test/websocket.test.ts` against a raw-socket test server). One delivery
+  borrows a pooled connection exclusively, sends the payload as a single
+  masked text frame (client frames are always masked, RFC 6455 §5.3), and
+  waits for the downstream's reply — a text frame becomes the response body
+  (surfaced with status 200), a clean close with no reply counts as accepted
+  (fire-and-forget endpoints close right after reading). Pings are
+  auto-ponged; unsolicited frames on an idle pooled connection destroy it
+  (fail-safe — a stray frame must never be mistaken for a later delivery's
+  response). `x-relay-*` headers (idempotency key, trace, signature, …)
+  ride the upgrade request as plain HTTP headers — the handshake *is* an
+  HTTP request — with one honest caveat: the handshake is connection-scoped,
+  so a reused pooled connection keeps the opening delivery's headers; read
+  per-delivery metadata from the handshake, per-message bytes from the text
+  frames. Failure mapping keeps the retry layer honest: a completed
+  handshake with a non-101 status becomes `HttpDeliveryError` with that
+  status code (WR-30 classification applies — 4xx-except-408/429
+  dead-letters immediately, `Retry-After` honored); anything else (refused
+  connection, TLS error, handshake timeout, no reply before the timeout) is
+  a plain `Error`, so the classifier treats it as retryable. Composes with
+  SPKI pinning (WR-21: for `wss:` the whitelist replaces PKI verification
+  and the peer's SPKI is checked *before* the handshake bytes are written —
+  a MITM never sees the payload; a mismatch fails the attempt with
+  `TlsPinMismatchError` through the normal retry path) and with the
+  keep-alive pool (WR-24: connections pooled per `(scheme, host, port,
+  pin-whitelist)`, idle sockets ping/pong-probed every `pingIntervalMs`
+  (default 30s, `0` disables) and reaped after `idleTimeoutMs` (default
+  60s), so a dead socket never serves a delivery; `timeoutMs` (default 10s)
+  bounds the TCP+TLS+handshake phase and the reply wait separately).
+  Invalid option values throw `RangeError` at startup.
 - `src/proxy.ts` — outbound HTTP(S) proxy support: per-endpoint proxy URLs
   (`proxies: { "<exact targetUrl>": "http://user:pass@proxy:8080" }`, also
   exposed as `createRelayServer({ proxies })` and the fourth

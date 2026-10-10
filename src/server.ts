@@ -48,6 +48,7 @@ import {
   runHttp2Stream,
   type Http2PoolOptions,
 } from "./http2.ts";
+import { WebSocketPool, type WebSocketPoolOptions } from "./websocket.ts";
 import type { AuditLog } from "./audit.ts";
 import { buildDeliverySnapshot } from "./delivery-status.ts";
 import type { EndpointConfigPatch } from "./hotreload.ts";
@@ -467,12 +468,22 @@ export interface RelayServerOptions {
  * of `(event id, attempt)` under `secret`, prefixed with `keyPrefix` —
  * so the downstream can dedupe retries and dead-letter replays on it.
  * Off by default. Invalid values throw `RangeError` at startup.
+ *
+ * `websocket` tunes the WebSocket downstream path (WR-45, see
+ * `src/websocket.ts`): `{ timeoutMs?, maxMessageBytes?, pingIntervalMs?,
+ * idleTimeoutMs? }`. The pool itself is always created — a `ws:`/`wss:`
+ * target just works — the options only tune timeouts and caps. Invalid
+ * values throw `RangeError` at startup. The returned sender carries the
+ * pool as `.wsPool` and closes it via `.destroy()` alongside the other
+ * pools.
  */
 export interface PooledSender extends Sender {
   /** The keep-alive pool, or `undefined` when pooling is disabled. */
   pool: OutboundConnectionPool | undefined;
   /** The HTTP/2 session pool, or `undefined` when H2 is not enabled. */
   http2Pool: Http2SessionPool | undefined;
+  /** The WebSocket connection pool (always created). */
+  wsPool: WebSocketPool;
   /** Close all pooled connections and stop the idle reaper. Idempotent. */
   destroy(): void;
 }
@@ -485,7 +496,8 @@ export function createDefaultSender(
   tlsClientCerts?: Record<string, TlsClientCert>,
   compressOutbound?: Record<string, CompressOutboundOptions>,
   http2?: Http2PoolOptions,
-  idempotencyKey?: IdempotencyKeyOptions
+  idempotencyKey?: IdempotencyKeyOptions,
+  websocket?: WebSocketPoolOptions
 ): PooledSender {
   if (tlsPins !== undefined) {
     for (const [endpoint, pins] of Object.entries(tlsPins)) {
@@ -559,6 +571,9 @@ export function createDefaultSender(
     http2Opts !== undefined && http2Opts.enabled && http2Opts.hosts.length > 0
       ? new Http2SessionPool(http2Opts)
       : undefined;
+  // WebSocket pool (WR-45): always created — a ws:/wss: target just
+  // works. RangeError on invalid values, at startup — never mid-delivery.
+  const wsPool = new WebSocketPool(websocket);
 
   /**
    * Shared outbound request material: passthrough headers, trace id,
@@ -834,6 +849,28 @@ export function createDefaultSender(
     }
   };
 
+  /**
+   * The WebSocket delivery path (WR-45): pooled RFC 6455 connections,
+   * one masked text frame per delivery, `x-relay-*` headers as upgrade
+   * request headers. Handshake failures surface as `HttpDeliveryError`
+   * (non-101) or plain errors (transport), so they flow through the
+   * normal retry / dead-letter path like the HTTP transports.
+   */
+  const deliverViaWebSocket = (
+    item: RetryItem,
+    url: URL,
+    pins: string[] | undefined
+  ): Promise<DownstreamResponse> => {
+    const { headers, body } = buildWireRequest(item);
+    const relayHeaders: Record<string, string> = {};
+    for (const [name, value] of Object.entries(headers)) {
+      if (typeof value === "string" && name.toLowerCase().startsWith("x-relay-")) {
+        relayHeaders[name] = value;
+      }
+    }
+    return wsPool.deliver(url, body, relayHeaders, pins, item.targetUrl);
+  };
+
   const sender = function defaultSender(item: RetryItem): Promise<DownstreamResponse | void> {
     const url = new URL(item.targetUrl);
     // Pinning is per endpoint (exact targetUrl match). When pins are
@@ -841,8 +878,11 @@ export function createDefaultSender(
     // replaces Node's PKI chain verification, and the peer certificate is
     // verified on `secureConnect` before a single payload byte is written
     // (a MITM must not even see the request body). See `src/pinning.ts`
-    // for why `checkServerIdentity` cannot do this job.
-    const pins = url.protocol === "https:" ? tlsPins?.[item.targetUrl] : undefined;
+    // for why `checkServerIdentity` cannot do this job. WR-45: the same
+    // rule covers `wss:` targets — the WebSocket pool verifies the SPKI
+    // fingerprint before the upgrade handshake is written.
+    const pins =
+      url.protocol === "https:" || url.protocol === "wss:" ? tlsPins?.[item.targetUrl] : undefined;
     // mTLS client identity for this endpoint (exact targetUrl match):
     // the certificate is presented during the TLS handshake so the
     // downstream can verify the relay. Off by default — endpoints without
@@ -859,6 +899,12 @@ export function createDefaultSender(
       return Promise.reject(
         new Error(`outbound proxy: proxy configured for non-HTTP(S) target ${item.targetUrl}`)
       );
+    }
+    // WebSocket (WR-45): ws:/wss: targets ride the pooled RFC 6455 path.
+    // Proxied ws: is rejected above (explicit proxy + non-HTTP(S)
+    // target), same as any other non-HTTP scheme.
+    if (url.protocol === "ws:" || url.protocol === "wss:") {
+      return deliverViaWebSocket(item, url, pins);
     }
     // HTTP/2 (WR-42): opt-in per host, never under a proxy — proxied
     // traffic rides the HTTP/1.1 CONNECT tunnel (see `src/http2.ts`). Any
@@ -877,9 +923,11 @@ export function createDefaultSender(
   } as PooledSender;
   sender.pool = pool;
   sender.http2Pool = h2pool;
+  sender.wsPool = wsPool;
   sender.destroy = () => {
     pool?.destroy();
     h2pool?.destroy();
+    wsPool.destroy();
   };
   return sender;
 }
