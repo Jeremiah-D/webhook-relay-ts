@@ -23,6 +23,9 @@ import {
   type EndpointLatencyStats,
   type LatencyTrackerOptions,
 } from "./latency.ts";
+import { EndpointDeliveryWindow, parseDeliveryWindowSpec, type DeliveryWindowOptions, type DeliveryWindowStats } from "./delivery-window.ts";
+export { parseDeliveryWindowSpec, EndpointDeliveryWindow };
+export type { DeliveryWindowOptions, DeliveryWindowStats };
 import { EndpointQuota, type QuotaOptions, type QuotaStats } from "./quota.ts";
 import { RetryBudget, type RetryBudgetOptions } from "./retry-budget.ts";
 import {
@@ -777,6 +780,20 @@ export interface RetryQueueOptions {
    * throws `RangeError` at construction.
    */
   globalMaxConcurrent?: number;
+  /**
+   * Per-endpoint delivery time windows ("quiet hours"; WR-52, see
+   * `src/delivery-window.ts`): exact `targetUrl` -> window spec
+   * (`"HH:MM-HH:MM"` in UTC, e.g. `"09:00-18:00"` for daytime-only
+   * deliveries). Opt-in: endpoints without a configured window are always
+   * deliverable. A delivery due outside its endpoint's window is parked
+   * until the window opens — never dropped, never consuming the retry
+   * budget, a quota token, or a circuit-breaker verdict, and never
+   * dead-lettered for being out of window. Disabled (undefined) by
+   * default: purely backward-compatible. Invalid specs throw `RangeError`
+   * at construction. Reachable over HTTP via
+   * `opts.retry.deliveryWindow` on the relay server.
+   */
+  deliveryWindow?: DeliveryWindowOptions;
 }
 
 /**
@@ -1406,6 +1423,14 @@ export class RetryQueue {
   /** Attempts rescheduled because the endpoint's quota bucket was empty. Keyed by scoped key (WR-48). */
   private readonly quotaStats = new Map<string, Map<string, number>>();
   /**
+   * WR-52: per-endpoint delivery time windows ("quiet hours"). Shared
+   * across tenants like the WR-50 pause switch — the window is a property
+   * of the downstream, not of the sender.
+   */
+  private readonly deliveryWindow?: EndpointDeliveryWindow;
+  /** Attempts parked outside an endpoint's delivery window. Keyed by scoped key (WR-48). */
+  private readonly deliveryWindowStats = new Map<string, Map<string, number>>();
+  /**
    * WR-37: per-endpoint response semantic validators (exact `targetUrl`
    * match) plus an optional global fallback. Validators run after a 2xx
    * transport success; a failing verdict becomes a `SemanticDeliveryError`
@@ -1545,6 +1570,11 @@ export class RetryQueue {
     // WR-51: invalid values throw here, at construction — never mid-delivery.
     this.globalMaxConcurrent = opts.globalMaxConcurrent ?? Infinity;
     this.globalGate = new GlobalConcurrencyGate(this.globalMaxConcurrent);
+    // WR-52: invalid window specs throw here, at construction — an invalid
+    // quiet-hours config is a misconfiguration, never a runtime surprise.
+    if (opts.deliveryWindow !== undefined) {
+      this.deliveryWindow = new EndpointDeliveryWindow(opts.deliveryWindow);
+    }
     // Wrap the caller's state-change hook so the metrics gauge always sees
     // the latest circuit state, even when nobody subscribes to the hook.
     // The wrapper is installed per tenant instance in `breakerFor()`.
@@ -1810,6 +1840,12 @@ export class RetryQueue {
 
   private recordQuotaStat(tenant: string | undefined, endpoint: string): void {
     const inner = innerFor(this.quotaStats, tenant);
+    inner.set(endpoint, (inner.get(endpoint) ?? 0) + 1);
+  }
+
+  /** WR-52: count one window-outside park for the (tenant, endpoint) row. */
+  private recordDeliveryWindowStat(tenant: string | undefined, endpoint: string): void {
+    const inner = innerFor(this.deliveryWindowStats, tenant);
     inner.set(endpoint, (inner.get(endpoint) ?? 0) + 1);
   }
 
@@ -2484,6 +2520,19 @@ export class RetryQueue {
       this.park(id, 0);
       return;
     }
+    // WR-52: delivery time window ("quiet hours") — second only to the
+    // manual pause. Outside a configured window the delivery is parked
+    // until the window opens: it stays queued with its attempt count
+    // intact and consumes nothing — no quota token, no breaker verdict,
+    // no retry-budget token, no dead-letter. The re-schedule targets the
+    // window's opening instant (inclusive open edge), so boundary races
+    // resolve as "flush at window open".
+    if (this.deliveryWindow !== undefined && !this.deliveryWindow.isOpen(logicalEndpoint)) {
+      this.recordDeliveryWindowStat(tenant, logicalEndpoint);
+      this.deliveryWindow.noteDelayed(logicalEndpoint);
+      this.schedule(id, this.deliveryWindow.msUntilOpen(logicalEndpoint));
+      return;
+    }
     // Per-endpoint quota first: an exhausted budget delays the attempt
     // (rescheduled at the next token refill) instead of burning the retry
     // budget or tripping the circuit against a downstream we are
@@ -3090,6 +3139,53 @@ export class RetryQueue {
    */
   resetFailover(endpoint: string): boolean {
     return this.failover?.resetFailover(endpoint) ?? false;
+  }
+
+  /**
+   * Per-(tenant, endpoint) delivery-window counters (WR-52): `delayed` —
+   * deliveries parked outside the endpoint's window until it opened —
+   * plus the configured window spec and whether the window is open at
+   * the injected clock's current time. Empty when the feature is disabled
+   * or no attempt has been parked yet. Rows carry `tenant` only when set.
+   */
+  getDeliveryWindowStats(): DeliveryWindowStats[] {
+    const rows: DeliveryWindowStats[] = [];
+    for (const [tenantKey, inner] of this.deliveryWindowStats) {
+      const tenant = tenantKey === "" ? undefined : tenantKey;
+      for (const [endpoint, delayed] of inner) {
+        const spec = this.deliveryWindow?.specFor(endpoint);
+        rows.push({
+          endpoint,
+          ...(tenant === undefined ? {} : { tenant }),
+          window: spec?.raw ?? "",
+          delayed,
+          open: this.deliveryWindow?.isOpen(endpoint) ?? true,
+        });
+      }
+    }
+    return rows;
+  }
+
+  /**
+   * WR-52: set (or replace) the delivery window for one endpoint at
+   * runtime — the same hot-reload convention as the other per-endpoint
+   * overrides. An invalid spec or a non-string/empty endpoint throws
+   * `RangeError` and leaves the current window intact. Returns `false`
+   * when the delivery-window feature is disabled.
+   */
+  setEndpointDeliveryWindow(endpoint: string, spec: string): boolean {
+    if (this.deliveryWindow === undefined) return false;
+    this.deliveryWindow.setEndpointWindow(endpoint, spec);
+    return true;
+  }
+
+  /**
+   * WR-52: remove the delivery window for one endpoint at runtime — it
+   * becomes always deliverable. Returns `false` when the feature is
+   * disabled or no window was configured.
+   */
+  deleteEndpointDeliveryWindow(endpoint: string): boolean {
+    return this.deliveryWindow?.deleteEndpointWindow(endpoint) ?? false;
   }
 
   /** Attempts parked because the endpoint's circuit was open. */
