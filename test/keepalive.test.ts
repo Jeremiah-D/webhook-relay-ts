@@ -286,4 +286,28 @@ describe("keepalive: TLS pinning over pooled connections", () => {
       sender.destroy();
     }
   });
+
+  it("concurrent pinned handshakes never resume TLS sessions", async () => {
+    // Regression: the pooled https.Agent used to resume TLS sessions
+    // across burst handshakes; on a resumed (TLS 1.3 PSK) handshake the
+    // server does not re-send its certificate, so `getPeerCertificate()`
+    // came back empty and the pin check failed healthy endpoints with
+    // TlsPinMismatchError. Pinned agents now disable the agent's session
+    // cache (`maxCachedSessions: 0`), so every handshake is full.
+    const sender = createDefaultSender({ [url("/hook")]: [TLS_FIXTURE_SPKI_PIN] });
+    try {
+      // One warmup delivery, then a burst that forces fresh handshakes.
+      await sender(item(url("/hook")));
+      const batch: Promise<unknown>[] = [];
+      for (let i = 0; i < 30; i++) {
+        batch.push(sender(item(url("/hook"))));
+      }
+      const results = await Promise.all(batch);
+      for (const res of results) {
+        assert.ok(res && (res as { statusCode: number }).statusCode === 200);
+      }
+    } finally {
+      sender.destroy();
+    }
+  });
 });

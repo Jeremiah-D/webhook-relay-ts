@@ -26,7 +26,11 @@ import { createProxiedAgent, proxyPoolKeyFragment } from "./proxy.ts";
  *   on `secureConnect` for every *new* connection (see
  *   `createDefaultSender`); a reused connection's cached fingerprint is
  *   re-checked against the request's whitelist as a poisoned-socket
- *   guard.
+ *   guard. Pinned agents disable TLS session resumption
+ *   (`maxCachedSessions: 0`): on a resumed handshake the server does not
+ *   re-send its certificate, so the pin check would see an empty peer
+ *   certificate and fail a healthy endpoint — every pinned connection
+ *   does a full handshake instead.
  * - health probing (WR-28): every idle socket is probed *before* the
  *   agent hands it to a delivery — in the same tick, so there is no race
  *   between the check and the assignment. Sockets the kernel already
@@ -295,6 +299,14 @@ export class OutboundConnectionPool {
         // on its own unref'd timer instead, so idle sockets can be
         // unref'd without racing the agent's timer.
         freeSocketTimeout: 0,
+        // Pinned endpoints must never resume a TLS session: on a resumed
+        // (TLS 1.3 PSK) handshake the server does not re-send its
+        // certificate, so `getPeerCertificate()` comes back empty and the
+        // pin check — which must see the peer's SPKI on *every* new
+        // connection — would fail a healthy endpoint closed. Unpinned
+        // endpoints keep the agent's session cache (resumption is safe
+        // there: nothing reads the peer certificate).
+        ...(pinned && scheme === "https" ? { maxCachedSessions: 0 } : {}),
       };
       const agent: HttpAgent =
         proxyUrl !== undefined

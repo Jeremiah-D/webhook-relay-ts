@@ -285,6 +285,14 @@ export interface ProxiedAgentOptions {
   maxSockets?: number;
   maxFreeSockets?: number;
   freeSocketTimeout?: number;
+  /**
+   * `https.Agent` TLS session cache size. The agent caches client TLS
+   * sessions and resumes them on later handshakes; on a resumed handshake
+   * the server does not re-send its certificate, so pass `0` for pinned
+   * endpoints (see `OutboundConnectionPool`) — the pin check must see the
+   * peer's SPKI on every new connection.
+   */
+  maxCachedSessions?: number;
   /** TCP connect timeout for the proxy leg, per new socket. */
   proxyConnectTimeoutMs?: number;
 }

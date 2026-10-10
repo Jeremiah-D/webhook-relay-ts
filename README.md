@@ -290,7 +290,11 @@ reliability primitives that matter for any signed-payload pipeline.
   never serve another endpoint's), and the pin is still verified on
   `secureConnect` for every new connection; a reused connection re-checks its
   cached handshake fingerprint against the request's whitelist as a
-  poisoned-socket guard. Health probing (WR-28): every idle socket is probed
+  poisoned-socket guard. Pinned agents disable TLS session resumption
+  (`maxCachedSessions: 0`): on a resumed handshake the server does not
+  re-send its certificate, so the pin check would see an empty peer
+  certificate and fail a healthy endpoint under concurrent handshakes —
+  every pinned connection does a full handshake instead. Health probing (WR-28): every idle socket is probed
   *before* the agent hands it to a delivery, in the same tick — sockets the
   kernel already knows are dead (destroyed, closed, or half-closed by the
   peer) are culled on the spot and never serve a delivery, and on pinned
@@ -310,6 +314,31 @@ reliability primitives that matter for any signed-payload pipeline.
   (`close` → `queue.stop()` → pool `destroy()`), covering the
   graceful-shutdown drain path. Invalid option values throw `RangeError` at
   startup.
+- `src/http2.ts` — outbound HTTP/2 session reuse (WR-42): on top of the
+  keep-alive pool, per-origin H2 sessions multiplex high-concurrency
+  deliveries over a single connection — one session per `(scheme, host,
+  port)` instead of `maxSocketsPerHost` TCP/TLS handshakes. Opt-in per host
+  (`createRelayServer({ outboundHttp2: { enabled: true, hosts:
+  ["relay.example.com"] } })`, also the seventh `createDefaultSender(...)`
+  argument); off by default, so existing deployments keep their exact
+  current behavior. `http:` targets use h2c, `https:` targets use TLS: SPKI
+  pins (WR-21) keep their trust-anchor semantics — verified on the session
+  socket's `secureConnect` before the first stream, with the verified
+  fingerprint re-checked on reuse as a poisoned-session guard — and mTLS
+  client certificates (WR-36) ride the handshake; sessions are keyed per
+  origin + pin set + client identity, so a session pinned or authenticated
+  for one endpoint can never serve another's. A failed or refused H2 session
+  never loses a delivery: the sender falls back to the HTTP/1.1 keep-alive
+  pool (the origin sits out H2 for `fallbackCooldownMs`, default 30s), and
+  a server GOAWAY drains in-flight streams gracefully while new deliveries
+  establish a fresh session. H2 is bypassed for proxied endpoints — proxy
+  traffic rides the HTTP/1.1 CONNECT tunnel (`src/proxy.ts`), never H2, so
+  the two transports are never composed by hand. `getStats()` exposes the
+  live per-origin sessions plus `established` / `reused` / `fallback`
+  counters; idle sessions are closed by an unref'd reaper
+  (`sessionIdleTimeoutMs`, default 60s), and an idle session's socket never
+  pins process exit (re-ref'd per stream). Invalid option values throw
+  `RangeError` at startup. Zero dependencies (`node:http2` only).
 - `src/proxy.ts` — outbound HTTP(S) proxy support: per-endpoint proxy URLs
   (`proxies: { "<exact targetUrl>": "http://user:pass@proxy:8080" }`, also
   exposed as `createRelayServer({ proxies })` and the fourth
@@ -347,6 +376,27 @@ reliability primitives that matter for any signed-payload pipeline.
   pooled arm is fast enough that a few slow iterations move p99). Takeaway:
   the handshake is the whole cost at this scale — ~3x on plain HTTP,
   ~10–17x when every delivery pays a TLS handshake.
+- `bench/http2-bench.ts` (`npm run bench:http2`) — high-concurrency
+  deliveries to localhost stubs: the HTTP/1.1 keep-alive pool vs. HTTP/2
+  session reuse (1500 deliveries at 100-way concurrency over HTTP; 400 at
+  50-way over HTTPS with TLS pinning; 50 warmup deliveries per scenario;
+  connection counts include warmup). Measured 2026-10-09, Node v24.20.0,
+  AMD EPYC 9D64, linux x64:
+
+  | scenario | deliveries | concurrency | connections | total | mean | p50 | p99 |
+  |---|---|---|---|---|---|---|---|
+  | HTTP/1.1 keep-alive pool | 1500 | 100 | 64 | 577.50 ms | 0.39 ms | 14.76 ms | 91.88 ms |
+  | HTTP/2 (h2c) | 1500 | 100 | 1 | 263.03 ms | 0.18 ms | 14.97 ms | 29.53 ms |
+  | HTTPS+pins, HTTP/1.1 pool | 400 | 50 | 50 | 327.34 ms | 0.82 ms | 11.34 ms | 172.08 ms |
+  | HTTPS+pins, HTTP/2 | 400 | 50 | 1 | 92.85 ms | 0.23 ms | 7.04 ms | 26.76 ms |
+
+  Speedup (total time): HTTP 2.2x, HTTPS+pins 3.5x (a second run gave 2.1x
+  / 5.7x — localhost noise; p50/p99 move around under batch scheduling).
+  Takeaway: under concurrency the H1.1 pool is capped by
+  `maxSocketsPerHost` (64 connections here, one TLS handshake each on the
+  HTTPS arm) while H2 multiplexes everything over a single connection —
+  ~2x on plain HTTP, ~3–6x when every H1.1 connection also pays a TLS
+  handshake.
 - `src/server.ts` — a minimal `node:http` receiver: read the raw body, verify
   the `x-signature` header with the injected `verifier` (defaults to
   HMAC-SHA256 with `secret`; pass e.g. `new Ed25519Verifier(pem)` to change
@@ -918,7 +968,7 @@ Requires Node 24+ (runs `.ts` directly via type stripping; zero dependencies).
   buffered batch one immediate attempt before draining. Server integration:
   three inbound webhooks become one downstream request, audited as
   `batch_flushed`.
-- `test/keepalive.test.ts` — the outbound keep-alive pool (12 tests):
+- `test/keepalive.test.ts` — the outbound keep-alive pool (13 tests):
   `RangeError` on invalid pool options (also via `createDefaultSender`);
   options reaching the underlying agent; sequential deliveries sharing one
   connection by default (`created: 1`, `reused: 4`) with `getStats()`
@@ -929,7 +979,9 @@ Requires Node 24+ (runs `.ts` directly via type stripping; zero dependencies).
   pinning over pooled connections — one handshake for three pinned
   deliveries, every pin-mismatch attempt failing with `TlsPinMismatchError`
   on a fresh (never pooled) connection, and pinned/unpinned endpoints on the
-  same origin never sharing a pool.
+  same origin never sharing a pool; concurrent pinned handshakes never
+  resuming TLS sessions (every pinned handshake is full, so the pin check
+  always sees the peer certificate).
 - `test/probe.test.ts` — the keep-alive health probe (9 tests):
   `RangeError` on non-boolean `healthProbe`; `isSocketReusable` unit checks
   (live socket passes, destroyed and peer half-closed sockets fail);
@@ -940,3 +992,19 @@ Requires Node 24+ (runs `.ts` directly via type stripping; zero dependencies).
   `healthProbe: false` leaving the free list untouched; the background
   sweep culling a poisoned-pin socket with no traffic; pinned TLS reuse
   passing the probe.
+- `test/http2.test.ts` — outbound HTTP/2 session reuse (18 tests):
+  `RangeError` on invalid `outboundHttp2` options (also via
+  `createDefaultSender`); H2 off by default (`http2Pool` undefined unless
+  `enabled` with eligible hosts); h2c multiplexing ten deliveries over one
+  TCP connection (`established: 1`, `reused: 9`); query-string preservation
+  in `:path`; re-establishment after a server-side session close; idle
+  session reaping after `sessionIdleTimeoutMs`; ineligible hosts and
+  `host:port` mismatch falling through to HTTP/1.1 with no fallback
+  counted; HTTPS H2 with TLS pinning (one session, pin re-verified) and
+  pin mismatch failing loudly as `TlsPinMismatchError` via the H1.1
+  fallback; mTLS client certificate presented on the H2 handshake with the
+  server pin verified; fallback to HTTP/1.1 never losing a delivery when
+  H2 is refused (`fallback` counted, H1.1 pool reusing); non-2xx over H2
+  surfacing `HttpDeliveryError` with no fallback; proxied endpoints
+  bypassing H2 for the CONNECT tunnel (zero H2 sessions); `getStats()`
+  shape and `destroy()` closing sessions.

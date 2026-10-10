@@ -12,7 +12,7 @@ import {
   type SigningKey,
   type Verifier,
 } from "./verify.ts";
-import { RetryQueue, type DeliveryPriority, type RetryItem, type Sender } from "./retry.ts";
+import { RetryQueue, type DeliveryPriority, type DownstreamResponse, type RetryItem, type Sender } from "./retry.ts";
 import type { AutoReplayOptions } from "./autoreplay.ts";
 import { HttpDeliveryError, parseRetryAfterMs } from "./failure.ts";
 import { installGracefulShutdown } from "./shutdown.ts";
@@ -34,6 +34,13 @@ import {
   createProxiedAgent,
   resolveProxyUrl,
 } from "./proxy.ts";
+import {
+  Http2SessionPool,
+  Http2UnavailableError,
+  resolveHttp2PoolOptions,
+  runHttp2Stream,
+  type Http2PoolOptions,
+} from "./http2.ts";
 import type { AuditLog } from "./audit.ts";
 import type { EndpointConfigPatch } from "./hotreload.ts";
 import {
@@ -239,6 +246,22 @@ export interface RelayServerOptions {
    */
   outboundKeepAlive?: KeepAlivePoolOptions | false;
   /**
+   * Outbound HTTP/2 session reuse (see `src/http2.ts`): on top of the
+   * keep-alive pool, per-origin H2 sessions multiplex high-concurrency
+   * deliveries over a single connection. Opt-in per host —
+   * `{ enabled: true, hosts: ["relay.example.com"] }` — and off by default,
+   * so existing deployments keep their exact current behavior. `http:`
+   * targets use h2c; `https:` targets use TLS with the same WR-21 pinning
+   * trust-anchor semantics and WR-36 client certificates as the HTTP/1.1
+   * path (sessions are keyed per origin + pin set + client identity). A
+   * failed or refused H2 session falls back to the HTTP/1.1 keep-alive
+   * pool — a delivery is never lost because of H2 — and the origin sits
+   * out H2 for `fallbackCooldownMs` (default 30s). H2 is bypassed for
+   * proxied endpoints: proxy traffic rides the HTTP/1.1 CONNECT tunnel.
+   * Invalid values throw `RangeError` at startup.
+   */
+  outboundHttp2?: Http2PoolOptions;
+  /**
    * Outbound HTTP(S) proxy (see `src/proxy.ts`): per-endpoint proxy URLs,
    * keyed by exact delivery `targetUrl`. Deliveries to a configured
    * endpoint ride a `CONNECT` tunnel through the proxy — proxy basic-auth
@@ -406,10 +429,18 @@ export interface RelayServerOptions {
  * Off by default; composes with `tlsPins` and the keep-alive pool (agents
  * are keyed per `(origin, cert)`). Invalid values throw `RangeError` at
  * startup.
+ *
+ * `http2` is the opt-in HTTP/2 session pool (see `src/http2.ts` and the
+ * `outboundHttp2` server option): `{ enabled: true, hosts: [...] }`.
+ * Disabled by default. Invalid values throw `RangeError` at startup. The
+ * returned sender carries the pool as `.http2Pool` and closes it via
+ * `.destroy()` alongside the keep-alive pool.
  */
 export interface PooledSender extends Sender {
   /** The keep-alive pool, or `undefined` when pooling is disabled. */
   pool: OutboundConnectionPool | undefined;
+  /** The HTTP/2 session pool, or `undefined` when H2 is not enabled. */
+  http2Pool: Http2SessionPool | undefined;
   /** Close all pooled connections and stop the idle reaper. Idempotent. */
   destroy(): void;
 }
@@ -420,7 +451,8 @@ export function createDefaultSender(
   outboundSigning?: OutboundSigningConfig,
   proxies?: Record<string, string>,
   tlsClientCerts?: Record<string, TlsClientCert>,
-  compressOutbound?: Record<string, CompressOutboundOptions>
+  compressOutbound?: Record<string, CompressOutboundOptions>,
+  http2?: Http2PoolOptions
 ): PooledSender {
   if (tlsPins !== undefined) {
     for (const [endpoint, pins] of Object.entries(tlsPins)) {
@@ -478,34 +510,64 @@ export function createDefaultSender(
     }
   }
   const pool = keepAlive === false ? undefined : new OutboundConnectionPool(keepAlive);
-  const sender = function defaultSender(item: RetryItem): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const url = new URL(item.targetUrl);
-      // Pinning is per endpoint (exact targetUrl match). When pins are
-      // configured for the endpoint, the whitelist is the trust anchor: it
-      // replaces Node's PKI chain verification, and the peer certificate is
-      // verified on `secureConnect` before a single payload byte is written
-      // (a MITM must not even see the request body). See `src/pinning.ts`
-      // for why `checkServerIdentity` cannot do this job.
-      const pins = url.protocol === "https:" ? tlsPins?.[item.targetUrl] : undefined;
-      // mTLS client identity for this endpoint (exact targetUrl match):
-      // the certificate is presented during the TLS handshake so the
-      // downstream can verify the relay. Off by default — endpoints without
-      // an entry send no client certificate, exactly as before.
-      const clientCert = url.protocol === "https:" ? tlsClientCerts?.[item.targetUrl] : undefined;
-      // Outbound proxy for this endpoint: explicit per-endpoint config
-      // first, then the environment (read per delivery, so proxy rotation
-      // needs no restart; `NO_PROXY` bypasses the env fallback only — an
-      // explicit entry always wins). An invalid *environment* value throws
-      // here and fails the delivery through the normal retry path; explicit
-      // values were validated at startup.
-      const proxyUrl = resolveProxyUrl(item.targetUrl, proxies);
-      if (proxyUrl === undefined && proxies?.[item.targetUrl] !== undefined) {
-        reject(
-          new Error(`outbound proxy: proxy configured for non-HTTP(S) target ${item.targetUrl}`)
-        );
-        return;
-      }
+  // RangeError on invalid values, at startup — never mid-delivery.
+  const http2Opts = http2 === undefined ? undefined : resolveHttp2PoolOptions(http2);
+  // No pool when H2 is disabled or no host is eligible for it: `undefined`
+  // is the "H2 inactive" signal, mirroring `keepAlive: false`.
+  const h2pool =
+    http2Opts !== undefined && http2Opts.enabled && http2Opts.hosts.length > 0
+      ? new Http2SessionPool(http2Opts)
+      : undefined;
+
+  /**
+   * Shared outbound request material: passthrough headers, trace id,
+   * compression, and the relay signature. Both transports stamp the same
+   * wire bytes, so an H2 delivery is indistinguishable downstream from an
+   * HTTP/1.1 one (a forged inbound `x-relay-signature` was already
+   * stripped from the passthrough headers at intake).
+   */
+  const buildWireRequest = (
+    item: RetryItem
+  ): { headers: Record<string, string | string[]>; body: Buffer } => {
+    const headers: Record<string, string | string[]> = {};
+    for (const [k, v] of Object.entries(item.headers)) {
+      if (v !== undefined) headers[k] = v;
+    }
+    // Propagate the trace ID downstream so the next hop can correlate the
+    // delivery with this relay's audit trail (overrides a stale inbound
+    // value, which is identical anyway after `resolveTraceId`).
+    if (item.traceId) headers[TRACE_ID_HEADER] = item.traceId;
+    // WR-40: per-endpoint opt-in gzip. Compression happens before
+    // signing so `x-relay-signature` covers the exact wire bytes the
+    // downstream receives.
+    const { body: wireBody, contentEncoding } = maybeCompressOutbound(
+      item.payload,
+      compressOutbound?.[item.targetUrl]
+    );
+    if (outboundSigning !== undefined) {
+      // Stamp AFTER the passthrough headers: this guarantees the relay's
+      // own signature always wins.
+      headers["x-relay-signature"] = signSha256(wireBody, outboundSigning.secret);
+      if (outboundSigning.keyId !== undefined) headers["x-relay-key-id"] = outboundSigning.keyId;
+    }
+    if (contentEncoding !== undefined) headers["content-encoding"] = contentEncoding;
+    headers["content-length"] = String(wireBody.length);
+    return { headers, body: wireBody };
+  };
+
+  /**
+   * The HTTP/1.1 delivery path: pooled keep-alive agent (or a fresh
+   * connection / one-off tunneled agent), with the WR-21 pinning and
+   * WR-36 mTLS handshake handling.
+   */
+  const deliverViaHttp1 = (
+    item: RetryItem,
+    url: URL,
+    pins: string[] | undefined,
+    clientCert: TlsClientCert | undefined,
+    proxyUrl: string | undefined
+  ): Promise<DownstreamResponse | void> =>
+    new Promise((resolve, reject) => {
       // Pooled keep-alive agent for this origin (dedicated agent per pin
       // whitelist, per proxy, and per client identity, so a connection
       // pinned, tunneled, or authenticated for one endpoint can never serve
@@ -616,31 +678,8 @@ export function createDefaultSender(
       }
 
       const writePayload = (): void => {
-        for (const [k, v] of Object.entries(item.headers)) {
-          if (v !== undefined) req.setHeader(k, v as string | string[]);
-        }
-        // Propagate the trace ID downstream so the next hop can correlate the
-        // delivery with this relay's audit trail (overrides a stale inbound
-        // value, which is identical anyway after `resolveTraceId`).
-        if (item.traceId) req.setHeader(TRACE_ID_HEADER, item.traceId);
-        // WR-40: per-endpoint opt-in gzip. Compression happens before
-        // signing so `x-relay-signature` covers the exact wire bytes the
-        // downstream receives.
-        const { body: wireBody, contentEncoding } = maybeCompressOutbound(
-          item.payload,
-          compressOutbound?.[item.targetUrl]
-        );
-        if (outboundSigning !== undefined) {
-          // Stamp AFTER the passthrough headers: a forged inbound
-          // `x-relay-signature` was already stripped from them above, and
-          // this guarantees the relay's own signature always wins.
-          req.setHeader("x-relay-signature", signSha256(wireBody, outboundSigning.secret));
-          if (outboundSigning.keyId !== undefined) {
-            req.setHeader("x-relay-key-id", outboundSigning.keyId);
-          }
-        }
-        if (contentEncoding !== undefined) req.setHeader("content-encoding", contentEncoding);
-        req.setHeader("content-length", wireBody.length);
+        const { headers, body: wireBody } = buildWireRequest(item);
+        for (const [k, v] of Object.entries(headers)) req.setHeader(k, v);
         req.end(wireBody);
       };
 
@@ -702,9 +741,89 @@ export function createDefaultSender(
         }
       });
     });
+
+  /**
+   * HTTP/2 delivery (WR-42): one multiplexed stream on the origin's
+   * session, stamping the same wire bytes as the HTTP/1.1 path. Any
+   * H2-level failure throws Http2UnavailableError, and the dispatcher
+   * below retries the delivery over HTTP/1.1 — a delivery is never lost
+   * because of H2.
+   */
+  const deliverViaHttp2 = async (
+    item: RetryItem,
+    url: URL,
+    pins: string[] | undefined,
+    clientCert: TlsClientCert | undefined
+  ): Promise<DownstreamResponse> => {
+    const session = await h2pool!.sessionFor(url, pins, clientCert);
+    h2pool!.acquireStream(session);
+    try {
+      const { headers, body } = buildWireRequest(item);
+      const res = await runHttp2Stream(session, {
+        method: "POST",
+        path: `${url.pathname}${url.search}`,
+        headers,
+        body,
+        captureMaxBytes: RESPONSE_CAPTURE_MAX_BYTES,
+      });
+      if (res.statusCode >= 200 && res.statusCode < 300) {
+        return { statusCode: res.statusCode, body: res.body, truncated: res.truncated };
+      }
+      // Structured failure, same as the HTTP/1.1 path: the retry queue
+      // classifies on the status code and honors a 429's Retry-After.
+      throw new HttpDeliveryError(res.statusCode, parseRetryAfterMs(res.headers["retry-after"]));
+    } finally {
+      h2pool!.releaseStream(session);
+    }
+  };
+
+  const sender = function defaultSender(item: RetryItem): Promise<DownstreamResponse | void> {
+    const url = new URL(item.targetUrl);
+    // Pinning is per endpoint (exact targetUrl match). When pins are
+    // configured for the endpoint, the whitelist is the trust anchor: it
+    // replaces Node's PKI chain verification, and the peer certificate is
+    // verified on `secureConnect` before a single payload byte is written
+    // (a MITM must not even see the request body). See `src/pinning.ts`
+    // for why `checkServerIdentity` cannot do this job.
+    const pins = url.protocol === "https:" ? tlsPins?.[item.targetUrl] : undefined;
+    // mTLS client identity for this endpoint (exact targetUrl match):
+    // the certificate is presented during the TLS handshake so the
+    // downstream can verify the relay. Off by default — endpoints without
+    // an entry send no client certificate, exactly as before.
+    const clientCert = url.protocol === "https:" ? tlsClientCerts?.[item.targetUrl] : undefined;
+    // Outbound proxy for this endpoint: explicit per-endpoint config
+    // first, then the environment (read per delivery, so proxy rotation
+    // needs no restart; `NO_PROXY` bypasses the env fallback only — an
+    // explicit entry always wins). An invalid *environment* value throws
+    // here and fails the delivery through the normal retry path; explicit
+    // values were validated at startup.
+    const proxyUrl = resolveProxyUrl(item.targetUrl, proxies);
+    if (proxyUrl === undefined && proxies?.[item.targetUrl] !== undefined) {
+      return Promise.reject(
+        new Error(`outbound proxy: proxy configured for non-HTTP(S) target ${item.targetUrl}`)
+      );
+    }
+    // HTTP/2 (WR-42): opt-in per host, never under a proxy — proxied
+    // traffic rides the HTTP/1.1 CONNECT tunnel (see `src/http2.ts`). Any
+    // H2-level failure falls back to the HTTP/1.1 pool below: a delivery
+    // is never lost because of H2.
+    if (h2pool !== undefined && proxyUrl === undefined && h2pool.eligibleFor(url)) {
+      return deliverViaHttp2(item, url, pins, clientCert).catch((err) => {
+        if (err instanceof Http2UnavailableError) {
+          h2pool!.noteFallback();
+          return deliverViaHttp1(item, url, pins, clientCert, proxyUrl);
+        }
+        throw err;
+      });
+    }
+    return deliverViaHttp1(item, url, pins, clientCert, proxyUrl);
   } as PooledSender;
   sender.pool = pool;
-  sender.destroy = () => pool?.destroy();
+  sender.http2Pool = h2pool;
+  sender.destroy = () => {
+    pool?.destroy();
+    h2pool?.destroy();
+  };
   return sender;
 }
 
@@ -794,7 +913,7 @@ export function createRelayServer(opts: RelayServerOptions): Server {
   // the default sender only; an injected sender signs on its own.
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound)
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2)
       : undefined;
   const queue = new RetryQueue({
     sender: opts.sender ?? defaultSender,

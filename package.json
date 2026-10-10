@@ -1,1 +1,11 @@
-{"dependencies":{},"name":"webhook-relay-ts","scripts":{"bench:keepalive":"node bench/keepalive-bench.ts","test":"node --test \"test/*.test.ts\""},"type":"module","version":"0.1.0"}
+{
+  "dependencies": {},
+  "name": "webhook-relay-ts",
+  "scripts": {
+    "bench:keepalive": "node bench/keepalive-bench.ts",
+    "bench:http2": "node bench/http2-bench.ts",
+    "test": "node --test \"test/*.test.ts\""
+  },
+  "type": "module",
+  "version": "0.1.0"
+}
