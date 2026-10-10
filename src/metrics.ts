@@ -41,6 +41,8 @@
 /** One endpoint's delivery counters, in Prometheus label order. */
 export interface DeliveryCountersInput {
   endpoint: string;
+  /** Tenant id (WR-48); when set it is rendered as a `tenant` label. */
+  tenant?: string;
   delivered: number;
   failed: number;
   retried: number;
@@ -49,11 +51,15 @@ export interface DeliveryCountersInput {
 
 export interface CircuitStateInput {
   endpoint: string;
+  /** Tenant id (WR-48); when set it is rendered as a `tenant` label. */
+  tenant?: string;
   state: "closed" | "half_open" | "open";
 }
 
 export interface LatencyHistogramInput {
   endpoint: string;
+  /** Tenant id (WR-48); when set it is rendered as a `tenant` label. */
+  tenant?: string;
   /** Ascending bucket upper bounds in seconds, without +Inf. */
   bucketBounds: number[];
   /** Cumulative sample counts per bound (same length as `bucketBounds`). */
@@ -109,6 +115,15 @@ function escapeLabelValue(value: string): string {
   return value.replace(/\\/g, "\\\\").replace(/\n/g, "\\n").replace(/"/g, '\\"');
 }
 
+/**
+ * WR-48: the `tenant="…"` label fragment for a series, or `""` when the
+ * input carries no tenant — so the default tenant's exposition is
+ * byte-identical to the pre-tenant relay.
+ */
+function tenantLabel(tenant: string | undefined): string {
+  return tenant === undefined ? "" : `,tenant="${escapeLabelValue(tenant)}"`;
+}
+
 /** Render the snapshot in Prometheus text exposition format (0.0.4). */
 export function renderPrometheus(input: MetricsInput): string {
   const lines: string[] = [];
@@ -116,10 +131,11 @@ export function renderPrometheus(input: MetricsInput): string {
   lines.push("# TYPE relay_deliveries_total counter");
   for (const d of input.deliveries) {
     const ep = escapeLabelValue(d.endpoint);
-    lines.push(`relay_deliveries_total{endpoint="${ep}",status="delivered"} ${d.delivered}`);
-    lines.push(`relay_deliveries_total{endpoint="${ep}",status="failed"} ${d.failed}`);
-    lines.push(`relay_deliveries_total{endpoint="${ep}",status="retried"} ${d.retried}`);
-    lines.push(`relay_deliveries_total{endpoint="${ep}",status="dead_letter"} ${d.deadLetter}`);
+    const tl = tenantLabel(d.tenant);
+    lines.push(`relay_deliveries_total{endpoint="${ep}"${tl},status="delivered"} ${d.delivered}`);
+    lines.push(`relay_deliveries_total{endpoint="${ep}"${tl},status="failed"} ${d.failed}`);
+    lines.push(`relay_deliveries_total{endpoint="${ep}"${tl},status="retried"} ${d.retried}`);
+    lines.push(`relay_deliveries_total{endpoint="${ep}"${tl},status="dead_letter"} ${d.deadLetter}`);
   }
   if (input.circuits.length > 0) {
     lines.push(
@@ -128,7 +144,9 @@ export function renderPrometheus(input: MetricsInput): string {
     lines.push("# TYPE relay_endpoint_circuit_state gauge");
     for (const c of input.circuits) {
       const n = c.state === "closed" ? 0 : c.state === "half_open" ? 1 : 2;
-      lines.push(`relay_endpoint_circuit_state{endpoint="${escapeLabelValue(c.endpoint)}"} ${n}`);
+      lines.push(
+        `relay_endpoint_circuit_state{endpoint="${escapeLabelValue(c.endpoint)}"${tenantLabel(c.tenant)}} ${n}`
+      );
     }
   }
   if (input.latencyHistograms.length > 0) {
@@ -136,14 +154,15 @@ export function renderPrometheus(input: MetricsInput): string {
     lines.push("# TYPE relay_delivery_latency_seconds histogram");
     for (const h of input.latencyHistograms) {
       const ep = escapeLabelValue(h.endpoint);
+      const tl = tenantLabel(h.tenant);
       for (let i = 0; i < h.bucketBounds.length; i++) {
         lines.push(
-          `relay_delivery_latency_seconds_bucket{endpoint="${ep}",le="${h.bucketBounds[i]}"} ${h.bucketCounts[i]}`
+          `relay_delivery_latency_seconds_bucket{endpoint="${ep}"${tl},le="${h.bucketBounds[i]}"} ${h.bucketCounts[i]}`
         );
       }
-      lines.push(`relay_delivery_latency_seconds_bucket{endpoint="${ep}",le="+Inf"} ${h.count}`);
-      lines.push(`relay_delivery_latency_seconds_sum{endpoint="${ep}"} ${h.sum}`);
-      lines.push(`relay_delivery_latency_seconds_count{endpoint="${ep}"} ${h.count}`);
+      lines.push(`relay_delivery_latency_seconds_bucket{endpoint="${ep}"${tl},le="+Inf"} ${h.count}`);
+      lines.push(`relay_delivery_latency_seconds_sum{endpoint="${ep}"${tl}} ${h.sum}`);
+      lines.push(`relay_delivery_latency_seconds_count{endpoint="${ep}"${tl}} ${h.count}`);
     }
   }
   if (input.probes !== undefined && input.probes.length > 0) {

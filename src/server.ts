@@ -15,6 +15,7 @@ import {
 import { RetryQueue, type DeliveryPriority, type DownstreamResponse, type RetryItem, type Sender } from "./retry.ts";
 import type { CompletionCallbackOptions } from "./callback.ts";
 import { createBoundAddressSelfCheck } from "./callback.ts";
+import { TENANT_ID_HEADER, assertValidTenantId, tenantScopeKey } from "./tenant.ts";
 import type { AutoReplayOptions } from "./autoreplay.ts";
 import { HttpDeliveryError, parseRetryAfterMs } from "./failure.ts";
 import { installGracefulShutdown } from "./shutdown.ts";
@@ -1085,6 +1086,7 @@ export function createRelayServer(opts: RelayServerOptions): Server {
         event: "callback_failed",
         id: info.id,
         traceId: info.traceId,
+        ...(info.tenant !== undefined ? { tenant: info.tenant } : {}),
         targetUrl: info.targetUrl,
         terminalState: info.terminalState,
         attempts: info.attempts,
@@ -1107,6 +1109,7 @@ export function createRelayServer(opts: RelayServerOptions): Server {
         event: "delivered",
         id: item.id,
         traceId: item.traceId,
+        ...(item.tenantId !== undefined ? { tenant: item.tenantId } : {}),
         targetUrl: item.targetUrl,
         attempts,
       });
@@ -1118,6 +1121,7 @@ export function createRelayServer(opts: RelayServerOptions): Server {
         event: "failed",
         id: info.id,
         traceId: info.traceId,
+        ...(info.tenant !== undefined ? { tenant: info.tenant } : {}),
         targetUrl: info.endpoint,
         attempts: info.attempts,
         reason: "semantic_failed",
@@ -1132,6 +1136,7 @@ export function createRelayServer(opts: RelayServerOptions): Server {
         event: "retry_budget_depleted",
         id: info.id,
         traceId: info.traceId,
+        ...(info.tenant !== undefined ? { tenant: info.tenant } : {}),
         targetUrl: info.endpoint,
         attempts: info.attempts,
         waitMs: info.waitMs,
@@ -1147,6 +1152,7 @@ export function createRelayServer(opts: RelayServerOptions): Server {
         event: "retrying",
         id: info.id,
         traceId: info.traceId,
+        ...(info.tenant !== undefined ? { tenant: info.tenant } : {}),
         targetUrl: info.endpoint,
         attempts: info.attempts,
         error: info.error,
@@ -1159,6 +1165,7 @@ export function createRelayServer(opts: RelayServerOptions): Server {
         event: "dead_letter",
         id: item.id,
         traceId: item.traceId,
+        ...(item.tenantId !== undefined ? { tenant: item.tenantId } : {}),
         targetUrl: item.targetUrl,
         attempts,
         error: lastError instanceof Error ? lastError.message : String(lastError),
@@ -1168,11 +1175,17 @@ export function createRelayServer(opts: RelayServerOptions): Server {
         failure_class: failureClass ?? "retryable",
       });
     },
-    onCircuitStateChange: (endpoint, from, to) => {
+    onCircuitStateChange: (endpoint, from, to, tenant) => {
       const event =
         to === "open" ? "circuit_open" : to === "half_open" ? "circuit_half_open" : "circuit_closed";
-      opts.auditLog.append({ event, endpoint, from, to });
-      opts.retry?.onCircuitStateChange?.(endpoint, from, to);
+      opts.auditLog.append({
+        event,
+        endpoint,
+        ...(tenant !== undefined ? { tenant } : {}),
+        from,
+        to,
+      });
+      opts.retry?.onCircuitStateChange?.(endpoint, from, to, tenant);
     },
     // Wrap the caller's onConfigChange so every runtime config change is
     // audited, not just observed.
@@ -1234,6 +1247,9 @@ export function createRelayServer(opts: RelayServerOptions): Server {
     req: Parameters<Parameters<typeof createServer>[0]>[0],
     res: Parameters<Parameters<typeof createServer>[0]>[1]
   ): void => {
+    // WR-48: `?tenant=` subscribes to one tenant's stream only.
+    const tenantFilter =
+      new URL(req.url ?? "/events", "http://internal").searchParams.get("tenant") ?? undefined;
     res.writeHead(200, {
       "content-type": "text/event-stream",
       "cache-control": "no-cache",
@@ -1258,6 +1274,7 @@ export function createRelayServer(opts: RelayServerOptions): Server {
     };
     const unsubscribe = queue.subscribeDeliveryEvents((event) => {
       if (closed) return;
+      if (tenantFilter !== undefined && event.tenant !== tenantFilter) return;
       // Slow-consumer guard: a dashboard that cannot keep up gets
       // disconnected instead of buffering without bound.
       if (res.writableLength > 1_048_576) {
@@ -1410,7 +1427,14 @@ export function createRelayServer(opts: RelayServerOptions): Server {
     }
     if (isLatency) {
       const params = new URL(req.url ?? "/latency", "http://internal").searchParams;
-      respondJson(res, 200, queue.getLatencyStats(params.get("endpoint") ?? undefined));
+      respondJson(
+        res,
+        200,
+        queue.getLatencyStats(
+          params.get("endpoint") ?? undefined,
+          params.get("tenant") ?? undefined
+        )
+      );
       return;
     }
     if (isAudit) {
@@ -1429,6 +1453,7 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       try {
         entries = opts.auditLog.query({
           endpoint: params.get("endpoint") ?? undefined,
+          tenant: params.get("tenant") ?? undefined,
           traceId: params.get("traceId") ?? undefined,
           since: params.get("since") ?? undefined,
           until: params.get("until") ?? undefined,
@@ -1472,18 +1497,25 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       return;
     }
     if (isList) {
+      // WR-48: `?tenant=` filters the dead-letter list to one tenant.
+      const dlTenant =
+        new URL(req.url ?? "/dead-letter", "http://internal").searchParams.get("tenant") ?? undefined;
       respondJson(
         res,
         200,
-        queue.getDeadLetter().map((e) => ({
-          id: e.id,
-          targetUrl: e.targetUrl,
-          attempts: e.attempts,
-          lastError: e.lastError,
-          deadLetteredAt: e.deadLetteredAt,
-          payloadBytes: e.payloadBytes,
-          encrypted: e.encryptedPayload !== undefined,
-        }))
+        queue
+          .getDeadLetter()
+          .filter((e) => dlTenant === undefined || e.tenantId === dlTenant)
+          .map((e) => ({
+            id: e.id,
+            targetUrl: e.targetUrl,
+            ...(e.tenantId !== undefined ? { tenant: e.tenantId } : {}),
+            attempts: e.attempts,
+            lastError: e.lastError,
+            deadLetteredAt: e.deadLetteredAt,
+            payloadBytes: e.payloadBytes,
+            encrypted: e.encryptedPayload !== undefined,
+          }))
       );
       return;
     }
@@ -1550,6 +1582,8 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       // no partial application on validation failure, so a 400 always
       // means "nothing changed". Applied changes are audited as
       // `endpoint_config_updated` by the onConfigChange hook.
+      // WR-48: an optional `tenant` scopes the patch to that tenant's
+      // instance; without it the default tenant is patched.
       let body: Record<string, unknown>;
       try {
         const raw = (await readRawBody(req, maxBodyBytes)).toString("utf8");
@@ -1566,14 +1600,26 @@ export function createRelayServer(opts: RelayServerOptions): Server {
         respondJson(res, 400, { error: "body must be a JSON object" });
         return;
       }
-      const { endpoint, ...patch } = body;
+      const { endpoint, tenant, ...patch } = body;
       if (typeof endpoint !== "string" || endpoint.length === 0) {
         respondJson(res, 400, { error: "endpoint must be a non-empty string" });
         return;
       }
+      if (tenant !== undefined) {
+        try {
+          assertValidTenantId(tenant as string);
+        } catch {
+          respondJson(res, 400, { error: "invalid tenant" });
+          return;
+        }
+      }
       try {
-        const changes = queue.updateEndpointConfig(endpoint, patch as EndpointConfigPatch);
-        respondJson(res, 200, { endpoint, changes });
+        const changes = queue.updateEndpointConfig(
+          endpoint,
+          patch as EndpointConfigPatch,
+          tenant as string | undefined
+        );
+        respondJson(res, 200, { endpoint, ...(tenant !== undefined ? { tenant } : {}), changes });
       } catch (err) {
         if (err instanceof RangeError) {
           respondJson(res, 400, { error: err.message });
@@ -1739,6 +1785,27 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       return;
     }
 
+    // Multi-tenant isolation (WR-48): the inbound `x-tenant-id` header
+    // claims the tenant for this webhook. It is validated here — after
+    // signature verification, so unauthenticated callers learn nothing —
+    // and an invalid value is answered 400, never enqueued. Everything
+    // below (dedup, the queue, audits) sees the validated tenant.
+    const tenantHeader = req.headers[TENANT_ID_HEADER];
+    const tenantRaw = Array.isArray(tenantHeader) ? tenantHeader[0] : tenantHeader;
+    let tenantId: string | undefined;
+    if (tenantRaw !== undefined) {
+      try {
+        assertValidTenantId(tenantRaw);
+        tenantId = tenantRaw;
+      } catch {
+        opts.auditLog.append({ event: "rejected", id, traceId, reason: "invalid_tenant_id" });
+        res.writeHead(400, { "content-type": "text/plain" }).end("Invalid x-tenant-id");
+        return;
+      }
+    }
+    // Spread into audit events; empty when the request claimed no tenant.
+    const tenantLabel = tenantId === undefined ? {} : { tenant: tenantId };
+
     // Inbound gzip (WR-40): a webhook posted with `Content-Encoding: gzip`
     // is transparently decompressed. Signature verification above ran on
     // the raw wire bytes the sender signed; everything below — version
@@ -1799,6 +1866,7 @@ export function createRelayServer(opts: RelayServerOptions): Server {
             event: "rejected",
             id,
             traceId,
+            ...tenantLabel,
             reason: "version_adapt_failed",
             version,
             error: err instanceof Error ? err.message : String(err),
@@ -1864,6 +1932,7 @@ export function createRelayServer(opts: RelayServerOptions): Server {
             event: "rejected",
             id,
             traceId,
+            ...tenantLabel,
             reason: "schema_failed",
             schema: schema.name,
             schemaVersion: schema.version,
@@ -1886,7 +1955,7 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       const verdict = opts.replay.check(nonce, timestampMs);
       if (!verdict.ok) {
         const reason = verdict.reason as string;
-        opts.auditLog.append({ event: "rejected", id, traceId, reason });
+        opts.auditLog.append({ event: "rejected", id, traceId, ...tenantLabel, reason });
         const status = reason === "duplicate_nonce" ? 409 : 400;
         res.writeHead(status, { "content-type": "text/plain" }).end(`Rejected: ${reason}`);
         return;
@@ -1897,14 +1966,30 @@ export function createRelayServer(opts: RelayServerOptions): Server {
     // the window is acknowledged but never delivered — the duplicate
     // business action (e.g. a repeated payment callback charging twice) is
     // what we are protecting against. 202, not 409, so upstream treats the
-    // event as handled instead of retrying again.
+    // event as handled instead of retrying again. WR-48: the dedup key is
+    // tenant-scoped — one tenant's push must never suppress another
+    // tenant's identical business event.
     if (deduplicator) {
       const payloadHash = DeliveryDeduplicator.hashPayload(body);
-      if (deduplicator.check(opts.forwardUrl, payloadHash)) {
-        opts.auditLog.append({ event: "duplicate_suppressed", id, traceId, targetUrl: opts.forwardUrl });
+      if (deduplicator.check(tenantScopeKey(tenantId, opts.forwardUrl), payloadHash)) {
+        opts.auditLog.append({
+          event: "duplicate_suppressed",
+          id,
+          traceId,
+          ...tenantLabel,
+          targetUrl: opts.forwardUrl,
+        });
         res
           .writeHead(202, { "content-type": "application/json" })
-          .end(JSON.stringify({ id, traceId, status: "accepted", duplicate: true }));
+          .end(
+            JSON.stringify({
+              id,
+              traceId,
+              status: "accepted",
+              duplicate: true,
+              ...tenantLabel,
+            })
+          );
         return;
       }
     }
@@ -1920,8 +2005,11 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       // are this relay's own namespace: an inbound client asserting them
       // would impersonate the relay downstream. Strip them always; when
       // outbound signing / idempotency keys are enabled the sender stamps
-      // fresh ones below.
+      // fresh ones below. `x-tenant-id` is likewise relay-internal routing
+      // state (WR-48): the tenant is already on the queued item, and the
+      // downstream never asked for the caller's tenancy claim.
       if (k === "x-relay-signature" || k === "x-relay-key-id" || k === IDEMPOTENCY_KEY_HEADER) continue;
+      if (k === TENANT_ID_HEADER) continue;
       passthrough[k] = v;
     }
 
@@ -1937,6 +2025,9 @@ export function createRelayServer(opts: RelayServerOptions): Server {
     queue.enqueue({
       id,
       traceId,
+      // WR-48: the validated tenant rides the item into the per-tenant
+      // isolation scope (breaker/quota/limiter/latency instances).
+      ...(tenantId !== undefined ? { tenantId } : {}),
       payload: body,
       targetUrl: opts.forwardUrl,
       headers: passthrough,
@@ -1957,6 +2048,7 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       event: "accepted",
       id,
       traceId,
+      ...tenantLabel,
       targetUrl: opts.forwardUrl,
     };
     if (version !== undefined) acceptedEvent.version = version;
@@ -1970,7 +2062,9 @@ export function createRelayServer(opts: RelayServerOptions): Server {
     if (inboundGzip) acceptedEvent.contentEncoding = "gzip";
     if (opts.auditPayloads) acceptedEvent.payload = body;
     opts.auditLog.append(acceptedEvent);
-    res.writeHead(202, { "content-type": "application/json" }).end(JSON.stringify({ id, traceId, status: "accepted" }));
+    res
+      .writeHead(202, { "content-type": "application/json" })
+      .end(JSON.stringify({ id, traceId, status: "accepted", ...tenantLabel }));
   });
 
   server.on("close", () => {

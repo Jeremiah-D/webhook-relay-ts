@@ -43,6 +43,7 @@ import {
   type CompletionReceipt,
   type TerminalDeliveryState,
 } from "./callback.ts";
+import { TENANT_ID_HEADER, assertValidTenantId, tenantScopeKey, splitTenantScopeKey } from "./tenant.ts";
 import { newTraceId, TRACE_ID_HEADER } from "./trace.ts";
 import {
   assertValidEndpointConfigPatch,
@@ -67,6 +68,7 @@ import {
 
 export { TRACE_ID_HEADER };
 export { renderPrometheus };
+export { TENANT_ID_HEADER, assertValidTenantId, tenantScopeKey, splitTenantScopeKey };
 export type { DeliveryCountersInput, CircuitStateInput, LatencyHistogramInput, StarvationGuardMetricsInput };
 export { HttpDeliveryError, classifyFailure, parseRetryAfterMs };
 export type { FailureClass, ClassifiedFailure };
@@ -117,6 +119,15 @@ export interface RetryItem {
    * path and in dead-letter entries.
    */
   traceId?: string;
+  /**
+   * Tenant id (WR-48; see `src/tenant.ts`), from the inbound `x-tenant-id`
+   * header. Scopes the per-(tenant, endpoint) isolation primitives
+   * (concurrency limiter, quota, circuit breaker, latency tracker) and is
+   * carried as a label on audit events, SSE delivery events, and metrics.
+   * Unset = the default tenant: identical code paths with unscoped keys,
+   * so behavior matches the pre-tenant relay exactly.
+   */
+  tenantId?: string;
   /**
    * WR-44: attempts consumed *before* the in-flight dispatch (0-based),
    * maintained by the queue on its stored entry. The queue hands the
@@ -195,6 +206,8 @@ export interface SloMissInfo {
   id: string;
   /** End-to-end trace ID of the slow delivery. */
   traceId: string;
+  /** Tenant id (WR-48); absent for the default tenant. */
+  tenant?: string;
   endpoint: string;
   latencyMs: number;
   sloMs: number;
@@ -227,6 +240,8 @@ export interface DeliveryEvent {
   id: string;
   /** End-to-end trace ID (see `src/trace.ts`), always populated. */
   traceId: string;
+  /** Tenant id (WR-48); absent for the default tenant. */
+  tenant?: string;
   targetUrl: string;
   /** Attempts consumed so far (including the successful one for `delivered`). */
   attempts: number;
@@ -309,6 +324,8 @@ export interface SemanticFailureInfo {
   id: string;
   /** End-to-end trace ID. */
   traceId: string;
+  /** Tenant id (WR-48); absent for the default tenant. */
+  tenant?: string;
   /** Downstream endpoint (`targetUrl`). */
   endpoint: string;
   /** Attempts consumed so far, including this one. */
@@ -323,6 +340,8 @@ export interface RetryBudgetDepletedInfo {
   id: string;
   /** End-to-end trace ID. */
   traceId: string;
+  /** Tenant id (WR-48); absent for the default tenant. */
+  tenant?: string;
   /** Downstream endpoint (`targetUrl`). */
   endpoint: string;
   /** Attempts consumed so far (the failed attempt is already counted). */
@@ -344,6 +363,8 @@ export interface AttemptFailedInfo {
   id: string;
   /** End-to-end trace ID. */
   traceId: string;
+  /** Tenant id (WR-48); absent for the default tenant. */
+  tenant?: string;
   /** Physical downstream target the failed attempt went to. */
   endpoint: string;
   /** Attempts consumed so far (the failed attempt is already counted). */
@@ -514,8 +535,15 @@ export interface RetryQueueOptions {
    * Called on every circuit state transition
    * (closed->open, open->half_open, half_open->closed, half_open->open).
    * Takes precedence over `circuitBreaker.onStateChange` when both are set.
+   * The fourth argument is the tenant (WR-48) whose breaker instance
+   * transitioned; absent for the default tenant.
    */
-  onCircuitStateChange?: (endpoint: string, from: CircuitState, to: CircuitState) => void;
+  onCircuitStateChange?: (
+    endpoint: string,
+    from: CircuitState,
+    to: CircuitState,
+    tenant?: string
+  ) => void;
   /**
    * Opt-in active health probing of downstream endpoints (see
    * `src/downstream-probe.ts`). When set, each listed endpoint gets a timed HEAD (or
@@ -712,6 +740,33 @@ function assertConcurrencyLimit(maxConcurrentPerEndpoint: number): void {
       `maxConcurrentPerEndpoint must be a positive integer or Infinity, got ${maxConcurrentPerEndpoint}`
     );
   }
+}
+
+/**
+ * WR-48 tenant scope key. The default (tenant-less) scope keys plain
+ * endpoints — byte-identical to the pre-tenant relay — while a tenant
+ * prefixes its id. (Implementation lives in `src/tenant.ts` so the server
+ * can scope its dedup keys the same way.)
+ */
+/** Map key for a tenant's private instance (`""` = the default tenant). */
+function tenantInstanceKey(tenant: string | undefined): string {
+  return tenant ?? "";
+}
+
+/**
+ * The inner per-endpoint map for `tenant` inside a two-level
+ * tenant -> endpoint map, creating it on first use. Nested maps keep the
+ * endpoint bytes verbatim — no string encoding, so a newline (or any byte)
+ * in an endpoint can never corrupt the tenant split.
+ */
+function innerFor<K, V>(outer: Map<string, Map<K, V>>, tenant: string | undefined): Map<K, V> {
+  const k = tenantInstanceKey(tenant);
+  let inner = outer.get(k);
+  if (inner === undefined) {
+    inner = new Map<K, V>();
+    outer.set(k, inner);
+  }
+  return inner;
 }
 
 /**
@@ -1187,7 +1242,21 @@ export class RetryQueue {
   private readonly clearTimer: (handle: { clear(): void }) => void;
   private readonly onDeadLetter?: (item: RetryItem, attempts: number, lastError: unknown, failureClass?: FailureClass) => void;
   private readonly onDelivered?: (item: RetryItem, attempts: number) => void;
-  private readonly breaker?: EndpointCircuitBreaker;
+  /**
+   * WR-48: per-tenant circuit breaker instances, keyed by tenant
+   * (`""` = the default tenant). One tenant's downstream outage trips
+   * only its own breaker — another tenant's deliveries to the same
+   * endpoint keep flowing. Lazily created so a tenant that never appears
+   * costs nothing.
+   */
+  private readonly breakers = new Map<string, EndpointCircuitBreaker>();
+  private readonly circuitBreakerOpts?: CircuitBreakerOptions;
+  private readonly circuitBreakerOnStateChange?: (
+    endpoint: string,
+    from: CircuitState,
+    to: CircuitState,
+    tenant?: string
+  ) => void;
   private readonly onConfigChange?: (endpoint: string, changes: ConfigChange[]) => void;
   /** Attempts parked because the endpoint's circuit was open. */
   private circuitBlocked = 0;
@@ -1203,11 +1272,23 @@ export class RetryQueue {
    */
   private readonly laneScheduler: LaneScheduler;
   private readonly onStarvationGuardAudit?: (event: StarvationGuardAuditEvent) => void;
-  private readonly latency?: LatencyTracker;
+  /**
+   * WR-48: per-tenant latency trackers, keyed by tenant (`""` = default).
+   * Accepted→delivered latency is sampled per (tenant, endpoint) so one
+   * tenant's slow downstream does not pollute another's SLO picture.
+   */
+  private readonly latencies = new Map<string, LatencyTracker>();
+  private readonly latencyOpts?: LatencyOptions;
   private readonly onSloMiss?: (info: SloMissInfo) => void;
-  private readonly quota?: EndpointQuota;
-  /** Attempts rescheduled because the endpoint's quota bucket was empty. */
-  private readonly quotaStats = new Map<string, number>();
+  /**
+   * WR-48: per-tenant quota instances, keyed by tenant (`""` = default).
+   * Each tenant gets its own per-endpoint delivery budget.
+   */
+  private readonly quotas = new Map<string, EndpointQuota>();
+  private readonly quotaDeliveriesPerMinute?: number;
+  private readonly quotaNow: () => number;
+  /** Attempts rescheduled because the endpoint's quota bucket was empty. Keyed by scoped key (WR-48). */
+  private readonly quotaStats = new Map<string, Map<string, number>>();
   /**
    * WR-37: per-endpoint response semantic validators (exact `targetUrl`
    * match) plus an optional global fallback. Validators run after a 2xx
@@ -1228,17 +1309,20 @@ export class RetryQueue {
   private readonly onBatch?: (info: BatchInfo) => void;
   /** Per-endpoint flushed-batch counters. */
   private readonly batchStats = new Map<string, { batches: number; events: number }>();
-  /** Prometheus delivery counters per endpoint (see `src/metrics.ts`). */
+  /** Prometheus delivery counters per (tenant, endpoint) — see `src/metrics.ts`. Outer key is the tenant (`""` = default), inner key the plain endpoint. */
   private readonly deliveryCounters = new Map<
     string,
-    { delivered: number; failed: number; retried: number; deadLetter: number }
+    Map<string, { delivered: number; failed: number; retried: number; deadLetter: number }>
   >();
-  /** Last observed circuit state per endpoint (only endpoints that tripped). */
-  private readonly circuitStates = new Map<string, "closed" | "half_open" | "open">();
+  /** Last observed circuit state per (tenant, endpoint) — only endpoints that tripped. */
+  private readonly circuitStates = new Map<string, Map<string, "closed" | "half_open" | "open">>();
   /** Histogram bucket upper bounds in ms (validated ascending). */
   private readonly histBucketsMs: number[];
   /** Per-endpoint latency histogram: per-bucket individual counts + sum. */
-  private readonly latencyHist = new Map<string, { counts: number[]; sumMs: number; count: number }>();
+  private readonly latencyHist = new Map<
+    string,
+    Map<string, { counts: number[]; sumMs: number; count: number }>
+  >();
   private readonly deliveryEventListeners = new Set<(e: DeliveryEvent) => void>();
   /** Opt-in dead-letter auto-replay scheduler; undefined when disabled. */
   private readonly autoReplayer?: DeadLetterAutoReplayer;
@@ -1257,7 +1341,13 @@ export class RetryQueue {
   private readonly queue = new Map<string, RetryItem & { attempt: number }>();
   private readonly timers = new Map<string, Scheduled>();
   private readonly deadLetter: DeadLetterEntry[] = [];
-  private readonly limiter: EndpointConcurrencyLimiter;
+  /**
+   * WR-48: per-tenant concurrency limiters, keyed by tenant (`""` =
+   * default). Each tenant gets its own per-endpoint in-flight budget, so
+   * one tenant's slow downstream cannot starve another's deliveries.
+   */
+  private readonly limiters = new Map<string, EndpointConcurrencyLimiter>();
+  private readonly maxConcurrentPerEndpoint: number;
   /** Deliveries currently executing (inside `deliver()`), for graceful drain. */
   private readonly inFlight = new Set<Promise<void>>();
   private running = false;
@@ -1294,19 +1384,16 @@ export class RetryQueue {
     this.onDeadLetter = opts.onDeadLetter;
     this.onDelivered = opts.onDelivered;
     this.onConfigChange = opts.onConfigChange;
-    this.limiter = new EndpointConcurrencyLimiter(opts.maxConcurrentPerEndpoint);
+    // WR-48: the limiter is per-tenant now; instances are created lazily
+    // by `limiterFor()` so tenants that never appear cost nothing. The
+    // limit itself is still validated eagerly, at construction.
+    this.maxConcurrentPerEndpoint = opts.maxConcurrentPerEndpoint ?? Infinity;
+    assertConcurrencyLimit(this.maxConcurrentPerEndpoint);
     // Wrap the caller's state-change hook so the metrics gauge always sees
     // the latest circuit state, even when nobody subscribes to the hook.
-    const userOnStateChange = opts.onCircuitStateChange ?? opts.circuitBreaker?.onStateChange;
-    this.breaker = opts.circuitBreaker
-      ? new EndpointCircuitBreaker({
-          ...opts.circuitBreaker,
-          onStateChange: (endpoint, from, to) => {
-            this.circuitStates.set(endpoint, to);
-            userOnStateChange?.(endpoint, from, to);
-          },
-        })
-      : undefined;
+    // The wrapper is installed per tenant instance in `breakerFor()`.
+    this.circuitBreakerOpts = opts.circuitBreaker;
+    this.circuitBreakerOnStateChange = opts.onCircuitStateChange ?? opts.circuitBreaker?.onStateChange;
     this.payloadEncryptor = opts.payloadEncryptor;
     this.urgentRetryDelayMs = opts.urgent?.retryDelayMs ?? 0;
     if (!Number.isFinite(this.urgentRetryDelayMs) || this.urgentRetryDelayMs < 0) {
@@ -1324,7 +1411,19 @@ export class RetryQueue {
       opts.failover !== undefined
         ? new FailoverManager(opts.failover, {
             now: opts.failoverNow ?? Date.now,
-            circuitState: (target) => this.breaker?.state(target) ?? "closed",
+            circuitState: (target) => {
+              // WR-48: failover routing is per-endpoint (shared downstream),
+              // while breakers are per-tenant. A target counts as open when
+              // any tenant's breaker says so — a real failure signal from
+              // any tenant's deliveries should move the shared routing.
+              let seen: CircuitState = "closed";
+              for (const b of this.breakers.values()) {
+                const s = b.state(target);
+                if (s === "open") return "open";
+                if (s === "half_open") seen = "half_open";
+              }
+              return seen;
+            },
             onSwitch: (event) => this.recordFailoverSwitch(event),
           })
         : undefined;
@@ -1343,12 +1442,19 @@ export class RetryQueue {
         : new CompletionCallbacker(callbackConfig, {
             onFailed: (info) => opts.onCompletionCallbackFailed?.(info),
           });
-    this.latency = opts.latency ? new LatencyTracker(opts.latency) : undefined;
+    this.latencyOpts = opts.latency;
     this.onSloMiss = opts.latency?.onSloMiss;
-    this.quota =
-      opts.quota?.deliveriesPerMinute !== undefined
-        ? new EndpointQuota(opts.quota.deliveriesPerMinute, opts.quota.now ?? Date.now)
-        : undefined;
+    // WR-48: latency trackers and quotas are per-tenant now; instances are
+    // created lazily by `latencyFor()` / `quotaFor()`.
+    this.quotaDeliveriesPerMinute = opts.quota?.deliveriesPerMinute;
+    this.quotaNow = opts.quota?.now ?? Date.now;
+    // WR-48: the default tenant's breaker/quota/latency instances are
+    // created eagerly (as before), so option validation still throws at
+    // construction and probe outcomes behave identically with no tenant in
+    // play; other tenants' instances stay lazy.
+    this.breakerFor(undefined);
+    this.quotaFor(undefined);
+    this.latencyFor(undefined);
     // WR-37: normalize the response validators — either a single global
     // validator or a record of exact-targetUrl → validator. Bad values
     // throw at construction, never mid-delivery.
@@ -1417,16 +1523,100 @@ export class RetryQueue {
       this.prober = new DownstreamProber({
         ...opts.probe,
         recordOutcome: (endpoint, ok) => {
-          if (ok) this.breaker?.recordSuccess(endpoint);
-          else this.breaker?.recordFailure(endpoint);
+          // WR-48: probes measure the downstream itself (shared across
+          // tenants), so a probe outcome feeds every tenant's breaker
+          // instance for that endpoint.
+          for (const b of this.breakers.values()) {
+            if (ok) b.recordSuccess(endpoint);
+            else b.recordFailure(endpoint);
+          }
         },
         onAudit: opts.onProbeAudit,
       });
     }
   }
 
-  private recordQuotaStat(endpoint: string): void {
-    this.quotaStats.set(endpoint, (this.quotaStats.get(endpoint) ?? 0) + 1);
+  /**
+   * WR-48: the calling tenant's circuit breaker, created on first use.
+   * `undefined` when the breaker is not configured. State changes are
+   * recorded under the tenant-scoped key and the tenant is passed to the
+   * user hook, so metrics and audits can label them.
+   */
+  private breakerFor(tenant: string | undefined): EndpointCircuitBreaker | undefined {
+    if (this.circuitBreakerOpts === undefined) return undefined;
+    const key = tenantInstanceKey(tenant);
+    let b = this.breakers.get(key);
+    if (b === undefined) {
+      const t = tenant;
+      b = new EndpointCircuitBreaker({
+        ...this.circuitBreakerOpts,
+        onStateChange: (endpoint, from, to) => {
+          innerFor(this.circuitStates, t).set(endpoint, to);
+          this.circuitBreakerOnStateChange?.(endpoint, from, to, t);
+        },
+      });
+      this.breakers.set(key, b);
+    }
+    return b;
+  }
+
+  /** WR-48: the calling tenant's quota instance; `undefined` when quotas are off. */
+  private quotaFor(tenant: string | undefined): EndpointQuota | undefined {
+    if (this.quotaDeliveriesPerMinute === undefined) return undefined;
+    const key = tenantInstanceKey(tenant);
+    let q = this.quotas.get(key);
+    if (q === undefined) {
+      q = new EndpointQuota(this.quotaDeliveriesPerMinute, this.quotaNow);
+      this.quotas.set(key, q);
+    }
+    return q;
+  }
+
+  /** WR-48: the calling tenant's concurrency limiter (always present). */
+  private limiterFor(tenant: string | undefined): EndpointConcurrencyLimiter {
+    const key = tenantInstanceKey(tenant);
+    let l = this.limiters.get(key);
+    if (l === undefined) {
+      l = new EndpointConcurrencyLimiter(this.maxConcurrentPerEndpoint);
+      this.limiters.set(key, l);
+    }
+    return l;
+  }
+
+  /** WR-48: the calling tenant's latency tracker; `undefined` when latency tracking is off. */
+  private latencyFor(tenant: string | undefined): LatencyTracker | undefined {
+    if (this.latencyOpts === undefined) return undefined;
+    const key = tenantInstanceKey(tenant);
+    let l = this.latencies.get(key);
+    if (l === undefined) {
+      l = new LatencyTracker(this.latencyOpts);
+      this.latencies.set(key, l);
+    }
+    return l;
+  }
+
+  /**
+   * WR-48: default-tenant views of the per-tenant instances, preserving the
+   * pre-tenant private field names (`breaker`, `quota`, `limiter`,
+   * `latency`) that white-box tests reach for. New code should use the
+   * `*For(tenant)` accessors above.
+   */
+  private get breaker(): EndpointCircuitBreaker | undefined {
+    return this.breakerFor(undefined);
+  }
+  private get quota(): EndpointQuota | undefined {
+    return this.quotaFor(undefined);
+  }
+  private get limiter(): EndpointConcurrencyLimiter {
+    return this.limiterFor(undefined);
+  }
+  private get latency(): LatencyTracker | undefined {
+    return this.latencyFor(undefined);
+  }
+
+  private recordQuotaStat(tenant: string | undefined, endpoint: string): void {
+    const inner = innerFor(this.quotaStats, tenant);
+    inner.set(endpoint, (inner.get(endpoint) ?? 0) + 1);
   }
 
   private recordUrgentStat(endpoint: string, kind: "delivered" | "retried" | "throttled"): void {
@@ -1438,12 +1628,17 @@ export class RetryQueue {
     s[kind] += 1;
   }
 
-  /** Increment one Prometheus delivery counter for `endpoint`. */
-  private recordDelivery(endpoint: string, kind: "delivered" | "failed" | "retried" | "deadLetter"): void {
-    let c = this.deliveryCounters.get(endpoint);
+  /** Increment one Prometheus delivery counter for (tenant, endpoint). */
+  private recordDelivery(
+    tenant: string | undefined,
+    endpoint: string,
+    kind: "delivered" | "failed" | "retried" | "deadLetter"
+  ): void {
+    const inner = innerFor(this.deliveryCounters, tenant);
+    let c = inner.get(endpoint);
     if (!c) {
       c = { delivered: 0, failed: 0, retried: 0, deadLetter: 0 };
-      this.deliveryCounters.set(endpoint, c);
+      inner.set(endpoint, c);
     }
     c[kind] += 1;
   }
@@ -1463,12 +1658,13 @@ export class RetryQueue {
     this.onFailoverSwitch?.(event);
   }
 
-  /** Bucket one accepted→delivered sample into the endpoint's latency histogram. */
-  private recordLatencySample(endpoint: string, latencyMs: number): void {
-    let h = this.latencyHist.get(endpoint);
+  /** Bucket one accepted→delivered sample into the (tenant, endpoint) latency histogram. */
+  private recordLatencySample(tenant: string | undefined, endpoint: string, latencyMs: number): void {
+    const inner = innerFor(this.latencyHist, tenant);
+    let h = inner.get(endpoint);
     if (!h) {
       h = { counts: new Array(this.histBucketsMs.length).fill(0), sumMs: 0, count: 0 };
-      this.latencyHist.set(endpoint, h);
+      inner.set(endpoint, h);
     }
     const idx = this.histBucketsMs.findIndex((b) => latencyMs <= b);
     // A sample above the last bound lands in +Inf only (the `count` series).
@@ -1622,7 +1818,9 @@ export class RetryQueue {
     this.queue.set(item.id, { ...item, payload, targetUrl: failoverEndpoint ?? item.targetUrl, attempt: 0 });
     // A replay starts a fresh delivery cycle: restart the latency clock so
     // the sample measures the replayed attempt, not the original one.
-    this.latency?.recordAccepted(item.id);
+    // WR-48: the replay keeps the dead letter's tenant, so the clock
+    // restarts on the same tenant's tracker.
+    this.latencyFor(item.tenantId)?.recordAccepted(item.id);
     if (this.running) {
       this.schedule(item.id, 0);
     }
@@ -1758,7 +1956,8 @@ export class RetryQueue {
     // duplicate-id throw must not leave a stale pending record behind.
     // (Batched items start their clock at flush time, when the merged item
     // is queued: the batching delay is by design, not lateness.)
-    this.latency?.recordAccepted(item.id);
+    // WR-48: per-tenant tracker.
+    this.latencyFor(item.tenantId)?.recordAccepted(item.id);
     if (this.running) {
       this.schedule(item.id, 0);
     }
@@ -1896,15 +2095,24 @@ export class RetryQueue {
    * before/after diff of every patched field, and reports it through
    * `onConfigChange` (audited by the server as `endpoint_config_updated`).
    */
-  updateEndpointConfig(endpoint: string, patch: EndpointConfigPatch = {}): ConfigChange[] {
+  /**
+   * Apply a runtime config patch to one endpoint (WR-32 hot reload).
+   * WR-48: pass `tenant` to patch that tenant's instance; without it the
+   * default tenant's instance is patched (pre-tenant behavior). Invalid
+   * values throw `RangeError` and leave the current config intact.
+   */
+  updateEndpointConfig(endpoint: string, patch: EndpointConfigPatch = {}, tenant?: string): ConfigChange[] {
     if (typeof endpoint !== "string" || endpoint.length === 0) {
       throw new RangeError("updateEndpointConfig: endpoint must be a non-empty string");
     }
     assertValidEndpointConfigPatch(patch);
-    if (patch.circuitBreaker !== undefined && this.breaker === undefined) {
+    const breaker = this.breakerFor(tenant);
+    const quota = this.quotaFor(tenant);
+    const limiter = this.limiterFor(tenant);
+    if (patch.circuitBreaker !== undefined && breaker === undefined) {
       throw new RangeError("updateEndpointConfig: circuitBreaker is not enabled; cannot patch circuit thresholds");
     }
-    if (patch.quota !== undefined && this.quota === undefined) {
+    if (patch.quota !== undefined && quota === undefined) {
       throw new RangeError("updateEndpointConfig: quota is not enabled; cannot patch quota limits");
     }
 
@@ -1914,22 +2122,22 @@ export class RetryQueue {
     };
 
     if (patch.maxConcurrentPerEndpoint !== undefined) {
-      rec("maxConcurrentPerEndpoint", this.limiter.maxFor(endpoint), patch.maxConcurrentPerEndpoint);
-      this.limiter.setEndpointMax(endpoint, patch.maxConcurrentPerEndpoint);
+      rec("maxConcurrentPerEndpoint", limiter.maxFor(endpoint), patch.maxConcurrentPerEndpoint);
+      limiter.setEndpointMax(endpoint, patch.maxConcurrentPerEndpoint);
     }
     if (patch.circuitBreaker !== undefined) {
-      const before = this.breaker!.thresholdsFor(endpoint);
+      const before = breaker!.thresholdsFor(endpoint);
       if (patch.circuitBreaker.failureThreshold !== undefined) {
         rec("circuitBreaker.failureThreshold", before.failureThreshold, patch.circuitBreaker.failureThreshold);
       }
       if (patch.circuitBreaker.cooldownMs !== undefined) {
         rec("circuitBreaker.cooldownMs", before.cooldownMs, patch.circuitBreaker.cooldownMs);
       }
-      this.breaker!.setEndpointThresholds(endpoint, patch.circuitBreaker);
+      breaker!.setEndpointThresholds(endpoint, patch.circuitBreaker);
     }
     if (patch.quota !== undefined && patch.quota.deliveriesPerMinute !== undefined) {
-      rec("quota.deliveriesPerMinute", this.quota!.limit(endpoint), patch.quota.deliveriesPerMinute);
-      this.quota!.setEndpointLimit(endpoint, patch.quota.deliveriesPerMinute);
+      rec("quota.deliveriesPerMinute", quota!.limit(endpoint), patch.quota.deliveriesPerMinute);
+      quota!.setEndpointLimit(endpoint, patch.quota.deliveriesPerMinute);
     }
     if (patch.retry !== undefined) {
       const r = patch.retry;
@@ -1992,6 +2200,10 @@ export class RetryQueue {
     // `enqueue()`/`enqueueNow()` guarantee every queued item carries a
     // trace ID, so it is safe to thread it through all downstream events.
     const traceId = entry.traceId as string;
+    // WR-48: the tenant scopes the isolation primitives below (quota,
+    // breaker, limiter, latency). `undefined` = the default tenant, which
+    // keys plain endpoints exactly as before.
+    const tenant = entry.tenantId;
     // WR-39: the logical endpoint (`entry.targetUrl`, the configured
     // primary) never changes on the queued item, so replays always
     // re-resolve against the *current* active target. `target` is the
@@ -2004,22 +2216,25 @@ export class RetryQueue {
     // (rescheduled at the next token refill) instead of burning the retry
     // budget or tripping the circuit against a downstream we are
     // voluntarily throttling. A little jitter keeps many delayed items
-    // from re-checking in lockstep.
-    if (this.quota && !this.quota.take(target)) {
-      this.recordQuotaStat(target);
-      this.schedule(id, this.quota.msUntilToken(target) + this.random() * 50);
+    // from re-checking in lockstep. WR-48: the budget is per
+    // (tenant, endpoint).
+    const quota = this.quotaFor(tenant);
+    if (quota && !quota.take(target)) {
+      this.recordQuotaStat(tenant, target);
+      this.schedule(id, quota.msUntilToken(target) + this.random() * 50);
       return;
     }
     let probe = false;
-    if (this.breaker) {
-      const verdict = this.breaker.shouldAllow(target);
+    const breaker = this.breakerFor(tenant);
+    if (breaker) {
+      const verdict = breaker.shouldAllow(target);
       if (!verdict.allowed) {
         // Circuit open (or its probe slot busy): park the attempt until the
         // cooldown elapses instead of burning the retry budget against a
         // known-down endpoint. A little jitter keeps many parked items from
         // re-checking in lockstep.
         this.circuitBlocked += 1;
-        this.schedule(id, this.breaker.retryInMs(target) + this.random() * 100);
+        this.schedule(id, breaker.retryInMs(target) + this.random() * 100);
         return;
       }
       probe = verdict.probe;
@@ -2052,14 +2267,15 @@ export class RetryQueue {
     );
     // The fast lane bypasses the per-endpoint concurrency limiter entirely:
     // an urgent delivery never waits behind queued normal deliveries. Its
-    // own bound is the token bucket above.
-    const release = fastLane ? undefined : await this.limiter.acquire(target);
+    // own bound is the token bucket above. WR-48: the limiter is per
+    // (tenant, endpoint).
+    const release = fastLane ? undefined : await this.limiterFor(tenant).acquire(target);
     try {
       // The queue may have stopped, or the item may have been settled, while
       // we waited for a turn or a concurrency slot. Bail out; the releases
       // cascade to the next waiters so nobody hangs.
       if ((!this.running && !force) || !this.queue.has(id)) {
-        if (probe) this.breaker?.cancelProbe(target);
+        if (probe) breaker?.cancelProbe(target);
         return;
       }
       // A normal dispatch earns the urgent lane its proportional deficit
@@ -2094,19 +2310,28 @@ export class RetryQueue {
             );
           }
         }
-        this.breaker?.recordSuccess(target);
+        breaker?.recordSuccess(target);
         this.failover?.recordOutcome(logicalEndpoint, target, true);
         this.queue.delete(id);
-        this.recordDelivery(target, "delivered");
+        this.recordDelivery(tenant, target, "delivered");
         if (fastLane) this.recordUrgentStat(target, "delivered");
-        const latencyMs = this.latency?.recordDelivered(entry.id, target);
+        const latency = this.latencyFor(tenant);
+        const latencyMs = latency?.recordDelivered(entry.id, target);
         if (latencyMs !== undefined) {
           // The histogram samples the same delivery the JSON latency stats
           // do — accepted→delivered, dead letters excluded by `discard()`.
-          this.recordLatencySample(target, latencyMs);
+          // WR-48: the histogram is per (tenant, endpoint).
+          this.recordLatencySample(tenant, target, latencyMs);
         }
-        if (latencyMs !== undefined && this.latency && latencyMs > this.latency.sloMs) {
-          this.onSloMiss?.({ id: entry.id, traceId, endpoint: target, latencyMs, sloMs: this.latency.sloMs });
+        if (latencyMs !== undefined && latency && latencyMs > latency.sloMs) {
+          this.onSloMiss?.({
+            id: entry.id,
+            traceId,
+            ...(tenant === undefined ? {} : { tenant }),
+            endpoint: target,
+            latencyMs,
+            sloMs: latency.sloMs,
+          });
         }
         // The hooks see the physical target the delivery actually went to.
         this.onDelivered?.({ ...entry, targetUrl: target }, entry.attempt + 1);
@@ -2114,6 +2339,7 @@ export class RetryQueue {
           type: "delivered",
           id: entry.id,
           traceId,
+          ...(tenant === undefined ? {} : { tenant }),
           targetUrl: target,
           attempts: entry.attempt + 1,
           at: new Date().toISOString(),
@@ -2122,6 +2348,7 @@ export class RetryQueue {
         this.callbacker?.notifyDelivered({
           id: entry.id,
           traceId,
+          tenantId: tenant,
           targetUrl: target,
           attempts: entry.attempt + 1,
         });
@@ -2137,6 +2364,7 @@ export class RetryQueue {
           this.onSemanticFailure?.({
             id: entry.id,
             traceId,
+            ...(tenant === undefined ? {} : { tenant }),
             endpoint: target,
             attempts: entry.attempt + 1,
             reason: err.reason,
@@ -2151,16 +2379,16 @@ export class RetryQueue {
           // settles a half-open probe exactly once, as the breaker
           // requires). Failover agrees: an answering target is a healthy
           // target.
-          this.breaker?.recordSuccess(target);
+          breaker?.recordSuccess(target);
           this.failover?.recordOutcome(logicalEndpoint, target, true);
-          this.recordDelivery(target, "failed");
+          this.recordDelivery(tenant, target, "failed");
           entry.attempt += 1;
           this.moveToDeadLetter(entry, id, err, classified, at, traceId, target);
           return;
         }
-        this.breaker?.recordFailure(target);
+        breaker?.recordFailure(target);
         this.failover?.recordOutcome(logicalEndpoint, target, false);
-        this.recordDelivery(target, "failed");
+        this.recordDelivery(tenant, target, "failed");
         entry.attempt += 1;
         if (entry.attempt >= this.maxAttempts) {
           this.moveToDeadLetter(entry, id, err, classified, at, traceId, target);
@@ -2184,11 +2412,12 @@ export class RetryQueue {
               retryDelayMs = this.delayForAttempt(entry.attempt);
             }
           }
-          this.recordDelivery(target, "retried");
+          this.recordDelivery(tenant, target, "retried");
           this.emitDeliveryEvent({
             type: "retrying",
             id: entry.id,
             traceId,
+            ...(tenant === undefined ? {} : { tenant }),
             targetUrl: target,
             attempts: entry.attempt,
             at,
@@ -2208,6 +2437,7 @@ export class RetryQueue {
             this.onRetryBudgetDepleted?.({
               id: entry.id,
               traceId,
+              ...(tenant === undefined ? {} : { tenant }),
               endpoint: target,
               attempts: entry.attempt,
               waitMs: Math.max(0, Math.round(waitMs)),
@@ -2220,6 +2450,7 @@ export class RetryQueue {
           this.onAttemptFailed?.({
             id: entry.id,
             traceId,
+            ...(tenant === undefined ? {} : { tenant }),
             endpoint: target,
             attempts: entry.attempt,
             error,
@@ -2259,9 +2490,9 @@ export class RetryQueue {
   ): void {
     const error = err instanceof Error ? err.message : String(err);
     this.queue.delete(id);
-    this.recordDelivery(target, "deadLetter");
+    this.recordDelivery(entry.tenantId, target, "deadLetter");
     // Never delivered: drop the pending clock without sampling.
-    this.latency?.discard(entry.id);
+    this.latencyFor(entry.tenantId)?.discard(entry.id);
     const encryptedPayload = this.payloadEncryptor?.encrypt(entry.payload);
     // The dead letter records the physical target the final attempt went
     // to; `failoverEndpoint` remembers the logical endpoint so a replay
@@ -2278,6 +2509,9 @@ export class RetryQueue {
       headers: entry.headers,
       // Kept so a replayed item re-enters the same delivery lane.
       priority: entry.priority,
+      // WR-48: kept so a replay re-enters the same tenant's isolation
+      // scope (breaker/quota/limiter instances).
+      ...(entry.tenantId !== undefined ? { tenantId: entry.tenantId } : {}),
       attempts: entry.attempt,
       lastError: error,
       failureClass: classified.failureClass,
@@ -2291,6 +2525,7 @@ export class RetryQueue {
       type: "dead_letter",
       id: entry.id,
       traceId,
+      ...(entry.tenantId === undefined ? {} : { tenant: entry.tenantId }),
       targetUrl: target,
       attempts: entry.attempt,
       at,
@@ -2300,15 +2535,23 @@ export class RetryQueue {
     this.callbacker?.notifyDeadLetter({
       id: entry.id,
       traceId,
+      tenantId: entry.tenantId,
       targetUrl: target,
       attempts: entry.attempt,
       error,
     });
   }
 
-  /** Per-endpoint concurrency snapshot: in-flight and queued deliveries. */
-  getConcurrencyStats(): Array<{ endpoint: string; inFlight: number; queued: number }> {
-    return this.limiter.stats();
+  /** Per-(tenant, endpoint) concurrency snapshot: in-flight and queued deliveries. Rows carry `tenant` only when set. */
+  getConcurrencyStats(): Array<{ endpoint: string; tenant?: string; inFlight: number; queued: number }> {
+    const out: Array<{ endpoint: string; tenant?: string; inFlight: number; queued: number }> = [];
+    for (const [key, limiter] of this.limiters) {
+      const tenant = key === "" ? undefined : key;
+      for (const row of limiter.stats()) {
+        out.push(tenant === undefined ? row : { ...row, tenant });
+      }
+    }
+    return out;
   }
 
   /**
@@ -2349,12 +2592,22 @@ export class RetryQueue {
   }
 
   /**
-   * Per-endpoint accepted→delivered latency distribution (p50/p95/p99) plus
-   * SLO attainment. Empty when latency tracking is disabled or no delivery
-   * has completed yet. With `endpoint` set, only that endpoint is returned.
+   * Per-(tenant, endpoint) accepted→delivered latency distribution
+   * (p50/p95/p99) plus SLO attainment. Empty when latency tracking is
+   * disabled or no delivery has completed yet. With `endpoint` set, only
+   * that endpoint is returned; with `tenant` set, only that tenant's
+   * rows. Rows carry `tenant` only when set.
    */
-  getLatencyStats(endpoint?: string): EndpointLatencyStats[] {
-    return this.latency?.stats(endpoint) ?? [];
+  getLatencyStats(endpoint?: string, tenant?: string): EndpointLatencyStats[] {
+    const out: EndpointLatencyStats[] = [];
+    for (const [key, tracker] of this.latencies) {
+      if (tenant !== undefined && key !== tenant) continue;
+      const t = key === "" ? undefined : key;
+      for (const row of tracker.stats(endpoint)) {
+        out.push(t === undefined ? row : { ...row, tenant: t });
+      }
+    }
+    return out;
   }
 
   /**
@@ -2371,34 +2624,50 @@ export class RetryQueue {
    * (`relay_retry_budget_depleted_total`) when the WR-38 budget is enabled.
    */
   renderMetrics(): string {
-    const deliveries: DeliveryCountersInput[] = [...this.deliveryCounters.entries()].map(
-      ([endpoint, c]) => ({
-        endpoint,
-        delivered: c.delivered,
-        failed: c.failed,
-        retried: c.retried,
-        deadLetter: c.deadLetter,
-      })
-    );
-    const circuits: CircuitStateInput[] = [...this.circuitStates.entries()].map(
-      ([endpoint, state]) => ({ endpoint, state })
-    );
-    const latencyHistograms: LatencyHistogramInput[] = [];
-    if (this.latency) {
-      for (const [endpoint, h] of this.latencyHist) {
-        const bucketCounts: number[] = [];
-        let cumulative = 0;
-        for (const n of h.counts) {
-          cumulative += n;
-          bucketCounts.push(cumulative);
-        }
-        latencyHistograms.push({
+    // WR-48: counters are keyed by (tenant, endpoint); the tenant becomes
+    // a series label only when set, so the default tenant's exposition is
+    // byte-identical to the pre-tenant relay.
+    const deliveries: DeliveryCountersInput[] = [];
+    for (const [tenantKey, inner] of this.deliveryCounters) {
+      const tenant = tenantKey === "" ? undefined : tenantKey;
+      for (const [endpoint, c] of inner) {
+        deliveries.push({
           endpoint,
-          bucketBounds: this.histBucketsMs.map((b) => b / 1000),
-          bucketCounts,
-          sum: h.sumMs / 1000,
-          count: h.count,
+          ...(tenant === undefined ? {} : { tenant }),
+          delivered: c.delivered,
+          failed: c.failed,
+          retried: c.retried,
+          deadLetter: c.deadLetter,
         });
+      }
+    }
+    const circuits: CircuitStateInput[] = [];
+    for (const [tenantKey, inner] of this.circuitStates) {
+      const tenant = tenantKey === "" ? undefined : tenantKey;
+      for (const [endpoint, state] of inner) {
+        circuits.push({ endpoint, ...(tenant === undefined ? {} : { tenant }), state });
+      }
+    }
+    const latencyHistograms: LatencyHistogramInput[] = [];
+    if (this.latencyOpts !== undefined) {
+      for (const [tenantKey, inner] of this.latencyHist) {
+        const tenant = tenantKey === "" ? undefined : tenantKey;
+        for (const [endpoint, h] of inner) {
+          const bucketCounts: number[] = [];
+          let cumulative = 0;
+          for (const n of h.counts) {
+            cumulative += n;
+            bucketCounts.push(cumulative);
+          }
+          latencyHistograms.push({
+            endpoint,
+            ...(tenant === undefined ? {} : { tenant }),
+            bucketBounds: this.histBucketsMs.map((b) => b / 1000),
+            bucketCounts,
+            sum: h.sumMs / 1000,
+            count: h.count,
+          });
+        }
       }
     }
     const probes: ProbeMetricsInput[] = (this.prober?.stats() ?? []).map((s) => ({
@@ -2429,11 +2698,19 @@ export class RetryQueue {
   }
 
   /**
-   * Per-endpoint circuit state (`state`, `consecutiveFailures`, `trips`).
-   * Empty when the circuit breaker is disabled.
+   * Per-(tenant, endpoint) circuit state (`state`, `consecutiveFailures`,
+   * `trips`). Empty when the circuit breaker is disabled. Rows carry
+   * `tenant` only when set.
    */
   getCircuitStats(): CircuitStats[] {
-    return this.breaker?.stats() ?? [];
+    const out: CircuitStats[] = [];
+    for (const [key, breaker] of this.breakers) {
+      const tenant = key === "" ? undefined : key;
+      for (const row of breaker.stats()) {
+        out.push(tenant === undefined ? row : { ...row, tenant });
+      }
+    }
+    return out;
   }
 
   /**
@@ -2461,11 +2738,19 @@ export class RetryQueue {
   }
 
   /**
-   * Per-endpoint quota counters (`delayed`). Empty when the quota is
-   * disabled or no attempt has been delayed yet.
+   * Per-(tenant, endpoint) quota counters (`delayed`). Empty when the quota
+   * is disabled or no attempt has been delayed yet. Rows carry `tenant`
+   * only when set.
    */
   getQuotaStats(): QuotaStats[] {
-    return [...this.quotaStats.entries()].map(([endpoint, delayed]) => ({ endpoint, delayed }));
+    const rows: QuotaStats[] = [];
+    for (const [tenantKey, inner] of this.quotaStats) {
+      const tenant = tenantKey === "" ? undefined : tenantKey;
+      for (const [endpoint, delayed] of inner) {
+        rows.push(tenant === undefined ? { endpoint, delayed } : { endpoint, tenant, delayed });
+      }
+    }
+    return rows;
   }
 
   /**

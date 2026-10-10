@@ -49,6 +49,8 @@ export interface CompletionReceipt {
   id: string;
   /** End-to-end trace ID (WR-18), always populated on the delivery path. */
   traceId: string;
+  /** Tenant id (WR-48); absent for the default tenant. */
+  tenant?: string;
   /** Physical downstream target the terminal attempt went to. */
   targetUrl: string;
   terminalState: TerminalDeliveryState;
@@ -146,6 +148,8 @@ export interface ResolvedCompletionCallbackConfig {
 export interface CompletionCallbackFailedInfo {
   id: string;
   traceId: string;
+  /** Tenant id (WR-48); absent for the default tenant. */
+  tenant?: string;
   targetUrl: string;
   terminalState: TerminalDeliveryState;
   /** Callback POST attempts made. */
@@ -373,21 +377,40 @@ export class CompletionCallbacker {
   notifyDelivered(info: {
     id: string;
     traceId: string;
+    tenantId?: string;
     targetUrl: string;
     attempts: number;
   }): void {
-    this.send({ ...info, terminalState: "delivered", at: new Date().toISOString() });
+    this.send({
+      id: info.id,
+      traceId: info.traceId,
+      ...(info.tenantId !== undefined ? { tenant: info.tenantId } : {}),
+      targetUrl: info.targetUrl,
+      terminalState: "delivered",
+      attempts: info.attempts,
+      at: new Date().toISOString(),
+    });
   }
 
   /** Queue a receipt for a dead-lettered delivery. Fire-and-forget. */
   notifyDeadLetter(info: {
     id: string;
     traceId: string;
+    tenantId?: string;
     targetUrl: string;
     attempts: number;
     error: string;
   }): void {
-    this.send({ ...info, terminalState: "dead_letter", at: new Date().toISOString() });
+    this.send({
+      id: info.id,
+      traceId: info.traceId,
+      ...(info.tenantId !== undefined ? { tenant: info.tenantId } : {}),
+      targetUrl: info.targetUrl,
+      terminalState: "dead_letter",
+      attempts: info.attempts,
+      error: info.error,
+      at: new Date().toISOString(),
+    });
   }
 
   private send(receipt: CompletionReceipt): void {
@@ -398,6 +421,7 @@ export class CompletionCallbacker {
       this.hooks.onFailed({
         id: receipt.id,
         traceId: receipt.traceId,
+        tenant: receipt.tenant,
         targetUrl: receipt.targetUrl,
         terminalState: receipt.terminalState,
         attempts: 0,
@@ -453,6 +477,7 @@ export class CompletionCallbacker {
     this.hooks.onFailed({
       id: receipt.id,
       traceId: receipt.traceId,
+      tenant: receipt.tenant,
       targetUrl: receipt.targetUrl,
       terminalState: receipt.terminalState,
       attempts: attempt,

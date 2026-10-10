@@ -29,6 +29,8 @@ export interface LatencyTrackerOptions {
 /** Per-endpoint latency distribution plus SLO attainment. All JSON-serializable. */
 export interface EndpointLatencyStats {
   endpoint: string;
+  /** Tenant id (WR-48); absent for the default tenant. */
+  tenant?: string;
   /** Samples currently in the rolling window. */
   count: number;
   min: number;

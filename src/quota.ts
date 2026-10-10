@@ -104,6 +104,8 @@ export class EndpointQuota {
 /** Per-endpoint quota observability. */
 export interface QuotaStats {
   endpoint: string;
+  /** Tenant id (WR-48); absent for the default tenant. */
+  tenant?: string;
   /** Attempts delayed (rescheduled) because the endpoint's budget was exhausted. */
   delayed: number;
 }

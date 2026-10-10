@@ -784,6 +784,39 @@ and again before every POST against the actually bound address (so even an
 undeclared self-target is refused). A refused target fails fast and is
 audited as `callback_failed` — it is never POSTed.
 
+### Multi-tenant isolation
+
+One relay can serve many tenants without them stepping on each other. An
+inbound webhook claims its tenant with the `x-tenant-id` header (1–64
+chars, `[A-Za-z0-9_-]`); an invalid value is answered `400` and audited as
+`rejected` / `invalid_tenant_id`. No header means the default tenant, and
+everything behaves exactly as before — the default tenant's metrics
+exposition is byte-identical to the pre-tenant relay.
+
+Per (tenant, endpoint), the relay isolates:
+
+- **concurrency limiter** — one tenant's slow downstream never starves
+  another's deliveries;
+- **delivery quota** — token buckets are per tenant;
+- **circuit breaker** — a tripped breaker only parks its own tenant's
+  attempts (probes still feed every tenant's breaker, so shared-downstream
+  outages are visible everywhere);
+- **latency tracker** — SLO stats and histograms are per tenant.
+
+Deliberately shared: the urgent-lane token bucket, the DRR lane
+scheduler, the global retry budget, failover routing, downstream probes,
+and batch merging. Dedup keys are tenant-scoped (one tenant's push never
+suppresses another's identical event), and `x-tenant-id` is stripped from
+the headers forwarded downstream.
+
+Tenant shows up as a label wherever the relay reports: audit events carry
+`tenant`, Prometheus series gain `tenant="…"`, the SSE `/events` stream
+emits it per delivery event, and the operator endpoints
+(`/audit`, `/latency`, `/dead-letter`, `/events`) all accept `?tenant=` to
+filter to one tenant. Completion-callback receipts carry the tenant too.
+`POST /config/endpoint` accepts an optional `tenant` to hot-reload one
+tenant's endpoint config.
+
 ### Failure classification
 
 Not every failed delivery deserves a retry (`src/failure.ts`):

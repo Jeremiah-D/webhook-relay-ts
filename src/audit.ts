@@ -24,6 +24,12 @@ export interface AuditQuery {
    * explicit `endpoint` field when present.
    */
   endpoint?: string;
+  /**
+   * Keep only entries carrying this tenant id (WR-48). Matches the
+   * `tenant` field that delivery-lifecycle and intake audit events carry
+   * when the inbound request claimed a tenant.
+   */
+  tenant?: string;
   /** ISO-8601 lower bound (inclusive). Invalid values throw. */
   since?: string;
   /** ISO-8601 upper bound (inclusive). Invalid values throw. */
@@ -49,6 +55,7 @@ interface IndexEntry {
   tsMs: number;
   event?: string;
   endpoint?: string;
+  tenant?: string;
   traceId?: string;
   offset: number;
   length: number;
@@ -177,6 +184,7 @@ export class AuditLog {
     let matches = this.index.filter((e) => {
       if (events !== undefined && (e.event === undefined || !events.includes(e.event))) return false;
       if (filter.endpoint !== undefined && e.endpoint !== filter.endpoint) return false;
+      if (filter.tenant !== undefined && e.tenant !== filter.tenant) return false;
       if (filter.traceId !== undefined && e.traceId !== filter.traceId) return false;
       // Lines without a parseable `ts` can only match unfiltered time ranges.
       if (!Number.isNaN(sinceMs) && (Number.isNaN(e.tsMs) || e.tsMs < sinceMs)) return false;
@@ -272,6 +280,7 @@ export class AuditLog {
           ? rec.endpoint
           : undefined;
     const traceId = typeof rec.traceId === "string" ? rec.traceId : undefined;
-    this.index.push({ tsMs: ts, event, endpoint, traceId, offset, length: line.length });
+    const tenant = typeof rec.tenant === "string" ? rec.tenant : undefined;
+    this.index.push({ tsMs: ts, event, endpoint, tenant, traceId, offset, length: line.length });
   }
 }

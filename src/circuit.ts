@@ -34,6 +34,8 @@ export interface CircuitBreakerOptions {
 /** Observable snapshot of one endpoint's circuit. */
 export interface CircuitStats {
   endpoint: string;
+  /** Tenant id (WR-48); absent for the default tenant. */
+  tenant?: string;
   state: CircuitState;
   /** Consecutive failures since the last success (0 once closed). */
   consecutiveFailures: number;
