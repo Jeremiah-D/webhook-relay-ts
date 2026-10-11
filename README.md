@@ -946,6 +946,42 @@ payment-webhook JSON, Node v24.20.0 / AMD EPYC 9D25):
 
 gzip p50: ~34µs per payload — negligible next to a network round trip.
 
+## Batch inbound ingestion
+
+`POST /ingest/batch` accepts one JSON envelope carrying many events, so a
+producer — e.g. a payment provider pushing a batch of callbacks — pays one
+HTTP round trip instead of one per event:
+
+```bash
+# envelope: { "events": [{ "payload": "<base64>", "headers": {...} }, ...] }
+# x-signature: HMAC of the whole raw envelope body (same secret/verifier)
+curl -X POST http://relay/ingest/batch \
+  -H "x-signature: sha256=<envelope-signature>" \
+  -d '{"events":[{"payload":"eyJvcmRlciI6IjEyMyJ9","headers":{"x-signature":"sha256=<item-signature>"}}]}'
+# → 202 { batchId, traceId, results: [{ index, status: 202, id, traceId }, ...] }
+# → 207 Multi-Status when items have mixed outcomes
+```
+
+- **Envelope signature first** — the batch `x-signature` is verified over
+  the whole raw envelope body *before* the batch is split, so dropping,
+  reordering, or tampering with items invalidates the batch (`401`).
+  Per-endpoint verifier rules and key rotation apply to the batch path.
+- **Full per-item pipeline** — each item then walks the same admission as
+  a single webhook: per-item signature → tenant → gzip → version
+  adaptation → schema → replay guard → dedup → enqueue. Item `payload` is
+  base64 of the exact bytes the per-item `x-signature` covers, so per-item
+  trust semantics are identical to a single `POST`. An item without a
+  verifiable signature is rejected `401` exactly like an unsigned webhook.
+- **Failure isolation** — one bad item never affects the rest: per-item
+  `{ index, status, id, traceId, reason? }` results, `207` when mixed.
+  A malformed envelope is `400` and never touches per-item admission.
+- **Independent trace IDs** — each item carries its own trace ID (its own
+  `x-trace-id` or a fresh one), never the batch's.
+- **Audit** — one `batch_ingested` event (totals) plus the normal
+  per-item `accepted` / `rejected` / `duplicate_suppressed` events, each
+  carrying `batchId` for correlation. A batch-level `x-tenant-id` is
+  validated once and inherited; a per-item `x-tenant-id` overrides it.
+
 ## Outbound end-to-end encryption
 
 Deliveries to sensitive downstreams can be sealed end-to-end per endpoint

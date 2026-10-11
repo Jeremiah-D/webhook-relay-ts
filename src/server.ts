@@ -1336,6 +1336,79 @@ function isOperatorPath(pathname: string): boolean {
 }
 
 /**
+ * WR-61: one event inside a `POST /ingest/batch` envelope. `payload` is
+ * base64 of the exact event bytes the per-item `x-signature` covers, so
+ * per-item trust semantics are identical to a single webhook POST;
+ * `headers` carries the per-item headers (`x-signature`, `x-trace-id`,
+ * `x-nonce`, `x-timestamp`, `x-priority`, `x-tenant-id`, `x-deliver-at`,
+ * `content-encoding`, …).
+ */
+export interface IngestBatchItem {
+  payload: string;
+  headers?: Record<string, string | string[]>;
+}
+
+/** Strict base64 shape: canonical alphabet, correct padding, no whitespace. */
+const BATCH_ITEM_BASE64_SHAPE = /^[A-Za-z0-9+/]*={0,2}$/;
+
+/** Strict base64 decode — `undefined` on any shape violation. */
+function decodeBatchItemPayload(payload: string): Buffer | undefined {
+  if (
+    payload.length === 0 ||
+    payload.length % 4 !== 0 ||
+    !BATCH_ITEM_BASE64_SHAPE.test(payload)
+  ) {
+    return undefined;
+  }
+  return Buffer.from(payload, "base64");
+}
+
+/**
+ * WR-61: validate one batch item's shape. Returns the normalized item
+ * plus the decoded event bytes, or a short machine-readable `problem`
+ * string when the item is malformed (audited as `invalid_item` — it
+ * fails in isolation and never aborts the batch).
+ */
+export function checkIngestBatchItem(
+  raw: unknown
+): { item: IngestBatchItem; body: Buffer } | { problem: string } {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    return { problem: "item_must_be_object" };
+  }
+  const { payload, headers } = raw as { payload?: unknown; headers?: unknown };
+  if (typeof payload !== "string") {
+    return { problem: "payload_must_be_base64" };
+  }
+  const body = decodeBatchItemPayload(payload);
+  if (body === undefined) {
+    return { problem: "payload_must_be_base64" };
+  }
+  let normalizedHeaders: Record<string, string | string[]> | undefined;
+  if (headers !== undefined) {
+    if (headers === null || typeof headers !== "object" || Array.isArray(headers)) {
+      return { problem: "headers_must_be_object" };
+    }
+    normalizedHeaders = {};
+    for (const [k, v] of Object.entries(headers as Record<string, unknown>)) {
+      if (typeof v === "string") {
+        normalizedHeaders[k] = v;
+      } else if (Array.isArray(v) && v.every((e) => typeof e === "string")) {
+        normalizedHeaders[k] = v as string[];
+      } else {
+        return { problem: "header_values_must_be_strings" };
+      }
+    }
+  }
+  return {
+    item: {
+      payload,
+      ...(normalizedHeaders === undefined ? {} : { headers: normalizedHeaders }),
+    },
+    body,
+  };
+}
+
+/**
  * Create a minimal webhook relay: verify the `x-signature` header, enqueue
  * the payload into a retry queue, and forward it to `forwardUrl`.
  * Both accepted deliveries and signature rejections are written to the audit log.
@@ -2160,20 +2233,21 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
    * Shared by the legacy single-plane listener and the split-plane intake
    * listener, so both planes admit webhooks identically.
    */
-  const handleInbound = async (
+  /**
+   * WR-61: the intake gates shared by the single-webhook and batch
+   * ingestion paths — IP allowlist (WR-53), inbound rate limiting
+   * (WR-22), and the body-size cap (WR-25). Runs before any signature
+   * verification, so a flood costs almost nothing. Writes its own
+   * rejection responses; resolves to the raw body on success, or
+   * `undefined` when the response was already written.
+   */
+  const runIntakeGates = async (
     req: Parameters<Parameters<typeof createServer>[0]>[0],
     res: Parameters<Parameters<typeof createServer>[0]>[1],
-    pathname: string
-  ): Promise<void> => {
-    if (req.method !== "POST") {
-      res.writeHead(405, { "content-type": "text/plain" }).end("Method not allowed");
-      return;
-    }
-    const id = randomUUID();
-    // Resolve the trace ID before any admission decision so even rejections
-    // are traceable; a client-supplied x-trace-id is honored, otherwise fresh.
-    const traceId = resolveTraceId(req.headers[TRACE_ID_HEADER]);
-
+    pathname: string,
+    id: string,
+    traceId: string
+  ): Promise<Buffer | undefined> => {
     // Inbound IP allowlist/denylist (WR-53): the outermost admission
     // gate — before the body is even read, before rate limiting, before
     // signature verification — so a hostile IP costs us zero bandwidth
@@ -2198,7 +2272,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         res
           .writeHead(403, { "content-type": "text/plain", connection: "close" })
           .end("Forbidden");
-        return;
+        return undefined;
       }
     }
 
@@ -2225,7 +2299,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
             "retry-after": String(Math.max(1, Math.ceil(verdict.retryAfterMs / 1000))),
           })
           .end("Too many requests");
-        return;
+        return undefined;
       }
     }
 
@@ -2249,7 +2323,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         res
           .writeHead(413, { "content-type": "text/plain", connection: "close" })
           .end("Request body too large");
-        return;
+        return undefined;
       }
     }
 
@@ -2270,14 +2344,62 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         res
           .writeHead(413, { "content-type": "text/plain", connection: "close" })
           .end("Request body too large");
-        return;
+        return undefined;
       }
       res.writeHead(400, { "content-type": "text/plain" }).end("Bad request");
-      return;
+      return undefined;
     }
+    return body;
+  };
 
-    const signatureHeader = req.headers["x-signature"];
-    const keyIdHeader = req.headers["x-key-id"];
+  /**
+   * WR-61: the outcome of admitting one event through the inbound
+   * pipeline (signature → tenant → gzip → version → schema → replay →
+   * dedup → enqueue). The single-webhook path and the batch ingestion
+   * path share it; each caller translates it into its own HTTP response
+   * shape.
+   */
+  interface AdmitOutcome {
+    /** HTTP status the admission decided: 202 accepted, 400/401/409/413 rejected. */
+    status: number;
+    /** Per-event UUID minted before admission (audited even on rejection). */
+    id: string;
+    /** Per-event trace ID (client-supplied or fresh). */
+    traceId: string;
+    /** Machine-readable rejection reason (the audit `reason`); absent on 202. */
+    reason?: string;
+    /** Human-readable rejection detail for the response body. */
+    detail?: string;
+    /** WR-14: the event was a duplicate — 202 with `duplicate: true`. */
+    duplicate?: boolean;
+    /** WR-57: the delivery was parked for a future time (epoch ms). */
+    scheduledAt?: number;
+    /** Validated tenant, when the event claimed one. */
+    tenantId?: string;
+    /** The rejection must close the connection (413 flood protection). */
+    closeConnection?: boolean;
+  }
+
+  /**
+   * WR-61: admit one event through the full inbound pipeline — signature
+   * verification → tenant validation → inbound gzip → version adaptation
+   * → schema validation → replay guard → dedup → enqueue — auditing every
+   * decision. `headers` is the event's header map (the HTTP headers for a
+   * single webhook, the item's `headers` for a batch item); `correlation`
+   * is spread into every audit event the admission emits (e.g.
+   * `{ batchId }`, empty for single webhooks). Never writes the HTTP
+   * response — the caller translates the outcome.
+   */
+  const admitOneEvent = async (
+    id: string,
+    traceId: string,
+    body: Buffer,
+    headers: Record<string, string | string[] | undefined>,
+    pathname: string,
+    correlation: Record<string, unknown>
+  ): Promise<AdmitOutcome> => {
+    const signatureHeader = headers["x-signature"];
+    const keyIdHeader = headers["x-key-id"];
     const keyIdHint = Array.isArray(keyIdHeader) ? keyIdHeader[0] : keyIdHeader;
 
     // Per-endpoint verifier selection (WR-29): the request path picks the
@@ -2301,7 +2423,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     }
 
     if (!verified) {
-      const rejectedEvent: Record<string, unknown> = {
+      const rejectedEvent: Record<string, unknown> = { ...correlation,
         event: "rejected",
         id,
         traceId,
@@ -2312,8 +2434,13 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       // trail shows which trust rule fired.
       if (perEndpointVerifier) rejectedEvent.verifier = activeVerifier.name;
       opts.auditLog.append(rejectedEvent);
-      res.writeHead(401, { "content-type": "text/plain" }).end("Invalid signature");
-      return;
+      return {
+        status: 401,
+        id,
+        traceId,
+        reason: "invalid_signature",
+        detail: "Invalid signature",
+      };
     }
 
     // Multi-tenant isolation (WR-48): the inbound `x-tenant-id` header
@@ -2321,7 +2448,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // signature verification, so unauthenticated callers learn nothing —
     // and an invalid value is answered 400, never enqueued. Everything
     // below (dedup, the queue, audits) sees the validated tenant.
-    const tenantHeader = req.headers[TENANT_ID_HEADER];
+    const tenantHeader = headers[TENANT_ID_HEADER];
     const tenantRaw = Array.isArray(tenantHeader) ? tenantHeader[0] : tenantHeader;
     let tenantId: string | undefined;
     if (tenantRaw !== undefined) {
@@ -2329,9 +2456,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         assertValidTenantId(tenantRaw);
         tenantId = tenantRaw;
       } catch {
-        opts.auditLog.append({ event: "rejected", id, traceId, reason: "invalid_tenant_id" });
-        res.writeHead(400, { "content-type": "text/plain" }).end("Invalid x-tenant-id");
-        return;
+        opts.auditLog.append({ ...correlation, event: "rejected", id, traceId, reason: "invalid_tenant_id" });
+        return { status: 400, id, traceId, reason: "invalid_tenant_id", detail: "Invalid x-tenant-id" };
       }
     }
     // Spread into audit events; empty when the request claimed no tenant.
@@ -2345,33 +2471,36 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // (WR-25 applies to the decompressed size too), so a gzip bomb is
     // answered 413 exactly like an oversized plain body.
     let inboundGzip = false;
-    if (isGzipContentEncoding(req.headers["content-encoding"])) {
+    if (isGzipContentEncoding(headers["content-encoding"])) {
       try {
         body = await gunzipCapped(body, maxBodyBytes);
         inboundGzip = true;
       } catch (err) {
         if (err instanceof DecompressionTooLargeError) {
-          opts.auditLog.append({
+          opts.auditLog.append({ ...correlation,
             event: "rejected",
             id,
             traceId,
             reason: "body_too_large",
             maxBodyBytes,
           });
-          res
-            .writeHead(413, { "content-type": "text/plain", connection: "close" })
-            .end("Request body too large");
-          return;
+          return {
+            status: 413,
+            id,
+            traceId,
+            reason: "body_too_large",
+            detail: "Request body too large",
+            closeConnection: true,
+          };
         }
-        opts.auditLog.append({
+        opts.auditLog.append({ ...correlation,
           event: "rejected",
           id,
           traceId,
           reason: "decompression_failed",
           error: err instanceof Error ? err.message : String(err),
         });
-        res.writeHead(400, { "content-type": "text/plain" }).end("Invalid gzip body");
-        return;
+        return { status: 400, id, traceId, reason: "decompression_failed", detail: "Invalid gzip body" };
       }
     }
 
@@ -2393,7 +2522,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
           body = versionRoute.adapter.adapt(body, { version, path: pathname, traceId });
         } catch (err) {
           versionMetrics.record(version, "rejected");
-          opts.auditLog.append({
+          opts.auditLog.append({ ...correlation,
             event: "rejected",
             id,
             traceId,
@@ -2402,8 +2531,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
             version,
             error: err instanceof Error ? err.message : String(err),
           });
-          res.writeHead(400, { "content-type": "text/plain" }).end("Invalid versioned payload");
-          return;
+          return { status: 400, id, traceId, reason: "version_adapt_failed", detail: "Invalid versioned payload" };
         }
       }
     }
@@ -2459,7 +2587,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         }
         if (errors !== undefined) {
           schemaMetrics.record(schema.name, "rejected");
-          opts.auditLog.append({
+          opts.auditLog.append({ ...correlation,
             event: "rejected",
             id,
             traceId,
@@ -2469,16 +2597,15 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
             schemaVersion: schema.version,
             errors: errors.slice(0, 10),
           });
-          res.writeHead(400, { "content-type": "text/plain" }).end("Schema validation failed");
-          return;
+          return { status: 400, id, traceId, reason: "schema_failed", detail: "Schema validation failed" };
         }
       }
     }
 
     if (opts.replay) {
-      const nonceHeader = req.headers["x-nonce"];
+      const nonceHeader = headers["x-nonce"];
       const nonce = Array.isArray(nonceHeader) ? nonceHeader[0] : nonceHeader;
-      const tsHeader = req.headers["x-timestamp"];
+      const tsHeader = headers["x-timestamp"];
       const tsRaw = Array.isArray(tsHeader) ? tsHeader[0] : tsHeader;
       // x-timestamp is unix seconds (same unit as the `t=` signature field);
       // the guard works in ms. A non-numeric value fails the window check.
@@ -2486,10 +2613,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       const verdict = opts.replay.check(nonce, timestampMs);
       if (!verdict.ok) {
         const reason = verdict.reason as string;
-        opts.auditLog.append({ event: "rejected", id, traceId, ...tenantLabel, reason });
+        opts.auditLog.append({ ...correlation, event: "rejected", id, traceId, ...tenantLabel, reason });
         const status = reason === "duplicate_nonce" ? 409 : 400;
-        res.writeHead(status, { "content-type": "text/plain" }).end(`Rejected: ${reason}`);
-        return;
+        return { status, id, traceId, reason, detail: `Rejected: ${reason}` };
       }
     }
 
@@ -2503,30 +2629,19 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     if (deduplicator) {
       const payloadHash = DeliveryDeduplicator.hashPayload(body);
       if (deduplicator.check(tenantScopeKey(tenantId, opts.forwardUrl), payloadHash)) {
-        opts.auditLog.append({
+        opts.auditLog.append({ ...correlation,
           event: "duplicate_suppressed",
           id,
           traceId,
           ...tenantLabel,
           targetUrl: opts.forwardUrl,
         });
-        res
-          .writeHead(202, { "content-type": "application/json" })
-          .end(
-            JSON.stringify({
-              id,
-              traceId,
-              status: "accepted",
-              duplicate: true,
-              ...tenantLabel,
-            })
-          );
-        return;
+        return { status: 202, id, traceId, duplicate: true, tenantId };
       }
     }
 
     const passthrough: Record<string, string | string[] | undefined> = {};
-    for (const [k, v] of Object.entries(req.headers)) {
+    for (const [k, v] of Object.entries(headers)) {
       if (k === "host" || k === "content-length") continue;
       // WR-40: the payload was decompressed above, so a stale inbound
       // `content-encoding: gzip` must not travel with the plain bytes —
@@ -2548,7 +2663,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // the exponential backoff and the per-endpoint concurrency limiter, and
     // is instead bounded by the per-endpoint urgent token bucket
     // (`retry.urgent`, defaults: immediate retries, 100/sec per endpoint).
-    const priorityHeader = req.headers["x-priority"];
+    const priorityHeader = headers["x-priority"];
     const priorityValue = Array.isArray(priorityHeader) ? priorityHeader[0] : priorityHeader;
     const priority: DeliveryPriority | undefined =
       priorityValue?.toLowerCase() === "urgent" ? "urgent" : undefined;
@@ -2560,15 +2675,14 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // callers learn nothing new). A past-due value takes the normal
     // delivery path; the queue decides the parking, the check below only
     // mirrors it for the 202 response and the audit event.
-    const deliverAtHeader = req.headers[DELIVER_AT_HEADER];
+    const deliverAtHeader = headers[DELIVER_AT_HEADER];
     let deliverAt: number | undefined;
     if (deliverAtHeader !== undefined) {
       try {
         deliverAt = parseDeliverAtHeader(deliverAtHeader);
       } catch {
-        opts.auditLog.append({ event: "rejected", id, traceId, ...tenantLabel, reason: "invalid_deliver_at" });
-        res.writeHead(400, { "content-type": "text/plain" }).end("Invalid x-deliver-at");
-        return;
+        opts.auditLog.append({ ...correlation, event: "rejected", id, traceId, ...tenantLabel, reason: "invalid_deliver_at" });
+        return { status: 400, id, traceId, reason: "invalid_deliver_at", detail: "Invalid x-deliver-at" };
       }
     }
 
@@ -2595,7 +2709,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     if (schema !== undefined) {
       schemaMetrics.record(schema.name, "accepted");
     }
-    const acceptedEvent: Record<string, unknown> = {
+    const acceptedEvent: Record<string, unknown> = { ...correlation,
       event: "accepted",
       id,
       traceId,
@@ -2618,7 +2732,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // `GET /audit?event=scheduled`, and tell the sender when to expect it.
     const scheduledAt = deliverAt !== undefined && queue.isScheduled(id) ? deliverAt : undefined;
     if (scheduledAt !== undefined) {
-      opts.auditLog.append({
+      opts.auditLog.append({ ...correlation,
         event: "scheduled",
         id,
         traceId,
@@ -2628,19 +2742,261 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         deliverAt: new Date(scheduledAt).toISOString(),
       });
     }
-    res
-      .writeHead(202, { "content-type": "application/json" })
-      .end(
-        JSON.stringify({
-          id,
-          traceId,
-          status: "accepted",
-          ...tenantLabel,
-          ...(scheduledAt !== undefined
-            ? { scheduled: true, deliverAt: new Date(scheduledAt).toISOString() }
-            : {}),
-        })
+    return { status: 202, id, traceId, tenantId, scheduledAt };
+  };
+
+  /**
+   * Intake pipeline: everything below the operator/intake plane split.
+   * Shared by the legacy single-plane listener and the split-plane intake
+   * listener, so both planes admit webhooks identically.
+   */
+  const handleInbound = async (
+    req: Parameters<Parameters<typeof createServer>[0]>[0],
+    res: Parameters<Parameters<typeof createServer>[0]>[1],
+    pathname: string
+  ): Promise<void> => {
+    if (req.method !== "POST") {
+      res.writeHead(405, { "content-type": "text/plain" }).end("Method not allowed");
+      return;
+    }
+    // WR-61: batch ingestion rides the intake plane like any webhook —
+    // one envelope signature, then per-item admission.
+    if (pathname === "/ingest/batch") {
+      await handleIngestBatch(req, res);
+      return;
+    }
+    const id = randomUUID();
+    // Resolve the trace ID before any admission decision so even rejections
+    // are traceable; a client-supplied x-trace-id is honored, otherwise fresh.
+    const traceId = resolveTraceId(req.headers[TRACE_ID_HEADER]);
+    const body = await runIntakeGates(req, res, pathname, id, traceId);
+    if (body === undefined) return;
+    const outcome = await admitOneEvent(id, traceId, body, req.headers, pathname, {});
+    const tenantLabel = outcome.tenantId === undefined ? {} : { tenant: outcome.tenantId };
+    if (outcome.status === 202) {
+      res
+        .writeHead(202, { "content-type": "application/json" })
+        .end(
+          JSON.stringify({
+            id: outcome.id,
+            traceId: outcome.traceId,
+            status: "accepted",
+            ...tenantLabel,
+            ...(outcome.duplicate === true ? { duplicate: true } : {}),
+            ...(outcome.scheduledAt !== undefined
+              ? { scheduled: true, deliverAt: new Date(outcome.scheduledAt).toISOString() }
+              : {}),
+          })
+        );
+      return;
+    }
+    const rejHeaders: Record<string, string> = { "content-type": "text/plain" };
+    if (outcome.closeConnection === true) rejHeaders["connection"] = "close";
+    res.writeHead(outcome.status, rejHeaders).end(outcome.detail ?? "Rejected");
+  };
+
+  /**
+   * Batch inbound ingestion (WR-61): `POST /ingest/batch` accepts one
+   * JSON envelope carrying many events, so a producer — e.g. a payment
+   * provider pushing a batch of callbacks — pays one HTTP round trip
+   * instead of one per event.
+   *
+   * Trust model, in order:
+   *  1. The intake gates (IP allowlist, rate limit, body cap) run first,
+   *     exactly like a single webhook.
+   *  2. The envelope's `x-signature` is verified over the whole raw
+   *     batch body BEFORE the batch is split — a tampered or reordered
+   *     batch never reaches per-item admission. Per-endpoint verifier
+   *     rules apply to the batch path, with key-rotation support.
+   *  3. Each item then walks the full per-item pipeline through
+   *     `admitOneEvent` (per-item signature → tenant → gzip → version →
+   *     schema → replay → dedup → enqueue) with its own id and its own
+   *     trace ID. Item failures are isolated: one bad item never affects
+   *     the rest of the batch.
+   *
+   * Envelope shape:
+   * `{ "events": [{ "payload": "<base64>", "headers": { "x-signature":
+   * "sha256=…", "x-trace-id": "…", … } }, …] }`
+   * `payload` is base64 of the exact bytes the per-item signature
+   * covers. Per-item `headers` are optional; an item without a verifiable
+   * signature is rejected 401 exactly like an unsigned single webhook —
+   * the batch envelope signature authenticates the batcher, the item
+   * signature authenticates each event's origin.
+   *
+   * Responses: 202 when every item was accepted, 207 Multi-Status when
+   * mixed, with per-item `{ index, status, id, traceId, … }` results. A
+   * malformed envelope is 400 and never touches per-item admission. The
+   * batch is audited once as `batch_ingested` (totals), plus the normal
+   * per-item `accepted` / `rejected` / `duplicate_suppressed` events,
+   * each carrying `batchId` for correlation.
+   */
+  const handleIngestBatch = async (
+    req: Parameters<Parameters<typeof createServer>[0]>[0],
+    res: Parameters<Parameters<typeof createServer>[0]>[1]
+  ): Promise<void> => {
+    const batchId = randomUUID();
+    const batchTraceId = resolveTraceId(req.headers[TRACE_ID_HEADER]);
+    const body = await runIntakeGates(req, res, "/ingest/batch", batchId, batchTraceId);
+    if (body === undefined) return;
+
+    // The envelope signature covers the whole raw batch body — verified
+    // before splitting, so dropping, reordering, or tampering with items
+    // invalidates the batch.
+    const envelopeVerifier =
+      selectEndpointVerifier("/ingest/batch", opts.endpointVerifiers) ?? verifier;
+    const envelopeKeyIdHeader = req.headers["x-key-id"];
+    const envelopeKeyIdHint = Array.isArray(envelopeKeyIdHeader)
+      ? envelopeKeyIdHeader[0]
+      : envelopeKeyIdHeader;
+    const envelopeSignature = req.headers["x-signature"];
+    const envelopeSigValue = Array.isArray(envelopeSignature)
+      ? envelopeSignature[0]
+      : (envelopeSignature ?? "");
+    let envelopeVerified = false;
+    if (envelopeVerifier instanceof RotatingHmacVerifier) {
+      envelopeVerified = envelopeVerifier.verifyDetailed(body, envelopeSigValue, {
+        keyId: envelopeKeyIdHint,
+      }).ok;
+    } else {
+      envelopeVerified = envelopeVerifier.verify(body, envelopeSigValue);
+    }
+    if (!envelopeVerified) {
+      opts.auditLog.append({
+        event: "rejected",
+        id: batchId,
+        traceId: batchTraceId,
+        path: "/ingest/batch",
+        reason: "invalid_batch_signature",
+      });
+      res.writeHead(401, { "content-type": "text/plain" }).end("Invalid batch signature");
+      return;
+    }
+
+    // A batch-level tenant is validated once here; a per-item
+    // `x-tenant-id` overrides it for that item.
+    const batchTenantHeader = req.headers[TENANT_ID_HEADER];
+    const batchTenantRaw = Array.isArray(batchTenantHeader)
+      ? batchTenantHeader[0]
+      : batchTenantHeader;
+    let batchTenantId: string | undefined;
+    if (batchTenantRaw !== undefined) {
+      try {
+        assertValidTenantId(batchTenantRaw);
+        batchTenantId = batchTenantRaw;
+      } catch {
+        opts.auditLog.append({
+          event: "rejected",
+          id: batchId,
+          traceId: batchTraceId,
+          path: "/ingest/batch",
+          reason: "invalid_tenant_id",
+        });
+        res.writeHead(400, { "content-type": "text/plain" }).end("Invalid x-tenant-id");
+        return;
+      }
+    }
+
+    let envelope: unknown;
+    try {
+      envelope = JSON.parse(body.toString("utf8"));
+    } catch {
+      envelope = undefined;
+    }
+    const events =
+      typeof envelope === "object" && envelope !== null
+        ? (envelope as { events?: unknown }).events
+        : undefined;
+    if (!Array.isArray(events) || events.length === 0) {
+      opts.auditLog.append({
+        event: "rejected",
+        id: batchId,
+        traceId: batchTraceId,
+        path: "/ingest/batch",
+        reason: !Array.isArray(events) ? "invalid_batch_shape" : "empty_batch",
+      });
+      res.writeHead(400, { "content-type": "text/plain" }).end("Invalid batch envelope");
+      return;
+    }
+
+    const correlation = { batchId };
+    const results: Array<Record<string, unknown>> = [];
+    let accepted = 0;
+    for (let index = 0; index < events.length; index++) {
+      const itemId = randomUUID();
+      const checked = checkIngestBatchItem(events[index]);
+      // Per-item trace IDs are independent: an item's own `x-trace-id`
+      // is honored, otherwise a fresh one — never the batch's.
+      const itemTraceId = resolveTraceId(
+        "item" in checked && checked.item.headers !== undefined
+          ? checked.item.headers[TRACE_ID_HEADER]
+          : undefined
       );
+      if (!("item" in checked)) {
+        opts.auditLog.append({
+          event: "rejected",
+          ...correlation,
+          id: itemId,
+          traceId: itemTraceId,
+          index,
+          reason: "invalid_item",
+          detail: checked.problem,
+        });
+        results.push({
+          index,
+          status: 400,
+          id: itemId,
+          traceId: itemTraceId,
+          reason: "invalid_item",
+          detail: checked.problem,
+        });
+        continue;
+      }
+      const itemHeaders: Record<string, string | string[] | undefined> = {
+        ...(checked.item.headers ?? {}),
+      };
+      if (itemHeaders[TENANT_ID_HEADER] === undefined && batchTenantId !== undefined) {
+        itemHeaders[TENANT_ID_HEADER] = batchTenantId;
+      }
+      const outcome = await admitOneEvent(
+        itemId,
+        itemTraceId,
+        checked.body,
+        itemHeaders,
+        "/ingest/batch",
+        correlation
+      );
+      const result: Record<string, unknown> = {
+        index,
+        status: outcome.status,
+        id: outcome.id,
+        traceId: outcome.traceId,
+      };
+      if (outcome.reason !== undefined) result.reason = outcome.reason;
+      if (outcome.detail !== undefined) result.detail = outcome.detail;
+      if (outcome.duplicate === true) result.duplicate = true;
+      if (outcome.scheduledAt !== undefined) {
+        result.scheduled = true;
+        result.deliverAt = new Date(outcome.scheduledAt).toISOString();
+      }
+      results.push(result);
+      if (outcome.status === 202) accepted++;
+    }
+
+    opts.auditLog.append({
+      event: "batch_ingested",
+      id: batchId,
+      traceId: batchTraceId,
+      path: "/ingest/batch",
+      total: events.length,
+      accepted,
+      rejected: events.length - accepted,
+      ...(batchTenantId !== undefined ? { tenant: batchTenantId } : {}),
+    });
+    res
+      .writeHead(accepted === events.length ? 202 : 207, {
+        "content-type": "application/json",
+      })
+      .end(JSON.stringify({ batchId, traceId: batchTraceId, results }));
   };
 
   /**
