@@ -867,7 +867,8 @@ written to the audit log, so the log is the machine's trace.
   below; an empty urgent token bucket degrades it back to this normal path
   (still `delivering`, never dropped).
 - `delivering` → **`delivered`** when the downstream answers 2xx. Done —
-  audited with the total attempt count. When latency tracking is enabled
+  audited with the total attempt count and a `response_summary` (see
+  *Downstream response summary* below). When latency tracking is enabled
   (`retry.latency`), the accepted→delivered delay is sampled into the
   endpoint's distribution, and a delivery slower than `sloMs` is additionally
   audited as `slo_missed` with the measured `latencyMs`.
@@ -887,13 +888,51 @@ written to the audit log, so the log is the machine's trace.
   audited on the `dead_letter` event): `"retryable"` means every attempt was
   spent against a transient failure, `"non_retryable"` means the payload was
   poison and was dead-lettered on the first attempt without burning the
-  retry budget (see *Failure classification* below).
+  retry budget (see *Failure classification* below). The `dead_letter` audit
+  event also carries a `response_summary` with the last attempt's HTTP
+  status code (the only thing a failed attempt can honestly report — see
+  *Downstream response summary* below).
 - `dead_letter` → **`delivering`** (fresh attempt budget) when an operator
   replays it via `POST /dead-letter/:id/replay`, audited as
   `dead_letter_replayed`. A replayed item that fails again walks the same
   `delivering` → `retrying` → `dead_letter` path. The opt-in
   auto-replay scheduler (see *Dead-letter auto-replay* below) replays the
   whole list on a timer with identical fresh-budget semantics.
+
+### Downstream response summary
+
+Every terminal delivery audits a compact, privacy-safe sketch of what the
+downstream answered — `src/response-summary.ts`, no new dependencies:
+
+```jsonc
+// on `delivered` / `dead_letter` audit events, as `response_summary`
+{
+  "statusCode": 200,                 // number, or "unavailable"
+  "responseBytes": 128,              // captured body length, or "unavailable"
+  "timeToFirstByteMs": 42,           // request-issued → first response bytes, or "unavailable"
+  "bodyFingerprintSha256": "2cf2…"   // sha256 hex of the first 256 body bytes; omitted when empty
+}
+```
+
+- `timeToFirstByteMs` is measured by the default sender (request issued →
+  the `'response'` event) — a 首响应头到达耗时 (first-response-header
+  arrival) approximation covering connection setup + request write +
+  server think time, not kernel-to-user dispatch. Custom senders that
+  return `void`, and the WebSocket/H2 paths, leave it unset.
+- Any value that was not measured is the string `"unavailable"` — never a
+  fabricated 0 or -1. A custom sender returning `void` yields an
+  all-`"unavailable"` summary; a dead letter reports only the last
+  attempt's status code (duck-typed off the error, e.g. `HttpDeliveryError`),
+  since a failed attempt has no usable body or TTFB.
+- By default the summary never includes the response body — downstream
+  payloads can carry tokens and PII, and the audit log is not their home.
+  Opt in per queue with `new RetryQueue({ responseBodyCapture: true,
+  payloadEncryptor })`: the full captured body is sealed with the WR-11
+  encryptor and stored as `response_summary.capturedBody` (an
+  `EncryptedPayload` envelope) on every `delivered` audit event.
+  Enabling capture **without** a `payloadEncryptor` throws `RangeError`
+  at construction — fail-fast, so a body can never be logged in the clear
+  by misconfiguration. Dead-letter events never carry a body.
 
 ### Completion callbacks
 
@@ -1310,6 +1349,25 @@ Requires Node 24+ (runs `.ts` directly via type stripping; zero dependencies).
   on persistent failure; heartbeat comments arrive on idle connections; a
   disconnected client stops receiving without breaking the server for the
   remaining subscribers.
+- `test/response-audit.test.ts` — downstream response summaries on
+  `delivered` / `dead_letter` audit events: `statusCode` / `responseBytes` /
+  `timeToFirstByteMs` / `bodyFingerprintSha256` fields, `"unavailable"`
+  honesty for unmeasured fields, opt-in `responseBodyCapture` sealing the
+  body through the WR-11 encryptor, `RangeError` when capture is enabled
+  without an encryptor.
+- `test/event-archive.test.ts` — the `DeliveryEventArchiver`: archives
+  `delivered` / `retrying` / `dead_letter` events to `<dir>/events.jsonl`
+  and queries them sorted by `at`; `since` / `until` / `endpoint` (exact
+  match on `targetUrl`) / `event` filters; invalid `since` / `until`
+  throws; `RangeError` on invalid retention options; `maxBytes` evicts
+  oldest-first keeping the newest line; `maxAgeMs` evicts expired events;
+  restart re-reads history from the same directory; appends never throw
+  (failures counted); source subscribe/unsubscribe; corrupt lines skipped.
+  `GET /events/archive` end to end: serves archived deliveries with
+  filters, 404 fail-closed when unconfigured, guarded like the other
+  operator endpoints (404 without `operatorToken`, 403 on a wrong token,
+  405 on non-GET), 400 on an invalid `event` filter or bad
+  `since` / `until`.
 - `test/batch.test.ts` — batch delivery merging: same-endpoint items inside
   the window merge into one delivery with the JSON envelope (arrival order,
   base64 payloads, per-event headers preserved); endpoints stay separate;

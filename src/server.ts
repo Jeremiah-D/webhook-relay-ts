@@ -694,6 +694,13 @@ export function createDefaultSender(
     proxyUrl: string | undefined
   ): Promise<DownstreamResponse | void> =>
     new Promise((resolve, reject) => {
+      // WR-54: time-to-first-byte — request-issued timestamp; the diff is
+      // taken when the downstream's first response bytes arrive (the
+      // 'response' handler below). A "首响应头到达耗时" approximation:
+      // connection setup + request write + server think time. It does not
+      // measure kernel-to-user dispatch, and the doc on
+      // `DownstreamResponse.timeToFirstByteMs` says so.
+      const requestIssuedMs = Date.now();
       // Pooled keep-alive agent for this origin (dedicated agent per pin
       // whitelist, per proxy, and per client identity, so a connection
       // pinned, tunneled, or authenticated for one endpoint can never serve
@@ -716,6 +723,9 @@ export function createDefaultSender(
             ))
           : undefined);
       const onResponse = (res: Parameters<Parameters<typeof httpsRequest>[2]>[0]): void => {
+        // WR-54: the downstream's first response bytes just arrived — this
+        // is the TTFB instant measured against `requestIssuedMs` above.
+        const timeToFirstByteMs = Date.now() - requestIssuedMs;
         // WR-37: capture the response body (capped) so a per-endpoint
         // responseValidator can check its semantics after a 2xx
         // transport success. Non-2xx responses still reject on the
@@ -744,6 +754,7 @@ export function createDefaultSender(
               statusCode: res.statusCode,
               body: Buffer.concat(chunks),
               truncated,
+              timeToFirstByteMs,
             });
           } else {
             // Structured failure: the retry queue classifies on the status
@@ -1185,7 +1196,7 @@ export function createRelayServer(opts: RelayServerOptions): Server {
           },
         }
       : undefined,
-    onDelivered: (item, attempts) => {
+    onDelivered: (item, attempts, summary) => {
       opts.auditLog.append({
         event: "delivered",
         id: item.id,
@@ -1193,6 +1204,12 @@ export function createRelayServer(opts: RelayServerOptions): Server {
         ...(item.tenantId !== undefined ? { tenant: item.tenantId } : {}),
         targetUrl: item.targetUrl,
         attempts,
+        // WR-54: downstream response summary — statusCode, responseBytes,
+        // timeToFirstByteMs, bodyFingerprintSha256. `capturedBody` (the
+        // sealed full body) appears only with the
+        // `retry.responseBodyCapture` opt-in plus a payloadEncryptor;
+        // unmeasured fields are honestly "unavailable".
+        response_summary: summary,
       });
     },
     // Wrap the caller's onSemanticFailure so every semantic failure is
@@ -1241,7 +1258,7 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       });
       opts.retry?.onAttemptFailed?.(info);
     },
-    onDeadLetter: (item, attempts, lastError, failureClass) => {
+    onDeadLetter: (item, attempts, lastError, failureClass, summary) => {
       opts.auditLog.append({
         event: "dead_letter",
         id: item.id,
@@ -1254,6 +1271,10 @@ export function createRelayServer(opts: RelayServerOptions): Server {
         // attempt (no retry budget burned); "retryable" = every attempt
         // spent against a transient failure.
         failure_class: failureClass ?? "retryable",
+        // WR-54: last attempt's response summary — only statusCode is
+        // known (from the failing HTTP response); the rest is honestly
+        // "unavailable". Never carries a body.
+        response_summary: summary,
       });
     },
     onCircuitStateChange: (endpoint, from, to, tenant) => {

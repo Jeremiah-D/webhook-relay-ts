@@ -73,6 +73,11 @@ import {
   type ProbeMetricsInput,
   type StarvationGuardMetricsInput,
 } from "./metrics.ts";
+import {
+  summarizeDeadLetterFailure,
+  summarizeDownstreamResponse,
+  type DownstreamResponseSummary,
+} from "./response-summary.ts";
 
 export { TRACE_ID_HEADER };
 export { renderPrometheus };
@@ -80,6 +85,7 @@ export { TENANT_ID_HEADER, assertValidTenantId, tenantScopeKey, splitTenantScope
 export type { DeliveryCountersInput, CircuitStateInput, LatencyHistogramInput, StarvationGuardMetricsInput };
 export { HttpDeliveryError, classifyFailure, parseRetryAfterMs };
 export type { FailureClass, ClassifiedFailure };
+export type { DownstreamResponseSummary };
 export type { FailoverConfig, FailoverEndpointStats, FailoverSwitchEvent };
 export { CompletionCallbacker, createBoundAddressSelfCheck, isSelfCallbackTarget, resolveCompletionCallbackConfig };
 export { GlobalConcurrencyGate };
@@ -295,6 +301,16 @@ export interface DownstreamResponse {
   body: Buffer;
   /** True when the body was cut at the sender's capture cap. */
   truncated: boolean;
+  /**
+   * WR-54: time-to-first-byte in ms — measured by the sender from the
+   * request being issued to the downstream's first response bytes
+   * arriving. Documented as a "首响应头到达耗时" (first-response-header
+   * arrival) approximation: it covers connection setup + request write +
+   * server think time, not kernel-to-user dispatch. Unset when the sender
+   * did not measure it (custom senders, WebSocket/H2 paths) — the audit
+   * summary then marks TTFB `"unavailable"` instead of fabricating one.
+   */
+  timeToFirstByteMs?: number;
 }
 
 /**
@@ -527,10 +543,25 @@ export interface RetryQueueOptions {
    * or is dead-lettered immediately as non-retryable. `failureClass` is
    * the classification of the final failure (see `src/failure.ts`); it is
    * an optional fourth parameter so existing callbacks keep compiling.
+   * `summary` is the WR-54 response summary of the last attempt — only
+   * the status code is known (from the failing HTTP response), the rest
+   * is honestly `"unavailable"`. Also optional, for the same reason.
    */
-  onDeadLetter?: (item: RetryItem, attempts: number, lastError: unknown, failureClass?: FailureClass) => void;
-  /** Callback when an item is successfully delivered. */
-  onDelivered?: (item: RetryItem, attempts: number) => void;
+  onDeadLetter?: (
+    item: RetryItem,
+    attempts: number,
+    lastError: unknown,
+    failureClass?: FailureClass,
+    summary?: DownstreamResponseSummary
+  ) => void;
+  /**
+   * Callback when an item is successfully delivered. `summary` is the
+   * WR-54 downstream response summary (status code, byte count, TTFB,
+   * body fingerprint); an optional third parameter so existing callbacks
+   * keep compiling. A custom sender returning `void` still yields a
+   * summary — every field honestly marked `"unavailable"`.
+   */
+  onDelivered?: (item: RetryItem, attempts: number, summary?: DownstreamResponseSummary) => void;
   /**
    * Per-endpoint circuit breaker (see `src/circuit.ts`). When set,
    * `failureThreshold` consecutive delivery failures trip the endpoint's
@@ -592,6 +623,20 @@ export interface RetryQueueOptions {
    * default, in which case dead-letter payloads are kept in the clear.
    */
   payloadEncryptor?: PayloadEncryptor;
+  /**
+   * WR-54: opt-in full downstream response body capture in the audit
+   * trail. Off by default — a delivery's audit footprint is just the
+   * response summary (status code, byte count, TTFB, body fingerprint),
+   * never the body, so sensitive downstream payloads never land on disk
+   * unasked. When `true`, the full captured body is sealed with the WR-11
+   * `payloadEncryptor` and stored as `response_summary.capturedBody` (an
+   * `EncryptedPayload` envelope) on every `delivered` audit event.
+   * Requires `payloadEncryptor`: enabling capture without one throws
+   * `RangeError` at construction (fail-fast — logging response bodies in
+   * the clear would silently defeat the default). Dead-letter events
+   * never carry a body: a failed attempt has nothing worth capturing.
+   */
+  responseBodyCapture?: boolean;
   /**
    * Urgent delivery lane for items with `priority: "urgent"` (see
    * {@link DeliveryPriority}). The lane is always available when an item is
@@ -1339,8 +1384,18 @@ export class RetryQueue {
   private readonly random: () => number;
   private readonly setTimer: (fn: () => void, ms: number) => { clear(): void };
   private readonly clearTimer: (handle: { clear(): void }) => void;
-  private readonly onDeadLetter?: (item: RetryItem, attempts: number, lastError: unknown, failureClass?: FailureClass) => void;
-  private readonly onDelivered?: (item: RetryItem, attempts: number) => void;
+  private readonly onDeadLetter?: (
+    item: RetryItem,
+    attempts: number,
+    lastError: unknown,
+    failureClass?: FailureClass,
+    summary?: DownstreamResponseSummary
+  ) => void;
+  private readonly onDelivered?: (
+    item: RetryItem,
+    attempts: number,
+    summary?: DownstreamResponseSummary
+  ) => void;
   /**
    * WR-48: per-tenant circuit breaker instances, keyed by tenant
    * (`""` = the default tenant). One tenant's downstream outage trips
@@ -1394,6 +1449,8 @@ export class RetryQueue {
   /** Attempts parked because the endpoint's circuit was open. */
   private circuitBlocked = 0;
   private readonly payloadEncryptor?: PayloadEncryptor;
+  /** WR-54: opt-in sealed response-body capture on `delivered` audit events. */
+  private readonly responseBodyCapture: boolean;
   private readonly urgentRetryDelayMs: number;
   private readonly urgentLimiter: UrgentRateLimiter;
   private readonly urgentStats = new Map<string, { delivered: number; retried: number; throttled: number }>();
@@ -1581,6 +1638,15 @@ export class RetryQueue {
     this.circuitBreakerOpts = opts.circuitBreaker;
     this.circuitBreakerOnStateChange = opts.onCircuitStateChange ?? opts.circuitBreaker?.onStateChange;
     this.payloadEncryptor = opts.payloadEncryptor;
+    // WR-54: fail-fast — capturing response bodies without an encryptor
+    // would log them in the clear; refuse at construction, never
+    // mid-delivery.
+    this.responseBodyCapture = opts.responseBodyCapture ?? false;
+    if (this.responseBodyCapture && this.payloadEncryptor === undefined) {
+      throw new RangeError(
+        "responseBodyCapture requires a payloadEncryptor: refusing to audit response bodies in the clear"
+      );
+    }
     this.urgentRetryDelayMs = opts.urgent?.retryDelayMs ?? 0;
     if (!Number.isFinite(this.urgentRetryDelayMs) || this.urgentRetryDelayMs < 0) {
       throw new RangeError(`urgent.retryDelayMs must be >= 0, got ${opts.urgent?.retryDelayMs}`);
@@ -2641,6 +2707,17 @@ export class RetryQueue {
         // Pinned copy: the sender sees the physical target chosen above,
         // so a failover switch mid-flight cannot reroute this attempt.
         const response = await this.sender({ ...entry, targetUrl: target });
+        // WR-54: summarize the downstream response for the audit trail. A
+        // `void` sender (no response visibility) yields an honest
+        // all-"unavailable" summary — never fabricated numbers.
+        const responseSummary = summarizeDownstreamResponse(response);
+        if (this.responseBodyCapture && response !== undefined) {
+          // Opt-in full body capture: sealed with the WR-11 encryptor
+          // before it ever touches the audit log. The constructor
+          // guarantees an encryptor exists when this flag is on.
+          const encryptor = this.payloadEncryptor as PayloadEncryptor;
+          responseSummary.capturedBody = encryptor.encrypt(response.body);
+        }
         // WR-37: the transport succeeded (2xx); the validator decides
         // whether the body actually means success. A failing verdict
         // becomes a SemanticDeliveryError, which the catch below treats
@@ -2698,7 +2775,7 @@ export class RetryQueue {
           });
         }
         // The hooks see the physical target the delivery actually went to.
-        this.onDelivered?.({ ...entry, targetUrl: target }, entry.attempt + 1);
+        this.onDelivered?.({ ...entry, targetUrl: target }, entry.attempt + 1, responseSummary);
         this.emitDeliveryEvent({
           type: "delivered",
           id: entry.id,
@@ -2908,7 +2985,11 @@ export class RetryQueue {
     // Never delivered: drop the pending clock without sampling.
     this.latencyFor(entry.tenantId)?.discard(entry.id);
     this.deadLetter.push(dlEntry);
-    this.onDeadLetter?.({ ...entry, targetUrl: target }, entry.attempt, err, classified.failureClass);
+    // WR-54: the last attempt's response summary — only the status code
+    // survives (from the failing HTTP response); a failed attempt has no
+    // usable body and no meaningful TTFB, so those stay "unavailable".
+    const responseSummary = summarizeDeadLetterFailure(err);
+    this.onDeadLetter?.({ ...entry, targetUrl: target }, entry.attempt, err, classified.failureClass, responseSummary);
     this.emitDeliveryEvent({
       type: "dead_letter",
       id: entry.id,
