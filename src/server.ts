@@ -81,6 +81,33 @@ import {
   type CompressOutboundOptions,
 } from "./gzip.ts";
 
+/**
+ * Operator/intake plane split (WR-56). When set, the relay listens on two
+ * ports: the intake plane (the returned server, bound by the caller with
+ * `listen()`) accepts only webhooks, and the operator plane (bound by the
+ * relay itself at creation, see `RelayServer.operatorServer`) serves only
+ * the operator endpoints (`/dead-letter`, `/audit`, `/metrics`, `/events`,
+ * `/config/endpoint`, `/deliveries/:traceId`, ...). Operator paths hit on
+ * the intake plane — and webhook posts hit on the operator plane — are
+ * answered with a plain 404 that reveals nothing about the other plane.
+ * Bind errors surface as `error` on `operatorServer`, the standard Server
+ * contract.
+ */
+export interface OperatorPortOptions {
+  /**
+   * The operator plane's listen port. `0` binds an ephemeral port (useful
+   * for tests; read the bound port from `server.operatorServer.address()`).
+   * Integer 0-65535; anything else throws `RangeError` at startup.
+   */
+  port: number;
+  /**
+   * Bind host for the operator plane. Defaults to `127.0.0.1` — the
+   * operator plane never binds `0.0.0.0` by default, so it is not
+   * reachable from the network unless the operator explicitly opts in.
+   */
+  host?: string;
+}
+
 export interface RelayServerOptions {
   /** HMAC secret used to verify incoming webhooks. */
   secret: string;
@@ -340,6 +367,16 @@ export interface RelayServerOptions {
    * endpoints are disabled and answer 404 (fail closed).
    */
   operatorToken?: string;
+  /**
+   * Operator/intake plane split (WR-56, see `OperatorPortOptions`): serve
+   * the operator endpoints on a second listener bound by the relay itself
+   * (default host `127.0.0.1`) while the intake plane keeps accepting
+   * webhooks on the caller-bound port. Cross-plane requests answer 404
+   * without revealing the other plane. Unset by default: a single
+   * listener serves both planes, exactly the legacy behavior. Invalid
+   * values throw `RangeError` at startup.
+   */
+  operatorPort?: OperatorPortOptions;
   /**
    * Opt-in dead-letter auto-replay scheduler (see `src/autoreplay.ts` and
    * the `autoReplay` `RetryQueue` option): timed rounds that replay the
@@ -1081,16 +1118,73 @@ export interface OutboundSigningConfig {
 }
 
 /**
+ * The value `createRelayServer` returns: the intake plane's `http.Server`
+ * (bound by the caller with `listen()`, like the legacy single-plane
+ * return), plus — only when `operatorPort` is configured — the relay-bound
+ * operator plane listener. Closing the returned server also closes the
+ * operator plane.
+ */
+export interface RelayServer extends Server {
+  /**
+   * WR-56: the operator-plane listener. Set only when `operatorPort` is
+   * configured; the relay binds it at creation (default host `127.0.0.1`,
+   * ephemeral when `port: 0`). It answers 404 to anything that is not an
+   * operator path, so it can never accept a webhook.
+   */
+  operatorServer?: Server;
+}
+
+/**
+ * WR-56: the operator-plane path set. Shared by both planes in
+ * split-plane mode — the intake plane 404s these paths without revealing
+ * the operator plane exists, the operator plane 404s everything else —
+ * and by the legacy single-plane dispatch, where it is unchanged.
+ */
+function isOperatorPath(pathname: string): boolean {
+  return (
+    pathname === "/dead-letter" ||
+    pathname.startsWith("/dead-letter/") ||
+    pathname === "/audit" ||
+    pathname === "/latency" ||
+    pathname === "/events" ||
+    pathname === "/events/archive" ||
+    pathname === "/metrics" ||
+    pathname === "/config/endpoint" ||
+    pathname === "/endpoints/pause" ||
+    pathname === "/endpoints/resume" ||
+    pathname.startsWith("/deliveries/")
+  );
+}
+
+/**
  * Create a minimal webhook relay: verify the `x-signature` header, enqueue
  * the payload into a retry queue, and forward it to `forwardUrl`.
  * Both accepted deliveries and signature rejections are written to the audit log.
  */
-export function createRelayServer(opts: RelayServerOptions): Server {
+export function createRelayServer(opts: RelayServerOptions): RelayServer {
   const latencyOpts = opts.retry?.latency;
   // RangeError on invalid values, at startup — never mid-request.
   const maxBodyBytes = opts.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
   if (!Number.isInteger(maxBodyBytes) || maxBodyBytes <= 0) {
     throw new RangeError("createRelayServer: `maxBodyBytes` must be a positive integer");
+  }
+  // WR-56: split-plane config is validated once at startup, so a bad port
+  // or host can never surface as a half-bound relay mid-flight.
+  const operatorPlane = opts.operatorPort;
+  if (operatorPlane !== undefined) {
+    if (
+      !Number.isInteger(operatorPlane.port) ||
+      operatorPlane.port < 0 ||
+      operatorPlane.port > 65535
+    ) {
+      throw new RangeError("createRelayServer: `operatorPort.port` must be an integer 0-65535");
+    }
+    if (
+      operatorPlane.host !== undefined &&
+      (typeof operatorPlane.host !== "string" || operatorPlane.host.length === 0)
+    ) {
+      throw new RangeError("createRelayServer: `operatorPort.host` must be a non-empty string");
+    }
   }
   // When the caller does not inject a sender, the server owns the default
   // sender — and with it the keep-alive pool, which is closed on server
@@ -1872,33 +1966,16 @@ export function createRelayServer(opts: RelayServerOptions): Server {
     }
   };
 
-  const server = createServer(async (req, res) => {
-    const pathname = new URL(req.url ?? "/", "http://internal").pathname;
-    if (
-      pathname === "/dead-letter" ||
-      pathname.startsWith("/dead-letter/") ||
-      pathname === "/audit" ||
-      pathname === "/latency" ||
-      pathname === "/events" ||
-      pathname === "/events/archive" ||
-      pathname === "/metrics" ||
-      pathname === "/config/endpoint" ||
-      pathname === "/endpoints/pause" ||
-      pathname === "/endpoints/resume" ||
-      pathname.startsWith("/deliveries/")
-    ) {
-      try {
-        await handleOperator(req, res, pathname);
-      } catch {
-        // Never let an operator-endpoint failure crash the process as an
-        // unhandled rejection; the batch replay path rethrows per-item
-        // decrypt errors internally, so this is a last-resort guard.
-        if (!res.headersSent) {
-          respondJson(res, 500, { error: "internal server error" });
-        }
-      }
-      return;
-    }
+  /**
+   * Intake pipeline: everything below the operator/intake plane split.
+   * Shared by the legacy single-plane listener and the split-plane intake
+   * listener, so both planes admit webhooks identically.
+   */
+  const handleInbound = async (
+    req: Parameters<Parameters<typeof createServer>[0]>[0],
+    res: Parameters<Parameters<typeof createServer>[0]>[1],
+    pathname: string
+  ): Promise<void> => {
     if (req.method !== "POST") {
       res.writeHead(405, { "content-type": "text/plain" }).end("Method not allowed");
       return;
@@ -2330,7 +2407,75 @@ export function createRelayServer(opts: RelayServerOptions): Server {
     res
       .writeHead(202, { "content-type": "application/json" })
       .end(JSON.stringify({ id, traceId, status: "accepted", ...tenantLabel }));
-  });
+  };
+
+  /**
+   * Operator-plane call with the last-resort crash guard: never let an
+   * operator-endpoint failure crash the process as an unhandled rejection;
+   * the batch replay path rethrows per-item decrypt errors internally, so
+   * this is only the final safety net.
+   */
+  const guardOperator = async (
+    req: Parameters<Parameters<typeof createServer>[0]>[0],
+    res: Parameters<Parameters<typeof createServer>[0]>[1],
+    pathname: string
+  ): Promise<void> => {
+    try {
+      await handleOperator(req, res, pathname);
+    } catch {
+      if (!res.headersSent) {
+        respondJson(res, 500, { error: "internal server error" });
+      }
+    }
+  };
+
+  /** Plain 404 that reveals nothing about the other plane (WR-56). */
+  const crossPlaneNotFound = (
+    res: Parameters<Parameters<typeof createServer>[0]>[1]
+  ): void => {
+    res.writeHead(404, { "content-type": "text/plain" }).end("Not found");
+  };
+
+  let server: RelayServer;
+  let operatorServer: Server | undefined;
+  if (operatorPlane === undefined) {
+    // Legacy single-plane behavior: one listener serves operator paths
+    // and webhooks alike.
+    server = createServer(async (req, res) => {
+      const pathname = new URL(req.url ?? "/", "http://internal").pathname;
+      if (isOperatorPath(pathname)) {
+        await guardOperator(req, res, pathname);
+        return;
+      }
+      await handleInbound(req, res, pathname);
+    });
+  } else {
+    // Split plane (WR-56): operator paths hit on the intake listener are
+    // indistinguishable from unknown paths — the operator plane's
+    // existence is not revealed — and the operator listener 404s anything
+    // that is not an operator path, so it can never accept a webhook.
+    server = createServer(async (req, res) => {
+      const pathname = new URL(req.url ?? "/", "http://internal").pathname;
+      if (isOperatorPath(pathname)) {
+        crossPlaneNotFound(res);
+        return;
+      }
+      await handleInbound(req, res, pathname);
+    });
+    operatorServer = createServer(async (req, res) => {
+      const pathname = new URL(req.url ?? "/", "http://internal").pathname;
+      if (!isOperatorPath(pathname)) {
+        crossPlaneNotFound(res);
+        return;
+      }
+      await guardOperator(req, res, pathname);
+    });
+    server.operatorServer = operatorServer;
+    // The operator port is fully specified in the options, so the relay
+    // binds it itself at creation; the caller only ever binds the intake
+    // plane with `listen()`.
+    operatorServer.listen(operatorPlane.port, operatorPlane.host ?? "127.0.0.1");
+  }
 
   server.on("close", () => {
     queue.stop();
@@ -2339,6 +2484,9 @@ export function createRelayServer(opts: RelayServerOptions): Server {
     // queue — this covers stop() and the graceful-shutdown drain alike.
     // Idle pool sockets are unref'd anyway, so even a missed close cannot
     // pin process exit.
+    // WR-56: the returned (intake) server owns the operator plane's
+    // lifecycle — closing it closes the operator listener too.
+    if (operatorServer?.listening) operatorServer.close();
     defaultSender?.destroy();
   });
 
@@ -2348,6 +2496,8 @@ export function createRelayServer(opts: RelayServerOptions): Server {
   // `selfOrigins`) ran at queue construction; this re-checks against the
   // actually bound address before every receipt POST, so even an
   // undeclared self-target (e.g. an ephemeral test port) is refused.
+  // WR-56: the check only needs the intake listener — the operator plane
+  // 404s webhooks, so a callback pointed at it can never re-enter intake.
   queue.setCompletionCallbackSelfCheck(
     createBoundAddressSelfCheck(() => {
       const addr = server.address();
@@ -2358,9 +2508,24 @@ export function createRelayServer(opts: RelayServerOptions): Server {
 
   if (opts.gracefulShutdown) {
     const timeoutMs = opts.gracefulShutdown.timeoutMs ?? 30_000;
-    const uninstall = installGracefulShutdown(server, () => queue.shutdown(timeoutMs), {
-      exit: opts.gracefulShutdown.exit,
-    });
+    const uninstall = installGracefulShutdown(
+      server,
+      async () => {
+        // WR-56: stop the operator plane before draining, so no manual
+        // replays or config changes can land while in-flight deliveries
+        // settle. (The intake plane was already closed by
+        // installGracefulShutdown, whose close handler also closes the
+        // operator plane — the `listening` check makes this a no-op then.)
+        const op = operatorServer;
+        if (op?.listening) {
+          await new Promise<void>((resolve) => op.close(() => resolve()));
+        }
+        return queue.shutdown(timeoutMs);
+      },
+      {
+        exit: opts.gracefulShutdown.exit,
+      }
+    );
     // Remove the signal listeners once the server is gone so an embedded
     // server does not leave process-level handlers behind.
     server.on("close", () => uninstall());

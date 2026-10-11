@@ -1250,6 +1250,29 @@ double-recorded event appears twice and queries return it twice. Corrupt
 (torn) lines are skipped on read. Decoupled from the audit log by design:
 audit = operator actions, archive = delivery event stream.
 
+### Operator/intake plane split
+
+Opt-in network segmentation for the control plane:
+`operatorPort: { port, host? }` makes the relay listen on **two** ports.
+The intake plane (the server `createRelayServer` returns, bound by the
+caller with `listen()`) accepts only webhooks; the operator plane (bound
+by the relay itself at creation, exposed as `server.operatorServer`)
+serves only the operator endpoints (`/dead-letter`, `/audit`, `/metrics`,
+`/events`, `/config/endpoint`, `/deliveries/:traceId`, ...).
+
+Cross-plane requests are answered with a plain `404 Not found` that
+reveals nothing about the other plane: operator paths hit on the intake
+plane are indistinguishable from unknown paths, and webhook posts hit on
+the operator plane are rejected without ever entering the queue. The
+operator plane binds `127.0.0.1` by default — never `0.0.0.0` — so it is
+not reachable from the network unless the operator explicitly opts in
+with `host`. Without `operatorPort` the relay keeps the legacy behavior:
+one listener serves both planes. Invalid values (`port` outside 0–65535
+or non-integer, empty `host`) throw `RangeError` at startup. Closing the
+returned server also closes the operator plane; graceful shutdown stops
+the operator plane before draining in-flight deliveries, so no manual
+replays or config changes can land mid-drain.
+
 ## Run
 
 ```sh
