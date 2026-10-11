@@ -171,6 +171,30 @@ reliability primitives that matter for any signed-payload pipeline.
   payload-identity dedup across re-ids. Memory-bounded: entries expire out of
   the window lazily and `maxEntries` (default 10k) evicts oldest-first.
   Opt-in via `dedup: {...}` (off by default); injectable clock for tests.
+- `src/ip-acl.ts` — inbound IP allowlist/denylist (`InboundIpAcl`, WR-53):
+  per-endpoint CIDR gates on the sender's IP — the outermost admission
+  check, before the body is read, before rate limiting, before signature
+  verification, so a hostile IP costs zero bandwidth and zero downstream
+  state (a denial never enqueues: no retry budget burned, no breaker
+  tripped). Rules match the inbound request path (exact `/hooks/stripe`
+  or prefix `/hooks/*`, first match wins, same semantics as the endpoint
+  verifier/schema rules); each rule carries either an `allow` or a `deny`
+  list of IPv4/IPv6 CIDRs (both on one rule is a `RangeError` at startup —
+  allow/deny are mutually exclusive), checked deny-first. Denials are
+  answered 403 (with `connection: close`, so the client cannot keep
+  streaming into a dead request), audited as `rejected` (reason
+  `ip_denied`), and counted as
+  `relay_inbound_ip_denied_total{endpoint}`. Client IP resolution honors
+  `x-forwarded-for` only through configured `trustedProxies` (CIDR):
+  with none configured (the default) only the direct socket peer is
+  trusted, so a spoofed XFF is ignored; behind a trusted proxy the chain
+  is stripped from the right to the leftmost untrusted hop. An
+  unparseable peer IP on a guarded endpoint is denied (fail closed).
+  Zero dependencies — IPv4/IPv6 CIDR parsing and prefix matching are
+  hand-written (IPv4 compares in IPv4-mapped `::ffff:0:0/96` space, so a
+  dual-stack `::ffff:127.0.0.1` remoteAddress matches a `127.0.0.1/32`
+  rule). Wired into the server via `ipAcl: { rules, trustedProxies }`
+  (off by default); invalid CIDRs throw `RangeError` at startup.
 - `src/ratelimit.ts` — inbound rate limiting (`InboundRateLimiter`):
   dual-dimension token buckets — per-sender IP and per-endpoint — guarding
   the webhook intake. Each dimension is a per-second bucket refilled lazily
@@ -1081,6 +1105,9 @@ endpoints (404 when disabled):
 - `relay_inbound_version_total{version,status}` — inbound intake by API
   version (`accepted` / `rejected`; `version="none"` for unversioned
   requests), only when `versions` is configured,
+- `relay_inbound_ip_denied_total{endpoint}` — inbound requests rejected
+  by the IP allowlist/denylist, by endpoint path pattern, only when
+  `ipAcl` is configured,
 - `relay_probe_total{endpoint,result}` — downstream health-probe
   outcomes (`success` / `failure`), only when `probe` is configured,
 - `relay_probe_consecutive_failures{endpoint}` — current consecutive

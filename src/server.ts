@@ -23,6 +23,7 @@ import type { PayloadEncryptor } from "./encrypt.ts";
 import type { ReplayGuard } from "./replay.ts";
 import { DeliveryDeduplicator, type DedupOptions } from "./dedup.ts";
 import { InboundRateLimiter, type InboundRateLimitOptions } from "./ratelimit.ts";
+import { InboundIpAcl, IpAclMetrics, type IpAclOptions } from "./ip-acl.ts";
 import { resolveTraceId, TRACE_ID_HEADER } from "./trace.ts";
 import {
   deriveIdempotencyKey,
@@ -382,6 +383,35 @@ export interface RelayServerOptions {
    * the legacy always-deliver behavior unless the operator opts in.
    */
   dedup?: DedupOptions;
+  /**
+   * Inbound IP allowlist/denylist (WR-53, see `src/ip-acl.ts`):
+   * per-endpoint CIDR gates on the sender's IP — the outermost admission
+   * check. Rules match the inbound request path (exact `/hooks/stripe` or
+   * prefix `/hooks/*`, first match wins, same semantics as WR-29 endpoint
+   * verifiers); each rule carries either an `allow` or a `deny` list of
+   * IPv4/IPv6 CIDRs (never both — configuring both is a `RangeError` at
+   * startup). A deny-list hit rejects; in allow mode an IP outside every
+   * allow range rejects; paths with no matching rule skip the check
+   * entirely. The check runs before the body is read, before WR-22 rate
+   * limiting, and before signature verification, so a hostile IP costs
+   * zero bandwidth and zero downstream state — a denial never enqueues,
+   * so it burns no retry budget and never trips the breaker. Denials are
+   * answered 403 (with `connection: close`, so the client cannot keep
+   * streaming a flood into a dead request), audited as `rejected` with
+   * reason `ip_denied`, and counted in the Prometheus exposition
+   * (`relay_inbound_ip_denied_total{endpoint}`).
+   *
+   * Client IP resolution honors `x-forwarded-for` only through
+   * `trustedProxies` (CIDR list of known reverse proxies): when the
+   * direct socket peer is a trusted proxy, the chain is stripped from the
+   * right and the leftmost untrusted hop becomes the client IP. The
+   * default (no trusted proxies) trusts only the direct socket peer — a
+   * spoofed `x-forwarded-for` from an untrusted client is ignored, never
+   * honored. An unparseable peer IP on a guarded endpoint is denied (fail
+   * closed). Off by default: with no `rules`, intake behavior is exactly
+   * the legacy one. Invalid CIDRs throw `RangeError` at startup.
+   */
+  ipAcl?: IpAclOptions;
   /**
    * Inbound rate limiting (see `src/ratelimit.ts`): dual-dimension token
    * buckets — per-sender IP and per-endpoint — guarding the webhook intake.
@@ -1296,6 +1326,11 @@ export function createRelayServer(opts: RelayServerOptions): Server {
   const schemaMetrics = new SchemaMetrics();
   const deduplicator = opts.dedup ? new DeliveryDeduplicator(opts.dedup) : undefined;
   const rateLimiter = opts.rateLimit ? new InboundRateLimiter(opts.rateLimit) : undefined;
+  // Inbound IP allowlist/denylist (WR-53): rules and trusted proxies are
+  // validated (and every CIDR pre-parsed) once at startup, so a bad CIDR
+  // can never fail a request mid-flight.
+  const ipAcl = opts.ipAcl !== undefined ? new InboundIpAcl(opts.ipAcl) : undefined;
+  const ipAclMetrics = new IpAclMetrics();
 
   const respondJson = (
     res: Parameters<Parameters<typeof createServer>[0]>[1],
@@ -1487,7 +1522,7 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       // configured, keeping the output byte-identical to the legacy shape.
       res
         .writeHead(200, { "content-type": "text/plain; version=0.0.4" })
-        .end(queue.renderMetrics() + versionMetrics.render() + schemaMetrics.render());
+        .end(queue.renderMetrics() + versionMetrics.render() + schemaMetrics.render() + ipAclMetrics.render());
       return;
     }
     if (isEvents) {
@@ -1785,6 +1820,34 @@ export function createRelayServer(opts: RelayServerOptions): Server {
     // Resolve the trace ID before any admission decision so even rejections
     // are traceable; a client-supplied x-trace-id is honored, otherwise fresh.
     const traceId = resolveTraceId(req.headers[TRACE_ID_HEADER]);
+
+    // Inbound IP allowlist/denylist (WR-53): the outermost admission
+    // gate — before the body is even read, before rate limiting, before
+    // signature verification — so a hostile IP costs us zero bandwidth
+    // and zero downstream state. A denial never enqueues, so it burns no
+    // retry budget and never trips the breaker.
+    if (ipAcl) {
+      const clientIp = ipAcl.clientIp(req.socket.remoteAddress, req.headers["x-forwarded-for"]);
+      const aclVerdict = ipAcl.check(pathname, clientIp);
+      if (!aclVerdict.ok) {
+        ipAclMetrics.record(aclVerdict.pattern);
+        opts.auditLog.append({
+          event: "rejected",
+          id,
+          traceId,
+          reason: "ip_denied",
+          ip: clientIp,
+          endpoint: aclVerdict.pattern,
+        });
+        // `connection: close` drops the socket after the 403, so the
+        // client cannot keep streaming a flood into a dead request (same
+        // rationale as the WR-25 413).
+        res
+          .writeHead(403, { "content-type": "text/plain", connection: "close" })
+          .end("Forbidden");
+        return;
+      }
+    }
 
     // Inbound rate limiting (WR-22): per-sender-IP + per-endpoint buckets.
     // Checked before the body is even read and before signature
