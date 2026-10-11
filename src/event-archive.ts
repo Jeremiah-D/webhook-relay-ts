@@ -1,0 +1,351 @@
+/**
+ * Delivery-event archive (WR-55).
+ *
+ * Persistent history for the delivery lifecycle events the queue emits
+ * (`delivered` / `retrying` / `dead_letter`, see
+ * {@link RetryQueue.subscribeDeliveryEvents}). The server subscribes a
+ * {@link DeliveryEventArchiver} to its queue when `eventArchive` is
+ * configured, and serves the history at `GET /events/archive`.
+ *
+ * Relationship to the other event surfaces:
+ * - `GET /events` (SSE, WR-16) is the **live stream**: in-memory
+ *   subscriptions, real-time frames, no replay of past events.
+ * - The archive is the **durable event history**: every subscribed event is
+ *   appended to `<dir>/events.jsonl` and survives process restarts.
+ * - The audit log (`GET /audit`) records **operator actions** (accepted,
+ *   replayed, paused, config changes…); the archive records the **delivery
+ *   event stream**. Decoupled by design — they answer different questions.
+ *
+ * Line format: one JSON object per line —
+ * `{type, id, traceId, tenant?, targetUrl, attempts, at, error?}`.
+ *
+ * Rolling retention (both opt-in):
+ * - `maxAgeMs`: lines whose event `at` is older than `now - maxAgeMs` are
+ *   dropped.
+ * - `maxBytes`: when the file grows past this many bytes, the oldest lines
+ *   (file order — appends are chronological) are dropped first. The newest
+ *   line is always kept, so a pathologically small `maxBytes` degrades to a
+ *   one-line archive instead of an empty one.
+ * Retention runs amortized on the append path (a full pass at most every
+ * {@link RETENTION_CHECK_EVERY} appends, or immediately when `maxBytes` is
+ * exceeded), plus once at construction so a restart applies pending
+ * retention. Use {@link DeliveryEventArchiver.compactNow} to force a pass.
+ *
+ * Crash semantics (at-least-once, honestly not exactly-once):
+ * - Appends are synchronous and never throw: a failed write is counted in
+ *   `writeErrors` and swallowed, so a full disk can never fail a delivery.
+ *   Appends are *not* fsync'd — an OS crash may lose the unwritten tail.
+ *   (Delivery state itself is unaffected; the archive is observability.)
+ * - Retention rewrites via "write temp file + fsync + atomic rename", so a
+ *   crash before the rename leaves the previous complete file: retention
+ *   simply didn't happen and is retried later — never half-applied.
+ * - The archive never dedupes: if the same event is recorded twice (two
+ *   archiver instances on one queue, a double `record()` call), both lines
+ *   persist and queries return both. A torn line from a crash mid-append is
+ *   skipped on read. Queries therefore see every successfully appended
+ *   event *at least* once, but must not assume exactly-once.
+ * - Restart recovery: opening the same directory re-reads `events.jsonl`,
+ *   so history survives restarts; a stale `events.jsonl.tmp` from a crash
+ *   mid-retention is removed at construction (it is never the source of
+ *   truth).
+ */
+
+import {
+  appendFileSync,
+  closeSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+  writeSync,
+} from "node:fs";
+import { join } from "node:path";
+import type { DeliveryEvent, DeliveryEventType } from "./retry.ts";
+
+/** Archive file name inside the archive directory. */
+export const EVENT_ARCHIVE_FILE = "events.jsonl";
+
+/** Temp file used for atomic retention rewrites (same directory, so rename is atomic). */
+const ARCHIVE_TMP_SUFFIX = ".tmp";
+
+/** Amortization: a full retention pass runs at most this often on the append path. */
+const RETENTION_CHECK_EVERY = 64;
+
+/**
+ * Minimal event source surface — satisfied by {@link RetryQueue} and by
+ * test fakes. Duck-typed so this module has no runtime dependency on
+ * `retry.ts`.
+ */
+export interface DeliveryEventSource {
+  subscribeDeliveryEvents(listener: (e: DeliveryEvent) => void): () => void;
+}
+
+export interface EventArchiveOptions {
+  /** Directory holding `events.jsonl`. Created recursively when missing. */
+  dir: string;
+  /** Opt-in: drop lines whose event `at` predates `now - maxAgeMs`. */
+  maxAgeMs?: number;
+  /** Opt-in: drop oldest lines first when the file exceeds this many bytes. */
+  maxBytes?: number;
+  /** Event source to subscribe at construction (e.g. the server's queue). */
+  source?: DeliveryEventSource;
+}
+
+/** Filters for {@link DeliveryEventArchiver.query}. All filters are ANDed. */
+export interface EventArchiveQuery {
+  /** ISO-8601 lower bound (inclusive) on the event `at`. */
+  since?: string;
+  /** ISO-8601 upper bound (inclusive) on the event `at`. */
+  until?: string;
+  /** Exact match on `targetUrl`. */
+  endpoint?: string;
+  /** One of `delivered` / `retrying` / `dead_letter`. */
+  event?: DeliveryEventType;
+}
+
+export interface EventArchiveStats {
+  /** Successful appends since this archiver was opened. */
+  appends: number;
+  /** Failed appends/retention writes (counted, never thrown). */
+  writeErrors: number;
+  /** Current on-disk size of `events.jsonl`, best-effort. */
+  bytes: number;
+}
+
+export class DeliveryEventArchiver {
+  private readonly path: string;
+  private readonly maxAgeMs?: number;
+  private readonly maxBytes?: number;
+  private readonly unsubscribe?: () => void;
+  private appends = 0;
+  private writeErrors = 0;
+  private bytes = 0;
+  private appendsSinceRetain = 0;
+
+  /**
+   * `dir` is created (recursively) when missing — a missing directory is
+   * normal on first boot; an *uncreatable* one is an operator
+   * misconfiguration and throws, fail-fast at construction. Invalid
+   * retention values throw `RangeError` at startup, never mid-request.
+   */
+  constructor(options: EventArchiveOptions) {
+    const { dir, maxAgeMs, maxBytes, source } = options;
+    if (maxAgeMs !== undefined && (!Number.isFinite(maxAgeMs) || maxAgeMs <= 0)) {
+      throw new RangeError("DeliveryEventArchiver: `maxAgeMs` must be a positive finite number");
+    }
+    if (maxBytes !== undefined && (!Number.isInteger(maxBytes) || maxBytes <= 0)) {
+      throw new RangeError("DeliveryEventArchiver: `maxBytes` must be a positive integer");
+    }
+    mkdirSync(dir, { recursive: true });
+    this.path = join(dir, EVENT_ARCHIVE_FILE);
+    // A stale temp file is debris from a crash mid-retention, never the
+    // source of truth — remove it so a later pass starts clean.
+    try {
+      rmSync(this.path + ARCHIVE_TMP_SUFFIX, { force: true });
+    } catch {
+      /* best effort */
+    }
+    // Touch the file so a missing archive reads as "no history", not an error.
+    if (!existsSync(this.path)) {
+      writeFileSync(this.path, "");
+    }
+    try {
+      this.bytes = statSync(this.path).size;
+    } catch {
+      this.bytes = 0;
+    }
+    this.maxAgeMs = maxAgeMs;
+    this.maxBytes = maxBytes;
+    if (source !== undefined) {
+      const listener = (event: DeliveryEvent): void => this.record(event);
+      this.unsubscribe = source.subscribeDeliveryEvents(listener);
+    }
+    // Restart applies pending retention once, so a reboot does not
+    // resurrect lines the policy would already have dropped.
+    if (maxAgeMs !== undefined || maxBytes !== undefined) {
+      this.retain();
+    }
+  }
+
+  /** Unsubscribe from the event source. The file stays on disk. */
+  close(): void {
+    this.unsubscribe?.();
+  }
+
+  get stats(): EventArchiveStats {
+    return { appends: this.appends, writeErrors: this.writeErrors, bytes: this.bytes };
+  }
+
+  /**
+   * Append one event. Never throws: a failed write is counted in
+   * `writeErrors` and swallowed, so archiving can never fail a delivery.
+   * Runs on the queue's synchronous delivery path — kept O(1).
+   */
+  record(event: DeliveryEvent): void {
+    const line =
+      JSON.stringify({
+        type: event.type,
+        id: event.id,
+        traceId: event.traceId,
+        ...(event.tenant !== undefined ? { tenant: event.tenant } : {}),
+        targetUrl: event.targetUrl,
+        attempts: event.attempts,
+        at: event.at,
+        ...(event.error !== undefined ? { error: event.error } : {}),
+      }) + "\n";
+    try {
+      appendFileSync(this.path, line, "utf8");
+    } catch {
+      // The delivery path is authoritative; a failed archive write degrades
+      // to unarchived history, never a delivery failure.
+      this.writeErrors += 1;
+      return;
+    }
+    this.appends += 1;
+    this.bytes += Buffer.byteLength(line, "utf8");
+    this.appendsSinceRetain += 1;
+    const overBytes = this.maxBytes !== undefined && this.bytes > this.maxBytes;
+    const ageCheckDue = this.maxAgeMs !== undefined && this.appendsSinceRetain >= RETENTION_CHECK_EVERY;
+    if (overBytes || ageCheckDue) {
+      this.retain();
+    }
+  }
+
+  /** Force a retention pass now. Never throws; failures are counted. */
+  compactNow(): void {
+    this.retain();
+  }
+
+  /**
+   * Query the archive. Throws `Error` on invalid `since`/`until` (the
+   * server maps this to 400). Returns events sorted by `at` ascending;
+   * ties keep file order (stable sort). Corrupt lines are skipped.
+   */
+  query(filter: EventArchiveQuery = {}): DeliveryEvent[] {
+    const sinceMs = filter.since === undefined ? NaN : Date.parse(filter.since);
+    const untilMs = filter.until === undefined ? NaN : Date.parse(filter.until);
+    if (
+      (filter.since !== undefined && Number.isNaN(sinceMs)) ||
+      (filter.until !== undefined && Number.isNaN(untilMs))
+    ) {
+      throw new Error("DeliveryEventArchiver.query: since/until must be valid ISO-8601 timestamps");
+    }
+    let raw: string;
+    try {
+      raw = readFileSync(this.path, "utf8");
+    } catch {
+      return [];
+    }
+    const out: DeliveryEvent[] = [];
+    for (const rawLine of raw.split("\n")) {
+      if (rawLine.trim() === "") continue;
+      let obj: Record<string, unknown>;
+      try {
+        obj = JSON.parse(rawLine) as Record<string, unknown>;
+      } catch {
+        continue; // torn line from a crash mid-append — skip, never fail a query
+      }
+      if (obj["type"] !== "delivered" && obj["type"] !== "retrying" && obj["type"] !== "dead_letter") {
+        continue;
+      }
+      const at = typeof obj["at"] === "string" ? obj["at"] : "";
+      const atMs = Date.parse(at);
+      if (!Number.isNaN(sinceMs) && (Number.isNaN(atMs) || atMs < sinceMs)) continue;
+      if (!Number.isNaN(untilMs) && (Number.isNaN(atMs) || atMs > untilMs)) continue;
+      if (filter.endpoint !== undefined && obj["targetUrl"] !== filter.endpoint) continue;
+      if (filter.event !== undefined && obj["type"] !== filter.event) continue;
+      out.push({
+        type: obj["type"] as DeliveryEventType,
+        id: String(obj["id"] ?? ""),
+        traceId: String(obj["traceId"] ?? ""),
+        ...(typeof obj["tenant"] === "string" ? { tenant: obj["tenant"] } : {}),
+        targetUrl: String(obj["targetUrl"] ?? ""),
+        attempts: typeof obj["attempts"] === "number" ? obj["attempts"] : 0,
+        at,
+        ...(typeof obj["error"] === "string" ? { error: obj["error"] } : {}),
+      });
+    }
+    // Stable sort: equal `at` keeps file (chronological) order.
+    out.sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
+    return out;
+  }
+
+  /**
+   * Apply the retention policy: read all lines, drop what the policy
+   * rejects, and rewrite via temp-file + atomic rename. Never throws —
+   * failures are counted in `writeErrors` and the previous complete file
+   * is left in place. Skips the rewrite entirely when nothing would be
+   * dropped.
+   */
+  private retain(): void {
+    this.appendsSinceRetain = 0;
+    let raw: string;
+    try {
+      raw = readFileSync(this.path, "utf8");
+    } catch {
+      this.writeErrors += 1;
+      return;
+    }
+    const parsed: Array<{ line: string; atMs: number }> = [];
+    for (const rawLine of raw.split("\n")) {
+      if (rawLine.trim() === "") continue;
+      let atMs = NaN;
+      try {
+        const obj = JSON.parse(rawLine) as { at?: unknown };
+        atMs = typeof obj.at === "string" ? Date.parse(obj.at) : NaN;
+      } catch {
+        /* corrupt line: fail-safe toward evidence — kept, never ages out */
+      }
+      parsed.push({ line: rawLine, atMs });
+    }
+    const cutoff = this.maxAgeMs !== undefined ? Date.now() - this.maxAgeMs : Number.NEGATIVE_INFINITY;
+    let kept = parsed.filter((p) => Number.isNaN(p.atMs) || p.atMs >= cutoff);
+    if (this.maxBytes !== undefined) {
+      let size = 0;
+      for (const p of kept) size += Buffer.byteLength(p.line, "utf8") + 1;
+      let drop = 0;
+      // Oldest first (file order); the newest line is always kept.
+      while (kept.length - drop > 1 && size > this.maxBytes) {
+        size -= Buffer.byteLength(kept[drop].line, "utf8") + 1;
+        drop += 1;
+      }
+      kept = kept.slice(drop);
+    }
+    if (kept.length === parsed.length) {
+      // Nothing to drop — but re-sync the byte counter against reality.
+      try {
+        this.bytes = statSync(this.path).size;
+      } catch {
+        /* best effort */
+      }
+      return;
+    }
+    const tmp = this.path + ARCHIVE_TMP_SUFFIX;
+    try {
+      const data = kept.length > 0 ? kept.map((p) => p.line).join("\n") + "\n" : "";
+      const fd = openSync(tmp, "w");
+      try {
+        writeSync(fd, data, null, "utf8");
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+      renameSync(tmp, this.path);
+      this.bytes = Buffer.byteLength(data, "utf8");
+    } catch {
+      // The pre-retention file is untouched — retention is retried later,
+      // never half-applied.
+      this.writeErrors += 1;
+      try {
+        rmSync(tmp, { force: true });
+      } catch {
+        /* best effort */
+      }
+    }
+  }
+}

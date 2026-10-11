@@ -1060,7 +1060,11 @@ frames as JSON in real time (`event: delivery`), so an operator can watch
 the delivery flow without polling. A `: ping` heartbeat comment goes out
 every `heartbeatMs` (default 15s, unref'd), and a subscriber whose kernel
 buffer exceeds 1 MiB is disconnected instead of buffering without bound.
-Live-only — no replay of past events; `GET /audit` holds the history.
+Live-only — no replay of past events. For history, use the persistent
+**delivery event archive** (`GET /events/archive`, opt-in) — the archive
+records the same event stream durably, while the audit log (`GET /audit`)
+records operator actions; the three surfaces are complementary, not
+redundant.
 
 **Shutdown:** SIGTERM moves every `retrying` item straight out of the
 machine (dropped, never delivered) while `delivering` items are awaited;
@@ -1209,6 +1213,42 @@ The round timer is unref'd, so a configured scheduler never pins the
 process open, and `RetryQueue.stop()` / `shutdown()` cancel any pending
 round — a round never fires mid-shutdown and re-queues dead letters the
 operator expected to stay parked.
+
+### Delivery event archive
+
+Opt-in persistent history for the delivery lifecycle events
+(`delivered` / `retrying` / `dead_letter`, the same events the `GET
+/events` SSE stream carries live). Set `eventArchive: { dir }` and the
+server subscribes a `DeliveryEventArchiver` to its queue: every event is
+appended as one JSON line to `<dir>/events.jsonl`
+(`{type, id, traceId, tenant?, targetUrl, attempts, at, error?}`) and
+survives process restarts — reopening the same directory re-reads the
+history.
+
+`GET /events/archive?since=&until=&endpoint=&event=` (same
+`operatorToken` Bearer <redacted> as the other operator endpoints; 404
+fail-closed when no `operatorToken` is configured, 403 on a wrong bearer,
+and 404 — leaking no existence — when the archive itself is not
+configured) returns the matching events as a JSON array sorted by `at`
+ascending. `event` must be one of `delivered` / `retrying` /
+`dead_letter` (anything else is 400); `since` / `until` must be valid
+ISO-8601 timestamps (else 400); `endpoint` is an **exact** match on
+`targetUrl`, no substring matching.
+
+Rolling retention is opt-in via `maxAgeMs` (drop lines whose event `at`
+is older than `now - maxAgeMs`) and `maxBytes` (drop the oldest lines
+first when the file exceeds that size; the newest line is always kept).
+Retention runs amortized on the append path and once at startup, and
+rewrites through a temp file + atomic rename — a crash before the rename
+leaves the previous complete file, so retention is never half-applied.
+
+Crash semantics are at-least-once, honestly not exactly-once: appends are
+synchronous and never throw (a failed write is counted and swallowed, so
+archiving can never fail a delivery), but they are not fsync'd, so an OS
+crash may lose the unwritten tail; the archive never dedupes, so a
+double-recorded event appears twice and queries return it twice. Corrupt
+(torn) lines are skipped on read. Decoupled from the audit log by design:
+audit = operator actions, archive = delivery event stream.
 
 ## Run
 

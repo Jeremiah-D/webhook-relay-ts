@@ -54,6 +54,7 @@ import {
 } from "./http2.ts";
 import { WebSocketPool, type WebSocketPoolOptions } from "./websocket.ts";
 import type { AuditLog } from "./audit.ts";
+import { DeliveryEventArchiver } from "./event-archive.ts";
 import { buildDeliverySnapshot } from "./delivery-status.ts";
 import type { EndpointConfigPatch } from "./hotreload.ts";
 import {
@@ -459,6 +460,21 @@ export interface RelayServerOptions {
    * 404 when no `operatorToken` is configured.
    */
   events?: { heartbeatMs?: number };
+  /**
+   * Persistent delivery-event archive (WR-55; see `src/event-archive.ts`).
+   * Opt-in: subscribes to the queue's delivery events and appends every
+   * `delivered` / `retrying` / `dead_letter` event as JSONL to
+   * `<dir>/events.jsonl`, surviving process restarts and queryable via
+   * `GET /events/archive` (same `operatorToken` bearer auth; 404
+   * fail-closed when this option is unset, so an unconfigured archive
+   * leaks no existence). `maxAgeMs` / `maxBytes` enable rolling retention
+   * (oldest-first eviction, at-least-once crash semantics documented in
+   * `src/event-archive.ts`). Complements the live `GET /events` SSE stream
+   * (real-time, memory-only, no replay) and is decoupled from the audit
+   * log: audit records operator actions, the archive records the delivery
+   * event stream.
+   */
+  eventArchive?: { dir: string; maxAgeMs?: number; maxBytes?: number };
   /**
    * Opt-in graceful shutdown on SIGTERM/SIGINT: stop accepting new
    * connections, wait up to `timeoutMs` (default 30_000) for in-flight
@@ -1321,6 +1337,16 @@ export function createRelayServer(opts: RelayServerOptions): Server {
     },
   });
   queue.start();
+  // WR-55: persistent delivery-event archive. Subscribes to the queue's
+  // delivery events and appends every event to `<dir>/events.jsonl`
+  // (survives restarts; served at `GET /events/archive`). Unset by
+  // default — the endpoint then answers 404 fail-closed.
+  const eventArchiver = opts.eventArchive
+    ? new DeliveryEventArchiver({
+        ...opts.eventArchive,
+        source: { subscribeDeliveryEvents: (l) => queue.subscribeDeliveryEvents(l) },
+      })
+    : undefined;
 
   const verifier: Verifier =
     opts.signingKeys !== undefined
@@ -1426,6 +1452,7 @@ export function createRelayServer(opts: RelayServerOptions): Server {
     const isAudit = pathname === "/audit";
     const isLatency = pathname === "/latency";
     const isEvents = pathname === "/events";
+    const isEventsArchive = pathname === "/events/archive";
     const isMetrics = pathname === "/metrics";
     const isAutoStatus = pathname === "/dead-letter/auto-replay/status";
     const isAutoPause = pathname === "/dead-letter/auto-replay/pause";
@@ -1442,6 +1469,7 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       !isAudit &&
       !isLatency &&
       !isEvents &&
+      !isEventsArchive &&
       !isMetrics &&
       !isAutoStatus &&
       !isAutoPause &&
@@ -1463,6 +1491,7 @@ export function createRelayServer(opts: RelayServerOptions): Server {
         (isAudit && req.method === "GET") ||
         (isLatency && req.method === "GET") ||
         (isEvents && req.method === "GET") ||
+        (isEventsArchive && req.method === "GET") ||
         (isMetrics && req.method === "GET") ||
         (isAutoStatus && req.method === "GET") ||
         (isAutoPause && req.method === "POST") ||
@@ -1548,6 +1577,42 @@ export function createRelayServer(opts: RelayServerOptions): Server {
     }
     if (isEvents) {
       streamDeliveryEvents(req, res);
+      return;
+    }
+    if (isEventsArchive) {
+      // WR-55: persistent delivery-event history. The shared operator-token
+      // check above already ran (404 when no operatorToken is configured,
+      // 403 on a bad bearer), so an unconfigured archive 404s here without
+      // leaking its existence to unauthenticated callers.
+      if (!eventArchiver) {
+        respondJson(res, 404, { error: "event archive is not configured" });
+        return;
+      }
+      const params = new URL(req.url ?? "/events/archive", "http://internal").searchParams;
+      const eventRaw = params.get("event");
+      if (
+        eventRaw !== null &&
+        eventRaw !== "delivered" &&
+        eventRaw !== "retrying" &&
+        eventRaw !== "dead_letter"
+      ) {
+        respondJson(res, 400, { error: "invalid event" });
+        return;
+      }
+      let entries: object[];
+      try {
+        entries = eventArchiver.query({
+          since: params.get("since") ?? undefined,
+          until: params.get("until") ?? undefined,
+          // Exact match on targetUrl (documented; no substring matching).
+          endpoint: params.get("endpoint") ?? undefined,
+          event: (eventRaw ?? undefined) as "delivered" | "retrying" | "dead_letter" | undefined,
+        });
+      } catch {
+        respondJson(res, 400, { error: "invalid query parameters" });
+        return;
+      }
+      respondJson(res, 200, entries);
       return;
     }
     if (isLatency) {
@@ -1815,6 +1880,7 @@ export function createRelayServer(opts: RelayServerOptions): Server {
       pathname === "/audit" ||
       pathname === "/latency" ||
       pathname === "/events" ||
+      pathname === "/events/archive" ||
       pathname === "/metrics" ||
       pathname === "/config/endpoint" ||
       pathname === "/endpoints/pause" ||
