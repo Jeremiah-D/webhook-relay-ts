@@ -202,6 +202,31 @@ reliability primitives that matter for any signed-payload pipeline.
   dual-stack `::ffff:127.0.0.1` remoteAddress matches a `127.0.0.1/32`
   rule). Wired into the server via `ipAcl: { rules, trustedProxies }`
   (off by default); invalid CIDRs throw `RangeError` at startup.
+- `src/source-baseline.ts` — inbound source baseline anomaly detection
+  (`SourceBaselineDetector`, WR-63): opt-in per-endpoint learning of the
+  sender baseline — (source IP, approximate TLS fingerprint) triples. The
+  fingerprint is `"plain"` for the normal plain-HTTP listener, or
+  `${tlsProtocol}:${cipherName}` when the socket looks like a
+  `tls.TLSSocket` (duck-typed `getProtocol()`/`getCipher()`); it is an
+  *approximate* transport-profile fingerprint by design, not a
+  cryptographic peer identity. The first sighting for an endpoint pattern
+  learns the baseline silently; a later new triple is audited as
+  `source_anomaly` (`endpoint` = matched pattern, `path`, `sourceIp`,
+  `fingerprint`, `at`, plus `id`/`traceId` for correlation — only the
+  deviating triple is disclosed, never the rest of the baseline).
+  Alert-only, never blocks: the check runs after the WR-53 IP ACL (a
+  denied IP never teaches the baseline) and before the body is read, and
+  the request continues through every remaining gate unchanged — it is
+  orthogonal to IP ACL blocking. The source IP reuses the WR-53 `clientIp`
+  resolution when an IP ACL is configured (honoring `x-forwarded-for`
+  through trusted proxies), otherwise the direct socket peer. Baselines
+  live in memory by default; `dir` opts into append-only JSONL
+  persistence (`source-baseline.jsonl`, recovered at startup, torn or
+  malformed lines skipped, failed appends counted and never thrown — a
+  full disk degrades to memory-only, never fails intake). Wired into the
+  server via `sourceBaseline: { endpoints, dir? }` (off by default);
+  invalid config throws `RangeError` at startup; injectable clock for
+  deterministic tests.
 - `src/ratelimit.ts` — inbound rate limiting (`InboundRateLimiter`):
   dual-dimension token buckets — per-sender IP and per-endpoint — guarding
   the webhook intake. Each dimension is a per-second bucket refilled lazily

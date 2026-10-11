@@ -20,6 +20,7 @@ import { TENANT_ID_HEADER, assertValidTenantId, tenantScopeKey } from "./tenant.
 import type { AutoReplayOptions } from "./autoreplay.ts";
 import { HttpDeliveryError, parseRetryAfterMs } from "./failure.ts";
 import { installGracefulShutdown } from "./shutdown.ts";
+import { SourceBaselineDetector, type SourceBaselineOptions } from "./source-baseline.ts";
 import type { PayloadEncryptor } from "./encrypt.ts";
 import type { ReplayGuard } from "./replay.ts";
 import { DeliveryDeduplicator, type DedupOptions } from "./dedup.ts";
@@ -524,6 +525,28 @@ export interface RelayServerOptions {
    * the legacy one. Invalid CIDRs throw `RangeError` at startup.
    */
   ipAcl?: IpAclOptions;
+  /**
+   * Inbound source baseline anomaly detection (WR-63; see
+   * `src/source-baseline.ts`): opt-in per-endpoint learning of the sender
+   * baseline — (source IP, approximate TLS fingerprint) triples, the
+   * fingerprint being `"plain"` for the normal plain-HTTP listener or
+   * `${tlsProtocol}:${cipherName}` when the socket looks like a
+   * `tls.TLSSocket`. The first sighting of a triple learns the baseline
+   * silently; a later new triple on a guarded endpoint is audited as
+   * `source_anomaly` — alert-only, never blocks: the request continues
+   * through the remaining gates and is delivered exactly as before, so
+   * this is orthogonal to the WR-53 IP ACL (which *rejects*). The check
+   * runs on headers alone, before the body is read, and after the IP ACL
+   * — a denied IP returns before the check, so blocked senders never
+   * teach the baseline. The source IP is the WR-53 `clientIp` when an IP
+   * ACL is configured (honoring `x-forwarded-for` through trusted
+   * proxies), otherwise the direct socket peer. Baselines live in memory
+   * by default; set `dir` for append-only JSONL persistence across
+   * restarts (best-effort: a full disk degrades to memory-only, never
+   * fails intake). Off by default; invalid config throws `RangeError` at
+   * startup.
+   */
+  sourceBaseline?: SourceBaselineOptions;
   /**
    * Inbound rate limiting (see `src/ratelimit.ts`): dual-dimension token
    * buckets — per-sender IP and per-endpoint — guarding the webhook intake.
@@ -1817,6 +1840,11 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // can never fail a request mid-flight.
   const ipAcl = opts.ipAcl !== undefined ? new InboundIpAcl(opts.ipAcl) : undefined;
   const ipAclMetrics = new IpAclMetrics();
+  // Inbound source baseline anomaly detection (WR-63): validated once at
+  // startup so bad config can never fail a request mid-flight. Alert-only
+  // — it never rejects — so it is orthogonal to the WR-53 IP ACL above.
+  const sourceBaseline =
+    opts.sourceBaseline !== undefined ? new SourceBaselineDetector(opts.sourceBaseline) : undefined;
 
   const respondJson = (
     res: Parameters<Parameters<typeof createServer>[0]>[1],
@@ -2366,6 +2394,35 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
           .writeHead(403, { "content-type": "text/plain", connection: "close" })
           .end("Forbidden");
         return undefined;
+      }
+    }
+
+    // Inbound source baseline anomaly detection (WR-63): alert-only, never
+    // a gate — it cannot reject, skip, or alter anything below. Runs on
+    // headers alone, before the body is read. Placed after the WR-53 IP
+    // ACL on purpose: a denied IP returns above, so blocked senders never
+    // teach the baseline. The first sighting of an (endpoint, source IP,
+    // TLS fingerprint) triple learns the baseline silently; a later new
+    // triple on a guarded endpoint is audited as `source_anomaly` and the
+    // request continues unchanged. The source IP reuses the WR-53 client
+    // IP resolution when an IP ACL is configured (x-forwarded-for through
+    // trusted proxies), otherwise it is the direct socket peer.
+    if (sourceBaseline) {
+      const baselineIp = ipAcl
+        ? ipAcl.clientIp(req.socket.remoteAddress, req.headers["x-forwarded-for"])
+        : (req.socket.remoteAddress ?? "unknown");
+      const anomaly = sourceBaseline.observe(pathname, baselineIp, req.socket);
+      if (anomaly !== null) {
+        opts.auditLog.append({
+          event: "source_anomaly",
+          id,
+          traceId,
+          endpoint: anomaly.endpoint,
+          path: anomaly.path,
+          sourceIp: anomaly.sourceIp,
+          fingerprint: anomaly.fingerprint,
+          at: anomaly.at,
+        });
       }
     }
 
