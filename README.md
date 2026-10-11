@@ -982,6 +982,49 @@ curl -X POST http://relay/ingest/batch \
   carrying `batchId` for correlation. A batch-level `x-tenant-id` is
   validated once and inherited; a per-item `x-tenant-id` overrides it.
 
+## Downstream response compression negotiation
+
+Per-endpoint opt-in: the relay advertises `Accept-Encoding: gzip,
+deflate, br` on outbound deliveries, and a compressed downstream response
+is transparently decoded *before* the response validator and the audit
+summary see the body:
+
+```ts
+const server = createRelayServer({
+  secret, forwardUrl, auditLog,
+  responseCompression: {
+    "https://downstream/hook": {}, // or { acceptEncoding: "gzip", maxDecompressedBytes: 65536 }
+  },
+  retry: {
+    responseValidators: {
+      "https://downstream/hook": (r) => JSON.parse(r.body.toString()).ok === true,
+      // ^ sees the DECODED body — write validators against plain JSON,
+      // whether the downstream compressed or not.
+    },
+  },
+});
+```
+
+- **Negotiation** — opted-in endpoints send `Accept-Encoding: gzip,
+  deflate, br` (overridable per endpoint) on the HTTP/1.1 and HTTP/2
+  delivery paths. Stacked codings decode in reverse application order;
+  `identity` is a no-op.
+- **Bomb-proof** — every decode stage is hard-capped at
+  `maxDecompressedBytes` (default 64 KiB, the sender's response capture
+  cap): a compression bomb fails the attempt as a *retryable* delivery
+  failure instead of blowing up the process. Corrupt compressed bodies
+  fail the same way.
+- **Never loses a delivery** — a downstream that ignores
+  `Accept-Encoding` and answers plaintext works exactly as before, and an
+  unknown coding is passed through untouched for the validator to judge.
+  A wire capture cut at the cap cannot be decoded, so the raw bytes travel
+  on with `truncated: true` like the uncompressed path.
+- **Observability** — the decoded `contentEncoding` rides
+  `DownstreamResponse` into the WR-37 validator and the audit
+  `response_summary`, so operators can see which downstreams compress.
+- Endpoints without an entry send no `Accept-Encoding` and behave
+  byte-identically to before.
+
 ## Outbound end-to-end encryption
 
 Deliveries to sensitive downstreams can be sealed end-to-end per endpoint

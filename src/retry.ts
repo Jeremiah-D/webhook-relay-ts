@@ -334,6 +334,14 @@ export interface DownstreamResponse {
   /** True when the body was cut at the sender's capture cap. */
   truncated: boolean;
   /**
+   * WR-62: the downstream's `content-encoding` response header value,
+   * when the endpoint opted into response decompression and the
+   * downstream sent one. The `body` above is already decoded (when the
+   * coding was known); unset on the plain path. Custom senders never
+   * set it.
+   */
+  contentEncoding?: string;
+  /**
    * WR-54: time-to-first-byte in ms — measured by the sender from the
    * request being issued to the downstream's first response bytes
    * arriving. Documented as a "首响应头到达耗时" (first-response-header

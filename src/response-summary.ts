@@ -61,6 +61,12 @@ export interface DownstreamResponseSummary {
    * by default the audit trail carries the summary only, never the body.
    */
   capturedBody?: EncryptedPayload;
+  /**
+   * WR-62: the downstream's `content-encoding` response header value,
+   * when the endpoint opted into response decompression and the
+   * downstream sent one. Omitted on the plain path.
+   */
+  contentEncoding?: string;
 }
 
 /**
@@ -83,6 +89,9 @@ export function summarizeDownstreamResponse(
     statusCode: response.statusCode,
     responseBytes: response.body.length,
     timeToFirstByteMs: response.timeToFirstByteMs ?? "unavailable",
+    ...(response.contentEncoding !== undefined
+      ? { contentEncoding: response.contentEncoding }
+      : {}),
   };
   if (response.body.length > 0) {
     summary.bodyFingerprintSha256 = createHash("sha256")

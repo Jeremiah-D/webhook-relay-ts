@@ -97,10 +97,10 @@ export class DecompressionTooLargeError extends Error {
   }
 }
 
-/** Thrown by `gunzipCapped` when the body is not valid gzip data. */
+/** Thrown by the capped decoders when the body is not valid compressed data. */
 export class DecompressionFailedError extends Error {
-  constructor(cause: unknown) {
-    super(`gzip decompression failed: ${cause instanceof Error ? cause.message : String(cause)}`);
+  constructor(cause: unknown, coding = "gzip") {
+    super(`${coding} decompression failed: ${cause instanceof Error ? cause.message : String(cause)}`);
     this.name = "DecompressionFailedError";
   }
 }

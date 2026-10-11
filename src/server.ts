@@ -94,6 +94,12 @@ import {
   maybeCompressOutbound,
   type CompressOutboundOptions,
 } from "./gzip.ts";
+import {
+  assertValidResponseCompressionConfig,
+  decodeResponseBody,
+  DEFAULT_OUTBOUND_ACCEPT_ENCODING,
+  type ResponseCompressionOptions,
+} from "./response-encoding.ts";
 
 /**
  * Operator/intake plane split (WR-56). When set, the relay listens on two
@@ -305,6 +311,25 @@ export interface RelayServerOptions {
    * body. Invalid values throw `RangeError` at startup.
    */
   compressOutbound?: Record<string, CompressOutboundOptions>;
+  /**
+   * Outbound response compression negotiation (WR-62, see
+   * `src/response-encoding.ts`): per-endpoint opt-in, keyed by exact
+   * delivery `targetUrl`. An opted-in endpoint advertises
+   * `Accept-Encoding: gzip, deflate, br` (overridable per endpoint), and
+   * a compressed downstream response is transparently decoded *before*
+   * the WR-37 responseValidator and the audit summary see the body — a
+   * validator written against the downstream's plain JSON keeps working
+   * whether the downstream compressed or not. Every decode stage is
+   * hard-capped at `maxDecompressedBytes` (default 64 KiB, the sender's
+   * response capture cap), so a compression bomb fails the attempt
+   * (retryable) instead of blowing up the process; a downstream that
+   * ignores `Accept-Encoding` (or answers an unknown coding) is passed
+   * through untouched — negotiation never loses a delivery. Applies to
+   * the HTTP/1.1 and HTTP/2 delivery paths; endpoints without an entry
+   * keep the exact current behavior. Invalid values throw `RangeError`
+   * at startup.
+   */
+  responseCompression?: Record<string, ResponseCompressionOptions>;
   /**
    * Outbound keep-alive connection pool (see `src/keepalive.ts`): outbound
    * deliveries reuse TCP/TLS connections per `(scheme, host, port)` instead
@@ -671,7 +696,8 @@ export function createDefaultSender(
   idempotencyKey?: IdempotencyKeyOptions,
   websocket?: WebSocketPoolOptions,
   outboundEncryption?: Record<string, OutboundEncryptionConfig>,
-  tlsSniOverrides?: Record<string, TlsSniOverride>
+  tlsSniOverrides?: Record<string, TlsSniOverride>,
+  responseCompression?: Record<string, ResponseCompressionOptions>
 ): PooledSender {
   if (tlsPins !== undefined) {
     for (const [endpoint, pins] of Object.entries(tlsPins)) {
@@ -738,6 +764,16 @@ export function createDefaultSender(
     } catch (err) {
       throw new RangeError(
         `createDefaultSender: invalid compressOutbound config: ${(err as Error).message}`
+      );
+    }
+  }
+  // WR-62: RangeError on invalid values, at startup — never mid-delivery.
+  if (responseCompression !== undefined) {
+    try {
+      assertValidResponseCompressionConfig(responseCompression);
+    } catch (err) {
+      throw new RangeError(
+        `createDefaultSender: invalid responseCompression config: ${(err as Error).message}`
       );
     }
   }
@@ -857,6 +893,13 @@ export function createDefaultSender(
     // WR-58: a sealed body is the JSON envelope, not the gzip stream — the
     // pre-seal encoding travels inside the envelope instead.
     if (contentEncoding !== undefined && e2eeKey === undefined) headers["content-encoding"] = contentEncoding;
+    // WR-62: per-endpoint opt-in — advertise compressed responses, so a
+    // downstream that compresses saves us (and itself) bytes on the way
+    // back. The response is decoded before the WR-37 validator sees it.
+    const respCompress = responseCompression?.[item.targetUrl];
+    if (respCompress !== undefined) {
+      headers["accept-encoding"] = respCompress.acceptEncoding ?? DEFAULT_OUTBOUND_ACCEPT_ENCODING;
+    }
     headers["content-length"] = String(body.length);
     return { headers, body };
   };
@@ -913,12 +956,18 @@ export function createDefaultSender(
         // responseValidator can check its semantics after a 2xx
         // transport success. Non-2xx responses still reject on the
         // status code alone — the validator never sees them.
+        // WR-62: when the endpoint opted into response compression, the
+        // wire cap is the decompressed-bytes cap (default: the same 64
+        // KiB as the plain capture) — the wire form of a compressed
+        // response is the smaller side, so one cap bounds both.
+        const respCompress = responseCompression?.[item.targetUrl];
+        const wireCap = respCompress?.maxDecompressedBytes ?? RESPONSE_CAPTURE_MAX_BYTES;
         const chunks: Buffer[] = [];
         let captured = 0;
         let truncated = false;
         res.on("data", (chunk: Buffer) => {
-          if (captured < RESPONSE_CAPTURE_MAX_BYTES) {
-            const room = RESPONSE_CAPTURE_MAX_BYTES - captured;
+          if (captured < wireCap) {
+            const room = wireCap - captured;
             if (chunk.length > room) {
               chunks.push(chunk.subarray(0, room));
               captured += room;
@@ -933,12 +982,35 @@ export function createDefaultSender(
         });
         res.on("end", () => {
           if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
-            resolve({
-              statusCode: res.statusCode,
-              body: Buffer.concat(chunks),
-              truncated,
-              timeToFirstByteMs,
-            });
+            const statusCode: number = res.statusCode;
+            // WR-62: decode a compressed downstream response before the
+            // WR-37 validator (and the audit summary) see the body. The
+            // decode runs async — a corrupt or over-budget body rejects
+            // the attempt, which the retry layer classifies retryable.
+            // A wire capture cut at the cap cannot be decoded (a
+            // truncated compressed stream is corrupt by definition): the
+            // raw bytes travel on with `truncated: true`, exactly like
+            // the uncompressed path.
+            (async () => {
+              let body = Buffer.concat(chunks);
+              let contentEncoding: string | undefined;
+              if (respCompress !== undefined && !truncated) {
+                const decoded = await decodeResponseBody(
+                  body,
+                  res.headers["content-encoding"],
+                  wireCap
+                );
+                body = decoded.body;
+                contentEncoding = decoded.contentEncoding;
+              }
+              resolve({
+                statusCode,
+                body,
+                truncated,
+                timeToFirstByteMs,
+                ...(contentEncoding !== undefined ? { contentEncoding } : {}),
+              });
+            })().catch(reject);
           } else {
             // Structured failure: the retry queue classifies on the status
             // code (4xx-except-408/429 → immediate dead letter, never
@@ -1107,7 +1179,28 @@ export function createDefaultSender(
         captureMaxBytes: RESPONSE_CAPTURE_MAX_BYTES,
       });
       if (res.statusCode >= 200 && res.statusCode < 300) {
-        return { statusCode: res.statusCode, body: res.body, truncated: res.truncated };
+        // WR-62: decode a compressed downstream response before the WR-37
+        // validator sees the body — same contract as the HTTP/1.1 path.
+        // A capture cut at the cap cannot be decoded: the raw bytes
+        // travel on with `truncated: true`.
+        const respCompress = responseCompression?.[item.targetUrl];
+        let body = res.body;
+        let contentEncoding: string | undefined;
+        if (respCompress !== undefined && !res.truncated) {
+          const decoded = await decodeResponseBody(
+            body,
+            res.headers["content-encoding"],
+            respCompress.maxDecompressedBytes ?? RESPONSE_CAPTURE_MAX_BYTES
+          );
+          body = decoded.body;
+          contentEncoding = decoded.contentEncoding;
+        }
+        return {
+          statusCode: res.statusCode,
+          body,
+          truncated: res.truncated,
+          ...(contentEncoding !== undefined ? { contentEncoding } : {}),
+        };
       }
       // Structured failure, same as the HTTP/1.1 path: the retry queue
       // classifies on the status code and honors a 429's Retry-After.
@@ -1445,7 +1538,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // the default sender only; an injected sender signs on its own.
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides)
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression)
       : undefined;
   // WR-50: endpoints the operator may pause/resume over HTTP. The server
   // only ever delivers to these — the intake target plus every
@@ -1466,7 +1559,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     if (validators !== undefined && typeof validators === "object") {
       for (const endpoint of Object.keys(validators)) knownEndpoints.add(endpoint);
     }
-    for (const record of [opts.tlsPins, opts.tlsClientCerts, opts.compressOutbound, opts.proxies, opts.outboundEncryption]) {
+    for (const record of [opts.tlsPins, opts.tlsClientCerts, opts.compressOutbound, opts.proxies, opts.outboundEncryption, opts.responseCompression]) {
       if (record) for (const endpoint of Object.keys(record)) knownEndpoints.add(endpoint);
     }
     for (const endpoint of opts.retry?.probe?.endpoints ?? []) knownEndpoints.add(endpoint);
