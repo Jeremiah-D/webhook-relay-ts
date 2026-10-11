@@ -227,6 +227,39 @@ reliability primitives that matter for any signed-payload pipeline.
   server via `sourceBaseline: { endpoints, dir? }` (off by default);
   invalid config throws `RangeError` at startup; injectable clock for
   deterministic tests.
+- `src/api-key.ts` — inbound per-endpoint API key authentication
+  (`InboundApiKeyAuth`, WR-65): a bearer-key admission gate for senders
+  that cannot do HMAC. Rules match the inbound request path (exact
+  `/hooks/legacy` or prefix `/hooks/*`, first match wins, same semantics
+  as the endpoint verifier/schema rules and the WR-53 IP ACL); each rule
+  lists one or more `{ id, key }` entries and the `x-api-key` header is
+  compared in constant time (`crypto.timingSafeEqual`, no early exit, so
+  timing reveals neither the key nor which entry matched). Several keys
+  coexist per rule so rotation is overlap-safe: deploy the new key
+  alongside the old (both verify), cut the sender over, then remove the
+  old entry — each entry's `id` is the stable identifier that rides on
+  `accepted` audit events as `keyId`. The check runs in the intake gates
+  before the body is read (right after the WR-53 IP ACL, before the
+  WR-63 baseline and WR-22 rate limiting), so an unauthenticated caller
+  costs zero bandwidth and zero downstream state: a missing or
+  non-matching key is answered 401 (`connection: close`) and audited as
+  `rejected` with reason `api_key_missing` / `api_key_invalid` (and
+  `keyId: "unknown"`, following the WR-20 rotation convention) — it never
+  enqueues, burns no retry budget, and never trips the breaker.
+  Orthogonal to signature verification: by default (`requireSignature`
+  unset/false) the API key alone authenticates the endpoint — the
+  signature check is skipped for requests that passed the key gate; set
+  `requireSignature: true` on the rule to demand BOTH the key and a valid
+  signature (the normal global/per-endpoint verifier check still runs).
+  When both factors are in play, the accepted audit's `keyId` names the
+  API key (the admission credential). Endpoints with no matching rule are
+  untouched — signature behavior there is exactly the legacy one.
+  `x-api-key` is the caller's inbound credential, not part of the event:
+  it is stripped from the headers forwarded downstream. Wired into the
+  server via `apiKeys: { rules }` (off by default — with no `rules`,
+  intake behavior is exactly the legacy one); invalid rules (empty key
+  list, empty id/key, duplicate key ids, bad pattern) throw `RangeError`
+  at startup.
 - `src/ratelimit.ts` — inbound rate limiting (`InboundRateLimiter`):
   dual-dimension token buckets — per-sender IP and per-endpoint — guarding
   the webhook intake. Each dimension is a per-second bucket refilled lazily

@@ -27,6 +27,7 @@ import type { ReplayGuard } from "./replay.ts";
 import { DeliveryDeduplicator, type DedupOptions } from "./dedup.ts";
 import { InboundRateLimiter, type InboundRateLimitOptions } from "./ratelimit.ts";
 import { InboundIpAcl, IpAclMetrics, type IpAclOptions } from "./ip-acl.ts";
+import { InboundApiKeyAuth, type ApiKeyOptions, type EndpointApiKeyRule } from "./api-key.ts";
 import { resolveTraceId, TRACE_ID_HEADER } from "./trace.ts";
 import {
   deriveIdempotencyKey,
@@ -540,6 +541,43 @@ export interface RelayServerOptions {
    * the legacy one. Invalid CIDRs throw `RangeError` at startup.
    */
   ipAcl?: IpAclOptions;
+  /**
+   * Inbound per-endpoint API key authentication (WR-65, see
+   * `src/api-key.ts`): a bearer-key admission gate for senders that
+   * cannot do HMAC — the shared secret travels in the `x-api-key`
+   * header and is compared in constant time (`crypto.timingSafeEqual`)
+   * against the endpoint's key set. Rules match the inbound request path
+   * (exact `/hooks/legacy` or prefix `/hooks/*`, first match wins, same
+   * semantics as WR-29 endpoint verifiers and the WR-53 IP ACL); each
+   * rule lists one or more `{ id, key }` entries — several keys coexist
+   * so rotation is overlap-safe (deploy the new key alongside the old,
+   * cut the sender over, then remove the old entry). The check runs in
+   * the intake gates before the body is read (right after the WR-53 IP
+   * ACL, before the WR-63 baseline and WR-22 rate limiting), so an
+   * unauthenticated caller costs zero bandwidth and zero downstream
+   * state: a missing or non-matching key is answered 401
+   * (`connection: close`) and audited as `rejected` with reason
+   * `api_key_missing` / `api_key_invalid` (and `keyId: "unknown"`) — it
+   * never enqueues, burns no retry budget, and never trips the breaker.
+   * `accepted` audit events carry the matched `keyId`.
+   *
+   * Orthogonal to signature verification: by default
+   * (`requireSignature` unset/false) the API key alone authenticates the
+   * endpoint — the signature check is skipped for requests that passed
+   * the key gate, so endpoints whose senders cannot sign keep working.
+   * Set `requireSignature: true` on the rule to demand BOTH the key and
+   * a valid signature (the normal global/per-endpoint verifier check
+   * still runs in the admission pipeline); when both factors are in
+   * play, the accepted audit's `keyId` names the API key (the admission
+   * credential). Endpoints with no matching rule are untouched —
+   * signature behavior there is exactly the legacy one. `x-api-key` is
+   * the caller's inbound credential, not part of the event: it is
+   * stripped from the headers forwarded downstream. Off by default: with
+   * no `rules`, intake behavior is exactly the legacy one. Invalid rules
+   * (empty key list, empty id/key, duplicate key ids, bad pattern) throw
+   * `RangeError` at startup.
+   */
+  apiKeys?: ApiKeyOptions;
   /**
    * Inbound source baseline anomaly detection (WR-63; see
    * `src/source-baseline.ts`): opt-in per-endpoint learning of the sender
@@ -1864,6 +1902,11 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // can never fail a request mid-flight.
   const ipAcl = opts.ipAcl !== undefined ? new InboundIpAcl(opts.ipAcl) : undefined;
   const ipAclMetrics = new IpAclMetrics();
+  // Inbound per-endpoint API key authentication (WR-65): rules are
+  // validated (constant-time comparison needs no precomputation, so this
+  // is pure validation) once at startup, so a bad pattern or key entry
+  // can never fail a request mid-flight.
+  const apiKeyAuth = opts.apiKeys !== undefined ? new InboundApiKeyAuth(opts.apiKeys) : undefined;
   // Inbound source baseline anomaly detection (WR-63): validated once at
   // startup so bad config can never fail a request mid-flight. Alert-only
   // — it never rejects — so it is orthogonal to the WR-53 IP ACL above.
@@ -2395,13 +2438,29 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
    * rejection responses; resolves to the raw body on success, or
    * `undefined` when the response was already written.
    */
+  /**
+   * WR-65: what the intake gates hand downstream — the (possibly capped)
+   * body plus the API key auth context, when an API-key rule guarded the
+   * endpoint and the request passed the gate.
+   */
+  interface IntakeGateResult {
+    body: Buffer;
+    /**
+     * The matched API key id and the guarding rule. The rule travels
+     * with it so the admission pipeline knows whether the signature
+     * check still applies (`requireSignature`) and which `keyId` to
+     * audit. Absent when no API-key rule matched this endpoint.
+     */
+    apiKey?: { keyId: string; rule: EndpointApiKeyRule };
+  }
+
   const runIntakeGates = async (
     req: Parameters<Parameters<typeof createServer>[0]>[0],
     res: Parameters<Parameters<typeof createServer>[0]>[1],
     pathname: string,
     id: string,
     traceId: string
-  ): Promise<Buffer | undefined> => {
+  ): Promise<IntakeGateResult | undefined> => {
     // Inbound IP allowlist/denylist (WR-53): the outermost admission
     // gate — before the body is even read, before rate limiting, before
     // signature verification — so a hostile IP costs us zero bandwidth
@@ -2427,6 +2486,53 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
           .writeHead(403, { "content-type": "text/plain", connection: "close" })
           .end("Forbidden");
         return undefined;
+      }
+    }
+
+    // Inbound per-endpoint API key authentication (WR-65): the second
+    // admission gate — on headers alone, before the body is read (like
+    // the WR-53 IP ACL), so an unauthenticated caller costs zero
+    // bandwidth and zero downstream state. A rejection never enqueues,
+    // so it burns no retry budget and never trips the breaker.
+    let apiKey: IntakeGateResult["apiKey"];
+    if (apiKeyAuth !== undefined) {
+      const rule = apiKeyAuth.ruleFor(pathname);
+      if (rule !== undefined) {
+        const presentedRaw = req.headers["x-api-key"];
+        const presented = Array.isArray(presentedRaw) ? presentedRaw[0] : presentedRaw;
+        if (typeof presented !== "string" || presented === "") {
+          opts.auditLog.append({
+            event: "rejected",
+            id,
+            traceId,
+            reason: "api_key_missing",
+            keyId: "unknown",
+            endpoint: rule.pattern,
+          });
+          // `connection: close` like the other pre-body rejections: the
+          // caller is unauthenticated, don't let it stream a body into a
+          // dead request.
+          res
+            .writeHead(401, { "content-type": "text/plain", connection: "close" })
+            .end("Unauthorized");
+          return undefined;
+        }
+        const matchedId = apiKeyAuth.verifyKey(rule, presented);
+        if (matchedId === null) {
+          opts.auditLog.append({
+            event: "rejected",
+            id,
+            traceId,
+            reason: "api_key_invalid",
+            keyId: "unknown",
+            endpoint: rule.pattern,
+          });
+          res
+            .writeHead(401, { "content-type": "text/plain", connection: "close" })
+            .end("Unauthorized");
+          return undefined;
+        }
+        apiKey = { keyId: matchedId, rule };
       }
     }
 
@@ -2532,7 +2638,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       res.writeHead(400, { "content-type": "text/plain" }).end("Bad request");
       return undefined;
     }
-    return body;
+    return { body, apiKey };
   };
 
   /**
@@ -2571,7 +2677,10 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
    * single webhook, the item's `headers` for a batch item); `correlation`
    * is spread into every audit event the admission emits (e.g.
    * `{ batchId }`, empty for single webhooks). Never writes the HTTP
-   * response — the caller translates the outcome.
+   * response — the caller translates the outcome. `apiKey` carries the
+   * WR-65 gate result for the HTTP-level request (matched key id +
+   * rule); batch items pass none, so per-item signature verification
+   * always runs for them.
    */
   const admitOneEvent = async (
     id: string,
@@ -2579,7 +2688,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     body: Buffer,
     headers: Record<string, string | string[] | undefined>,
     pathname: string,
-    correlation: Record<string, unknown>
+    correlation: Record<string, unknown>,
+    apiKey?: { keyId: string; rule: EndpointApiKeyRule }
   ): Promise<AdmitOutcome> => {
     const signatureHeader = headers["x-signature"];
     const keyIdHeader = headers["x-key-id"];
@@ -2594,10 +2704,24 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
 
     // With key rotation, learn which key id verified so it can go on the
     // audit trail; otherwise keep the legacy boolean contract.
+    //
+    // Inbound API key authentication (WR-65): when an API-key rule
+    // guarded this endpoint and the request passed the pre-body key
+    // gate, the key is the endpoint's authenticator — the signature
+    // check is skipped UNLESS the rule demands both (`requireSignature:
+    // true`). Endpoints with no API-key rule keep the exact legacy
+    // behavior.
     let verified = false;
     let verifiedKeyId: string | undefined;
-    const rotating = activeVerifier instanceof RotatingHmacVerifier;
-    if (rotating) {
+    const apiKeyAuthenticates = apiKey !== undefined && apiKey.rule.requireSignature !== true;
+    const rotatingVerifier = activeVerifier instanceof RotatingHmacVerifier;
+    // Rotation attribution only applies when the signature check ran;
+    // in api-key-only mode the key gate already authenticated the
+    // request, so no signing key id is reported.
+    const rotating = !apiKeyAuthenticates && rotatingVerifier;
+    if (apiKeyAuthenticates) {
+      verified = true;
+    } else if (rotatingVerifier) {
       const detail = activeVerifier.verifyDetailed(body, signatureHeader ?? "", { keyId: keyIdHint });
       verified = detail.ok;
       verifiedKeyId = detail.keyId;
@@ -2613,6 +2737,11 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         reason: "invalid_signature",
       };
       if (rotating) rejectedEvent.keyId = "unknown";
+      // WR-65: the request proved possession of the API key at the
+      // pre-body gate before failing the signature check (both-required
+      // mode) — attribute the rejection to that key. "unknown" stays
+      // reserved for gates where no key ever matched.
+      if (apiKey !== undefined) rejectedEvent.keyId = apiKey.keyId;
       // Name the verifier that rejected, so a multi-scheme relay's audit
       // trail shows which trust rule fired.
       if (perEndpointVerifier) rejectedEvent.verifier = activeVerifier.name;
@@ -2839,6 +2968,10 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       // downstream never asked for the caller's tenancy claim.
       if (k === "x-relay-signature" || k === "x-relay-key-id" || k === IDEMPOTENCY_KEY_HEADER) continue;
       if (k === TENANT_ID_HEADER) continue;
+      // WR-65: `x-api-key` is the caller's inbound credential — it
+      // authenticates the intake, it is not part of the event, and it
+      // must never travel downstream to the forward target.
+      if (k === "x-api-key") continue;
       passthrough[k] = v;
     }
 
@@ -2905,6 +3038,10 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       acceptedEvent.schemaVersion = schema.version;
     }
     if (rotating) acceptedEvent.keyId = verifiedKeyId ?? "unknown";
+    // WR-65: the API key admitted the request — its id is the admission
+    // credential, so it wins over the signing key id when both factors
+    // are in play.
+    if (apiKey !== undefined) acceptedEvent.keyId = apiKey.keyId;
     if (perEndpointVerifier) acceptedEvent.verifier = activeVerifier.name;
     if (priority) acceptedEvent.priority = priority;
     if (inboundGzip) acceptedEvent.contentEncoding = "gzip";
@@ -2952,9 +3089,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // Resolve the trace ID before any admission decision so even rejections
     // are traceable; a client-supplied x-trace-id is honored, otherwise fresh.
     const traceId = resolveTraceId(req.headers[TRACE_ID_HEADER]);
-    const body = await runIntakeGates(req, res, pathname, id, traceId);
-    if (body === undefined) return;
-    const outcome = await admitOneEvent(id, traceId, body, req.headers, pathname, {});
+    const gates = await runIntakeGates(req, res, pathname, id, traceId);
+    if (gates === undefined) return;
+    const outcome = await admitOneEvent(id, traceId, gates.body, req.headers, pathname, {}, gates.apiKey);
     const tenantLabel = outcome.tenantId === undefined ? {} : { tenant: outcome.tenantId };
     if (outcome.status === 202) {
       res
@@ -3019,8 +3156,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   ): Promise<void> => {
     const batchId = randomUUID();
     const batchTraceId = resolveTraceId(req.headers[TRACE_ID_HEADER]);
-    const body = await runIntakeGates(req, res, "/ingest/batch", batchId, batchTraceId);
-    if (body === undefined) return;
+    const gates = await runIntakeGates(req, res, "/ingest/batch", batchId, batchTraceId);
+    if (gates === undefined) return;
+    const body = gates.body;
 
     // The envelope signature covers the whole raw batch body — verified
     // before splitting, so dropping, reordering, or tampering with items
