@@ -27,6 +27,7 @@
  */
 
 import type { JitterStrategy } from "./retry.ts";
+import { assertValidWeightedTargets, type WeightedTargetConfig } from "./weighted.ts";
 
 /** Patch for one endpoint's circuit-breaker trip/cooldown thresholds. */
 export interface CircuitBreakerPatch {
@@ -61,6 +62,17 @@ export interface RetryPatch {
 }
 
 /**
+ * Patch for one endpoint's weighted multi-target dispatch (WR-66).
+ * Replaces the endpoint's whole target list — weights included — so the
+ * shape is always complete, never a partial merge. Requires weighted
+ * dispatch to be enabled for the endpoint.
+ */
+export interface WeightedPatch {
+  /** The endpoint's new target list (validated before apply). */
+  targets: WeightedTargetConfig[];
+}
+
+/**
  * Partial endpoint configuration update accepted by
  * `RetryQueue.updateEndpointConfig`. Every field is optional; omitted
  * fields keep their current value.
@@ -76,6 +88,13 @@ export interface EndpointConfigPatch {
   circuitBreaker?: CircuitBreakerPatch;
   /** Per-endpoint quota limit (requires quota enabled). */
   quota?: QuotaPatch;
+  /**
+   * Per-endpoint weighted target list (requires weighted dispatch
+   * enabled for the endpoint). Replaces the whole list atomically; the
+   * smooth-WRR accumulators reset, health counters and dispatch counts
+   * survive.
+   */
+  weighted?: WeightedPatch;
   /** Queue-global backoff parameters. */
   retry?: RetryPatch;
 }
@@ -154,6 +173,18 @@ export function assertValidEndpointConfigPatch(patch: EndpointConfigPatch): void
     }
     if (p.quota.deliveriesPerMinute !== undefined) {
       assertNumberIn(p.quota.deliveriesPerMinute, "quota.deliveriesPerMinute", (n) => Number.isFinite(n) && n > 0, "a finite number > 0");
+    }
+  }
+  if (p.weighted !== undefined) {
+    if (typeof p.weighted !== "object" || p.weighted === null || Array.isArray(p.weighted)) {
+      throw new RangeError("updateEndpointConfig: `weighted` must be an object");
+    }
+    try {
+      assertValidWeightedTargets(p.weighted.targets);
+    } catch (err) {
+      throw new RangeError(
+        `updateEndpointConfig: \`weighted.targets\` is invalid: ${(err as Error).message}`
+      );
     }
   }
   if (p.retry !== undefined) {

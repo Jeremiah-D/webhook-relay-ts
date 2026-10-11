@@ -967,6 +967,68 @@ const server = createRelayServer({
   lists, a standby equal to the primary, duplicates, chained primaries,
   and illegal thresholds.
 
+## Weighted multi-target dispatch (opt-in)
+
+Where failover (above) answers "which target is *up*", weighted mode
+answers "how is traffic *shared*": one logical endpoint spreads every
+dispatch across several physical targets with a smooth weighted
+round-robin — hand-written, zero dependencies, nginx-style (each pick adds
+the target's weight to its accumulator, takes the max, and subtracts the
+pool total from the winner). Weights are relative shares, not
+percentages; 5:3:2 over ten dispatches yields exactly 5/3/2, and the
+sequence stays smooth so no target starves for a whole cycle:
+
+```ts
+const server = createRelayServer({
+  secret, forwardUrl, auditLog,
+  retry: {
+    weighted: {
+      "https://api/hook": {
+        targets: [
+          { targetUrl: "https://ingest-1/hook", weight: 5 },
+          { targetUrl: "https://ingest-2/hook", weight: 3 },
+          { targetUrl: "https://ingest-3/hook", weight: 2 },
+        ],
+        failureThreshold: 5,      // default 5; consecutive failures → excluded
+        recoveryIntervalMs: 30_000, // default 30s; quiet period before rejoining
+      },
+    },
+  },
+});
+```
+
+- **Only healthy targets join the rotation** — the signals are the ones
+  the relay already has: an open circuit breaker excludes the target, a
+  half-open breaker re-includes it so the probe delivery can settle (its
+  outcome re-admits or re-excludes), and the dispatcher's own
+  per-target consecutive-failure counter excludes sick targets even with
+  the breaker disabled. A downstream that *answers* — even with a 4xx —
+  counts as healthy. An excluded target rejoins once the recovery
+  interval passes since its last failure — its next outcome alone
+  decides (success resets, failure re-excludes for another interval). When
+  *every* target is unhealthy the first configured target is pinned and
+  the normal retry / dead-letter machinery owns the outcome.
+- **Mutually exclusive with failover per endpoint** — configuring
+  `weighted` and `failover` for the same endpoint throws `RangeError` at
+  startup ("share traffic" and "ordered standby" must never both claim an
+  endpoint). Different endpoints may use different modes.
+- **Runtime retuning** — `queue.updateEndpointConfig(endpoint, {
+  weighted: { targets: [...] } })` replaces the whole target list
+  atomically (validated before apply, zero partial application), resets
+  the round-robin accumulators, and keeps health counters and cumulative
+  dispatch counts. It fires `onConfigChange` like any hot-reload patch,
+  so the server audits it as `endpoint_config_updated` and operators can
+  apply it over `POST /config/endpoint`.
+- **Observability** — `relay_weighted_dispatch_total{endpoint,target}`
+  counts dispatches per physical target (present only when weighted mode
+  is in use); delivery counters, latency histograms, and circuit gauges
+  are keyed by the physical target that served the attempt;
+  `queue.getWeightedStats()` shows per-target
+  `{ weight, effectiveWeight, dispatched, consecutiveFailures, healthy }`.
+- **Invalid configs throw `RangeError` at startup** — empty target
+  lists, empty/duplicate `targetUrl`s, and non-positive or non-finite
+  weights.
+
 ## Payload gzip compression
 
 Outbound deliveries can be gzipped per endpoint (opt-in), and inbound

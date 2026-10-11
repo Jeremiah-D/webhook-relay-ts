@@ -1631,6 +1631,15 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         for (const standby of cfg.standbys ?? []) knownEndpoints.add(standby);
       }
     }
+    // WR-66: weighted physical targets are real delivery destinations —
+    // operators can pause them and the pause-404 validation covers them.
+    const weightedCfg = opts.retry?.weighted;
+    if (weightedCfg) {
+      for (const [endpoint, cfg] of Object.entries(weightedCfg)) {
+        knownEndpoints.add(endpoint);
+        for (const target of cfg.targets ?? []) knownEndpoints.add(target.targetUrl);
+      }
+    }
     const validators = opts.retry?.responseValidators;
     if (validators !== undefined && typeof validators === "object") {
       for (const endpoint of Object.keys(validators)) knownEndpoints.add(endpoint);

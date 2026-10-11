@@ -29,6 +29,11 @@
  * - `relay_failover_switches_total{endpoint,from,to}`: counter of
  *   active/standby failover switches (WR-39) by logical endpoint,
  *   present only for (endpoint, from, to) triples that actually switched.
+ * - `relay_weighted_dispatch_total{endpoint,target}`: counter of
+ *   dispatches routed to each physical target by logical endpoint
+ *   (WR-66 weighted multi-target dispatch), present only when weighted
+ *   mode is in use and only for (endpoint, target) pairs that actually
+ *   received a dispatch.
  * - `relay_retry_budget_depleted_total`: counter of retries parked because
  *   the global retry budget (WR-38) was exhausted. Present only when the
  *   budget is enabled. No endpoint label — the budget is global.
@@ -90,6 +95,12 @@ export interface MetricsInput {
   starvationGuard?: StarvationGuardMetricsInput[];
   /** Present only for (endpoint, from, to) triples that actually switched. */
   failover?: FailoverMetricsInput[];
+  /**
+   * Present only when weighted multi-target dispatch (WR-66) is in use;
+   * one series per (endpoint, target) pair that actually received a
+   * dispatch.
+   */
+  weighted?: WeightedMetricsInput[];
   /** Present only when the global retry budget (WR-38) is enabled. */
   retryBudgetDepleted?: number;
   /** Present only when the relay-level global concurrency cap (WR-51) is configured (finite). */
@@ -113,6 +124,16 @@ export interface FailoverMetricsInput {
   /** Target deliveries go to after the switch. */
   to: string;
   switches: number;
+}
+
+/** One weighted-dispatch count, in Prometheus label order. */
+export interface WeightedMetricsInput {
+  /** Logical endpoint. */
+  endpoint: string;
+  /** Physical target the dispatch was routed to. */
+  target: string;
+  /** Cumulative dispatches to this target. */
+  dispatched: number;
 }
 
 /** One endpoint's health-probe counters, in Prometheus label order. */
@@ -222,6 +243,17 @@ export function renderPrometheus(input: MetricsInput): string {
     for (const f of input.failover) {
       lines.push(
         `relay_failover_switches_total{endpoint="${escapeLabelValue(f.endpoint)}",from="${escapeLabelValue(f.from)}",to="${escapeLabelValue(f.to)}"} ${f.switches}`
+      );
+    }
+  }
+  if (input.weighted !== undefined && input.weighted.length > 0) {
+    lines.push(
+      "# HELP relay_weighted_dispatch_total Weighted multi-target dispatches by logical endpoint and physical target."
+    );
+    lines.push("# TYPE relay_weighted_dispatch_total counter");
+    for (const w of input.weighted) {
+      lines.push(
+        `relay_weighted_dispatch_total{endpoint="${escapeLabelValue(w.endpoint)}",target="${escapeLabelValue(w.target)}"} ${w.dispatched}`
       );
     }
   }

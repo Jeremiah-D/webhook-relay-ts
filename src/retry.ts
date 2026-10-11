@@ -83,6 +83,12 @@ import {
   type FailoverSwitchEvent,
 } from "./failover.ts";
 import {
+  WeightedDispatcher,
+  type WeightedConfig,
+  type WeightedEndpointStats,
+  type WeightedTargetConfig,
+} from "./weighted.ts";
+import {
   GlobalConcurrencyGate,
   type GlobalConcurrencyStats,
 } from "./global-concurrency.ts";
@@ -94,6 +100,7 @@ import {
   type LatencyHistogramInput,
   type ProbeMetricsInput,
   type StarvationGuardMetricsInput,
+  type WeightedMetricsInput,
 } from "./metrics.ts";
 import {
   summarizeDeadLetterFailure,
@@ -109,6 +116,8 @@ export { HttpDeliveryError, classifyFailure, parseRetryAfterMs };
 export type { FailureClass, ClassifiedFailure };
 export type { DownstreamResponseSummary };
 export type { FailoverConfig, FailoverEndpointStats, FailoverSwitchEvent };
+export type { WeightedConfig, WeightedEndpointStats, WeightedTargetConfig };
+export type { WeightedMetricsInput };
 export { CompletionCallbacker, createBoundAddressSelfCheck, isSelfCallbackTarget, resolveCompletionCallbackConfig };
 export { GlobalConcurrencyGate };
 export type { GlobalConcurrencyStats };
@@ -832,6 +841,28 @@ export interface RetryQueueOptions {
    * `failover_switched`; library users get the hook directly.
    */
   onFailoverSwitch?: (event: FailoverSwitchEvent) => void;
+  /**
+   * Weighted multi-target outbound dispatch (see `src/weighted.ts`),
+   * opt-in per endpoint: a record of logical endpoint -> `{ targets: [{
+   * targetUrl, weight }], failureThreshold?, recoveryIntervalMs? }`.
+   * Every dispatch for a configured endpoint is spread across its
+   * physical targets with a smooth weighted round-robin (zero
+   * dependencies); only healthy targets join the rotation (circuit
+   * breaker state plus the dispatcher's own consecutive-failure counter,
+   * so it works with the breaker disabled). When every target is
+   * unhealthy the first configured target is pinned and the normal
+   * retry / dead-letter machinery owns the outcome. Weights are tunable
+   * at runtime through `updateEndpointConfig` (`weighted` patch).
+   * Mutually exclusive with `failover` per endpoint: configuring both
+   * for the same endpoint throws `RangeError` at construction. Invalid
+   * configs throw `RangeError` at construction.
+   */
+  weighted?: WeightedConfig;
+  /**
+   * Weighted dispatch clock in ms; defaults to `Date.now`. Injectable
+   * for deterministic tests (drives the recovery interval).
+   */
+  weightedNow?: () => number;
   /**
    * Delivery completion callbacks (WR-47; see `src/callback.ts`). Opt-in:
    * when a delivery reaches a terminal state (`delivered` or
@@ -1685,6 +1716,8 @@ export class RetryQueue {
     string,
     { endpoint: string; from: string; to: string; switches: number }
   >();
+  /** WR-66: smooth weighted round-robin routing; undefined when not configured. */
+  private readonly weighted?: WeightedDispatcher;
   /** WR-47: completion-receipt sender; undefined when the feature is off. */
   private readonly callbacker?: CompletionCallbacker;
 
@@ -1821,23 +1854,45 @@ export class RetryQueue {
     // WR-39: built after the breaker so the manager can read live circuit
     // state for the "circuit open" switch trigger. Invalid configs throw
     // here, at construction — never mid-delivery.
+    // WR-48: routing is per-endpoint (shared downstream), while breakers
+    // are per-tenant. A target counts as open when any tenant's breaker
+    // says so — a real failure signal from any tenant's deliveries should
+    // move the shared routing. WR-66 reuses the same reader for weighted
+    // dispatch health filtering.
+    const routingCircuitState = (target: string): CircuitState => {
+      let seen: CircuitState = "closed";
+      for (const b of this.breakers.values()) {
+        const s = b.state(target);
+        if (s === "open") return "open";
+        if (s === "half_open") seen = "half_open";
+      }
+      return seen;
+    };
+    // WR-66: weighted multi-target dispatch and WR-39 failover are
+    // mutually exclusive per endpoint — "share traffic" and "ordered
+    // standby" routing must never both claim the same endpoint. Fail-fast
+    // at construction, house style.
+    if (opts.weighted !== undefined && opts.failover !== undefined) {
+      for (const endpoint of Object.keys(opts.weighted)) {
+        if (Object.prototype.hasOwnProperty.call(opts.failover, endpoint)) {
+          throw new RangeError(
+            `weighted and failover are mutually exclusive for endpoint ${JSON.stringify(endpoint)}: configure only one`
+          );
+        }
+      }
+    }
+    this.weighted =
+      opts.weighted !== undefined
+        ? new WeightedDispatcher(opts.weighted, {
+            now: opts.weightedNow ?? Date.now,
+            circuitState: routingCircuitState,
+          })
+        : undefined;
     this.failover =
       opts.failover !== undefined
         ? new FailoverManager(opts.failover, {
             now: opts.failoverNow ?? Date.now,
-            circuitState: (target) => {
-              // WR-48: failover routing is per-endpoint (shared downstream),
-              // while breakers are per-tenant. A target counts as open when
-              // any tenant's breaker says so — a real failure signal from
-              // any tenant's deliveries should move the shared routing.
-              let seen: CircuitState = "closed";
-              for (const b of this.breakers.values()) {
-                const s = b.state(target);
-                if (s === "open") return "open";
-                if (s === "half_open") seen = "half_open";
-              }
-              return seen;
-            },
+            circuitState: routingCircuitState,
             onSwitch: (event) => this.recordFailoverSwitch(event),
           })
         : undefined;
@@ -2842,6 +2897,25 @@ export class RetryQueue {
       rec("quota.deliveriesPerMinute", quota!.limit(endpoint), patch.quota.deliveriesPerMinute);
       quota!.setEndpointLimit(endpoint, patch.quota.deliveriesPerMinute);
     }
+    if (patch.weighted !== undefined) {
+      // WR-66: runtime weight retuning. The patch was validated
+      // structurally by assertValidEndpointConfigPatch; setWeights
+      // re-validates the full per-endpoint config before applying, so an
+      // illegal list throws RangeError and leaves the running config
+      // completely intact — zero partial application.
+      if (this.weighted === undefined || !this.weighted.hasEndpoint(endpoint)) {
+        throw new RangeError(
+          "updateEndpointConfig: weighted dispatch is not enabled for this endpoint; cannot patch weights"
+        );
+      }
+      const before = this.weighted.stats().find((s) => s.endpoint === endpoint);
+      rec(
+        "weighted.targets",
+        before?.targets.map((t) => ({ targetUrl: t.targetUrl, weight: t.weight })) ?? [],
+        patch.weighted.targets.map((t) => ({ targetUrl: t.targetUrl, weight: t.weight }))
+      );
+      this.weighted.setWeights(endpoint, patch.weighted.targets);
+    }
     if (patch.retry !== undefined) {
       const r = patch.retry;
       const before = this.retryConfig();
@@ -2941,8 +3015,13 @@ export class RetryQueue {
     // physical target this attempt goes to; the sender gets a copy pinned
     // to it, so an in-flight delivery keeps its old target across a
     // mid-flight switch — switches never cancel or reroute in-flight work.
+    // WR-66: weighted dispatch (opt-in per endpoint, mutually exclusive
+    // with failover) resolves first; it returns undefined when the
+    // endpoint has no weighted config, falling through to failover / the
+    // endpoint itself.
     const logicalEndpoint = entry.targetUrl;
-    const target = this.failover?.resolveTarget(logicalEndpoint) ?? logicalEndpoint;
+    const weightedTarget = this.weighted?.resolveTarget(logicalEndpoint);
+    const target = weightedTarget ?? this.failover?.resolveTarget(logicalEndpoint) ?? logicalEndpoint;
     // WR-50: the pause lands before any gate is touched — a timer that
     // fired in the same tick as the pause parks instead of dispatching,
     // so a paused delivery consumes no quota token, no breaker verdict,
@@ -3113,6 +3192,10 @@ export class RetryQueue {
         // toward the floor.
         this.adaptiveBackoffFor(tenant)?.recordOutcome(target, true);
         this.failover?.recordOutcome(logicalEndpoint, target, true);
+        // WR-66: an answering target is a healthy target — same rule as
+        // failover; non_retryable delivery outcomes feed both routers so
+        // their per-target health counters agree.
+        this.weighted?.recordOutcome(logicalEndpoint, target, true);
         // WR-49: journal before the in-memory delete — a crash between the
         // two redelivers (at-least-once), never loses.
         if (this.durable !== undefined) {
@@ -3193,6 +3276,7 @@ export class RetryQueue {
           // endpoint) — cools the adaptive base like any success.
           this.adaptiveBackoffFor(tenant)?.recordOutcome(target, true);
           this.failover?.recordOutcome(logicalEndpoint, target, true);
+          this.weighted?.recordOutcome(logicalEndpoint, target, true);
           this.recordDelivery(tenant, target, "failed");
           entry.attempt += 1;
           this.moveToDeadLetter(entry, id, err, classified, at, traceId, target);
@@ -3203,6 +3287,7 @@ export class RetryQueue {
         // toward the ceiling.
         this.adaptiveBackoffFor(tenant)?.recordOutcome(target, false);
         this.failover?.recordOutcome(logicalEndpoint, target, false);
+        this.weighted?.recordOutcome(logicalEndpoint, target, false);
         this.recordDelivery(tenant, target, "failed");
         entry.attempt += 1;
         if (entry.attempt >= this.maxAttempts) {
@@ -3546,6 +3631,15 @@ export class RetryQueue {
     // switched; absent entirely when failover is unconfigured or never
     // fired.
     const failover: FailoverMetricsInput[] = [...this.failoverSwitchCounts.values()];
+    // WR-66: one series per (endpoint, target) pair that actually
+    // received a dispatch; absent entirely when weighted mode is not in
+    // use. The dispatcher's own cumulative counts are the source — the
+    // queue does not keep a parallel counter.
+    const weighted: WeightedMetricsInput[] = (this.weighted?.stats() ?? []).flatMap((s) =>
+      s.targets
+        .filter((t) => t.dispatched > 0)
+        .map((t) => ({ endpoint: s.endpoint, target: t.targetUrl, dispatched: t.dispatched }))
+    );
     // WR-57: the scheduled-delivery counters appear once a delivery has
     // actually been parked — activity-gated, like the starvation-guard
     // series, so an untouched relay's exposition is unchanged.
@@ -3557,6 +3651,9 @@ export class RetryQueue {
       probes,
       starvationGuard,
       failover,
+      // WR-66: activity-gated (see above) — weighted mode's series stay
+      // absent until a dispatch has actually been weighted.
+      ...(weighted.length > 0 ? { weighted } : {}),
       ...(this.retryBudget !== undefined ? { retryBudgetDepleted: this.retryBudgetDepleted } : {}),
       // WR-51: the wait counter is exposed only when the cap is
       // configured (finite) — the default unlimited gate never waits,
@@ -3611,6 +3708,16 @@ export class RetryQueue {
    */
   resetFailover(endpoint: string): boolean {
     return this.failover?.resetFailover(endpoint) ?? false;
+  }
+
+  /**
+   * WR-66: per-endpoint weighted dispatch state — per-target
+   * `{ weight, effectiveWeight, dispatched, consecutiveFailures,
+   * healthy }` in config order. Empty when weighted dispatch is not
+   * configured.
+   */
+  getWeightedStats(): WeightedEndpointStats[] {
+    return this.weighted?.stats() ?? [];
   }
 
   /**
