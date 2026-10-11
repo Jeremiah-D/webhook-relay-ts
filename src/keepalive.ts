@@ -5,6 +5,7 @@ import type { Socket } from "node:net";
 import { createHash } from "node:crypto";
 import { normalizePin } from "./pinning.ts";
 import { createProxiedAgent, proxyPoolKeyFragment } from "./proxy.ts";
+import { tlsSniPoolKeyFragment, type ResolvedTlsSniOverride } from "./tls-sni.ts";
 
 /**
  * Outbound keep-alive connection pool (WR-24).
@@ -31,6 +32,12 @@ import { createProxiedAgent, proxyPoolKeyFragment } from "./proxy.ts";
  *   re-send its certificate, so the pin check would see an empty peer
  *   certificate and fail a healthy endpoint — every pinned connection
  *   does a full handshake instead.
+ * - per-endpoint TLS-identity binding (WR-60): endpoints with a
+ *   `tlsSniOverrides` entry get their own agent, keyed by a hash of the
+ *   effective (servername, ALPN) pair, so a connection handshaked with one
+ *   SNI can never serve an endpoint configured with a different one.
+ *   Endpoints without an entry share the historical `(scheme, host, port)`
+ *   keys, exactly as before.
  * - health probing (WR-28): every idle socket is probed *before* the
  *   agent hands it to a delivery — in the same tick, so there is no race
  *   between the check and the assignment. Sockets the kernel already
@@ -169,8 +176,10 @@ export function isSocketReusable(socket: Socket): boolean {
 export interface PoolEndpointStats {
   /**
    * Pool key: `<scheme>//<host>:<port>`, plus `|proxy:<hash>` when routed
-   * through an outbound proxy, `|pins:<hash>` when pinned, and
-   * `|cert:<hash>` when a client certificate is bound.
+   * through an outbound proxy, `|pins:<hash>` when pinned,
+   * `|cert:<hash>` when a client certificate is bound, and `|sni:<hash>`
+   * when a per-endpoint TLS SNI/ALPN override applies (see
+   * `src/tls-sni.ts`).
    */
   key: string;
   scheme: "http" | "https";
@@ -268,8 +277,13 @@ export class OutboundConnectionPool {
    * identity, so a connection authenticated as one identity can never
    * serve an endpoint configured with a different one — a rotated
    * identity gets a fresh agent instead of riding a stale connection.
+   * `tlsSni` (see `resolveTlsSniOverride` in `src/tls-sni.ts`) binds the
+   * agent to one effective TLS identity (SNI servername + ALPN offer), so
+   * a connection handshaked with one SNI can never serve an endpoint
+   * configured with a different one. Endpoints without an override entry
+   * pass `undefined` and keep the exact historical pool keys.
    */
-  agentFor(url: URL, pins?: readonly string[], proxyUrl?: string, clientCertId?: string): HttpAgent {
+  agentFor(url: URL, pins?: readonly string[], proxyUrl?: string, clientCertId?: string, tlsSni?: ResolvedTlsSniOverride): HttpAgent {
     if (url.protocol !== "http:" && url.protocol !== "https:") {
       throw new Error(`OutboundConnectionPool: unsupported protocol ${url.protocol}`);
     }
@@ -288,6 +302,7 @@ export class OutboundConnectionPool {
       key += `|pins:${digest}`;
     }
     if (clientCertId !== undefined) key += `|cert:${clientCertId}`;
+    if (tlsSni !== undefined) key += tlsSniPoolKeyFragment(tlsSni);
     let entry = this.entries.get(key);
     if (entry === undefined) {
       const agentOpts = {

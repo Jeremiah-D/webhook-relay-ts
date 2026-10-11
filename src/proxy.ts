@@ -303,8 +303,10 @@ export interface ProxiedAgentOptions {
  * runs over the tunnel via `tls.connect({ socket })`, honoring the merged
  * request/agent options the same way `https.Agent` would — notably
  * `rejectUnauthorized` (the default sender passes `false` there when SPKI
- * pins are configured, making the pin the trust anchor) and `servername`
- * for SNI.
+ * pins are configured, making the pin the trust anchor), `servername` for
+ * SNI, and `ALPNProtocols` — so a WR-60 per-endpoint SNI/ALPN override
+ * (see `src/tls-sni.ts`) applies over the proxy tunnel exactly as on a
+ * direct connection.
  *
  * The returned agent does normal keep-alive bookkeeping on the tunneled
  * sockets, so it drops straight into `OutboundConnectionPool` or serves a
@@ -342,6 +344,7 @@ export function createProxiedAgent(
         const tlsSock = tlsConnect({
           socket: sock,
           servername: (options.servername as string | undefined) ?? targetHost,
+          ALPNProtocols: options.ALPNProtocols as string[] | undefined,
           rejectUnauthorized: options.rejectUnauthorized !== false,
         });
         tlsSock.once("secureConnect", () => cb(null, tlsSock as unknown as Socket));

@@ -337,6 +337,28 @@ reliability primitives that matter for any signed-payload pipeline.
   destroys the socket, and the checkout probe culls it, so it is never handed
   to another delivery). Empty cert/key, unparseable PEM, and cert/key mismatch
   throw `RangeError` at startup. Zero dependencies (`node:crypto` + `node:tls`).
+- `src/tls-sni.ts` — per-endpoint outbound TLS SNI/ALPN overrides (WR-60):
+  `tlsSniOverrides: { "<exact targetUrl>": { servername?, alpnProtocols? } }`
+  (also exposed as `createRelayServer({ tlsSniOverrides })` and the eleventh
+  `createDefaultSender(...)` argument). `servername` is the SNI name sent in
+  the TLS ClientHello and defaults to the target URL's host — set it
+  explicitly for CDN / multi-tenant-fronting setups, either to present the
+  real service name to the front or to keep the default SNI from leaking the
+  real backend host. `alpnProtocols` is the ALPN offer in preference order
+  and defaults to `["h2", "http/1.1"]`. Endpoints without an entry keep the
+  exact current behavior (no `servername`/`ALPNProtocols` set — Node's
+  defaults apply untouched). The override changes only the SNI/ALPN wire
+  values: certificate verification still anchors on the target URL's host
+  (or the `tlsPins` whitelist — the pin is verified on the overridden-SNI
+  connection), and the keep-alive pool plus the H2 session pool key
+  connections by the effective TLS identity (`|sni:<hash>`), so a connection
+  handshaked with one SNI can never serve an endpoint configured with a
+  different one. Composes with `tlsPins`, `tlsClientCerts` (the client
+  certificate rides the same handshake), the H2 pool, and proxied endpoints
+  (the handshake runs over the CONNECT tunnel). Applies to `https:` targets;
+  empty servernames, IP-literal servernames, and empty/malformed
+  `alpnProtocols` throw `RangeError` at startup. Zero dependencies
+  (`node:net` + `node:crypto`).
 - `src/keepalive.ts` — outbound keep-alive connection pool: deliveries reuse
   TCP/TLS connections per `(scheme, host, port)` instead of paying a handshake
   per attempt. One `http.Agent`/`https.Agent` per origin, with
@@ -345,7 +367,10 @@ reliability primitives that matter for any signed-payload pipeline.
   an idle pool never pins process exit, and a failed connection is never
   handed to another delivery. Endpoints with a TLS pin whitelist get a
   dedicated agent per pin set (so a connection pinned for one whitelist can
-  never serve another endpoint's), and the pin is still verified on
+  never serve another endpoint's), endpoints with a `tlsSniOverrides` entry
+  get a dedicated agent per effective TLS identity (so a connection
+  handshaked with one SNI can never serve an endpoint configured with a
+  different one), and the pin is still verified on
   `secureConnect` for every new connection; a reused connection re-checks its
   cached handshake fingerprint against the request's whitelist as a
   poisoned-socket guard. Pinned agents disable TLS session resumption
@@ -384,7 +409,9 @@ reliability primitives that matter for any signed-payload pipeline.
   socket's `secureConnect` before the first stream, with the verified
   fingerprint re-checked on reuse as a poisoned-session guard — and mTLS
   client certificates (WR-36) ride the handshake; sessions are keyed per
-  origin + pin set + client identity, so a session pinned or authenticated
+  origin + pin set + client identity + effective TLS identity (WR-60
+  `tlsSniOverrides`: a session handshaked with one SNI never serves an
+  endpoint configured with another), so a session pinned or authenticated
   for one endpoint can never serve another's. A failed or refused H2 session
   never loses a delivery: the sender falls back to the HTTP/1.1 keep-alive
   pool (the origin sits out H2 for `fallbackCooldownMs`, default 30s), and

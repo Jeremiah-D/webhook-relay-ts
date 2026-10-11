@@ -7,6 +7,7 @@ import type { TLSSocket } from "node:tls";
 import type { Socket } from "node:net";
 import { normalizePin, spkiFingerprint } from "./pinning.ts";
 import { clientCertIdentity, type TlsClientCert } from "./mtls.ts";
+import { tlsSniPoolKeyFragment, type ResolvedTlsSniOverride } from "./tls-sni.ts";
 import { createHash } from "node:crypto";
 
 /**
@@ -188,10 +189,12 @@ export function hostEligible(hosts: readonly string[], url: URL): boolean {
 /** Per-origin H2 session state snapshot. */
 export interface Http2SessionStats {
   /**
-   * Pool key: `<scheme>//<host>:<port>`, plus `|pins:<hash>` when pinned
-   * and `|cert:<hash>` when a client certificate is bound — the same
-   * binding rules as the HTTP/1.1 pool, so a session pinned or
-   * authenticated for one endpoint can never serve another's.
+   * Pool key: `<scheme>//<host>:<port>`, plus `|pins:<hash>` when pinned,
+   * `|cert:<hash>` when a client certificate is bound, and `|sni:<hash>`
+   * when a per-endpoint TLS SNI/ALPN override applies (see
+   * `src/tls-sni.ts`) — the same binding rules as the HTTP/1.1 pool, so a
+   * session pinned or authenticated for one endpoint can never serve
+   * another's.
    */
   key: string;
   scheme: "http" | "https";
@@ -229,6 +232,8 @@ interface Http2Entry {
   /** SPKI fingerprint verified at session establishment (pinned entries). */
   verifiedPin: string | undefined;
   cert: TlsClientCert | undefined;
+  /** Effective TLS identity (WR-60); undefined when no override applies. */
+  tlsSni: ResolvedTlsSniOverride | undefined;
   session: ClientHttp2Session | undefined;
   connecting: Promise<ClientHttp2Session> | undefined;
   /** Origin sits out H2 until this timestamp (after a failure). */
@@ -267,13 +272,13 @@ export class Http2SessionPool {
 
   /**
    * The H2 session serving `url` — established on first use, then shared
-   * by every later delivery to the same `(scheme, host, port, pins,
-   * cert)`. Concurrent first deliveries share the in-flight connect.
-   * Throws {@link Http2UnavailableError} when H2 cannot serve the
+   * by every later delivery to the same `(scheme, host, port, pins, cert,
+   * tls identity)`. Concurrent first deliveries share the in-flight
+   * connect. Throws {@link Http2UnavailableError} when H2 cannot serve the
    * delivery (not eligible, origin in fallback cooldown, connect failed,
    * or pin verification failed) — the caller falls back to HTTP/1.1.
    */
-  async sessionFor(url: URL, pins?: readonly string[], clientCert?: TlsClientCert): Promise<ClientHttp2Session> {
+  async sessionFor(url: URL, pins?: readonly string[], clientCert?: TlsClientCert, tlsSni?: ResolvedTlsSniOverride): Promise<ClientHttp2Session> {
     if (!this.eligibleFor(url)) {
       throw new Http2UnavailableError(`${url.host} is not eligible for HTTP/2`);
     }
@@ -287,12 +292,14 @@ export class Http2SessionPool {
       key += `|pins:${createHash("sha256").update(pinWhitelist!.join(",")).digest("hex").slice(0, 16)}`;
     }
     if (clientCert !== undefined) key += `|cert:${clientCertIdentity(clientCert)}`;
+    if (tlsSni !== undefined) key += tlsSniPoolKeyFragment(tlsSni);
     let entry = this.entries.get(key);
     if (entry === undefined) {
       entry = {
         key, scheme, host, port, pinned,
         clientCert: clientCert !== undefined,
         pinWhitelist, verifiedPin: undefined, cert: clientCert,
+        tlsSni,
         session: undefined, connecting: undefined, cooldownUntil: 0,
         lastUsed: Date.now(),
       };
@@ -351,7 +358,14 @@ export class Http2SessionPool {
       const session =
         entry.scheme === "https"
           ? h2connect(authority, {
-              ALPNProtocols: ["h2"],
+              // WR-60: per-endpoint SNI/ALPN override; without an entry the
+              // historical ALPN offer (h2 only) and the origin host as SNI
+              // apply, exactly as before.
+              ALPNProtocols:
+                entry.tlsSni !== undefined ? [...entry.tlsSni.alpnProtocols] : ["h2"],
+              ...(entry.tlsSni?.servername !== undefined
+                ? { servername: entry.tlsSni.servername }
+                : {}),
               // Pinned origins use the pin as the trust anchor (same as
               // the HTTP/1.1 path); unpinned origins keep PKI verification.
               rejectUnauthorized: entry.pinWhitelist === undefined,

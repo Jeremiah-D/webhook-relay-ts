@@ -40,6 +40,12 @@ import {
   clientCertIdentity,
   type TlsClientCert,
 } from "./mtls.ts";
+import {
+  assertValidTlsSniOverride,
+  resolveTlsSniOverride,
+  type ResolvedTlsSniOverride,
+  type TlsSniOverride,
+} from "./tls-sni.ts";
 import { OutboundConnectionPool, type KeepAlivePoolOptions } from "./keepalive.ts";
 import {
   assertValidProxyUrl,
@@ -261,6 +267,30 @@ export interface RelayServerOptions {
    * startup.
    */
   tlsClientCerts?: Record<string, TlsClientCert>;
+  /**
+   * Per-endpoint outbound TLS SNI/ALPN overrides (WR-60, see
+   * `src/tls-sni.ts`): `{ "<exact targetUrl>": { servername?,
+   * alpnProtocols? } }`. `servername` is the SNI name sent in the TLS
+   * ClientHello and defaults to the target URL's host — set it explicitly
+   * for CDN / multi-tenant-fronting setups, either to present the real
+   * service name to the front or to keep the default SNI from leaking the
+   * real backend host. `alpnProtocols` is the ALPN offer in preference
+   * order and defaults to `["h2", "http/1.1"]`. Endpoints without an entry
+   * keep the exact current behavior (no `servername`/`ALPNProtocols` set —
+   * Node's defaults apply untouched). The override changes only the
+   * SNI/ALPN wire values: certificate verification still anchors on the
+   * target URL's host (or the `tlsPins` whitelist), and the keep-alive
+   * pool plus the H2 session pool key connections by the effective TLS
+   * identity, so a connection handshaked with one SNI can never serve an
+   * endpoint configured with a different one. Composes with `tlsPins`
+   * (the pin is verified on the overridden-SNI connection),
+   * `tlsClientCerts` (the client certificate rides the same handshake),
+   * the H2 pool, and proxied endpoints (the handshake runs over the
+   * CONNECT tunnel). Applies to `https:` targets; entry keys for other
+   * schemes, empty servernames, IP-literal servernames, and
+   * empty/malformed `alpnProtocols` throw `RangeError` at startup.
+   */
+  tlsSniOverrides?: Record<string, TlsSniOverride>;
   /**
    * Outbound gzip compression (see `src/gzip.ts`): per-endpoint opt-in,
    * keyed by exact delivery `targetUrl`. When the payload reaches
@@ -609,6 +639,15 @@ export interface RelayServerOptions {
  * so `x-relay-signature` covers the ciphertext wire bytes. Off by default;
  * endpoints without an entry are sent exactly as before. Invalid values
  * throw `RangeError` at startup.
+ *
+ * `tlsSniOverrides` is the per-endpoint outbound TLS SNI/ALPN override map
+ * (WR-60, see `src/tls-sni.ts` and the `tlsSniOverrides` server option):
+ * `{ "<exact targetUrl>": { servername?, alpnProtocols? } }`. `servername`
+ * defaults to the target URL's host, `alpnProtocols` to `["h2",
+ * "http/1.1"]`; endpoints without an entry behave exactly as before.
+ * Composes with `tlsPins`, `tlsClientCerts`, the keep-alive pool, the H2
+ * pool, and proxied endpoints. Invalid values throw `RangeError` at
+ * startup.
  */
 export interface PooledSender extends Sender {
   /** The keep-alive pool, or `undefined` when pooling is disabled. */
@@ -631,7 +670,8 @@ export function createDefaultSender(
   http2?: Http2PoolOptions,
   idempotencyKey?: IdempotencyKeyOptions,
   websocket?: WebSocketPoolOptions,
-  outboundEncryption?: Record<string, OutboundEncryptionConfig>
+  outboundEncryption?: Record<string, OutboundEncryptionConfig>,
+  tlsSniOverrides?: Record<string, TlsSniOverride>
 ): PooledSender {
   if (tlsPins !== undefined) {
     for (const [endpoint, pins] of Object.entries(tlsPins)) {
@@ -662,6 +702,31 @@ export function createDefaultSender(
       } catch (err) {
         throw new RangeError(
           `createDefaultSender: invalid TLS client certificate for ${endpoint}: ${(err as Error).message}`
+        );
+      }
+    }
+  }
+  // WR-60: RangeError on invalid values, at startup — never mid-handshake.
+  // `undefined` (feature off) is the common case. Entry keys must be
+  // `https:` URLs: SNI/ALPN only exist on the TLS handshake.
+  if (tlsSniOverrides !== undefined) {
+    for (const [endpoint, override] of Object.entries(tlsSniOverrides)) {
+      try {
+        assertValidTlsSniOverride(override, `tlsSniOverrides[${endpoint}]`);
+        let protocol: string;
+        try {
+          protocol = new URL(endpoint).protocol;
+        } catch {
+          throw new RangeError(`not a valid URL: ${endpoint}`);
+        }
+        if (protocol !== "https:") {
+          throw new RangeError(
+            `only https: targets support TLS SNI/ALPN overrides (got ${protocol})`
+          );
+        }
+      } catch (err) {
+        throw new RangeError(
+          `createDefaultSender: invalid TLS SNI override for ${endpoint}: ${(err as Error).message}`
         );
       }
     }
@@ -806,7 +871,8 @@ export function createDefaultSender(
     url: URL,
     pins: string[] | undefined,
     clientCert: TlsClientCert | undefined,
-    proxyUrl: string | undefined
+    proxyUrl: string | undefined,
+    tlsSni: ResolvedTlsSniOverride | undefined
   ): Promise<DownstreamResponse | void> =>
     new Promise((resolve, reject) => {
       // WR-54: time-to-first-byte — request-issued timestamp; the diff is
@@ -817,18 +883,20 @@ export function createDefaultSender(
       // `DownstreamResponse.timeToFirstByteMs` says so.
       const requestIssuedMs = Date.now();
       // Pooled keep-alive agent for this origin (dedicated agent per pin
-      // whitelist, per proxy, and per client identity, so a connection
-      // pinned, tunneled, or authenticated for one endpoint can never serve
-      // another's). With pooling disabled but a proxy configured, each
-      // delivery gets a one-off tunneled agent —
-      // fresh tunnel per delivery, destroyed when the request settles.
+      // whitelist, per proxy, per client identity, and per effective TLS
+      // identity, so a connection pinned, tunneled, authenticated, or
+      // handshaked for one endpoint can never serve another's). With
+      // pooling disabled but a proxy configured, each delivery gets a
+      // one-off tunneled agent — fresh tunnel per delivery, destroyed when
+      // the request settles.
       let oneOffAgent: HttpAgent | undefined;
       const agent =
         pool?.agentFor(
           url,
           pins,
           proxyUrl,
-          clientCert !== undefined ? clientCertIdentity(clientCert) : undefined
+          clientCert !== undefined ? clientCertIdentity(clientCert) : undefined,
+          tlsSni
         ) ??
         (proxyUrl !== undefined
           ? (oneOffAgent = createProxiedAgent(
@@ -897,6 +965,21 @@ export function createDefaultSender(
                 method: "POST",
                 agent: agent ?? false,
                 ...(pins ? { rejectUnauthorized: false } : {}),
+                // WR-60: per-endpoint TLS SNI/ALPN override. `servername`
+                // and `ALPNProtocols` flow through the agent's
+                // `createConnection` into `tls.connect` — the pooled
+                // `https.Agent`, the one-off agent, and the proxied tunnel
+                // agent all honor them (verified against Node v24). Without
+                // an entry nothing is set: Node's defaults apply, exactly
+                // as before.
+                ...(tlsSni !== undefined
+                  ? {
+                      ...(tlsSni.servername !== undefined
+                        ? { servername: tlsSni.servername }
+                        : {}),
+                      ALPNProtocols: [...tlsSni.alpnProtocols],
+                    }
+                  : {}),
                 // The client certificate rides the TLS handshake (per-request
                 // TLS options apply to connections the pooled agent opens;
                 // the pool key already binds this exact identity, so a
@@ -940,6 +1023,10 @@ export function createDefaultSender(
         return;
       }
       // Normalized once, up front, so the per-handshake path is a plain compare.
+      // WR-60 consistency: this socket comes from a pool agent keyed by the
+      // effective TLS identity, so the pin is always verified on the
+      // connection that was handshaked with the (possibly overridden) SNI —
+      // the check and the handshake cannot disagree about the peer.
       const allowed = pins.map(normalizePin);
       const verifyFreshPin = (tlsSocket: TLSSocket): void => {
         let presented: string;
@@ -1005,9 +1092,10 @@ export function createDefaultSender(
     item: RetryItem,
     url: URL,
     pins: string[] | undefined,
-    clientCert: TlsClientCert | undefined
+    clientCert: TlsClientCert | undefined,
+    tlsSni: ResolvedTlsSniOverride | undefined
   ): Promise<DownstreamResponse> => {
-    const session = await h2pool!.sessionFor(url, pins, clientCert);
+    const session = await h2pool!.sessionFor(url, pins, clientCert, tlsSni);
     h2pool!.acquireStream(session);
     try {
       const { headers, body } = buildWireRequest(item);
@@ -1068,6 +1156,13 @@ export function createDefaultSender(
     // downstream can verify the relay. Off by default — endpoints without
     // an entry send no client certificate, exactly as before.
     const clientCert = url.protocol === "https:" ? tlsClientCerts?.[item.targetUrl] : undefined;
+    // WR-60: per-endpoint TLS SNI/ALPN override (exact targetUrl match).
+    // `undefined` for endpoints without an entry — and for non-`https:`
+    // targets — keeps the exact current behavior.
+    const tlsSni =
+      url.protocol === "https:"
+        ? resolveTlsSniOverride(item.targetUrl, url, tlsSniOverrides)
+        : undefined;
     // Outbound proxy for this endpoint: explicit per-endpoint config
     // first, then the environment (read per delivery, so proxy rotation
     // needs no restart; `NO_PROXY` bypasses the env fallback only — an
@@ -1091,15 +1186,15 @@ export function createDefaultSender(
     // H2-level failure falls back to the HTTP/1.1 pool below: a delivery
     // is never lost because of H2.
     if (h2pool !== undefined && proxyUrl === undefined && h2pool.eligibleFor(url)) {
-      return deliverViaHttp2(item, url, pins, clientCert).catch((err) => {
+      return deliverViaHttp2(item, url, pins, clientCert, tlsSni).catch((err) => {
         if (err instanceof Http2UnavailableError) {
           h2pool!.noteFallback();
-          return deliverViaHttp1(item, url, pins, clientCert, proxyUrl);
+          return deliverViaHttp1(item, url, pins, clientCert, proxyUrl, tlsSni);
         }
         throw err;
       });
     }
-    return deliverViaHttp1(item, url, pins, clientCert, proxyUrl);
+    return deliverViaHttp1(item, url, pins, clientCert, proxyUrl, tlsSni);
   } as PooledSender;
   sender.pool = pool;
   sender.http2Pool = h2pool;
@@ -1277,7 +1372,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // the default sender only; an injected sender signs on its own.
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption)
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides)
       : undefined;
   // WR-50: endpoints the operator may pause/resume over HTTP. The server
   // only ever delivers to these — the intake target plus every
