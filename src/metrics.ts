@@ -36,6 +36,12 @@
  *   to wait for a relay-level global concurrency slot (WR-51). Present
  *   only when the cap is configured (finite). No endpoint label — the
  *   cap is relay-wide.
+ * - `relay_scheduled_total` / `relay_scheduled_due_total` /
+ *   `relay_scheduled_canceled_total`: counters of deliveries parked for a
+ *   future `deliver_at` (WR-57), of parked deliveries whose instant
+ *   arrived, and of parked deliveries canceled before it. Present only
+ *   once a delivery has actually been parked. No endpoint label — the
+ *   delay queue is relay-wide.
  *
  * Cardinality note: labels are per endpoint (`targetUrl`), so a relay
  * fanning out to many distinct downstream URLs grows the series count —
@@ -88,6 +94,8 @@ export interface MetricsInput {
   retryBudgetDepleted?: number;
   /** Present only when the relay-level global concurrency cap (WR-51) is configured (finite). */
   globalConcurrencyWaits?: number;
+  /** Present only once a delivery has been parked for a future deliver_at (WR-57). */
+  scheduled?: ScheduledMetricsInput;
 }
 
 /** One endpoint's starvation-guard activation count, in Prometheus label order. */
@@ -114,6 +122,16 @@ export interface ProbeMetricsInput {
   failure: number;
   /** Current consecutive-failure streak (0 once healthy). */
   consecutiveFailures: number;
+}
+
+/** One relay's scheduled-delivery counters (WR-57), in a fixed order. */
+export interface ScheduledMetricsInput {
+  /** Cumulative deliveries parked for a future deliver_at. */
+  scheduled: number;
+  /** Cumulative parked deliveries whose deliver_at arrived. */
+  due: number;
+  /** Cumulative parked deliveries canceled before their deliver_at. */
+  canceled: number;
 }
 
 /** Escape a label value per the Prometheus exposition format. */
@@ -220,6 +238,23 @@ export function renderPrometheus(input: MetricsInput): string {
     );
     lines.push("# TYPE relay_global_concurrency_wait_total counter");
     lines.push(`relay_global_concurrency_wait_total ${input.globalConcurrencyWaits}`);
+  }
+  if (input.scheduled !== undefined) {
+    lines.push(
+      "# HELP relay_scheduled_total Deliveries parked for a future deliver_at (WR-57)."
+    );
+    lines.push("# TYPE relay_scheduled_total counter");
+    lines.push(`relay_scheduled_total ${input.scheduled.scheduled}`);
+    lines.push(
+      "# HELP relay_scheduled_due_total Parked deliveries whose deliver_at arrived and entered the normal delivery path."
+    );
+    lines.push("# TYPE relay_scheduled_due_total counter");
+    lines.push(`relay_scheduled_due_total ${input.scheduled.due}`);
+    lines.push(
+      "# HELP relay_scheduled_canceled_total Parked deliveries canceled before their deliver_at."
+    );
+    lines.push("# TYPE relay_scheduled_canceled_total counter");
+    lines.push(`relay_scheduled_canceled_total ${input.scheduled.canceled}`);
   }
   return lines.join("\n") + "\n";
 }

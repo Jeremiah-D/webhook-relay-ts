@@ -13,6 +13,7 @@ import {
   type Verifier,
 } from "./verify.ts";
 import { RetryQueue, type DeliveryPriority, type DownstreamResponse, type RetryItem, type Sender } from "./retry.ts";
+import { parseDeliverAtHeader, DELIVER_AT_HEADER } from "./retry.ts";
 import type { CompletionCallbackOptions } from "./callback.ts";
 import { createBoundAddressSelfCheck } from "./callback.ts";
 import { TENANT_ID_HEADER, assertValidTenantId, tenantScopeKey } from "./tenant.ts";
@@ -1152,6 +1153,7 @@ function isOperatorPath(pathname: string): boolean {
     pathname === "/config/endpoint" ||
     pathname === "/endpoints/pause" ||
     pathname === "/endpoints/resume" ||
+    pathname === "/scheduled" ||
     pathname.startsWith("/deliveries/")
   );
 }
@@ -1555,6 +1557,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     const isConfigEndpoint = pathname === "/config/endpoint";
     const isEndpointsPause = pathname === "/endpoints/pause";
     const isEndpointsResume = pathname === "/endpoints/resume";
+    const isScheduledList = pathname === "/scheduled";
     const deliveryMatch = /^\/deliveries\/([^/]+)$/.exec(pathname);
     const replayMatch = /^\/dead-letter\/([^/]+)\/replay$/.exec(pathname);
     if (
@@ -1572,6 +1575,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       !isConfigEndpoint &&
       !isEndpointsPause &&
       !isEndpointsResume &&
+      !isScheduledList &&
       !deliveryMatch &&
       !replayMatch
     ) {
@@ -1594,6 +1598,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         (isConfigEndpoint && req.method === "POST") ||
         (isEndpointsPause && req.method === "POST") ||
         (isEndpointsResume && req.method === "POST") ||
+        (isScheduledList && req.method === "GET") ||
         (deliveryMatch && req.method === "GET") ||
         (replayMatch && req.method === "POST")
       )
@@ -1719,6 +1724,13 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
           params.get("tenant") ?? undefined
         )
       );
+      return;
+    }
+    if (isScheduledList) {
+      // WR-57: pending scheduled deliveries — operator metadata only
+      // (id, targetUrl, deliverAt, traceId, tenant, priority). The payload
+      // is never exposed here.
+      respondJson(res, 200, queue.getScheduled());
       return;
     }
     if (isAudit) {
@@ -2364,6 +2376,25 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     const priority: DeliveryPriority | undefined =
       priorityValue?.toLowerCase() === "urgent" ? "urgent" : undefined;
 
+    // Timed delivery (WR-57): `x-deliver-at` declares a future delivery
+    // time as epoch ms or an HTTP-date. An invalid value is a sender bug —
+    // answered 400 fail-fast, never enqueued (fail-fast placement: after
+    // signature verification and tenant validation, so unauthenticated
+    // callers learn nothing new). A past-due value takes the normal
+    // delivery path; the queue decides the parking, the check below only
+    // mirrors it for the 202 response and the audit event.
+    const deliverAtHeader = req.headers[DELIVER_AT_HEADER];
+    let deliverAt: number | undefined;
+    if (deliverAtHeader !== undefined) {
+      try {
+        deliverAt = parseDeliverAtHeader(deliverAtHeader);
+      } catch {
+        opts.auditLog.append({ event: "rejected", id, traceId, ...tenantLabel, reason: "invalid_deliver_at" });
+        res.writeHead(400, { "content-type": "text/plain" }).end("Invalid x-deliver-at");
+        return;
+      }
+    }
+
     queue.enqueue({
       id,
       traceId,
@@ -2374,6 +2405,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       targetUrl: opts.forwardUrl,
       headers: passthrough,
       ...(priority ? { priority } : {}),
+      ...(deliverAt !== undefined ? { deliverAt } : {}),
     });
     // Version intake accounting (WR-33): unversioned requests count under
     // "none" so the version mix is fully visible in the exposition.
@@ -2404,9 +2436,34 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     if (inboundGzip) acceptedEvent.contentEncoding = "gzip";
     if (opts.auditPayloads) acceptedEvent.payload = body;
     opts.auditLog.append(acceptedEvent);
+    // WR-57: the queue parked the delivery in the delay queue (a future
+    // deliver_at) — audit it as its own event so operators can query
+    // `GET /audit?event=scheduled`, and tell the sender when to expect it.
+    const scheduledAt = deliverAt !== undefined && queue.isScheduled(id) ? deliverAt : undefined;
+    if (scheduledAt !== undefined) {
+      opts.auditLog.append({
+        event: "scheduled",
+        id,
+        traceId,
+        ...tenantLabel,
+        targetUrl: opts.forwardUrl,
+        deliverAtMs: scheduledAt,
+        deliverAt: new Date(scheduledAt).toISOString(),
+      });
+    }
     res
       .writeHead(202, { "content-type": "application/json" })
-      .end(JSON.stringify({ id, traceId, status: "accepted", ...tenantLabel }));
+      .end(
+        JSON.stringify({
+          id,
+          traceId,
+          status: "accepted",
+          ...tenantLabel,
+          ...(scheduledAt !== undefined
+            ? { scheduled: true, deliverAt: new Date(scheduledAt).toISOString() }
+            : {}),
+        })
+      );
   };
 
   /**

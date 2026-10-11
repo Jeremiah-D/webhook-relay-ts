@@ -26,6 +26,16 @@ import {
 import { EndpointDeliveryWindow, parseDeliveryWindowSpec, type DeliveryWindowOptions, type DeliveryWindowStats } from "./delivery-window.ts";
 export { parseDeliveryWindowSpec, EndpointDeliveryWindow };
 export type { DeliveryWindowOptions, DeliveryWindowStats };
+import {
+  ScheduledDeliveryQueue,
+  parseDeliverAtHeader,
+  DELIVER_AT_HEADER,
+  type ScheduledQueueOptions,
+  type ScheduledStats,
+  type ScheduledDeliveryInfo,
+} from "./scheduled.ts";
+export { ScheduledDeliveryQueue, parseDeliverAtHeader, DELIVER_AT_HEADER };
+export type { ScheduledQueueOptions, ScheduledStats, ScheduledDeliveryInfo };
 import { EndpointQuota, type QuotaOptions, type QuotaStats } from "./quota.ts";
 import { RetryBudget, type RetryBudgetOptions } from "./retry-budget.ts";
 import {
@@ -144,6 +154,15 @@ export interface RetryItem {
    * so behavior matches the pre-tenant relay exactly.
    */
   tenantId?: string;
+  /**
+   * WR-57: future delivery time (epoch ms), from the inbound `x-deliver-at`
+   * header. When set and in the future, the item is parked in the
+   * deliver_at delay queue instead of entering the normal path: nothing is
+   * attempted and nothing is consumed (no attempt, no retry budget, no
+   * quota, no circuit verdict) until the instant arrives. A past-due value
+   * takes the normal path like any other delivery.
+   */
+  deliverAt?: number;
   /**
    * WR-44: attempts consumed *before* the in-flight dispatch (0-based),
    * maintained by the queue on its stored entry. The queue hands the
@@ -839,6 +858,15 @@ export interface RetryQueueOptions {
    * `opts.retry.deliveryWindow` on the relay server.
    */
   deliveryWindow?: DeliveryWindowOptions;
+  /**
+   * Timed delivery (WR-57; see `src/scheduled.ts`): clock/timer injection
+   * for the deliver_at delay queue. The feature itself is always on — an
+   * inbound `x-deliver-at` header parks the delivery until its instant —
+   * these options only make the scheduler deterministic in tests.
+   * Reachable over HTTP via the `x-deliver-at` request header on the
+   * relay server.
+   */
+  scheduled?: ScheduledQueueOptions;
 }
 
 /**
@@ -1485,6 +1513,13 @@ export class RetryQueue {
    * of the downstream, not of the sender.
    */
   private readonly deliveryWindow?: EndpointDeliveryWindow;
+  /**
+   * WR-57: the deliver_at delay queue. Always available (the header is a
+   * per-request contract); `opts.scheduled` only injects the clock and
+   * timers for deterministic tests. Starts disarmed; `start()` arms it.
+   */
+  private readonly scheduler: ScheduledDeliveryQueue;
+  private readonly scheduledNow: () => number;
   /** Attempts parked outside an endpoint's delivery window. Keyed by scoped key (WR-48). */
   private readonly deliveryWindowStats = new Map<string, Map<string, number>>();
   /**
@@ -1632,6 +1667,15 @@ export class RetryQueue {
     if (opts.deliveryWindow !== undefined) {
       this.deliveryWindow = new EndpointDeliveryWindow(opts.deliveryWindow);
     }
+    // WR-57: the deliver_at delay queue is always on; the option only
+    // injects clock/timers (the module validates their shapes).
+    this.scheduledNow = opts.scheduled?.now ?? Date.now;
+    this.scheduler = new ScheduledDeliveryQueue({
+      now: this.scheduledNow,
+      setTimer: opts.scheduled?.setTimer,
+      clearTimer: opts.scheduled?.clearTimer,
+      onDue: (items) => this.releaseScheduled(items),
+    });
     // Wrap the caller's state-change hook so the metrics gauge always sees
     // the latest circuit state, even when nobody subscribes to the hook.
     // The wrapper is installed per tenant instance in `breakerFor()`.
@@ -2231,13 +2275,22 @@ export class RetryQueue {
   }
 
   enqueue(item: RetryItem): void {
-    if (this.queue.has(item.id) || this.batcher?.has(item.id)) {
+    if (this.queue.has(item.id) || this.batcher?.has(item.id) || this.scheduler.has(item.id)) {
       throw new Error(`Duplicate item id: ${item.id}`);
     }
     // Mint the trace ID up front so even batch-buffered items (which skip
     // `enqueueNow` until flush) carry one, and `flushBatch` can correlate
     // the merged delivery back to its members.
     const traced: RetryItem = { ...item, traceId: item.traceId ?? newTraceId() };
+    // WR-57: a future deliver_at parks the item in the delay queue instead
+    // of entering the normal path — no batching (a batch window would blur
+    // the per-event deliver_at), no attempt counting, and no budget, quota,
+    // or circuit consumption until the instant arrives. A past-due value
+    // falls through to the normal path below.
+    if (traced.deliverAt !== undefined && traced.deliverAt > this.scheduledNow()) {
+      this.scheduler.park(traced);
+      return;
+    }
     // The urgent lane is never batched: an urgent delivery must go out
     // immediately, not wait for a batch window.
     if (this.batcher && traced.priority !== "urgent") {
@@ -2245,6 +2298,52 @@ export class RetryQueue {
       return;
     }
     this.enqueueNow(traced);
+  }
+
+  /**
+   * WR-57: the delay queue hands due items back. Each enters the normal
+   * path via `enqueueNow` — the accepted→delivered latency clock starts
+   * here (the parking delay is by design, not lateness, exactly like the
+   * WR-09 batch window), attempt counting starts at the first *actual*
+   * dispatch, and retry / dead-letter / circuit / quota / budget plus the
+   * SSE delivery-event stream all apply from here.
+   */
+  private releaseScheduled(items: RetryItem[]): void {
+    for (const item of items) {
+      this.enqueueNow(item);
+    }
+  }
+
+  /**
+   * Cancel a parked deliver_at delivery (WR-57): the item is dropped from
+   * the delay queue and will never be delivered. Returns `true` on a real
+   * cancellation, `false` for an unknown id — including ids that already
+   * fired or were never scheduled.
+   */
+  cancelScheduled(id: string): boolean {
+    return this.scheduler.cancel(id);
+  }
+
+  /** True when `id` is currently parked in the deliver_at delay queue (WR-57). */
+  isScheduled(id: string): boolean {
+    return this.scheduler.has(id);
+  }
+
+  /**
+   * Pending scheduled deliveries (WR-57), earliest deliver_at first:
+   * operator metadata only (id, targetUrl, deliverAt, traceId, tenant,
+   * priority) — the payload is never exposed.
+   */
+  getScheduled(): ScheduledDeliveryInfo[] {
+    return this.scheduler.list();
+  }
+
+  /**
+   * Scheduled-delivery counters (WR-57): currently parked (`pending`) plus
+   * cumulative parked / released-due / canceled.
+   */
+  getScheduledStats(): ScheduledStats {
+    return this.scheduler.stats();
   }
 
   private enqueueNow(item: RetryItem): void {
@@ -2291,12 +2390,18 @@ export class RetryQueue {
     this.autoReplayer?.start();
     // Opt-in only: undefined when `probe` was never configured.
     this.prober?.start();
+    // WR-57: arm the deliver_at delay queue — parked items whose instant
+    // already passed while stopped fire immediately (past-due semantics).
+    this.scheduler.arm();
   }
 
   stop(): void {
     this.autoReplayer?.stop();
     this.prober?.stop();
     this.callbacker?.stop();
+    // WR-57: disarm the delay-queue timer but keep the heap — parked items
+    // stay parked with their absolute deliver_at; the next start() re-arms.
+    this.scheduler.disarm();
     this.running = false;
     for (const [id, s] of this.timers) {
       this.clearTimer(s.handle);
@@ -2354,6 +2459,10 @@ export class RetryQueue {
     this.autoReplayer?.stop();
     // Same for the health prober: no new probe rounds mid-shutdown.
     this.prober?.stop();
+    // WR-57: parked-but-not-due deliveries are dropped, exactly like
+    // backoff-waiting ones — they were never delivered. (The delay queue
+    // is in-memory only; a restart does not recover it either.)
+    this.scheduler.clear();
     this.running = false;
     for (const [id, s] of this.timers) {
       this.clearTimer(s.handle);
@@ -3104,7 +3213,10 @@ export class RetryQueue {
    * (`relay_retry_budget_depleted_total`) when the WR-38 budget is enabled,
    * and the global-concurrency wait counter
    * (`relay_global_concurrency_wait_total`) when the WR-51 cap is
-   * configured.
+   * configured, and the scheduled-delivery counters
+   * (`relay_scheduled_total`, `relay_scheduled_due_total`,
+   * `relay_scheduled_canceled_total`) once a delivery has actually been
+   * parked for a future deliver_at (WR-57).
    */
   renderMetrics(): string {
     // WR-48: counters are keyed by (tenant, endpoint); the tenant becomes
@@ -3169,6 +3281,10 @@ export class RetryQueue {
     // switched; absent entirely when failover is unconfigured or never
     // fired.
     const failover: FailoverMetricsInput[] = [...this.failoverSwitchCounts.values()];
+    // WR-57: the scheduled-delivery counters appear once a delivery has
+    // actually been parked — activity-gated, like the starvation-guard
+    // series, so an untouched relay's exposition is unchanged.
+    const scheduledStats = this.scheduler.stats();
     return renderPrometheus({
       deliveries,
       circuits,
@@ -3183,6 +3299,16 @@ export class RetryQueue {
       // counters.
       ...(this.globalMaxConcurrent !== Infinity
         ? { globalConcurrencyWaits: this.globalGate.waitedTotal() }
+        : {}),
+      // WR-57: activity-gated (see above).
+      ...(scheduledStats.scheduled > 0
+        ? {
+            scheduled: {
+              scheduled: scheduledStats.scheduled,
+              due: scheduledStats.due,
+              canceled: scheduledStats.canceled,
+            },
+          }
         : {}),
     });
   }

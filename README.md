@@ -699,6 +699,74 @@ curl -X POST http://127.0.0.1:PORT/endpoints/pause \
   (attempt counts survive through the durable queue; the remaining
   backoff does not).
 
+## Scheduled delivery (deliver_at)
+
+Timed delivery: an inbound event may declare a future delivery time via
+the `x-deliver-at` header — a decimal epoch-ms integer or an HTTP-date
+(IMF-fixdate / RFC 850 / asctime, e.g. `Sun, 11 Oct 2026 09:00:00 GMT`).
+Until that instant arrives the delivery is *parked* in an in-memory delay
+queue (a min-heap ordered by `deliverAt`, with exactly one timer armed
+for the head). A past-due value takes the normal delivery path, like any
+other event.
+
+```sh
+curl -X POST http://127.0.0.1:PORT/ \
+  -H "x-signature: <hmac>" \
+  -H "x-deliver-at: 1791234000000" \
+  -H "content-type: application/json" \
+  -d '{"order":"ord_123"}'
+# → 202 { id, traceId, status: "accepted", scheduled: true,
+#         deliverAt: "2026-10-11T09:00:00.000Z" }
+```
+
+```ts
+queue.cancelScheduled("evt_123"); // → true: parked item dropped, never delivered
+queue.cancelScheduled("unknown"); // → false
+queue.getScheduled();             // pending items, earliest deliverAt first
+queue.getScheduledStats();        // { pending, scheduled, due, canceled }
+```
+
+```sh
+curl http://127.0.0.1:PORT/scheduled \
+  -H "Authorization: Bearer $OPERATOR_TOKEN"
+# → 200 [{ id, targetUrl, deliverAt, deliverAtIso, traceId, tenant?, priority? }]
+# 403 without the token · 404 when operator endpoints are disabled (fail closed)
+```
+
+- **Parking consumes nothing** — a parked delivery is not attempted and
+  costs no attempt, no retry-budget token (WR-38), no quota token (WR-15),
+  no circuit-breaker verdict (WR-10), and no backoff timer or jitter
+  (WR-02). Attempt counting starts at the first *actual* dispatch, so a
+  delivery parked for a day still gets its full `maxAttempts` when its
+  instant arrives.
+- **Due means normal** — when the instant arrives the item enters the
+  standard path, so retry, dead-letter, circuit, quota, retry budget, and
+  the SSE delivery events (`delivered` / `retrying` / `dead_letter`) all
+  apply from the first real attempt. An invalid `x-deliver-at` is a sender
+  bug: answered 400 fail-fast, audited as `rejected` with reason
+  `invalid_deliver_at`, never enqueued.
+- **Operator visibility** — `GET /scheduled` lists pending scheduled
+  deliveries as metadata only (the payload is never exposed); parking is
+  audited as `scheduled` (queryable via `GET /audit?event=scheduled`).
+  `queue.cancelScheduled(id)` drops a parked item; unknown ids return
+  `false`.
+- **In-memory only, honestly** — the delay queue is *not* journaled: a
+  restart does not recover parked deliveries (orthogonal to the WR-49
+  durable queue, which still journals a delivery once its instant arrives
+  and it enters the normal path). `stop()` keeps parked items and re-arms
+  on `start()`; `shutdown()` drops parked-but-not-due items exactly like
+  backoff-waiting ones — they were never delivered.
+- **Timer hygiene** — the single arming timer is unref'd, so a far-future
+  `deliver_at` never pins the process open; delays beyond `2^31 - 1` ms
+  are clamped and re-armed instead of overflowing `setTimeout`. The clock
+  is injectable (`retry.scheduled.now` / `setTimer` / `clearTimer`) for
+  deterministic tests.
+- **Observability** — `relay_scheduled_total`,
+  `relay_scheduled_due_total`, and `relay_scheduled_canceled_total`
+  (present once a delivery has actually been parked); scheduled items
+  bypass batching, since a batch window would blur the per-event
+  deliver_at.
+
 ## Relay-level global concurrency cap
 
 `maxConcurrentPerEndpoint` bounds in-flight deliveries *per downstream*;
