@@ -222,6 +222,18 @@ reliability primitives that matter for any signed-payload pipeline.
   smuggle a forged relay signature downstream. The config applies to the
   default sender only — an injected sender signs (or doesn't) on its own.
   Invalid values throw `RangeError` at startup.
+- Outbound end-to-end encryption (`outboundEncryption`, off by default,
+  WR-58): per endpoint, `{ "<exact targetUrl>": { publicKey } }` with the
+  downstream's base64 X25519 public key (mint with `generateX25519KeyPair()`
+  from `src/e2ee.ts`; the private half never leaves the downstream).
+  Sealed deliveries carry `x-relay-encryption: x25519-hkdf-sha256/aes-256-gcm`
+  and a JSON envelope (fresh ephemeral X25519 keypair + HKDF-SHA256 +
+  AES-256-GCM per delivery); the downstream opens it with
+  `unsealOutboundPayload()`. Sealing runs after compression and before
+  signing, so `x-relay-signature` covers the ciphertext wire bytes —
+  authenticity from the relay, secrecy for the downstream, orthogonal by
+  design. Endpoints without a key are sent exactly as before. Invalid keys
+  throw `RangeError` at startup.
 - Outbound idempotency-key stamping (`outboundIdempotencyKey`, off by default,
   WR-44): when `enabled`, every delivery made by the default sender carries
   `x-relay-idempotency-key` — the HMAC-SHA256 of `(event id, attempt)` under
@@ -899,6 +911,47 @@ payment-webhook JSON, Node v24.20.0 / AMD EPYC 9D25):
 | ratio | 0.228 (**4.4x smaller**) |
 
 gzip p50: ~34µs per payload — negligible next to a network round trip.
+
+## Outbound end-to-end encryption
+
+Deliveries to sensitive downstreams can be sealed end-to-end per endpoint
+(opt-in), so the payload is opaque to everything between the relay and the
+downstream — including TLS-terminating proxies:
+
+```ts
+import { generateX25519KeyPair } from "./src/e2ee.ts";
+
+// once, on the downstream's side — the private half never leaves it
+const downstream = generateX25519KeyPair();
+
+const server = createRelayServer({
+  secret, forwardUrl, auditLog,
+  outboundEncryption: {
+    "https://downstream/hook": { publicKey: downstream.publicKey }, // base64 X25519
+  },
+});
+```
+
+- **Seal** — per delivery, the sender mints a fresh ephemeral X25519
+  keypair, runs ECDH against the downstream's public key, expands the
+  shared secret with HKDF-SHA256 into an AES-256-GCM content key, and
+  seals the (possibly gzipped) wire body under a fresh random IV. The
+  sealed body is a JSON envelope stamped with
+  `x-relay-encryption: x25519-hkdf-sha256/aes-256-gcm`; the downstream
+  opens it with its private key via `unsealOutboundPayload()` (same
+  module). `node:crypto` only — zero dependencies.
+- **Order** — sealing happens *after* compression (the envelope records
+  the pre-seal `content-encoding`, so the HTTP `content-encoding` header
+  is dropped — the wire bytes are the envelope, not the gzip stream) and
+  *before* signing, so `x-relay-signature` (WR-26) covers the ciphertext
+  wire bytes: authenticity from the relay, secrecy for the downstream,
+  orthogonal as designed.
+- **Fail-fast** — an invalid configured key (bad base64, wrong length,
+  not an X25519 point) throws `RangeError` at startup, never
+  mid-delivery; endpoints without a key are sent exactly as before.
+- **Tamper-evident** — the AES-GCM auth tag makes any modification (or a
+  wrong private key) fail `unsealOutboundPayload` loudly; it never
+  returns garbage silently.
 
 ## Delivery lifecycle
 

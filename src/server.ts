@@ -54,6 +54,13 @@ import {
   type Http2PoolOptions,
 } from "./http2.ts";
 import { WebSocketPool, type WebSocketPoolOptions } from "./websocket.ts";
+import {
+  E2EE_ALGORITHM,
+  E2EE_HEADER,
+  parseX25519PublicKey,
+  sealOutboundPayload,
+} from "./e2ee.ts";
+import type { KeyObject } from "node:crypto";
 import type { AuditLog } from "./audit.ts";
 import { DeliveryEventArchiver } from "./event-archive.ts";
 import { buildDeliverySnapshot } from "./delivery-status.ts";
@@ -345,6 +352,17 @@ export interface RelayServerOptions {
    */
   outboundSigning?: OutboundSigningConfig;
   /**
+   * Per-endpoint outbound end-to-end encryption (WR-58, see
+   * `OutboundEncryptionConfig` and `src/e2ee.ts`): `{ "<exact targetUrl>":
+   * { publicKey } }`, where `publicKey` is the downstream's base64 X25519
+   * public key. Sealed deliveries carry
+   * `x-relay-encryption: x25519-hkdf-sha256/aes-256-gcm` and the
+   * `x-relay-signature` (WR-26) still covers the ciphertext wire bytes.
+   * Off by default; applies to the default sender only. Invalid values
+   * throw `RangeError`.
+   */
+  outboundEncryption?: Record<string, OutboundEncryptionConfig>;
+  /**
    * Outbound idempotency-key stamping (WR-44, see `IdempotencyKeyOptions`
    * in `src/idempotency-key.ts`): when `enabled`, every delivery made by
    * the default sender carries `x-relay-idempotency-key` — the
@@ -584,6 +602,13 @@ export interface RelayServerOptions {
  * `src/deflate.ts`). Invalid values throw `RangeError` at startup. The
  * returned sender carries the pool as `.wsPool` and closes it via
  * `.destroy()` alongside the other pools.
+ *
+ * `outboundEncryption` is the per-endpoint end-to-end encryption map (WR-58,
+ * see `OutboundEncryptionConfig` and `src/e2ee.ts`): `{ "<exact targetUrl>":
+ * { publicKey } }`. Sealing happens after compression and before signing,
+ * so `x-relay-signature` covers the ciphertext wire bytes. Off by default;
+ * endpoints without an entry are sent exactly as before. Invalid values
+ * throw `RangeError` at startup.
  */
 export interface PooledSender extends Sender {
   /** The keep-alive pool, or `undefined` when pooling is disabled. */
@@ -605,7 +630,8 @@ export function createDefaultSender(
   compressOutbound?: Record<string, CompressOutboundOptions>,
   http2?: Http2PoolOptions,
   idempotencyKey?: IdempotencyKeyOptions,
-  websocket?: WebSocketPoolOptions
+  websocket?: WebSocketPoolOptions,
+  outboundEncryption?: Record<string, OutboundEncryptionConfig>
 ): PooledSender {
   if (tlsPins !== undefined) {
     for (const [endpoint, pins] of Object.entries(tlsPins)) {
@@ -662,6 +688,25 @@ export function createDefaultSender(
       throw new RangeError("createDefaultSender: `outboundSigning.keyId` must be a non-empty string");
     }
   }
+  // WR-58: RangeError on invalid values, at startup — never mid-delivery.
+  // `undefined` (feature off) is the common case. Parsed keys are cached
+  // so the per-delivery seal only does the ECDH + AEAD, never re-parse.
+  let e2eeKeys: Map<string, KeyObject> | undefined;
+  if (outboundEncryption !== undefined) {
+    e2eeKeys = new Map();
+    for (const [endpoint, cfg] of Object.entries(outboundEncryption)) {
+      try {
+        if (cfg === null || typeof cfg !== "object" || typeof cfg.publicKey !== "string") {
+          throw new RangeError(`outboundEncryption[${endpoint}].publicKey must be a base64 X25519 public key string`);
+        }
+        e2eeKeys.set(endpoint, parseX25519PublicKey(cfg.publicKey, `outboundEncryption[${endpoint}].publicKey`));
+      } catch (err) {
+        throw new RangeError(
+          `createDefaultSender: invalid outboundEncryption for ${endpoint}: ${(err as Error).message}`
+        );
+      }
+    }
+  }
   // RangeError on invalid values, at startup — never mid-delivery.
   // `undefined` (feature off) is the common case.
   let idempotencyKeyCfg: ResolvedIdempotencyKeyConfig | undefined;
@@ -709,10 +754,24 @@ export function createDefaultSender(
       item.payload,
       compressOutbound?.[item.targetUrl]
     );
+    // WR-58: per-endpoint end-to-end encryption. Seals the (possibly
+    // compressed) wire body with the downstream's X25519 public key BEFORE
+    // signing, so `x-relay-signature` covers the ciphertext wire bytes —
+    // exactly what the downstream receives and verifies. The envelope
+    // carries the pre-seal content encoding (WR-40), so the HTTP
+    // `content-encoding` header is dropped when a body is sealed: the wire
+    // bytes are the JSON envelope, not the gzip stream. Endpoints without
+    // a configured key behave exactly as before.
+    const e2eeKey = e2eeKeys?.get(item.targetUrl);
+    let body = wireBody;
+    if (e2eeKey !== undefined) {
+      body = sealOutboundPayload(wireBody, e2eeKey, contentEncoding);
+      headers[E2EE_HEADER] = E2EE_ALGORITHM;
+    }
     if (outboundSigning !== undefined) {
       // Stamp AFTER the passthrough headers: this guarantees the relay's
       // own signature always wins.
-      headers["x-relay-signature"] = signSha256(wireBody, outboundSigning.secret);
+      headers["x-relay-signature"] = signSha256(body, outboundSigning.secret);
       if (outboundSigning.keyId !== undefined) headers["x-relay-key-id"] = outboundSigning.keyId;
     }
     if (idempotencyKeyCfg !== undefined) {
@@ -730,9 +789,11 @@ export function createDefaultSender(
         idempotencyKeyCfg.keyPrefix
       );
     }
-    if (contentEncoding !== undefined) headers["content-encoding"] = contentEncoding;
-    headers["content-length"] = String(wireBody.length);
-    return { headers, body: wireBody };
+    // WR-58: a sealed body is the JSON envelope, not the gzip stream — the
+    // pre-seal encoding travels inside the envelope instead.
+    if (contentEncoding !== undefined && e2eeKey === undefined) headers["content-encoding"] = contentEncoding;
+    headers["content-length"] = String(body.length);
+    return { headers, body };
   };
 
   /**
@@ -1119,6 +1180,27 @@ export interface OutboundSigningConfig {
 }
 
 /**
+ * Per-endpoint outbound end-to-end encryption material (WR-58, see
+ * `src/e2ee.ts`). When an endpoint has an entry, the default sender seals
+ * the (possibly compressed) wire body with the downstream's X25519 public
+ * key *before* signing, so `x-relay-signature` (WR-26) covers the
+ * ciphertext wire bytes. The sealed request carries
+ * `x-relay-encryption: x25519-hkdf-sha256/aes-256-gcm`; the downstream
+ * opens it with its private key (`unsealOutboundPayload` in `src/e2ee.ts`).
+ * Endpoints without an entry behave exactly as before. Disabled by
+ * default. Invalid values throw `RangeError` at startup.
+ */
+export interface OutboundEncryptionConfig {
+  /**
+   * The downstream's X25519 public key: base64 of the raw 32-byte key.
+   * Generate with `generateX25519KeyPair()` from `src/e2ee.ts` — the
+   * private half stays with the downstream and is never given to the
+   * relay.
+   */
+  publicKey: string;
+}
+
+/**
  * The value `createRelayServer` returns: the intake plane's `http.Server`
  * (bound by the caller with `listen()`, like the legacy single-plane
  * return), plus — only when `operatorPort` is configured — the relay-bound
@@ -1195,7 +1277,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // the default sender only; an injected sender signs on its own.
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey)
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption)
       : undefined;
   // WR-50: endpoints the operator may pause/resume over HTTP. The server
   // only ever delivers to these — the intake target plus every
@@ -1216,7 +1298,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     if (validators !== undefined && typeof validators === "object") {
       for (const endpoint of Object.keys(validators)) knownEndpoints.add(endpoint);
     }
-    for (const record of [opts.tlsPins, opts.tlsClientCerts, opts.compressOutbound, opts.proxies]) {
+    for (const record of [opts.tlsPins, opts.tlsClientCerts, opts.compressOutbound, opts.proxies, opts.outboundEncryption]) {
       if (record) for (const endpoint of Object.keys(record)) knownEndpoints.add(endpoint);
     }
     for (const endpoint of opts.retry?.probe?.endpoints ?? []) knownEndpoints.add(endpoint);
