@@ -18,6 +18,7 @@ import type { CompletionCallbackOptions } from "./callback.ts";
 import { createBoundAddressSelfCheck } from "./callback.ts";
 import { TENANT_ID_HEADER, assertValidTenantId, tenantScopeKey } from "./tenant.ts";
 import type { AutoReplayOptions } from "./autoreplay.ts";
+import type { DeadLetterRetentionOptions } from "./deadletter-retention.ts";
 import { HttpDeliveryError, parseRetryAfterMs } from "./failure.ts";
 import { installGracefulShutdown } from "./shutdown.ts";
 import { SourceBaselineDetector, type SourceBaselineOptions } from "./source-baseline.ts";
@@ -435,10 +436,10 @@ export interface RelayServerOptions {
   outboundIdempotencyKey?: IdempotencyKeyOptions;
   /**
    * Bearer token guarding the operator endpoints (`GET /dead-letter`,
-   * `POST /dead-letter/:id/replay`, `POST /dead-letter/replay`,
-   * the `/dead-letter/auto-replay/*` controls, `GET /audit`,
-   * `GET /latency`, `GET /events`, `GET /metrics`,
-   * `GET /deliveries/:traceId`). When unset, those
+   * `GET /dead-letter/stats`, `POST /dead-letter/:id/replay`,
+   * `POST /dead-letter/replay`, the `/dead-letter/auto-replay/*`
+   * controls, `GET /audit`, `GET /latency`, `GET /events`,
+   * `GET /metrics`, `GET /deliveries/:traceId`). When unset, those
    * endpoints are disabled and answer 404 (fail closed).
    */
   operatorToken?: string;
@@ -466,6 +467,20 @@ export interface RelayServerOptions {
    * is the only behavior unless the operator opts in.
    */
   autoReplay?: AutoReplayOptions;
+  /**
+   * Dead-letter retention TTL (WR-64; see `src/deadletter-retention.ts`
+   * and the `deadLetterRetention` `RetryQueue` option): per-endpoint
+   * opt-in TTL in ms after which dead letters are auto-purged by a
+   * background sweep, auditing each purge as `dead_letter_purged`
+   * (`id`/`endpoint`/`attempts`/`deadLetteredAt` — never the payload).
+   * Purges skip entries claimed by an in-progress WR-23 batch replay or
+   * WR-31 auto-replay round, and are journaled when the durable queue is
+   * on, so a purged entry never resurrects after a restart. Off by
+   * default — dead letters live until replayed manually. Invalid values
+   * throw `RangeError` at startup. Stats are served at
+   * `GET /dead-letter/stats`.
+   */
+  deadLetterRetention?: DeadLetterRetentionOptions;
   /**
    * Delivery completion callbacks (WR-47; see `src/callback.ts`). Opt-in:
    * when a delivery reaches a terminal state (`delivered` or
@@ -1617,6 +1632,15 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       opts.auditLog.append(event);
       opts.retry?.onAutoReplayAudit?.(event);
     },
+    // An explicit server-level `deadLetterRetention` wins over the nested
+    // `retry.deadLetterRetention`; either way the queue owns the sweeper.
+    deadLetterRetention: opts.deadLetterRetention ?? opts.retry?.deadLetterRetention,
+    // Wrap the caller's hook so every retention purge is audited as
+    // `dead_letter_purged`, not just observed.
+    onDeadLetterPurged: (event) => {
+      opts.auditLog.append(event);
+      opts.retry?.onDeadLetterPurged?.(event);
+    },
     // An explicit server-level `probe` wins over the nested `retry.probe`;
     // either way the queue owns the prober. Wrap the caller's hook so
     // every probe outcome worth auditing lands in the audit log.
@@ -1915,6 +1939,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       return;
     }
     const isList = pathname === "/dead-letter";
+    const isStats = pathname === "/dead-letter/stats";
     const isBatchReplay = pathname === "/dead-letter/replay";
     const isAudit = pathname === "/audit";
     const isLatency = pathname === "/latency";
@@ -1933,6 +1958,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     const replayMatch = /^\/dead-letter\/([^/]+)\/replay$/.exec(pathname);
     if (
       !isList &&
+      !isStats &&
       !isBatchReplay &&
       !isAudit &&
       !isLatency &&
@@ -1956,6 +1982,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     if (
       !(
         (isList && req.method === "GET") ||
+        (isStats && req.method === "GET") ||
         (isBatchReplay && req.method === "POST") ||
         (isAudit && req.method === "GET") ||
         (isLatency && req.method === "GET") ||
@@ -2184,6 +2211,12 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
             encrypted: e.encryptedPayload !== undefined,
           }))
       );
+      return;
+    }
+    if (isStats) {
+      // WR-64: dead-letter observability — live entries, retention
+      // purges so far, and live entries per logical endpoint.
+      respondJson(res, 200, queue.getDeadLetterStats());
       return;
     }
     if (isAutoStatus || isAutoPause || isAutoResume || isAutoTrigger) {

@@ -609,7 +609,12 @@ reliability primitives that matter for any signed-payload pipeline.
   (see *Dead-letter auto-replay* below) replays the whole list on a timer
   with identical fresh-budget semantics, controlled by
   `POST /dead-letter/auto-replay/pause|resume|trigger` and observed via
-  `GET /dead-letter/auto-replay/status`. The same guard protects
+  `GET /dead-letter/auto-replay/status`. The opt-in `deadLetterRetention`
+  server option (see *Dead-letter retention* below) auto-purges dead
+  letters past their per-endpoint TTL on a background sweep — each purge
+  audited as `dead_letter_purged` with metadata only, never the payload —
+  and exposes `{ total, purged, byEndpoint }` at
+  `GET /dead-letter/stats`. The same guard protects
   `GET /audit` (`?endpoint=`, `?event=` repeatable, `?since=`/`?until=` ISO-8601,
   `?limit=`), which queries the audit log through its index — delivery
   forensics per endpoint and time range.
@@ -1477,6 +1482,41 @@ The round timer is unref'd, so a configured scheduler never pins the
 process open, and `RetryQueue.stop()` / `shutdown()` cancel any pending
 round — a round never fires mid-shutdown and re-queues dead letters the
 operator expected to stay parked.
+
+### Dead-letter retention
+
+Opt-in TTL-based cleanup of the dead-letter list (`src/deadletter-retention.ts`):
+with `deadLetterRetention` configured —
+`createRelayServer({ ..., deadLetterRetention: { retentionMs: { "https://pay.example/hook": 86_400_000 } } })`
+(or `retry.deadLetterRetention` on a raw queue) — a background sweep every
+`sweepIntervalMs` (default 60s, unref'd) purges entries dead-lettered longer
+ago than their endpoint's TTL. `retentionMs` is per-endpoint opt-in: a
+record of exact `targetUrl` → TTL purges only the listed endpoints (the
+same exact-match convention as `responseValidators`), a plain number applies
+one TTL to every endpoint. Off by default — dead letters live until
+replayed manually — and invalid values throw `RangeError` at construction.
+
+**Safety.** Each purge is audited as `dead_letter_purged` carrying only
+operator metadata — `id`, `endpoint`, `attempts`, `deadLetteredAt` — plus
+the standard correlation fields (`traceId`, `tenant`); the payload is
+never exposed, not even as metadata, and sealed entries are purged sealed.
+The TTL is keyed by the *logical* endpoint (an entry dead-lettered on a
+failover standby is governed by its configured primary's TTL, the same
+convention as the batch-replay filter). A purge skips entries currently
+claimed by an in-progress WR-23 batch replay or WR-31 auto-replay round,
+so a sweep never deletes an entry out from under a replay — the next
+sweep picks it up if it is still expired. With the durable queue enabled
+the purge is journaled, so a purged entry never resurrects after a
+restart. `RetryQueue.stop()` / `shutdown()` disarm the sweep: nothing is
+purged mid-shutdown.
+
+**Operator surface** (same Bearer <redacted>, fail closed to 404 without
+`operatorToken`):
+
+- `GET /dead-letter/stats` — `{ total, purged, byEndpoint }`: live
+  entries, entries auto-purged since startup, and live entries per
+  logical endpoint.
+- `GET /audit?event=dead_letter_purged` — the per-purge audit trail.
 
 ### Delivery event archive
 

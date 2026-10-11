@@ -16,6 +16,9 @@
  * - `dead_letter` — the item moved to the dead-letter list (full entry).
  * - `replayed`  — a dead letter was re-queued; the dead-letter line is
  *                 superseded (the re-queued item gets its own `enqueue`).
+ * - `purged`    — a dead letter was auto-purged by the retention sweep
+ *                 (WR-64); the dead-letter line is superseded and the
+ *                 entry is never resurrected by recovery.
  *
  * Recovery folds the lines in order; the latest line per id wins. A
  * restored retry resumes with its *remaining* backoff (`nextAt - now`,
@@ -96,7 +99,8 @@ export type QueueJournalLine =
   | { v: 1; op: "retry"; id: string; attempt: number; nextAt: number }
   | { v: 1; op: "delivered"; id: string }
   | { v: 1; op: "dead_letter"; id: string; entry: JournalDeadLetter }
-  | { v: 1; op: "replayed"; id: string };
+  | { v: 1; op: "replayed"; id: string }
+  | { v: 1; op: "purged"; id: string };
 
 /** One live item recovered from the journal. */
 export interface RecoveredItem {
@@ -253,6 +257,11 @@ export class QueueJournal {
     this.append({ v: 1, op: "replayed", id });
   }
 
+  /** A dead letter was auto-purged by the retention sweep (WR-64). */
+  appendPurged(id: string): void {
+    this.append({ v: 1, op: "purged", id });
+  }
+
   /**
    * Fold the journal into live items + dead letters. Malformed lines,
    * unknown ops, and payloads that no longer decrypt (e.g. the encryptor
@@ -359,6 +368,11 @@ export class QueueJournal {
           break;
         }
         case "replayed":
+          dead.delete(line.id);
+          break;
+        case "purged":
+          // A retention purge is terminal: the entry must not resurrect
+          // on recovery, exactly like a replayed one.
           dead.delete(line.id);
           break;
         default:

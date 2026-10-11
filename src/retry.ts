@@ -3,6 +3,13 @@ import {
   type AutoReplayOptions,
   type DeadLetterAutoReplayAuditEvent,
 } from "./autoreplay.ts";
+import {
+  DeadLetterRetentionSweeper,
+  resolveRetentionTtl,
+  type DeadLetterPurgeResult,
+  type DeadLetterPurgedEvent,
+  type DeadLetterRetentionOptions,
+} from "./deadletter-retention.ts";
 import { EndpointCircuitBreaker, type CircuitBreakerOptions, type CircuitState, type CircuitStats } from "./circuit.ts";
 import {
   DownstreamProber,
@@ -128,6 +135,13 @@ export {
 } from "./adaptive-backoff.ts";
 export type { BatchEnvelopeInput, BatchOptions };
 export type { AutoReplayOptions, DeadLetterAutoReplayAuditEvent };
+export type {
+  DeadLetterRetentionOptions,
+  DeadLetterPurgedEvent,
+  DeadLetterPurgeInfo,
+  DeadLetterPurgeResult,
+};
+export { DeadLetterRetentionSweeper, resolveRetentionTtl };
 
 /**
  * Delivery priority of an item.
@@ -547,6 +561,16 @@ export interface DeadLetterBatchReplayResult {
   failed: DeadLetterReplayFailure[];
 }
 
+/** Dead-letter observability snapshot (see {@link RetryQueue.getDeadLetterStats}). */
+export interface DeadLetterStats {
+  /** Entries currently live in the dead-letter list. */
+  total: number;
+  /** Entries auto-purged by the retention sweep (WR-64) since construction. */
+  purged: number;
+  /** Live entries per logical endpoint (first-seen order). */
+  byEndpoint: Array<{ endpoint: string; count: number }>;
+}
+
 export interface RetryQueueOptions {
   /** Sender function; defaults to a no-op success sender. Injectable for tests. */
   sender?: Sender;
@@ -901,6 +925,28 @@ export interface RetryQueueOptions {
    * relay server.
    */
   scheduled?: ScheduledQueueOptions;
+  /**
+   * Dead-letter retention TTL (WR-64; see
+   * `src/deadletter-retention.ts`): per-endpoint opt-in TTL in ms —
+   * `retentionMs` as a number (every endpoint) or a record of exact
+   * `targetUrl` -> TTL (only listed endpoints). A background sweep every
+   * `sweepIntervalMs` (default 60s, unref'd) purges entries older than
+   * their endpoint's TTL, auditing each as `dead_letter_purged`
+   * (id/endpoint/attempts/deadLetteredAt — never the payload) and
+   * skipping entries currently claimed by a WR-23 batch replay or the
+   * WR-31 auto-replay. Disabled by default: dead letters live until
+   * replayed manually. Invalid values throw `RangeError` at
+   * construction. Reachable over HTTP via the `deadLetterRetention`
+   * server option; stats via `getDeadLetterStats()` /
+   * `GET /dead-letter/stats`.
+   */
+  deadLetterRetention?: DeadLetterRetentionOptions;
+  /**
+   * Called once per dead-letter entry auto-purged by the retention
+   * sweep. The server audits these as `dead_letter_purged`; library
+   * users get the hook directly.
+   */
+  onDeadLetterPurged?: (event: DeadLetterPurgedEvent) => void;
 }
 
 /**
@@ -1597,6 +1643,39 @@ export class RetryQueue {
   private readonly deliveryEventListeners = new Set<(e: DeliveryEvent) => void>();
   /** Opt-in dead-letter auto-replay scheduler; undefined when disabled. */
   private readonly autoReplayer?: DeadLetterAutoReplayer;
+  /** WR-64: opt-in dead-letter retention sweeper; undefined when disabled. */
+  private readonly retentionSweeper?: DeadLetterRetentionSweeper;
+  /**
+   * Dead-letter ids currently claimed by a replay operation (WR-23
+   * batch replay, including the WR-31 auto-replay, which runs through
+   * the same batch replay), with claim counts. The retention sweep
+   * skips claimed ids so a purge never deletes an entry out from under
+   * an in-progress replay. Counted because a batch replay claims every
+   * matched id for its whole run while the per-entry replay inside it
+   * claims/releases its own id — the batch-level claim must survive the
+   * inner release.
+   */
+  private readonly deadLetterReplayInFlight = new Map<string, number>();
+
+  /** Claim a dead-letter id against retention purges (ref-counted). */
+  private claimReplay(id: string): void {
+    this.deadLetterReplayInFlight.set(id, (this.deadLetterReplayInFlight.get(id) ?? 0) + 1);
+  }
+
+  /** Release one replay claim on a dead-letter id. */
+  private releaseReplay(id: string): void {
+    const n = (this.deadLetterReplayInFlight.get(id) ?? 1) - 1;
+    if (n <= 0) this.deadLetterReplayInFlight.delete(id);
+    else this.deadLetterReplayInFlight.set(id, n);
+  }
+
+  /** Whether any replay operation currently claims the id. */
+  private isClaimedByReplay(id: string): boolean {
+    return this.deadLetterReplayInFlight.has(id);
+  }
+  /** Entries auto-purged by the retention sweep since construction. */
+  private deadLetterPurged = 0;
+  private readonly onDeadLetterPurged?: (event: DeadLetterPurgedEvent) => void;
   private readonly prober?: DownstreamProber;
   /** WR-39: active/standby target selection; undefined when not configured. */
   private readonly failover?: FailoverManager;
@@ -1688,6 +1767,7 @@ export class RetryQueue {
       });
     this.clearTimer = opts.clearTimer ?? ((h) => h.clear());
     this.onDeadLetter = opts.onDeadLetter;
+    this.onDeadLetterPurged = opts.onDeadLetterPurged;
     this.onDelivered = opts.onDelivered;
     this.onConfigChange = opts.onConfigChange;
     this.onEndpointPaused = opts.onEndpointPaused;
@@ -1856,6 +1936,19 @@ export class RetryQueue {
         ...opts.autoReplay,
         replayAll: () => this.replayDeadLetters(),
         onAudit: opts.onAutoReplayAudit,
+      });
+    }
+    if (opts.deadLetterRetention !== undefined) {
+      // The sweeper validates eagerly (illegal values throw RangeError)
+      // but only arms when a TTL is actually configured.
+      this.retentionSweeper = new DeadLetterRetentionSweeper({
+        ...opts.deadLetterRetention,
+        owner: {
+          listEntries: () => this.deadLetter,
+          removeEntry: (id) => this.removeDeadLetterEntry(id),
+          isClaimedByReplay: (id) => this.isClaimedByReplay(id),
+          onPurged: (event) => this.onDeadLetterPurged?.(event),
+        },
       });
     }
     if (opts.probe !== undefined) {
@@ -2187,22 +2280,29 @@ export class RetryQueue {
    * retry it again after fixing the cause.
    */
   replayDeadLetter(id: string): boolean {
-    const idx = this.deadLetter.findIndex((e) => e.id === id);
-    if (idx < 0) return false;
-    const [entry] = this.deadLetter.splice(idx, 1);
+    // Claim the id for the whole synchronous run so the retention sweep
+    // (WR-64) never purges the entry out from under an in-progress replay.
+    this.claimReplay(id);
     try {
-      this.requeueDeadLetter(entry);
-    } catch (err) {
-      // The entry was already removed from the list: put it back so a
-      // failed replay never loses the dead letter.
-      this.deadLetter.splice(Math.min(idx, this.deadLetter.length), 0, entry);
-      throw err;
+      const idx = this.deadLetter.findIndex((e) => e.id === id);
+      if (idx < 0) return false;
+      const [entry] = this.deadLetter.splice(idx, 1);
+      try {
+        this.requeueDeadLetter(entry);
+      } catch (err) {
+        // The entry was already removed from the list: put it back so a
+        // failed replay never loses the dead letter.
+        this.deadLetter.splice(Math.min(idx, this.deadLetter.length), 0, entry);
+        throw err;
+      }
+      // WR-49: the re-queued item journaled its own `enqueue` inside
+      // requeueDeadLetter; this line supersedes the `dead_letter` line.
+      this.durable?.appendReplayed(id);
+      this.compactDurable();
+      return true;
+    } finally {
+      this.releaseReplay(id);
     }
-    // WR-49: the re-queued item journaled its own `enqueue` inside
-    // requeueDeadLetter; this line supersedes the `dead_letter` line.
-    this.durable?.appendReplayed(id);
-    this.compactDurable();
-    return true;
   }
 
   /** Re-queue a dead-letter entry that has already been removed from the list. */
@@ -2249,6 +2349,63 @@ export class RetryQueue {
       if (this.replayDeadLetter(id)) replayed += 1;
     }
     return replayed;
+  }
+
+  /**
+   * Run one dead-letter retention sweep immediately (WR-64): purge every
+   * entry whose per-endpoint TTL has expired, skipping entries currently
+   * claimed by a WR-23 batch replay or the WR-31 auto-replay. Each purge
+   * is journaled (WR-49) and reported via `onDeadLetterPurged`. The
+   * armed sweep timer calls this on its schedule; calling it directly is
+   * safe and does not disturb the schedule. Returns
+   * `{ purged: [], skipped: [] }` when retention is not configured.
+   */
+  purgeExpiredDeadLetters(): DeadLetterPurgeResult {
+    return this.retentionSweeper?.sweepNow() ?? { purged: [], skipped: [] };
+  }
+
+  /**
+   * The opt-in dead-letter retention sweeper, or `undefined` when no
+   * `deadLetterRetention` option was configured.
+   */
+  getRetentionSweeper(): DeadLetterRetentionSweeper | undefined {
+    return this.retentionSweeper;
+  }
+
+  /**
+   * Dead-letter observability snapshot: live entry count, entries
+   * auto-purged by the retention sweep since construction, and live
+   * entries per logical endpoint (first-seen order). Served over HTTP
+   * as `GET /dead-letter/stats`.
+   */
+  getDeadLetterStats(): DeadLetterStats {
+    const byEndpoint = new Map<string, number>();
+    for (const e of this.deadLetter) {
+      const endpoint = e.failoverEndpoint ?? e.targetUrl;
+      byEndpoint.set(endpoint, (byEndpoint.get(endpoint) ?? 0) + 1);
+    }
+    return {
+      total: this.deadLetter.length,
+      purged: this.deadLetterPurged,
+      byEndpoint: [...byEndpoint].map(([endpoint, count]) => ({ endpoint, count })),
+    };
+  }
+
+  /**
+   * Remove a dead-letter entry for retention purging (WR-64). Journaled
+   * (WR-49: the `purged` line supersedes the `dead_letter` line, so a
+   * restarted process never resurrects the entry) and counted toward
+   * `getDeadLetterStats().purged`. Returns the removed entry, or
+   * `undefined` when the id is already gone.
+   */
+  private removeDeadLetterEntry(id: string): DeadLetterEntry | undefined {
+    const idx = this.deadLetter.findIndex((e) => e.id === id);
+    if (idx < 0) return undefined;
+    const [entry] = this.deadLetter.splice(idx, 1);
+    this.durable?.appendPurged(id);
+    this.deadLetterPurged += 1;
+    this.compactDurable();
+    return entry;
   }
 
   /** Dead-letter entries matching `filter`, in dead-letter order. */
@@ -2304,41 +2461,52 @@ export class RetryQueue {
         payloadBytes: e.payloadBytes,
       }));
     }
-    // Group by endpoint (first-seen order): each endpoint's backlog is
-    // replayed together so the downstream pressure stays grouped instead
-    // of interleaved across endpoints.
-    const groups = new Map<string, DeadLetterEntry[]>();
-    for (const entry of this.matchDeadLetters(filter)) {
-      const group = groups.get(entry.targetUrl);
-      if (group) group.push(entry);
-      else groups.set(entry.targetUrl, [entry]);
-    }
-    const replayed: string[] = [];
-    const failed: DeadLetterReplayFailure[] = [];
-    const seen = new Set<string>();
-    for (const entries of groups.values()) {
-      for (const entry of entries) {
-        seen.add(entry.id);
-        try {
-          if (this.replayDeadLetter(entry.id)) {
-            replayed.push(entry.id);
-          } else {
-            failed.push({ id: entry.id, error: "dead-letter entry no longer present" });
+    // WR-64: claim every matched id for the whole batch so the retention
+    // sweep skips them — the sweep can never interleave inside this
+    // synchronous loop, but the claim is what a reentrant caller (e.g. a
+    // decrypt hook that sweeps mid-batch) observes. The WR-31 auto-replay
+    // runs through this same method, so its rounds are covered too.
+    const matched = this.matchDeadLetters(filter);
+    for (const entry of matched) this.claimReplay(entry.id);
+    try {
+      // Group by endpoint (first-seen order): each endpoint's backlog is
+      // replayed together so the downstream pressure stays grouped instead
+      // of interleaved across endpoints.
+      const groups = new Map<string, DeadLetterEntry[]>();
+      for (const entry of matched) {
+        const group = groups.get(entry.targetUrl);
+        if (group) group.push(entry);
+        else groups.set(entry.targetUrl, [entry]);
+      }
+      const replayed: string[] = [];
+      const failed: DeadLetterReplayFailure[] = [];
+      const seen = new Set<string>();
+      for (const entries of groups.values()) {
+        for (const entry of entries) {
+          seen.add(entry.id);
+          try {
+            if (this.replayDeadLetter(entry.id)) {
+              replayed.push(entry.id);
+            } else {
+              failed.push({ id: entry.id, error: "dead-letter entry no longer present" });
+            }
+          } catch (err) {
+            failed.push({ id: entry.id, error: err instanceof Error ? err.message : String(err) });
           }
-        } catch (err) {
-          failed.push({ id: entry.id, error: err instanceof Error ? err.message : String(err) });
         }
       }
-    }
-    // Like the single-item endpoint (which 404s on an unknown id), report
-    // requested ids that match nothing instead of silently ignoring them —
-    // a typo in `ids` should be visible, not invisible.
-    if (filter.ids !== undefined) {
-      for (const id of filter.ids) {
-        if (!seen.has(id)) failed.push({ id, error: "unknown dead-letter id" });
+      // Like the single-item endpoint (which 404s on an unknown id), report
+      // requested ids that match nothing instead of silently ignoring them —
+      // a typo in `ids` should be visible, not invisible.
+      if (filter.ids !== undefined) {
+        for (const id of filter.ids) {
+          if (!seen.has(id)) failed.push({ id, error: "unknown dead-letter id" });
+        }
       }
+      return { replayed, failed };
+    } finally {
+      for (const entry of matched) this.releaseReplay(entry.id);
     }
-    return { replayed, failed };
   }
 
   enqueue(item: RetryItem): void {
@@ -2455,6 +2623,9 @@ export class RetryQueue {
     // Opt-in only: undefined when `autoReplay` was never configured, and
     // a no-op when constructed with `enabled: false`.
     this.autoReplayer?.start();
+    // Opt-in only: undefined when `deadLetterRetention` was never
+    // configured, and a no-op when no TTL is set.
+    this.retentionSweeper?.start();
     // Opt-in only: undefined when `probe` was never configured.
     this.prober?.start();
     // WR-57: arm the deliver_at delay queue — parked items whose instant
@@ -2464,6 +2635,7 @@ export class RetryQueue {
 
   stop(): void {
     this.autoReplayer?.stop();
+    this.retentionSweeper?.stop();
     this.prober?.stop();
     this.callbacker?.stop();
     // WR-57: disarm the delay-queue timer but keep the heap — parked items
@@ -2524,6 +2696,10 @@ export class RetryQueue {
     // timer is unref'd anyway; this is about not doing work, not process
     // lifetime.
     this.autoReplayer?.stop();
+    // Same for the retention sweep: no purges mid-shutdown — an entry
+    // whose TTL expired during the drain window stays visible for the
+    // operator's post-mortem instead of vanishing.
+    this.retentionSweeper?.stop();
     // Same for the health prober: no new probe rounds mid-shutdown.
     this.prober?.stop();
     // WR-57: parked-but-not-due deliveries are dropped, exactly like
