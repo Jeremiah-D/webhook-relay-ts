@@ -86,7 +86,14 @@ reliability primitives that matter for any signed-payload pipeline.
   choice when many deliveries fail at once); the random source is injectable
   (`random`) so jitter bounds are testable, and invalid configs
   (non-positive base/cap, `maxAttempts < 1`, negative jitter) throw
-  `RangeError`. Dead-lettered items carry `attempts`, `lastError`, and
+  `RangeError`. The opt-in adaptive backoff (`adaptiveBackoff`, WR-59,
+  off by default) scales the backoff *base* per endpoint from recent
+  delivery outcomes — consecutive retryable failures double it toward
+  `maxBaseMs`, successes halve it back toward `minBaseMs` — while the
+  exponent, jitter strategy, and cap keep working as before; it composes
+  orthogonally with the global retry budget (WR-38, which gates first),
+  and `getAdaptiveBackoffStats()` exposes each endpoint's current base.
+  Dead-lettered items carry `attempts`, `lastError`, and
   `deadLetteredAt`, and can be re-queued with a fresh attempt budget via
   `replayDeadLetter(id)` / `replayAllDeadLetters()`. Per-endpoint concurrency
   is capped with `maxConcurrentPerEndpoint` (default unlimited): at most N
@@ -996,7 +1003,12 @@ written to the audit log, so the log is the machine's trace.
 - `delivering` → **`retrying`** when the attempt fails (non-2xx, timeout,
   or connection error). The next attempt is scheduled after
   `baseDelayMs * 2^attempt` plus jitter, capped at `maxDelayMs`, then the
-  item goes back to `delivering`. When the circuit breaker is enabled and
+  item goes back to `delivering`. With the opt-in adaptive backoff
+  (`retry.adaptiveBackoff`), the *base* itself adapts per endpoint:
+  consecutive retryable failures double it toward `maxBaseMs` (a sick
+  downstream is retried progressively less often), successes halve it
+  back toward `minBaseMs` (recovery is quick); the current base per
+  endpoint is exposed via `queue.getAdaptiveBackoffStats()`. When the circuit breaker is enabled and
   the endpoint's circuit is open, the attempt is *parked* instead: it is
   rescheduled after the remaining cooldown without consuming the retry
   budget (still `delivering`, audited via `circuit_open` on the trip).

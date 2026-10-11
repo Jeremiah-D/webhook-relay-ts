@@ -39,6 +39,11 @@ export type { ScheduledQueueOptions, ScheduledStats, ScheduledDeliveryInfo };
 import { EndpointQuota, type QuotaOptions, type QuotaStats } from "./quota.ts";
 import { RetryBudget, type RetryBudgetOptions } from "./retry-budget.ts";
 import {
+  AdaptiveBackoffController,
+  type AdaptiveBackoffEndpointStats,
+  type AdaptiveBackoffOptions,
+} from "./adaptive-backoff.ts";
+import {
   BatchCollector,
   newBatchId,
   resolveBatchOptions,
@@ -113,6 +118,14 @@ export type { EndpointLatencyStats, LatencyTrackerOptions };
 export type { QuotaOptions, QuotaStats };
 export type { RetryBudgetOptions } from "./retry-budget.ts";
 export { RetryBudget, DEFAULT_RETRY_BUDGET_PER_MINUTE } from "./retry-budget.ts";
+export type { AdaptiveBackoffOptions, AdaptiveBackoffEndpointStats } from "./adaptive-backoff.ts";
+export {
+  AdaptiveBackoffController,
+  DEFAULT_ADAPTIVE_MIN_BASE_MS,
+  DEFAULT_ADAPTIVE_MAX_BASE_MS,
+  DEFAULT_ADAPTIVE_UP_FACTOR,
+  DEFAULT_ADAPTIVE_DOWN_FACTOR,
+} from "./adaptive-backoff.ts";
 export type { BatchEnvelopeInput, BatchOptions };
 export type { AutoReplayOptions, DeadLetterAutoReplayAuditEvent };
 
@@ -539,6 +552,19 @@ export interface RetryQueueOptions {
   jitterMs?: number;
   /** Jitter strategy; see {@link JitterStrategy}. Default: "additive". */
   jitterStrategy?: JitterStrategy;
+  /**
+   * Adaptive backoff (WR-59; see `src/adaptive-backoff.ts`): scales the
+   * exponential backoff's *base* per endpoint from recent delivery
+   * outcomes — consecutive retryable failures double it toward
+   * `maxBaseMs`, successes halve it back toward `minBaseMs`. The
+   * exponent, jitter strategy (WR-02), and `maxDelayMs` cap are
+   * untouched. Composes orthogonally with the global retry budget
+   * (WR-38): the budget gate runs before the backoff is computed, so a
+   * budget-parked retry waits on the budget, not on an inflated base.
+   * Disabled by default (absent = the classic fixed-base backoff).
+   * Invalid values throw `RangeError` at construction.
+   */
+  adaptiveBackoff?: AdaptiveBackoffOptions;
   /**
    * Random source in [0, 1) used for jitter; defaults to `Math.random`.
    * Injectable so tests can verify jitter bounds deterministically.
@@ -1533,6 +1559,10 @@ export class RetryQueue {
   private readonly onSemanticFailure?: (info: SemanticFailureInfo) => void;
   /** WR-38: global retry budget; undefined when disabled. */
   private readonly retryBudget?: RetryBudget;
+  /** WR-59: adaptive backoff options; undefined when disabled. */
+  private readonly adaptiveBackoffOpts?: AdaptiveBackoffOptions;
+  /** WR-59: per-tenant adaptive backoff controllers (WR-48 scoping). */
+  private readonly adaptiveBackoffs = new Map<string, AdaptiveBackoffController>();
   private readonly onRetryBudgetDepleted?: (info: RetryBudgetDepletedInfo) => void;
   private readonly onAttemptFailed?: (info: AttemptFailedInfo) => void;
   /** Retries parked because the global retry budget was exhausted. */
@@ -1780,6 +1810,15 @@ export class RetryQueue {
         ? new RetryBudget(opts.retryBudget.retriesPerMinute, opts.retryBudget.now ?? Date.now)
         : undefined;
     this.onRetryBudgetDepleted = opts.onRetryBudgetDepleted;
+    // WR-59: opt-in adaptive backoff. The default tenant's controller is
+    // created eagerly so invalid options throw at construction, never
+    // mid-delivery; other tenants' controllers stay lazy (WR-48). The
+    // resting base is read live from `baseDelayMs`, so a WR-32 hot-reload
+    // of the fixed base stays in sync for endpoints with no outcomes yet.
+    this.adaptiveBackoffOpts = opts.adaptiveBackoff;
+    if (opts.adaptiveBackoff !== undefined) {
+      this.adaptiveBackoffFor(undefined);
+    }
     this.onAttemptFailed = opts.onAttemptFailed;
     this.onBatch = opts.onBatch;
     const histBuckets = opts.metrics?.histogramBucketsMs ?? [50, 100, 250, 500, 1000, 2500, 5000, 10000];
@@ -1930,6 +1969,23 @@ export class RetryQueue {
   }
 
   /**
+   * WR-59: the calling tenant's adaptive backoff controller; `undefined`
+   * when adaptive backoff is disabled. Outcomes are keyed by the physical
+   * target — the same key the circuit breaker uses — so the base tracks
+   * the downstream that was actually hit.
+   */
+  private adaptiveBackoffFor(tenant: string | undefined): AdaptiveBackoffController | undefined {
+    if (this.adaptiveBackoffOpts === undefined) return undefined;
+    const key = tenantInstanceKey(tenant);
+    let c = this.adaptiveBackoffs.get(key);
+    if (c === undefined) {
+      c = new AdaptiveBackoffController(() => this.baseDelayMs, this.adaptiveBackoffOpts);
+      this.adaptiveBackoffs.set(key, c);
+    }
+    return c;
+  }
+
+  /**
    * WR-48: default-tenant views of the per-tenant instances, preserving the
    * pre-tenant private field names (`breaker`, `quota`, `limiter`,
    * `latency`) that white-box tests reach for. New code should use the
@@ -1946,6 +2002,9 @@ export class RetryQueue {
   }
   private get latency(): LatencyTracker | undefined {
     return this.latencyFor(undefined);
+  }
+  private get adaptiveBackoff(): AdaptiveBackoffController | undefined {
+    return this.adaptiveBackoffFor(undefined);
   }
 
   private recordQuotaStat(tenant: string | undefined, endpoint: string): void {
@@ -2506,14 +2565,27 @@ export class RetryQueue {
     return this.inFlight.size;
   }
 
-  /** Backoff for the *next* retry given the completed attempt index (0-based). */
-  delayForAttempt(attempt: number): number {
-    const cap = Math.min(this.maxDelayMs, this.baseDelayMs * 2 ** attempt);
+  /**
+   * Backoff for the *next* retry given the completed attempt index (0-based).
+   *
+   * WR-59: with adaptive backoff enabled and an `endpoint` given, the base
+   * is the endpoint's current adaptive base (per its recent delivery
+   * outcomes); otherwise the configured fixed base. `tenant` selects the
+   * tenant's controller (WR-48); omit it for the default tenant. The
+   * global retry budget (WR-38) gates before this is computed — the two
+   * compose orthogonally.
+   */
+  delayForAttempt(attempt: number, endpoint?: string, tenant?: string): number {
+    const base =
+      endpoint !== undefined
+        ? (this.adaptiveBackoffFor(tenant)?.baseFor(endpoint) ?? this.baseDelayMs)
+        : this.baseDelayMs;
+    const cap = Math.min(this.maxDelayMs, base * 2 ** attempt);
     if (this.jitterStrategy === "full") {
       return this.random() * cap;
     }
     const jitter = this.jitterMs > 0 ? this.random() * this.jitterMs : 0;
-    return Math.min(this.maxDelayMs, this.baseDelayMs * 2 ** attempt + jitter);
+    return Math.min(this.maxDelayMs, base * 2 ** attempt + jitter);
   }
 
   /** Current backoff parameters (reflects any hot-reload updates). */
@@ -2853,6 +2925,9 @@ export class RetryQueue {
           }
         }
         breaker?.recordSuccess(target);
+        // WR-59: a delivered attempt cools the endpoint's adaptive base
+        // toward the floor.
+        this.adaptiveBackoffFor(tenant)?.recordOutcome(target, true);
         this.failover?.recordOutcome(logicalEndpoint, target, true);
         // WR-49: journal before the in-memory delete — a crash between the
         // two redelivers (at-least-once), never loses.
@@ -2930,6 +3005,9 @@ export class RetryQueue {
           // requires). Failover agrees: an answering target is a healthy
           // target.
           breaker?.recordSuccess(target);
+          // WR-59: the downstream answered (poison payload, not a sick
+          // endpoint) — cools the adaptive base like any success.
+          this.adaptiveBackoffFor(tenant)?.recordOutcome(target, true);
           this.failover?.recordOutcome(logicalEndpoint, target, true);
           this.recordDelivery(tenant, target, "failed");
           entry.attempt += 1;
@@ -2937,6 +3015,9 @@ export class RetryQueue {
           return;
         }
         breaker?.recordFailure(target);
+        // WR-59: a retryable failure heats the endpoint's adaptive base
+        // toward the ceiling.
+        this.adaptiveBackoffFor(tenant)?.recordOutcome(target, false);
         this.failover?.recordOutcome(logicalEndpoint, target, false);
         this.recordDelivery(tenant, target, "failed");
         entry.attempt += 1;
@@ -2959,7 +3040,7 @@ export class RetryQueue {
                 this.recordUrgentStat(target, "throttled");
                 entry.priority = "normal";
               }
-              retryDelayMs = this.delayForAttempt(entry.attempt);
+              retryDelayMs = this.delayForAttempt(entry.attempt, target, tenant);
             }
           }
           this.recordDelivery(tenant, target, "retried");
@@ -3520,6 +3601,25 @@ export class RetryQueue {
     return this.retryBudget === undefined
       ? undefined
       : { retriesPerMinute: this.retryBudget.limit(), depleted: this.retryBudgetDepleted };
+  }
+
+  /**
+   * WR-59: per-(tenant, endpoint) adaptive backoff state — the current
+   * backoff base each endpoint's recent outcomes have earned. `undefined`
+   * when adaptive backoff is disabled. Rows carry `tenant` only when set.
+   * Endpoints with no recorded outcomes are absent: they use the resting
+   * base (`baseDelayMs`, hot-reload aware).
+   */
+  getAdaptiveBackoffStats(): AdaptiveBackoffEndpointStats[] | undefined {
+    if (this.adaptiveBackoffOpts === undefined) return undefined;
+    const rows: AdaptiveBackoffEndpointStats[] = [];
+    for (const [tenantKey, controller] of this.adaptiveBackoffs) {
+      const tenant = tenantKey === "" ? undefined : tenantKey;
+      for (const row of controller.stats()) {
+        rows.push(tenant === undefined ? row : { ...row, tenant });
+      }
+    }
+    return rows;
   }
 
   /** Durable delivery queue (WR-49) snapshot. */
