@@ -141,7 +141,7 @@ describe("ScheduledDeliveryQueue", () => {
     await t.step();
     assert.deepEqual(due, ["a", "tie2", "tie1", "b", "c"]);
     assert.equal(t.pendingCount(), 0); // heap drained
-    assert.deepEqual(q.stats(), { pending: 0, scheduled: 5, due: 5, canceled: 0 });
+    assert.deepEqual(q.stats(), { pending: 0, scheduled: 5, due: 5, canceled: 0, recurring: 0, fired: 0 });
   });
 
   it("re-arms when an earlier item is parked, and keeps one timer", async () => {
@@ -176,7 +176,7 @@ describe("ScheduledDeliveryQueue", () => {
     now += 5000;
     await t.step();
     assert.deepEqual(due, ["y"]); // x never fires
-    assert.deepEqual(q.stats(), { pending: 0, scheduled: 2, due: 1, canceled: 1 });
+    assert.deepEqual(q.stats(), { pending: 0, scheduled: 2, due: 1, canceled: 1, recurring: 0, fired: 0 });
   });
 
   it("canceling the only item disarms the timer", () => {
@@ -238,7 +238,7 @@ describe("ScheduledDeliveryQueue", () => {
     q.clear(); // shutdown(): parked-but-not-due items are dropped
     assert.equal(q.pendingCount(), 0);
     assert.equal(t.pendingCount(), 0);
-    assert.deepEqual(q.stats(), { pending: 0, scheduled: 0, due: 0, canceled: 0 });
+    assert.deepEqual(q.stats(), { pending: 0, scheduled: 0, due: 0, canceled: 0, recurring: 0, fired: 0 });
   });
 
   it("clamps far-future delays instead of overflowing setTimeout", async () => {
@@ -473,7 +473,7 @@ describe("RetryQueue scheduled delivery (WR-57)", () => {
     assert.equal(q.cancelScheduled("k1"), true);
     assert.equal(q.cancelScheduled("k1"), false); // already canceled
     assert.equal(q.cancelScheduled("never-was"), false);
-    assert.deepEqual(q.getScheduledStats(), { pending: 1, scheduled: 2, due: 0, canceled: 1 });
+    assert.deepEqual(q.getScheduledStats(), { pending: 1, scheduled: 2, due: 0, canceled: 1, recurring: 0, fired: 0 });
     now += 2000;
     await t.step(); // k2 due
     await t.step(); // k2 delivered; k1 never fires
@@ -507,7 +507,7 @@ describe("RetryQueue scheduled delivery (WR-57)", () => {
     });
     assert.equal(list[1].tenant, "t9");
     for (const e of list) assert.ok(!("payload" in e));
-    assert.deepEqual(q.getScheduledStats(), { pending: 2, scheduled: 2, due: 0, canceled: 0 });
+    assert.deepEqual(q.getScheduledStats(), { pending: 2, scheduled: 2, due: 0, canceled: 0, recurring: 0, fired: 0 });
     q.stop();
   });
 

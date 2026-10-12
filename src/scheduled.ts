@@ -24,6 +24,8 @@
  */
 
 import type { RetryItem } from "./retry.ts";
+import { newTraceId } from "./trace.ts";
+import { parseCronExpression, nextCronOccurrence, type CronExpression } from "./cron.ts";
 
 /** Inbound header declaring a future delivery time. */
 export const DELIVER_AT_HEADER = "x-deliver-at";
@@ -89,12 +91,25 @@ export interface ScheduledDeliveryInfo {
   traceId: string;
   /** Tenant id (WR-48); absent for the default tenant. */
   tenant?: string;
-  /** Absolute delivery time, epoch ms. */
-  deliverAt: number;
-  /** ISO-8601 rendering of `deliverAt`. */
-  deliverAtIso: string;
+  /** Absolute delivery time, epoch ms. One-shot (WR-57) only. */
+  deliverAt?: number;
+  /** ISO-8601 rendering of `deliverAt`. One-shot (WR-57) only. */
+  deliverAtIso?: string;
   /** Delivery lane; present only when set. */
   priority?: RetryItem["priority"];
+  /**
+   * WR-80: present and true for cron-recurring schedules. Recurring
+   * entries carry `cron` / `nextAt` instead of `deliverAt`.
+   */
+  recurring?: boolean;
+  /** Original cron expression text; present when `recurring`. */
+  cron?: string;
+  /** Next fire instant, epoch ms; present when `recurring`. */
+  nextAt?: number;
+  /** ISO-8601 rendering of `nextAt`; present when `recurring`. */
+  nextAtIso?: string;
+  /** True when the schedule is paused; present when `recurring`. */
+  paused?: boolean;
 }
 
 /** Scheduled-delivery counters: currently parked plus cumulative. */
@@ -107,6 +122,10 @@ export interface ScheduledStats {
   due: number;
   /** Cumulative parked deliveries canceled before their `deliver_at`. */
   canceled: number;
+  /** WR-80: cron-recurring schedules currently registered (paused included). */
+  recurring: number;
+  /** WR-80: cumulative cron occurrences ever generated. */
+  fired: number;
 }
 
 /** Injection points for {@link ScheduledDeliveryQueue}. */
@@ -130,15 +149,37 @@ export interface ScheduledQueueOptions {
 }
 
 interface HeapNode {
+  /** One-shot item id, or recurring schedule id (the two namespaces are disjoint). */
   id: string;
-  deliverAt: number;
-  /** Tie-break: FIFO among equal `deliverAt` instants. */
+  /** Fire instant, epoch ms: `deliverAt` for one-shots, next cron fire for recurring. */
+  at: number;
+  /** Tie-break: FIFO among equal fire instants. */
   seq: number;
+  /** True for recurring-schedule nodes (reinserted after every fire). */
+  recurring: boolean;
 }
 
 interface ParkedEntry {
   item: RetryItem;
   deliverAt: number;
+}
+
+/**
+ * WR-80: a registered recurring schedule. The intake-time item is the
+ * *template*: every cycle generates a fresh delivery from it (fresh id,
+ * fresh traceId — see {@link buildOccurrence}), so per-cycle deliveries
+ * are independent events that each walk the normal delivery path.
+ */
+interface RecurringEntry {
+  template: RetryItem;
+  cron: CronExpression;
+  /** Original cron expression text (operator display / audit). */
+  cronSource: string;
+  nextAt: number;
+  paused: boolean;
+  /** 1-based count of occurrences generated so far (also the occurrence id suffix). */
+  firedCount: number;
+  createdAt: number;
 }
 
 /**
@@ -159,6 +200,8 @@ export class ScheduledDeliveryQueue {
   private readonly clearTimer: (handle: { clear(): void }) => void;
   private readonly onDue?: (items: RetryItem[]) => void;
   private readonly items = new Map<string, ParkedEntry>();
+  /** WR-80: recurring schedules, keyed by schedule id. */
+  private readonly schedules = new Map<string, RecurringEntry>();
   private readonly heap: HeapNode[] = [];
   private readonly index = new Map<string, number>();
   private seq = 0;
@@ -168,6 +211,8 @@ export class ScheduledDeliveryQueue {
   private totalScheduled = 0;
   private totalDue = 0;
   private totalCanceled = 0;
+  /** WR-80: cumulative cron occurrences generated. */
+  private totalFired = 0;
 
   constructor(opts: ScheduledQueueOptions = {}) {
     if (opts.now !== undefined && typeof opts.now !== "function") {
@@ -215,6 +260,9 @@ export class ScheduledDeliveryQueue {
     if (this.items.has(item.id)) {
       throw new Error(`Duplicate scheduled id: ${item.id}`);
     }
+    if (this.schedules.has(item.id)) {
+      throw new Error(`Duplicate scheduled id: ${item.id} is already a recurring schedule`);
+    }
     const at = this.now();
     if (deliverAt <= at) {
       throw new RangeError(
@@ -223,7 +271,7 @@ export class ScheduledDeliveryQueue {
       );
     }
     this.items.set(item.id, { item: { ...item }, deliverAt });
-    this.pushNode({ id: item.id, deliverAt, seq: this.seq++ });
+    this.pushNode({ id: item.id, at: deliverAt, seq: this.seq++, recurring: false });
     this.totalScheduled += 1;
     // Re-arm only when the newcomer became the head — otherwise the armed
     // timer already covers it.
@@ -246,9 +294,86 @@ export class ScheduledDeliveryQueue {
     return true;
   }
 
-  /** True when `id` is currently parked. */
+  /**
+   * WR-80: register a recurring cron schedule. `item` is the *template* —
+   * copied at registration; every cycle generates a fresh delivery from it
+   * (see {@link buildOccurrence}). `item.id` becomes the schedule id and
+   * must be unique across one-shot items and schedules. Returns the
+   * schedule id. Throws `RangeError` on an invalid cron expression and
+   * `Error` on a duplicate id. A `deliverAt` on the template is ignored —
+   * recurring and one-shot parking are disjoint (a request declaring both
+   * headers is rejected at intake).
+   */
+  addRecurring(item: RetryItem, cronExpression: string): string {
+    if (typeof item.id !== "string" || item.id.length === 0) {
+      throw new RangeError("recurring schedule item id must be a non-empty string");
+    }
+    if (this.items.has(item.id) || this.schedules.has(item.id)) {
+      throw new Error(`Duplicate scheduled id: ${item.id}`);
+    }
+    const cron = parseCronExpression(cronExpression);
+    const at = this.now();
+    const nextAt = nextCronOccurrence(cron, at);
+    const { deliverAt: _ignored, ...rest } = item;
+    this.schedules.set(item.id, {
+      template: { ...rest },
+      cron,
+      cronSource: cron.source,
+      nextAt,
+      paused: false,
+      firedCount: 0,
+      createdAt: at,
+    });
+    this.pushNode({ id: item.id, at: nextAt, seq: this.seq++, recurring: true });
+    if (this.armed && this.heap[0].id === item.id) this.rearm();
+    return item.id;
+  }
+
+  /**
+   * WR-80: pause a recurring schedule — no further occurrences are
+   * generated until {@link resumeSchedule}. Already-generated deliveries
+   * are unaffected. Returns `true` on a real pause, `false` for an
+   * unknown schedule id (a paused schedule returns `true` again).
+   */
+  pauseSchedule(id: string): boolean {
+    const entry = this.schedules.get(id);
+    if (entry === undefined) return false;
+    if (!entry.paused) {
+      entry.paused = true;
+      const i = this.index.get(id);
+      if (i !== undefined) this.removeAt(i);
+      if (this.armed && this.armedId === id) this.rearm();
+    }
+    return true;
+  }
+
+  /**
+   * WR-80: resume a paused schedule. The next occurrence is computed from
+   * *now* — cycles missed while paused are skipped, never backfilled
+   * (cron semantics). Returns `true` on a real resume, `false` for an
+   * unknown id (an already-running schedule returns `true`, unchanged).
+   */
+  resumeSchedule(id: string): boolean {
+    const entry = this.schedules.get(id);
+    if (entry === undefined) return false;
+    if (entry.paused) {
+      entry.paused = false;
+      entry.nextAt = nextCronOccurrence(entry.cron, this.now());
+      this.pushNode({ id, at: entry.nextAt, seq: this.seq++, recurring: true });
+      if (this.armed && this.heap[0].id === id) this.rearm();
+    }
+    return true;
+  }
+
+  /** WR-80: next fire instant of a recurring schedule, or `undefined` when unknown/paused. */
+  nextFireAt(id: string): number | undefined {
+    const entry = this.schedules.get(id);
+    return entry !== undefined && !entry.paused ? entry.nextAt : undefined;
+  }
+
+  /** True when `id` is currently parked (one-shot) or registered (recurring). */
   has(id: string): boolean {
-    return this.items.has(id);
+    return this.items.has(id) || this.schedules.has(id);
   }
 
   /** Deliveries currently parked. */
@@ -257,9 +382,10 @@ export class ScheduledDeliveryQueue {
   }
 
   /**
-   * Pending scheduled deliveries, earliest `deliverAt` first: operator
-   * metadata only (id, targetUrl, deliverAt, traceId, tenant, priority) —
-   * the payload is never exposed.
+   * Pending scheduled deliveries, earliest fire first: operator metadata
+   * only (id, targetUrl, traceId, tenant, priority) — the payload is never
+   * exposed. One-shot entries carry `deliverAt`; recurring schedules
+   * (WR-80) carry `recurring: true` plus `cron` / `nextAt` / `paused`.
    */
   list(): ScheduledDeliveryInfo[] {
     const out: ScheduledDeliveryInfo[] = [];
@@ -274,18 +400,36 @@ export class ScheduledDeliveryQueue {
         ...(item.priority === undefined ? {} : { priority: item.priority }),
       });
     }
+    for (const [id, entry] of this.schedules) {
+      const t = entry.template;
+      out.push({
+        id,
+        targetUrl: t.targetUrl,
+        traceId: t.traceId as string,
+        ...(t.tenantId === undefined ? {} : { tenant: t.tenantId }),
+        ...(t.priority === undefined ? {} : { priority: t.priority }),
+        recurring: true,
+        cron: entry.cronSource,
+        nextAt: entry.nextAt,
+        nextAtIso: new Date(entry.nextAt).toISOString(),
+        paused: entry.paused,
+      });
+    }
     // Heap order is not sorted order — sort the snapshot deterministically.
-    out.sort((a, b) => a.deliverAt - b.deliverAt || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    const fireAt = (e: ScheduledDeliveryInfo) => e.deliverAt ?? e.nextAt ?? 0;
+    out.sort((a, b) => fireAt(a) - fireAt(b) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
     return out;
   }
 
-  /** Currently parked plus cumulative scheduled / due / canceled. */
+  /** Currently parked plus cumulative scheduled / due / canceled (WR-80 adds recurring / fired). */
   stats(): ScheduledStats {
     return {
       pending: this.items.size,
       scheduled: this.totalScheduled,
       due: this.totalDue,
       canceled: this.totalCanceled,
+      recurring: this.schedules.size,
+      fired: this.totalFired,
     };
   }
 
@@ -305,19 +449,24 @@ export class ScheduledDeliveryQueue {
   }
 
   /**
-   * Drop everything: clear the timer and forget all parked items (called
-   * by the owner's `shutdown()`). Parked-but-not-due deliveries are
-   * dropped exactly like backoff-waiting ones — they were never
-   * delivered — and the cumulative counters are reset with them.
+   * Drop everything: clear the timer and forget all parked items and
+   * recurring schedules (called by the owner's `shutdown()`).
+   * Parked-but-not-due deliveries are dropped exactly like backoff-waiting
+   * ones — they were never delivered — and recurring registrations are
+   * in-memory only: a restart does not recover them (documented honestly
+   * in the README, same as WR-57 parking). Cumulative counters reset with
+   * everything else.
    */
   clear(): void {
     this.disarm();
     this.items.clear();
+    this.schedules.clear();
     this.heap.length = 0;
     this.index.clear();
     this.totalScheduled = 0;
     this.totalDue = 0;
     this.totalCanceled = 0;
+    this.totalFired = 0;
   }
 
   private clearArmedTimer(): void {
@@ -334,9 +483,9 @@ export class ScheduledDeliveryQueue {
     const head = this.heap[0];
     // Clamp: Node collapses a setTimeout delay > 2^31-1 to ~1ms with a
     // warning. A clamped fire that finds the head not yet due simply
-    // re-arms (see onTimerFire), so a far-future deliver_at wakes the
+    // re-arms (see onTimerFire), so a far-future fire instant wakes the
     // scheduler periodically without ever delivering early.
-    const ms = Math.max(0, Math.min(head.deliverAt - this.now(), MAX_TIMER_MS));
+    const ms = Math.max(0, Math.min(head.at - this.now(), MAX_TIMER_MS));
     this.armedId = head.id;
     this.timer = this.setTimer(() => this.onTimerFire(), ms);
   }
@@ -346,8 +495,25 @@ export class ScheduledDeliveryQueue {
     this.armedId = undefined;
     const at = this.now();
     const due: RetryItem[] = [];
-    while (this.heap.length > 0 && this.heap[0].deliverAt <= at) {
+    while (this.heap.length > 0 && this.heap[0].at <= at) {
       const node = this.popHead()!;
+      if (node.recurring) {
+        // WR-80: a cron fire generates one fresh delivery from the
+        // template, then the schedule is reinserted at its next
+        // occurrence — computed from *now*, so cycles missed while the
+        // process was busy are skipped, never backfilled. Reinsert before
+        // handing items over: a throwing onDue must not lose the schedule.
+        const entry = this.schedules.get(node.id);
+        // Eager deletion keeps the heap clean; a missing or paused entry
+        // means the schedule went away on the same tick as the fire.
+        if (entry === undefined || entry.paused) continue;
+        entry.firedCount += 1;
+        due.push(this.buildOccurrence(node.id, entry));
+        this.totalFired += 1;
+        entry.nextAt = nextCronOccurrence(entry.cron, at);
+        this.pushNode({ id: node.id, at: entry.nextAt, seq: this.seq++, recurring: true });
+        continue;
+      }
       // Eager deletion keeps the heap clean; a missing entry means the
       // item was canceled on the same tick as the fire — skip it.
       const entry = this.items.get(node.id);
@@ -360,14 +526,33 @@ export class ScheduledDeliveryQueue {
     // the scheduler without a timer for the remaining heap.
     this.rearm();
     if (due.length > 0) this.onDue?.(due);
-    // No due items: a spurious/early fire (or a clamped far-future
-    // deliver_at) — the rearm above already covers the current head.
+    // No due items: a spurious/early fire (or a clamped far-future fire
+    // instant) — the rearm above already covers the current head.
+  }
+
+  /**
+   * WR-80: build one cron occurrence from the schedule template. The
+   * occurrence is an independent delivery: a fresh id (`<scheduleId>#<n>`),
+   * a fresh traceId, and `scheduleId` marking it as cron-generated (the
+   * owner audits `scheduled_fired` on it). `deliverAt` never survives onto
+   * an occurrence (recurring and one-shot parking are disjoint), and
+   * `enqueuedAt` is stripped so the WR-76 end-to-end deadline clock starts
+   * fresh per cycle — each occurrence gets an independent deadline.
+   */
+  private buildOccurrence(scheduleId: string, entry: RecurringEntry): RetryItem {
+    const { deliverAt: _d, enqueuedAt: _e, traceId: _t, id: _i, ...rest } = entry.template;
+    return {
+      ...rest,
+      id: `${scheduleId}#${entry.firedCount}`,
+      traceId: newTraceId(),
+      scheduleId,
+    };
   }
 
   // -- binary min-heap (by deliverAt, FIFO tie-break) with an index map --
 
   private less(a: HeapNode, b: HeapNode): boolean {
-    return a.deliverAt < b.deliverAt || (a.deliverAt === b.deliverAt && a.seq < b.seq);
+    return a.at < b.at || (a.at === b.at && a.seq < b.seq);
   }
 
   private swap(i: number, j: number): void {

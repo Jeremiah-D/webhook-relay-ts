@@ -14,6 +14,7 @@ import {
 } from "./verify.ts";
 import { RetryQueue, type DeliveryPriority, type DownstreamResponse, type RetryItem, type Sender } from "./retry.ts";
 import { parseDeliverAtHeader, DELIVER_AT_HEADER } from "./retry.ts";
+import { parseCronExpression, CRON_HEADER } from "./cron.ts";
 import type { CompletionCallbackOptions } from "./callback.ts";
 import { createBoundAddressSelfCheck } from "./callback.ts";
 import { TENANT_ID_HEADER, assertValidTenantId, tenantScopeKey } from "./tenant.ts";
@@ -1980,6 +1981,7 @@ function isOperatorPath(pathname: string): boolean {
     pathname === "/endpoints/pause" ||
     pathname === "/endpoints/resume" ||
     pathname === "/scheduled" ||
+    pathname.startsWith("/scheduled/") ||
     pathname.startsWith("/deliveries/")
   );
 }
@@ -2195,6 +2197,12 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // An explicit server-level `autoReplay` wins over the nested
     // `retry.autoReplay`; either way the queue owns the scheduler.
     autoReplay: opts.autoReplay ?? opts.retry?.autoReplay,
+    // Wrap the caller's hook so every cron occurrence is audited as
+    // `scheduled_fired`, not just observed.
+    onScheduledFired: (event) => {
+      opts.auditLog.append(event);
+      opts.retry?.onScheduledFired?.(event);
+    },
     // Wrap the caller's hook so rounds-exhaustion is always audited, not
     // just observed.
     onAutoReplayAudit: (event) => {
@@ -2579,6 +2587,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     const isEndpointsPause = pathname === "/endpoints/pause";
     const isEndpointsResume = pathname === "/endpoints/resume";
     const isScheduledList = pathname === "/scheduled";
+    const scheduleActionMatch = /^\/scheduled\/([^/]+)\/(pause|resume)$/.exec(pathname);
     const deliveryMatch = /^\/deliveries\/([^/]+)$/.exec(pathname);
     const replayMatch = /^\/dead-letter\/([^/]+)\/replay$/.exec(pathname);
     if (
@@ -2601,6 +2610,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       !isEndpointsPause &&
       !isEndpointsResume &&
       !isScheduledList &&
+      !scheduleActionMatch &&
       !deliveryMatch &&
       !replayMatch
     ) {
@@ -2628,6 +2638,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         (isEndpointsPause && req.method === "POST") ||
         (isEndpointsResume && req.method === "POST") ||
         (isScheduledList && req.method === "GET") ||
+        (scheduleActionMatch && req.method === "POST") ||
         (deliveryMatch && req.method === "GET") ||
         (replayMatch && req.method === "POST")
       )
@@ -2782,8 +2793,39 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     if (isScheduledList) {
       // WR-57: pending scheduled deliveries — operator metadata only
       // (id, targetUrl, deliverAt, traceId, tenant, priority). The payload
-      // is never exposed here.
+      // is never exposed here. WR-80: recurring schedules are included
+      // with `recurring: true` plus `cron` / `nextAt` / `paused`.
       respondJson(res, 200, queue.getScheduled());
+      return;
+    }
+    if (scheduleActionMatch) {
+      // WR-80: pause/resume a recurring cron schedule. Pausing stops
+      // occurrence generation (already-generated deliveries are
+      // unaffected); resuming computes the next occurrence from now —
+      // missed cycles are skipped, never backfilled. Unknown schedule
+      // ids are a fail-closed 404; transitions are audited.
+      const scheduleId = decodeURIComponent(scheduleActionMatch[1]);
+      const action = scheduleActionMatch[2];
+      const ok =
+        action === "pause" ? queue.pauseSchedule(scheduleId) : queue.resumeSchedule(scheduleId);
+      if (!ok) {
+        respondJson(res, 404, { error: "unknown schedule" });
+        return;
+      }
+      opts.auditLog.append({
+        event: action === "pause" ? "schedule_paused" : "schedule_resumed",
+        id: scheduleId,
+        ...(action === "resume"
+          ? {
+              nextAtMs: queue.nextScheduleFire(scheduleId),
+              nextAt:
+                queue.nextScheduleFire(scheduleId) !== undefined
+                  ? new Date(queue.nextScheduleFire(scheduleId)!).toISOString()
+                  : undefined,
+            }
+          : {}),
+      });
+      respondJson(res, 200, { id: scheduleId, paused: action === "pause" });
       return;
     }
     if (isAudit) {
@@ -3282,6 +3324,12 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     duplicate?: boolean;
     /** WR-57: the delivery was parked for a future time (epoch ms). */
     scheduledAt?: number;
+    /** WR-80: a recurring cron schedule was registered (the schedule id). */
+    scheduleId?: string;
+    /** WR-80: the registered cron expression text. */
+    cron?: string;
+    /** WR-80: next fire instant of the registered schedule (epoch ms). */
+    nextAt?: number;
     /** Validated tenant, when the event claimed one. */
     tenantId?: string;
     /** The rejection must close the connection (413 flood protection). */
@@ -3639,18 +3687,62 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       }
     }
 
-    queue.enqueue({
-      id,
-      traceId,
-      // WR-48: the validated tenant rides the item into the per-tenant
-      // isolation scope (breaker/quota/limiter/latency instances).
-      ...(tenantId !== undefined ? { tenantId } : {}),
-      payload: body,
-      targetUrl: opts.forwardUrl,
-      headers: passthrough,
-      ...(priority ? { priority } : {}),
-      ...(deliverAt !== undefined ? { deliverAt } : {}),
-    });
+    // Recurring schedules (WR-80): `x-schedule-cron` registers a cron
+    // schedule that emits one delivery per cycle, each with a fresh
+    // traceId. An invalid expression is a sender bug — 400 fail-fast,
+    // audited as `rejected` with reason `invalid_schedule_cron`.
+    // `x-deliver-at` and `x-schedule-cron` are mutually exclusive (a
+    // request declaring both is rejected as `conflicting_schedule`);
+    // the one-shot semantics of `x-deliver-at` are unchanged.
+    const cronHeader = headers[CRON_HEADER];
+    let cronSource: string | undefined;
+    if (cronHeader !== undefined) {
+      const rawCron = Array.isArray(cronHeader) ? cronHeader[0] : cronHeader;
+      try {
+        parseCronExpression(rawCron);
+      } catch {
+        opts.auditLog.append({ ...correlation, event: "rejected", id, traceId, ...tenantLabel, reason: "invalid_schedule_cron" });
+        return { status: 400, id, traceId, reason: "invalid_schedule_cron", detail: "Invalid x-schedule-cron" };
+      }
+      cronSource = rawCron;
+    }
+    if (deliverAt !== undefined && cronSource !== undefined) {
+      opts.auditLog.append({ ...correlation, event: "rejected", id, traceId, ...tenantLabel, reason: "conflicting_schedule" });
+      return { status: 400, id, traceId, reason: "conflicting_schedule", detail: "x-deliver-at and x-schedule-cron are mutually exclusive" };
+    }
+
+    let scheduleId: string | undefined;
+    let nextAt: number | undefined;
+    if (cronSource !== undefined) {
+      // Recurring: register the schedule — the intake-time event is the
+      // template, not a delivery. Each cycle mints a fresh delivery with
+      // a fresh traceId into the normal path.
+      scheduleId = queue.addRecurringDelivery({
+        id,
+        traceId,
+        // WR-48: the validated tenant rides the template into the
+        // per-tenant isolation scope, like any other delivery.
+        ...(tenantId !== undefined ? { tenantId } : {}),
+        payload: body,
+        targetUrl: opts.forwardUrl,
+        headers: passthrough,
+        ...(priority ? { priority } : {}),
+      }, cronSource);
+      nextAt = queue.nextScheduleFire(scheduleId);
+    } else {
+      queue.enqueue({
+        id,
+        traceId,
+        // WR-48: the validated tenant rides the item into the per-tenant
+        // isolation scope (breaker/quota/limiter/latency instances).
+        ...(tenantId !== undefined ? { tenantId } : {}),
+        payload: body,
+        targetUrl: opts.forwardUrl,
+        headers: passthrough,
+        ...(priority ? { priority } : {}),
+        ...(deliverAt !== undefined ? { deliverAt } : {}),
+      });
+    }
     // WR-78: usage metering — accepted events only. Rejections, schema
     // failures, replay-guard hits, and dedup-suppressed duplicates are
     // acknowledged-but-not-processed and never bill.
@@ -3721,7 +3813,22 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         deliverAt: new Date(scheduledAt).toISOString(),
       });
     }
-    return { status: 202, id, traceId, tenantId, scheduledAt };
+    // WR-80: a recurring schedule was registered — audit the registration
+    // (queryable via `GET /audit?event=schedule_registered`); each cycle
+    // is audited separately as `scheduled_fired`.
+    if (scheduleId !== undefined) {
+      opts.auditLog.append({ ...correlation,
+        event: "schedule_registered",
+        id: scheduleId,
+        traceId,
+        ...tenantLabel,
+        targetUrl: opts.forwardUrl,
+        cron: cronSource,
+        nextAtMs: nextAt,
+        nextAt: nextAt !== undefined ? new Date(nextAt).toISOString() : undefined,
+      });
+    }
+    return { status: 202, id, traceId, tenantId, scheduledAt, scheduleId, cron: cronSource, nextAt };
   };
 
   /**
@@ -3764,6 +3871,17 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
             ...(outcome.duplicate === true ? { duplicate: true } : {}),
             ...(outcome.scheduledAt !== undefined
               ? { scheduled: true, deliverAt: new Date(outcome.scheduledAt).toISOString() }
+              : {}),
+            ...(outcome.scheduleId !== undefined
+              ? {
+                  scheduled: true,
+                  recurring: true,
+                  scheduleId: outcome.scheduleId,
+                  cron: outcome.cron,
+                  ...(outcome.nextAt !== undefined
+                    ? { nextAt: new Date(outcome.nextAt).toISOString() }
+                    : {}),
+                }
               : {}),
           })
         );
@@ -3957,6 +4075,13 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       if (outcome.scheduledAt !== undefined) {
         result.scheduled = true;
         result.deliverAt = new Date(outcome.scheduledAt).toISOString();
+      }
+      if (outcome.scheduleId !== undefined) {
+        result.scheduled = true;
+        result.recurring = true;
+        result.scheduleId = outcome.scheduleId;
+        result.cron = outcome.cron;
+        if (outcome.nextAt !== undefined) result.nextAt = new Date(outcome.nextAt).toISOString();
       }
       results.push(result);
       if (outcome.status === 202) accepted++;

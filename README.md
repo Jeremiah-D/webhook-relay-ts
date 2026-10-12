@@ -1078,6 +1078,63 @@ curl http://127.0.0.1:PORT/scheduled \
   bypass batching, since a batch window would blur the per-event
   deliver_at.
 
+### Recurring scheduled delivery (cron)
+
+One-shot `x-deliver-at` covers a single future instant; for periodic
+jobs an inbound event may instead carry an `x-schedule-cron` header with
+a 5-field cron expression (`minute hour day-of-month month
+day-of-week`, e.g. `*/15 9-18 * * 1-5` — every 15 minutes during
+business hours, Monday–Friday). The request registers a *schedule* and
+returns a `scheduleId`; every cycle the relay emits one delivery event
+with a freshly generated `traceId`. Field shapes are `*`, `*/n`, `n`,
+`n-m`, `n-m/s`, and comma lists of those atoms (numeric only — month
+and weekday names are rejected, so a typo like `mon` fails loudly
+instead of misfiring). Day matching follows classic cron semantics
+(day-of-month OR day-of-week when both are restricted), and all
+evaluation is in UTC. The next occurrence is the first fire instant
+*strictly after* the registration (or resume) moment, at second 0 of
+the matching minute.
+
+```sh
+curl -X POST http://127.0.0.1:PORT/ \
+  -H "x-signature: <hmac>" \
+  -H "x-schedule-cron: */15 9-18 * * 1-5" \
+  -H "content-type: application/json" \
+  -d '{"report":"daily_sales"}'
+# → 202 { id, traceId, status: "accepted", scheduleId: "sched_<id>",
+#         cron: "*/15 9-18 * * 1-5", nextAt: "2026-10-12T09:15:00.000Z" }
+```
+
+- **Invalid is 400, never half-registered** — a malformed expression is
+  a sender bug: answered 400 fail-fast (`invalid_schedule_cron` /
+  `conflicting_schedule` when `x-deliver-at` is also present),
+  audited as `rejected`, nothing enqueued. The cron parser
+  (`src/cron.ts`) is zero-dependency and fully covered by its own
+  unit suite (`test/cron.test.ts`).
+- **Per-cycle independence** — each firing walks the normal delivery
+  path on its own: attempt counting, retry, dead-letter, circuit,
+  quota, retry budget, batching bypass, and the SSE delivery events
+  (`delivered` / `retrying` / `dead_letter`) all apply per cycle.
+  Per-cycle deadlines (WR-76) are evaluated independently, so a slow
+  cycle cannot eat the next cycle's SLO budget.
+- **Pause / resume** — `POST /scheduled/:id/pause` stops occurrence
+  generation (already-emitted deliveries are unaffected);
+  `POST /scheduled/:id/resume` recomputes the next occurrence from
+  *now* — missed cycles are skipped, never backfilled. Unknown ids
+  are a fail-closed 404; transitions are audited as
+  `schedule_paused` / `schedule_resumed`. `GET /scheduled` lists
+  recurring schedules with `recurring: true` plus `cron`, `nextAt`,
+  and `paused`.
+- **Observability** — every firing is audited as `scheduled_fired`
+  (wrapped through the caller's `onScheduledFired`, so custom hooks
+  keep working); `relay_scheduled_fired_total` counts cycles. The
+  schedules are in-memory only, like the one-shot delay queue —
+  a restart does not resurrect them (documented limitation, not a
+  bug).
+- **The clock is injectable** — the recurring scheduler takes its time
+  from the same injectable clock as the delay queue, so tests drive
+  cycles deterministically without wall-clock waits.
+
 ## Relay-level global concurrency cap
 
 `maxConcurrentPerEndpoint` bounds in-flight deliveries *per downstream*;
