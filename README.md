@@ -1637,6 +1637,33 @@ filter to one tenant. Completion-callback receipts carry the tenant too.
 `POST /config/endpoint` accepts an optional `tenant` to hot-reload one
 tenant's endpoint config.
 
+### Tenant usage metering
+
+Usage-based billing needs counters, not gates. Opt in with
+`usage: { windowMs }` (default window: 1 hour) and the relay meters every
+tenant in a rolling window — `x-tenant-id` selects the tenant, requests
+without it bill to the `default` tenant:
+
+- `delivered` / `failed` / `retried` / `dead_letter` — delivery outcomes
+  per tenant (`failed === retried + dead_letter`: a failed attempt either
+  schedules a retry or lands in the dead-letter queue);
+- `bytes_in` — inbound payload bytes accepted at intake (rejections and
+  dedup-suppressed duplicates never bill);
+- `bytes_out` — outbound payload bytes on successful deliveries;
+- `urgent` — accepted `x-priority: urgent` fast-lane admissions.
+
+Read back via the operator `GET /usage` endpoint (`?tenant=` filters to
+one tenant; Bearer `operatorToken`, 404 fail-closed when unconfigured or
+when metering is off) or scrape the Prometheus exposition:
+`relay_tenant_deliveries_total{tenant,outcome}`,
+`relay_tenant_bytes_in_total{tenant}`,
+`relay_tenant_bytes_out_total{tenant}`,
+`relay_tenant_urgent_total{tenant}`. The meter never gates, delays, or
+drops anything — it is orthogonal to the delivery quota (WR-15), which is
+the protective gate. Memory-bounded: per-tenant samples are capped
+(`maxEventsPerTenant`, oldest dropped first) and the tenant population is
+capped (`maxTenants`, least-recently-active evicted).
+
 ### Failure classification
 
 Not every failed delivery deserves a retry (`src/failure.ts`):

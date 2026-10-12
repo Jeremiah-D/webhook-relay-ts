@@ -27,6 +27,7 @@ import type { PayloadEncryptor } from "./encrypt.ts";
 import type { FieldMask } from "./masking.ts";
 import type { ReplayGuard } from "./replay.ts";
 import { DeliveryDeduplicator, type DedupOptions } from "./dedup.ts";
+import { UsageMeter, type UsageOptions } from "./usage.ts";
 import { InboundRateLimiter, type InboundRateLimitOptions } from "./ratelimit.ts";
 import { InboundIpAcl, IpAclMetrics, type IpAclOptions } from "./ip-acl.ts";
 import { InboundApiKeyAuth, type ApiKeyOptions, type EndpointApiKeyRule } from "./api-key.ts";
@@ -678,6 +679,20 @@ export interface RelayServerOptions {
    * the legacy always-deliver behavior unless the operator opts in.
    */
   dedup?: DedupOptions;
+  /**
+   * Tenant-level usage metering for usage-based billing (WR-78, see
+   * `src/usage.ts`). When set, every accepted webhook records `bytes_in`
+   * (and the urgent fast-lane admission) per tenant at intake, and every
+   * queue delivery event records `delivered` / `retried` / `failed` /
+   * `dead_letter` plus `bytes_out` per tenant. Read back via the operator
+   * `GET /usage` endpoint (`?tenant=` filter) and the Prometheus
+   * exposition (`relay_tenant_deliveries_total{tenant,outcome}` and
+   * friends). Requests without `x-tenant-id` bill to the `default`
+   * tenant. The meter never gates, delays, or drops anything — it is
+   * orthogonal to the delivery quota (WR-15), which is the protective
+   * gate. Off by default; the `/usage` endpoint 404s when unconfigured.
+   */
+  usage?: UsageOptions;
   /**
    * Inbound IP allowlist/denylist (WR-53, see `src/ip-acl.ts`):
    * per-endpoint CIDR gates on the sender's IP — the outermost admission
@@ -1957,6 +1972,7 @@ function isOperatorPath(pathname: string): boolean {
     pathname === "/audit/verify" ||
     pathname === "/latency" ||
     pathname === "/slo-risk" ||
+    pathname === "/usage" ||
     pathname === "/events" ||
     pathname === "/events/archive" ||
     pathname === "/metrics" ||
@@ -2418,6 +2434,16 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         source: { subscribeDeliveryEvents: (l) => queue.subscribeDeliveryEvents(l) },
       })
     : undefined;
+  // WR-78: tenant usage metering for usage-based billing. One permanent
+  // subscription feeds the meter from the queue's delivery events
+  // (delivered / retrying / dead_letter per tenant); intake records
+  // bytes_in via recordInbound in admitOneEvent. The meter never gates or
+  // delays — it only counts. Validated once at startup (RangeError on bad
+  // values), like every other module above.
+  const usageMeter = opts.usage !== undefined ? new UsageMeter(opts.usage) : undefined;
+  if (usageMeter !== undefined) {
+    queue.subscribeDeliveryEvents((event) => usageMeter.recordDeliveryEvent(event));
+  }
 
   const verifier: Verifier =
     opts.signingKeys !== undefined
@@ -2541,6 +2567,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     const isAuditVerify = pathname === "/audit/verify";
     const isLatency = pathname === "/latency";
     const isSloRisk = pathname === "/slo-risk";
+    const isUsage = pathname === "/usage";
     const isEvents = pathname === "/events";
     const isEventsArchive = pathname === "/events/archive";
     const isMetrics = pathname === "/metrics";
@@ -2562,6 +2589,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       !isAuditVerify &&
       !isLatency &&
       !isSloRisk &&
+      !isUsage &&
       !isEvents &&
       !isEventsArchive &&
       !isMetrics &&
@@ -2588,6 +2616,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         (isAuditVerify && req.method === "GET") ||
         (isLatency && req.method === "GET") ||
         (isSloRisk && req.method === "GET") ||
+        (isUsage && req.method === "GET") ||
         (isEvents && req.method === "GET") ||
         (isEventsArchive && req.method === "GET") ||
         (isMetrics && req.method === "GET") ||
@@ -2671,7 +2700,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       // configured, keeping the output byte-identical to the legacy shape.
       res
         .writeHead(200, { "content-type": "text/plain; version=0.0.4" })
-        .end(queue.renderMetrics() + versionMetrics.render() + schemaMetrics.render() + ipAclMetrics.render() + certExpiryMonitor.render() + tlsVersionMonitor.render() + (defaultSender?.compressionStats.render() ?? ""));
+        .end(queue.renderMetrics() + versionMetrics.render() + schemaMetrics.render() + ipAclMetrics.render() + certExpiryMonitor.render() + tlsVersionMonitor.render() + (usageMeter?.render() ?? "") + (defaultSender?.compressionStats.render() ?? ""));
       return;
     }
     if (isEvents) {
@@ -2733,6 +2762,21 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       // (fail-closed without operatorToken).
       const params = new URL(req.url ?? "/slo-risk", "http://internal").searchParams;
       respondJson(res, 200, queue.getSloRiskStats(params.get("tenant") ?? undefined));
+      return;
+    }
+    if (isUsage) {
+      // WR-78: tenant usage metering for usage-based billing — rolling
+      // window per-tenant counters (delivered/failed/retried/dead_letter,
+      // bytes_in/bytes_out, urgent). Same operator-token guard as the
+      // other operator endpoints (404 when no operatorToken — fail
+      // closed); when the meter itself is unconfigured the endpoint 404s
+      // without leaking anything.
+      if (usageMeter === undefined) {
+        respondJson(res, 404, { error: "usage metering is not configured" });
+        return;
+      }
+      const params = new URL(req.url ?? "/usage", "http://internal").searchParams;
+      respondJson(res, 200, usageMeter.snapshot(params.get("tenant") ?? undefined));
       return;
     }
     if (isScheduledList) {
@@ -3606,6 +3650,14 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       headers: passthrough,
       ...(priority ? { priority } : {}),
       ...(deliverAt !== undefined ? { deliverAt } : {}),
+    });
+    // WR-78: usage metering — accepted events only. Rejections, schema
+    // failures, replay-guard hits, and dedup-suppressed duplicates are
+    // acknowledged-but-not-processed and never bill.
+    usageMeter?.recordInbound({
+      tenant: tenantId,
+      bytesIn: body.length,
+      urgent: priority === "urgent",
     });
     // Version intake accounting (WR-33): unversioned requests count under
     // "none" so the version mix is fully visible in the exposition.

@@ -369,6 +369,12 @@ export interface DeliveryEvent {
   targetUrl: string;
   /** Attempts consumed so far (including the successful one for `delivered`). */
   attempts: number;
+  /**
+   * Outbound payload bytes for the delivery this event describes (WR-78
+   * usage metering). Always populated by the queue; absent on events
+   * constructed by hand (e.g. in tests).
+   */
+  bytesOut?: number;
   /** ISO-8601 timestamp when the event fired. */
   at: string;
   /** Failure message; present for `retrying` and `dead_letter`. */
@@ -3645,6 +3651,7 @@ export class RetryQueue {
           ...(tenant === undefined ? {} : { tenant }),
           targetUrl: target,
           attempts: entry.attempt + 1,
+          bytesOut: entry.payload.length,
           at: new Date().toISOString(),
         });
         // WR-47: terminal state — fire the completion receipt (opt-in).
@@ -3731,6 +3738,7 @@ export class RetryQueue {
             ...(tenant === undefined ? {} : { tenant }),
             targetUrl: target,
             attempts: entry.attempt,
+            bytesOut: entry.payload.length,
             at,
             error,
           });
@@ -3908,6 +3916,7 @@ export class RetryQueue {
       ...(entry.tenantId === undefined ? {} : { tenant: entry.tenantId }),
       targetUrl: target,
       attempts: entry.attempt,
+      bytesOut: entry.payload.length,
       at,
       error,
     });
