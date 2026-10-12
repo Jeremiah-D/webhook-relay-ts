@@ -1,10 +1,11 @@
 import { describe, it, after } from "node:test";
 import assert from "node:assert/strict";
 import { request as httpRequest, type Server } from "node:http";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DeliveryDeduplicator } from "../src/dedup.ts";
+import { DeliveryDeduplicator, DEDUP_JOURNAL_FILE } from "../src/dedup.ts";
+import { AesGcmEncryptor, randomAes256Key } from "../src/encrypt.ts";
 import { createRelayServer } from "../src/server.ts";
 import { signSha256 } from "../src/verify.ts";
 import { AuditLog } from "../src/audit.ts";
@@ -105,7 +106,7 @@ describe("server payload-hash dedup", () => {
     for (const s of servers) s.close();
   });
 
-  async function makeServer(dedup?: { windowMs?: number; maxEntries?: number }) {
+  async function makeServer(dedup?: { windowMs?: number; maxEntries?: number; journalDir?: string }) {
     const dir = mkdtempSync(join(tmpdir(), "dedup-"));
     const auditLog = new AuditLog(join(dir, "audit.jsonl"));
     const delivered: RetryItem[] = [];
@@ -169,5 +170,152 @@ describe("server payload-hash dedup", () => {
     assert.equal(r.status, 401);
     await new Promise((r2) => setTimeout(r2, 50));
     assert.equal(delivered.length, 0);
+  });
+
+  it("journalDir survives restarts: the same payload stays suppressed, never re-delivered", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "dedup-server-"));
+    const first = await makeServer({ windowMs: 60_000, journalDir: dir });
+    await post(first.port, BODY, signed(BODY));
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(first.delivered.length, 1);
+    // Simulate a process restart: a fresh server over the same journal dir.
+    const second = await makeServer({ windowMs: 60_000, journalDir: dir });
+    const r = await post(second.port, BODY, signed(BODY));
+    assert.equal(r.status, 202);
+    assert.match(r.text, /"duplicate":true/);
+    await new Promise((r2) => setTimeout(r2, 50));
+    assert.equal(second.delivered.length, 0);
+  });
+});
+
+describe("DeliveryDeduplicator journal (WR-79)", () => {
+  const HASH = DeliveryDeduplicator.hashPayload(BODY);
+
+  function journalPath(dir: string): string {
+    return join(dir, DEDUP_JOURNAL_FILE);
+  }
+
+  it("is off by default: no journal files are created", () => {
+    const dir = mkdtempSync(join(tmpdir(), "dedup-off-"));
+    const d = new DeliveryDeduplicator({ windowMs: 60_000 });
+    assert.equal(d.check(URL, HASH), false);
+    assert.equal(d.stats().journal, undefined);
+    assert.deepEqual(readdirSync(dir), []);
+  });
+
+  it("survives restarts: duplicates stay suppressed after reconstructing", () => {
+    const dir = mkdtempSync(join(tmpdir(), "dedup-restart-"));
+    let now = 1_000_000;
+    const d1 = new DeliveryDeduplicator({ windowMs: 60_000, now: () => now, journalDir: dir });
+    assert.equal(d1.check(URL, HASH), false);
+    assert.equal(d1.stats().journal?.journaled, 1);
+    // Simulate a process restart: a brand-new instance over the same dir.
+    const d2 = new DeliveryDeduplicator({ windowMs: 60_000, now: () => now, journalDir: dir });
+    assert.equal(d2.stats().journal?.recovered, 1);
+    assert.equal(d2.stats().journal?.corruptLines, 0);
+    assert.equal(d2.check(URL, HASH), true); // still suppressed — no double charge
+    assert.equal(d2.check("http://localhost:9999/other", HASH), false); // different endpoint: new
+  });
+
+  it("does not recover pairs whose window already expired", () => {
+    const dir = mkdtempSync(join(tmpdir(), "dedup-expire-"));
+    let now = 0;
+    const d1 = new DeliveryDeduplicator({ windowMs: 60_000, now: () => now, journalDir: dir });
+    assert.equal(d1.check(URL, HASH), false);
+    now = 60_000; // exactly at the window edge: expired, same as in-memory
+    const d2 = new DeliveryDeduplicator({ windowMs: 60_000, now: () => now, journalDir: dir });
+    assert.equal(d2.stats().journal?.recovered, 0);
+    assert.equal(d2.check(URL, HASH), false); // fresh window: delivered
+  });
+
+  it("skips corrupt lines and counts them", () => {
+    const dir = mkdtempSync(join(tmpdir(), "dedup-corrupt-"));
+    const key = Buffer.from(`${URL}\n${HASH}`, "utf8").toString("base64");
+    const valid = JSON.stringify({
+      v: 1,
+      op: "seen",
+      at: Date.now(),
+      key: { encoding: "base64", data: key },
+    });
+    writeFileSync(
+      journalPath(dir),
+      ["not json at all", "", valid, '{"v":1,"op":"bogus"}', '{"v":2,"op":"seen"}'].join("\n") + "\n"
+    );
+    const d = new DeliveryDeduplicator({ windowMs: 60_000, journalDir: dir });
+    assert.equal(d.stats().journal?.recovered, 1);
+    assert.equal(d.stats().journal?.corruptLines, 3);
+    assert.equal(d.check(URL, HASH), true); // the one good line still protects
+  });
+
+  it("seals journaled keys when a journalEncryptor is configured", () => {
+    const dir = mkdtempSync(join(tmpdir(), "dedup-enc-"));
+    const key = randomAes256Key();
+    let now = 1_000_000;
+    const d1 = new DeliveryDeduplicator({
+      windowMs: 60_000,
+      now: () => now,
+      journalDir: dir,
+      journalEncryptor: new AesGcmEncryptor(key),
+    });
+    assert.equal(d1.check(URL, HASH), false);
+    // The endpoint URL never lands on disk in the clear.
+    assert.ok(!readFileSync(journalPath(dir), "utf8").includes("localhost:9999"));
+    const d2 = new DeliveryDeduplicator({
+      windowMs: 60_000,
+      now: () => now,
+      journalDir: dir,
+      journalEncryptor: new AesGcmEncryptor(key),
+    });
+    assert.equal(d2.stats().journal?.recovered, 1);
+    assert.equal(d2.check(URL, HASH), true);
+    // A rotated-away key cannot open the sealed lines: counted as corrupt,
+    // never fatal, nothing recovered.
+    const d3 = new DeliveryDeduplicator({
+      windowMs: 60_000,
+      now: () => now,
+      journalDir: dir,
+      journalEncryptor: new AesGcmEncryptor(randomAes256Key()),
+    });
+    assert.equal(d3.stats().journal?.recovered, 0);
+    assert.equal(d3.stats().journal?.corruptLines, 1);
+    assert.equal(d3.check(URL, HASH), false);
+  });
+
+  it("caps recovered state at maxEntries, newest first", () => {
+    const dir = mkdtempSync(join(tmpdir(), "dedup-cap-"));
+    let now = 0;
+    const d1 = new DeliveryDeduplicator({
+      windowMs: 60_000,
+      maxEntries: 2,
+      now: () => now,
+      journalDir: dir,
+    });
+    // maxEntries bounds memory, but every first sight is journaled.
+    for (const ep of ["http://a/", "http://b/", "http://c/"]) {
+      now += 1;
+      assert.equal(d1.check(ep, HASH), false);
+    }
+    assert.equal(d1.stats().tracked, 2);
+    const d2 = new DeliveryDeduplicator({
+      windowMs: 60_000,
+      maxEntries: 2,
+      now: () => now,
+      journalDir: dir,
+    });
+    assert.equal(d2.stats().journal?.recovered, 2);
+    assert.equal(d2.stats().tracked, 2);
+    assert.equal(d2.check("http://b/", HASH), true);
+    assert.equal(d2.check("http://c/", HASH), true);
+    assert.equal(d2.check("http://a/", HASH), false); // evicted oldest: fresh again
+  });
+
+  it("an uncreatable journal directory throws at construction", () => {
+    const dir = mkdtempSync(join(tmpdir(), "dedup-baddir-"));
+    const file = join(dir, "not-a-dir");
+    writeFileSync(file, "x");
+    assert.throws(
+      () => new DeliveryDeduplicator({ journalDir: join(file, "sub") }),
+      /ENOTDIR/
+    );
   });
 });

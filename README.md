@@ -240,6 +240,14 @@ reliability primitives that matter for any signed-payload pipeline.
   payload-identity dedup across re-ids. Memory-bounded: entries expire out of
   the window lazily and `maxEntries` (default 10k) evicts oldest-first.
   Opt-in via `dedup: {...}` (off by default); injectable clock for tests.
+  Crash-safe mode: `dedup: { journalDir: "/var/lib/relay/dedup" }` journals
+  every first-sight pair to append-only JSONL (fsync'd per line, same
+  convention as the durable queue journal) and restores unexpired pairs on
+  construction — a restart no longer re-delivers duplicates, so the
+  payment-callback guard survives crashes. Corrupt lines are skipped and
+  counted (`stats().journal.corruptLines`), recovery always compacts, and
+  an optional `journalEncryptor` (WR-11 `PayloadEncryptor`) seals the
+  journaled keys at rest.
 - `src/ip-acl.ts` — inbound IP allowlist/denylist (`InboundIpAcl`, WR-53):
   per-endpoint CIDR gates on the sender's IP — the outermost admission
   check, before the body is read, before rate limiting, before signature
