@@ -88,10 +88,13 @@ import {
 } from "./http2.ts";
 import { WebSocketPool, type WebSocketPoolOptions } from "./websocket.ts";
 import {
+  DEFAULT_E2EE_KEY_GRACE_MS,
   E2EE_ALGORITHM,
   E2EE_HEADER,
+  RotatingE2eeSealer,
   parseX25519PublicKey,
   sealOutboundPayload,
+  type E2eeRotationKey,
 } from "./e2ee.ts";
 import type { KeyObject } from "node:crypto";
 import type { AuditLog } from "./audit.ts";
@@ -997,7 +1000,13 @@ export function createDefaultSender(
    * server audits these as `gzip_fallback_plaintext`; library users get
    * the hook directly.
    */
-  onGzipFallback?: (info: GzipFallbackInfo) => void
+  onGzipFallback?: (info: GzipFallbackInfo) => void,
+  /**
+   * WR-81: called once per endpoint at startup when E2EE key rotation is
+   * configured (a `keyId`/`previousKeys` entry). The server audits these
+   * as `e2ee_key_rotated`; library users get the hook directly.
+   */
+  onE2eeKeyRotated?: (info: E2eeKeyRotatedInfo) => void
 ): PooledSender {
   if (tlsPins !== undefined) {
     for (const [endpoint, pins] of Object.entries(tlsPins)) {
@@ -1139,15 +1148,56 @@ export function createDefaultSender(
   // WR-58: RangeError on invalid values, at startup — never mid-delivery.
   // `undefined` (feature off) is the common case. Parsed keys are cached
   // so the per-delivery seal only does the ECDH + AEAD, never re-parse.
+  // WR-81: endpoints with `keyId`/`previousKeys` get a RotatingE2eeSealer
+  // (envelope `kid` + grace-windowed retired keys); plain `{ publicKey }`
+  // endpoints keep the WR-58 single-key path exactly as before.
   let e2eeKeys: Map<string, KeyObject> | undefined;
+  let e2eeSealers: Map<string, RotatingE2eeSealer> | undefined;
   if (outboundEncryption !== undefined) {
     e2eeKeys = new Map();
+    e2eeSealers = new Map();
     for (const [endpoint, cfg] of Object.entries(outboundEncryption)) {
       try {
         if (cfg === null || typeof cfg !== "object" || typeof cfg.publicKey !== "string") {
           throw new RangeError(`outboundEncryption[${endpoint}].publicKey must be a base64 X25519 public key string`);
         }
-        e2eeKeys.set(endpoint, parseX25519PublicKey(cfg.publicKey, `outboundEncryption[${endpoint}].publicKey`));
+        const rotating = cfg.keyId !== undefined || cfg.previousKeys !== undefined;
+        if (!rotating) {
+          e2eeKeys.set(endpoint, parseX25519PublicKey(cfg.publicKey, `outboundEncryption[${endpoint}].publicKey`));
+          continue;
+        }
+        if (typeof cfg.keyId !== "string" || cfg.keyId === "") {
+          throw new RangeError(`outboundEncryption[${endpoint}].keyId is required when previousKeys is set`);
+        }
+        const previous: E2eeRotationKey[] = (cfg.previousKeys ?? []).map((k, i) => {
+          if (k === null || typeof k !== "object" || typeof k.id !== "string" || k.id === "") {
+            throw new RangeError(`outboundEncryption[${endpoint}].previousKeys[${i}].id must be a non-empty string`);
+          }
+          if (typeof k.publicKey !== "string") {
+            throw new RangeError(`outboundEncryption[${endpoint}].previousKeys[${i}].publicKey must be a base64 X25519 public key string`);
+          }
+          return {
+            id: k.id,
+            publicKey: k.publicKey,
+            ...(k.primary === true ? { primary: true as const } : {}),
+            retiredAtMs: k.retiredAtMs ?? Date.now(),
+          };
+        });
+        const sealer = new RotatingE2eeSealer({
+          keys: [{ id: cfg.keyId, publicKey: cfg.publicKey, primary: true }, ...previous],
+          ...(cfg.graceMs !== undefined ? { graceMs: cfg.graceMs } : {}),
+        });
+        e2eeSealers.set(endpoint, sealer);
+        // WR-81: a rotation is configured for this endpoint — the operator
+        // needs one audit line saying which key is now primary and which
+        // retired keys are still inside their grace window.
+        onE2eeKeyRotated?.({
+          endpoint,
+          primaryKeyId: sealer.primaryKeyId,
+          previousKeyIds: previous.map((k) => k.id),
+          graceMs: cfg.graceMs ?? DEFAULT_E2EE_KEY_GRACE_MS,
+          rotationInProgress: sealer.rotationInProgress,
+        });
       } catch (err) {
         throw new RangeError(
           `createDefaultSender: invalid outboundEncryption for ${endpoint}: ${(err as Error).message}`
@@ -1266,8 +1316,14 @@ export function createDefaultSender(
     // bytes are the JSON envelope, not the gzip stream. Endpoints without
     // a configured key behave exactly as before.
     const e2eeKey = e2eeKeys?.get(item.targetUrl);
+    const e2eeSealer = e2eeSealers?.get(item.targetUrl);
     let body = wireBody;
-    if (e2eeKey !== undefined) {
+    if (e2eeSealer !== undefined) {
+      // WR-81: rotation endpoint — the primary key seals and its id is
+      // stamped as the envelope `kid`.
+      body = e2eeSealer.seal(wireBody, contentEncoding);
+      headers[E2EE_HEADER] = E2EE_ALGORITHM;
+    } else if (e2eeKey !== undefined) {
       body = sealOutboundPayload(wireBody, e2eeKey, contentEncoding);
       headers[E2EE_HEADER] = E2EE_ALGORITHM;
     }
@@ -1940,6 +1996,40 @@ export interface OutboundEncryptionConfig {
    * relay.
    */
   publicKey: string;
+  /**
+   * WR-81: stable id for this key, stamped as the envelope `kid` and
+   * surfaced in `e2ee_key_rotated` audit events. Required when
+   * `previousKeys` is set; when unset the endpoint behaves exactly as
+   * WR-58 (no `kid` in the envelope).
+   */
+  keyId?: string;
+  /**
+   * WR-81: rotated-out downstream public keys, newest first. Each entry
+   * needs `id` and `publicKey`; `retiredAtMs` (ms epoch) defaults to
+   * sender-construction time. Retired keys stay in-rotation inside
+   * `graceMs` (default 24h, same as WR-20) — the rotation is reported
+   * as in flight while any retired key is inside its window.
+   */
+  previousKeys?: E2eeRotationKey[];
+  /**
+   * WR-81: grace period in ms for retired keys. Must be a non-negative
+   * number; defaults to 24h (`DEFAULT_E2EE_KEY_GRACE_MS`).
+   */
+  graceMs?: number;
+}
+
+/** Info passed to `onE2eeKeyRotated` (WR-81). */
+export interface E2eeKeyRotatedInfo {
+  /** The endpoint (`targetUrl`) whose rotation was configured. */
+  endpoint: string;
+  /** Id of the key now sealing new deliveries (the envelope `kid`). */
+  primaryKeyId: string;
+  /** Ids of the retired keys, newest first. */
+  previousKeyIds: string[];
+  /** Effective grace window in ms. */
+  graceMs: number;
+  /** True while any retired key is still inside its grace window. */
+  rotationInProgress: boolean;
 }
 
 /**
@@ -2130,6 +2220,18 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
           ...(info.traceId !== undefined ? { traceId: info.traceId } : {}),
           targetUrl: info.endpoint,
           bytesSaved: info.bytesSaved,
+        });
+      }, (info) => {
+        // WR-81: an endpoint's E2EE key rotation was picked up at
+        // startup — one audit line naming the new primary and the
+        // retired keys still inside their grace window.
+        opts.auditLog.append({
+          event: "e2ee_key_rotated",
+          targetUrl: info.endpoint,
+          primaryKeyId: info.primaryKeyId,
+          previousKeyIds: info.previousKeyIds,
+          graceMs: info.graceMs,
+          rotationInProgress: info.rotationInProgress,
         });
       })
       : undefined;

@@ -358,9 +358,11 @@ reliability primitives that matter for any signed-payload pipeline.
   default sender only — an injected sender signs (or doesn't) on its own.
   Invalid values throw `RangeError` at startup.
 - Outbound end-to-end encryption (`outboundEncryption`, off by default,
-  WR-58): per endpoint, `{ "<exact targetUrl>": { publicKey } }` with the
+  WR-58; key rotation WR-81): per endpoint, `{ "<exact targetUrl>": { publicKey } }` with the
   downstream's base64 X25519 public key (mint with `generateX25519KeyPair()`
   from `src/e2ee.ts`; the private half never leaves the downstream).
+  Rotating endpoints add `keyId` + `previousKeys` (envelope `kid`,
+  grace-windowed retired keys, `e2ee_key_rotated` audit).
   Sealed deliveries carry `x-relay-encryption: x25519-hkdf-sha256/aes-256-gcm`
   and a JSON envelope (fresh ephemeral X25519 keypair + HKDF-SHA256 +
   AES-256-GCM per delivery); the downstream opens it with
@@ -1518,6 +1520,78 @@ const server = createRelayServer({
 - **Tamper-evident** — the AES-GCM auth tag makes any modification (or a
   wrong private key) fail `unsealOutboundPayload` loudly; it never
   returns garbage silently.
+- **Key rotation (WR-81)** — when the downstream rotates its keypair, the
+  endpoint config carries `keyId` plus the retired keys
+  (`previousKeys`, newest first):
+  ```ts
+  outboundEncryption: {
+    "https://downstream/hook": {
+      publicKey: newKeypair.publicKey,
+      keyId: "k-2026-10",
+      previousKeys: [{ id: "k-2026-09", publicKey: oldKeypair.publicKey }],
+      // graceMs: 86_400_000, // default 24h, same as WR-20
+    },
+  },
+  ```
+  The primary key seals every new delivery and its id is stamped as the
+  envelope `kid`, so the downstream picks the right private key
+  directly; on the wire the downstream opens kid envelopes with that
+  single key (unknown `kid` throws — no silent fallback) and tries
+  kid-less legacy envelopes newest-first (`unsealOutboundPayloadWithKeys`).
+  Retired keys stay in-rotation inside `graceMs` (default 24h, same as
+  WR-20 signing rotation); picking up a rotation emits one
+  `e2ee_key_rotated` audit event per endpoint (primary kid, retired kids,
+  grace window). Invalid configs throw `RangeError` at startup.
+
+### E2EE key rotation
+
+Downstreams rotate their keys the same way signing keys do (WR-20):
+several X25519 public keys coexist per endpoint, one primary seals new
+deliveries, and the retired key stays usable for decryption inside a
+grace window (default 24h, configurable):
+
+```ts
+const server = createRelayServer({
+  secret, forwardUrl, auditLog,
+  outboundEncryption: {
+    "https://downstream/hook": {
+      publicKey: newKey.publicKey,  // base64 X25519 — seals new deliveries
+      keyId: "k-2026-10",          // stamped as the envelope `kid`
+      previousKeys: [
+        { id: "k-2026-09", publicKey: oldKey.publicKey }, // retiredAtMs defaults to now
+      ],
+      graceMs: 86_400_000,          // optional; 24h default, same as WR-20
+    },
+  },
+});
+```
+
+- **Seal with the newest** — `RotatingE2eeSealer` (in `src/e2ee.ts`,
+  mirroring `RotatingHmacVerifier`) seals with the current key and
+  stamps its id as the envelope `kid`, so the downstream picks the
+  right private key directly. Plain `{ publicKey }` endpoints keep the
+  WR-58 behavior byte-for-byte: no `kid`, no rotation bookkeeping.
+- **Grace window, inclusive** — a retired key counts as in-rotation for
+  `graceMs` after `retiredAtMs`, boundary *inclusive* (exactly
+  `graceMs` old is still in), same as WR-20. While any retired key is
+  inside its window the rotation reports `rotationInProgress`, surfaced
+  in the startup audit.
+- **Downstream opening** — `unsealOutboundPayloadWithKeys(bytes,
+  keyRing)`: an envelope carrying `kid` opens with that kid's key
+  *only* — an unknown `kid` throws, with no fallback to other keys (a
+  silent fallback would let a mis-provisioned downstream decrypt with
+  the wrong key and never notice). A pre-rotation envelope without
+  `kid` tries the ring newest-first, the first key that opens wins.
+- **Audited** — every configured rotation emits one `e2ee_key_rotated`
+  audit event at startup (`targetUrl`, `primaryKeyId`,
+  `previousKeyIds`, `graceMs`, `rotationInProgress`), so a rotation is
+  a visible operator action, not a silent config change.
+- **Fail-fast** — the full key set is parsed and validated at
+  construction; an invalid key, duplicate id, missing `keyId`, a
+  retired primary, or a negative `graceMs` throws `RangeError` at
+  startup, never mid-delivery. Only the relay-visible rule changes are
+  in the relay — the downstream holds its own private keys, and the
+  relay never sees them.
 
 ## Delivery lifecycle
 

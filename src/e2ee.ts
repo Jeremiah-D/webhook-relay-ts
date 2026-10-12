@@ -161,6 +161,13 @@ export interface SealedOutboundEnvelope {
   tag: string;
   /** Content encoding of the plaintext before sealing, if any. */
   innerEncoding?: string;
+  /**
+   * WR-81: key id of the downstream public key this envelope was sealed
+   * with. Present when the endpoint runs key rotation
+   * ({@link RotatingE2eeSealer}); absent on pre-WR-81 envelopes, which
+   * the downstream opens by trying its keys newest-first.
+   */
+  kid?: string;
 }
 
 /** True when `v` has the shape of a {@link SealedOutboundEnvelope}. */
@@ -173,7 +180,8 @@ export function isSealedOutboundEnvelope(v: unknown): v is SealedOutboundEnvelop
     typeof e.iv === "string" &&
     typeof e.ct === "string" &&
     typeof e.tag === "string" &&
-    (e.innerEncoding === undefined || typeof e.innerEncoding === "string")
+    (e.innerEncoding === undefined || typeof e.innerEncoding === "string") &&
+    (e.kid === undefined || typeof e.kid === "string")
   );
 }
 
@@ -182,12 +190,14 @@ export function isSealedOutboundEnvelope(v: unknown): v is SealedOutboundEnvelop
  * {@link parseX25519PublicKey} key). Returns the JSON envelope bytes ready
  * for the wire. A fresh ephemeral keypair and IV are used per call, so
  * identical plaintexts seal to different envelopes. Never throws on valid
- * input.
+ * input. When `kid` is given (WR-81 rotation), it is stamped into the
+ * envelope so the downstream can pick the right private key directly.
  */
 export function sealOutboundPayload(
   plaintext: Buffer,
   downstreamPublicKey: KeyObject,
-  innerEncoding?: string
+  innerEncoding?: string,
+  kid?: string
 ): Buffer {
   const ephemeral = generateKeyPairSync("x25519");
   const sharedSecret = diffieHellman({ privateKey: ephemeral.privateKey, publicKey: downstreamPublicKey });
@@ -203,6 +213,7 @@ export function sealOutboundPayload(
     ct: ct.toString("base64"),
     tag: cipher.getAuthTag().toString("base64"),
     ...(innerEncoding !== undefined ? { innerEncoding } : {}),
+    ...(kid !== undefined ? { kid } : {}),
   };
   return Buffer.from(JSON.stringify(envelope), "utf8");
 }
@@ -226,33 +237,227 @@ export function unsealOutboundPayload(
   envelopeBytes: Buffer,
   downstreamPrivateKey: KeyObject
 ): UnsealedOutboundPayload {
-  let envelope: unknown;
+  let envelope: SealedOutboundEnvelope;
   try {
-    envelope = JSON.parse(envelopeBytes.toString("utf8"));
-  } catch {
-    throw new Error("unsealOutboundPayload: envelope is not valid JSON");
-  }
-  if (!isSealedOutboundEnvelope(envelope)) {
-    throw new Error("unsealOutboundPayload: not a sealed outbound envelope");
+    envelope = parseSealedEnvelope(envelopeBytes);
+  } catch (err) {
+    throw new Error(`unsealOutboundPayload failed: ${err instanceof Error ? err.message : String(err)}`);
   }
   try {
-    const epk = parseX25519PublicKey(envelope.epk, "envelope.epk");
-    const iv = decodeBase64Strict(envelope.iv, "envelope.iv");
-    const tag = decodeBase64Strict(envelope.tag, "envelope.tag");
-    if (iv.length !== 12) throw new Error(`bad IV length: ${iv.length}`);
-    if (tag.length !== 16) throw new Error(`bad auth tag length: ${tag.length}`);
-    const sharedSecret = diffieHellman({ privateKey: downstreamPrivateKey, publicKey: epk });
-    const key = deriveContentKey(sharedSecret);
-    const decipher = createDecipheriv("aes-256-gcm", key, iv);
-    decipher.setAuthTag(tag);
-    const plaintext = Buffer.concat([
-      decipher.update(decodeBase64Strict(envelope.ct, "envelope.ct")),
-      decipher.final(),
-    ]);
-    return { plaintext, ...(envelope.innerEncoding !== undefined ? { innerEncoding: envelope.innerEncoding } : {}) };
+    return openParsedEnvelope(envelope, downstreamPrivateKey);
   } catch (err) {
     throw new Error(
       `unsealOutboundPayload failed: ${err instanceof Error ? err.message : String(err)}`
     );
+  }
+}
+
+/**
+ * Parse the wire bytes of a sealed envelope (JSON + shape check). Shared by
+ * {@link unsealOutboundPayload} and {@link unsealOutboundPayloadWithKeys}.
+ */
+function parseSealedEnvelope(envelopeBytes: Buffer): SealedOutboundEnvelope {
+  let envelope: unknown;
+  try {
+    envelope = JSON.parse(envelopeBytes.toString("utf8"));
+  } catch {
+    throw new Error("sealed envelope is not valid JSON");
+  }
+  if (!isSealedOutboundEnvelope(envelope)) {
+    throw new Error("not a sealed outbound envelope");
+  }
+  return envelope;
+}
+
+/** Decrypt a parsed envelope with one resolved private key. */
+function openParsedEnvelope(
+  envelope: SealedOutboundEnvelope,
+  downstreamPrivateKey: KeyObject
+): UnsealedOutboundPayload {
+  const epk = parseX25519PublicKey(envelope.epk, "envelope.epk");
+  const iv = decodeBase64Strict(envelope.iv, "envelope.iv");
+  const tag = decodeBase64Strict(envelope.tag, "envelope.tag");
+  if (iv.length !== 12) throw new Error(`bad IV length: ${iv.length}`);
+  if (tag.length !== 16) throw new Error(`bad auth tag length: ${tag.length}`);
+  const sharedSecret = diffieHellman({ privateKey: downstreamPrivateKey, publicKey: epk });
+  const key = deriveContentKey(sharedSecret);
+  const decipher = createDecipheriv("aes-256-gcm", key, iv);
+  decipher.setAuthTag(tag);
+  const plaintext = Buffer.concat([
+    decipher.update(decodeBase64Strict(envelope.ct, "envelope.ct")),
+    decipher.final(),
+  ]);
+  return { plaintext, ...(envelope.innerEncoding !== undefined ? { innerEncoding: envelope.innerEncoding } : {}) };
+}
+
+/**
+ * Open a sealed envelope with a ring of downstream private keys
+ * (`kid` → parsed key), for WR-81 rotation.
+ *
+ * - Envelope carrying `kid`: only that kid's key is tried — an unknown
+ *   `kid` throws, with no fallback to other keys (a silent fallback
+ *   would let a mis-provisioned downstream open with the wrong key and
+ *   never notice).
+ * - Envelope without `kid` (pre-WR-81): keys are tried in ring iteration
+ *   order — the caller passes newest-first — and the first key that opens
+ *   the envelope wins.
+ *
+ * Throws on any mismatch, exactly like {@link unsealOutboundPayload}.
+ */
+export function unsealOutboundPayloadWithKeys(
+  envelopeBytes: Buffer,
+  keyRing: Map<string, KeyObject>
+): UnsealedOutboundPayload {
+  let envelope: SealedOutboundEnvelope;
+  try {
+    envelope = parseSealedEnvelope(envelopeBytes);
+  } catch (err) {
+    throw new Error(`unsealOutboundPayload failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (envelope.kid !== undefined) {
+    const key = keyRing.get(envelope.kid);
+    if (key === undefined) {
+      throw new Error(`unsealOutboundPayload failed: unknown kid "${envelope.kid}"`);
+    }
+    try {
+      return openParsedEnvelope(envelope, key);
+    } catch (err) {
+      throw new Error(`unsealOutboundPayload failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  let lastErr: unknown = new Error("key ring is empty");
+  for (const key of keyRing.values()) {
+    try {
+      return openParsedEnvelope(envelope, key);
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw new Error(`unsealOutboundPayload failed: ${lastErr instanceof Error ? lastErr.message : String(lastErr)}`);
+}
+
+/** One downstream X25519 public key in a WR-81 rotation set. */
+export interface E2eeRotationKey {
+  /** Stable identifier, stamped as the envelope `kid` and surfaced in audit events. */
+  id: string;
+  /** base64 of the raw 32-byte X25519 public key. */
+  publicKey: string;
+  /** The key used to seal new deliveries. When unset, the first key is primary. */
+  primary?: boolean;
+  /**
+   * Millisecond epoch at which this key was rotated out. A retired key is
+   * no longer used for sealing but stays reportable inside the grace
+   * window, so the operator sees the rotation is still in flight.
+   * Undefined means the key is still in service.
+   */
+  retiredAtMs?: number;
+}
+
+/** Options for {@link RotatingE2eeSealer}. */
+export interface E2eeRotationConfig {
+  /** The key set: at least one key, ids unique, public keys valid. */
+  keys: E2eeRotationKey[];
+  /**
+   * Grace period in ms during which a retired key still counts as
+   * in-rotation. Default: 86_400_000 (24h), same as WR-20.
+   */
+  graceMs?: number;
+  /** Clock source for retirement checks; defaults to Date.now. Injectable for tests. */
+  nowMs?: () => number;
+}
+
+/** Default grace period for retired E2EE keys: 24h, matching WR-20. */
+export const DEFAULT_E2EE_KEY_GRACE_MS = 86_400_000;
+
+/**
+ * X25519 sealer with key rotation (WR-81), mirroring
+ * {@link RotatingHmacVerifier} from `src/verify.ts`: several downstream
+ * public keys coexist, one primary seals new deliveries (its id stamped as
+ * the envelope `kid`), and retired keys stay in-rotation inside the grace
+ * window. Keys are parsed once at construction — startup fail-fast, never
+ * mid-delivery.
+ */
+export class RotatingE2eeSealer {
+  readonly name = "x25519-rotating";
+
+  private readonly keys: { id: string; key: KeyObject; retiredAtMs?: number }[];
+  private readonly primaryId: string;
+  private readonly primaryKey: KeyObject;
+  private readonly graceMs: number;
+  private readonly nowMs: () => number;
+
+  constructor(config: E2eeRotationConfig) {
+    const keys = config?.keys;
+    if (!Array.isArray(keys) || keys.length === 0) {
+      throw new Error("RotatingE2eeSealer: `keys` must be a non-empty array");
+    }
+    const seen = new Set<string>();
+    let primaries = 0;
+    this.keys = keys.map((k, i) => {
+      if (!k || typeof k.id !== "string" || k.id === "") {
+        throw new Error(`RotatingE2eeSealer: key[${i}] needs a non-empty id`);
+      }
+      if (seen.has(k.id)) {
+        throw new Error(`RotatingE2eeSealer: duplicate key id "${k.id}"`);
+      }
+      seen.add(k.id);
+      if (k.retiredAtMs !== undefined && (!Number.isFinite(k.retiredAtMs) || k.retiredAtMs < 0)) {
+        throw new Error(`RotatingE2eeSealer: key "${k.id}" has an invalid retiredAtMs`);
+      }
+      if (k.primary === true) primaries++;
+      return {
+        id: k.id,
+        key: parseX25519PublicKey(k.publicKey, `RotatingE2eeSealer key "${k.id}"`),
+        retiredAtMs: k.retiredAtMs,
+      };
+    });
+    if (primaries > 1) {
+      throw new Error("RotatingE2eeSealer: at most one key may be primary");
+    }
+    const primary = this.keys.find((k) => keys.find((raw) => raw.id === k.id)?.primary === true) ?? this.keys[0];
+    if (primary.retiredAtMs !== undefined) {
+      throw new Error(`RotatingE2eeSealer: primary key "${primary.id}" is retired`);
+    }
+    this.primaryId = primary.id;
+    this.primaryKey = primary.key;
+
+    const graceMs = config.graceMs ?? DEFAULT_E2EE_KEY_GRACE_MS;
+    if (!Number.isFinite(graceMs) || graceMs < 0) {
+      throw new Error("RotatingE2eeSealer: `graceMs` must be a non-negative number");
+    }
+    this.graceMs = graceMs;
+    this.nowMs = config.nowMs ?? Date.now;
+  }
+
+  /** Id stamped as the envelope `kid` on every sealed delivery. */
+  get primaryKeyId(): string {
+    return this.primaryId;
+  }
+
+  /** Whether the key is still in service or retired inside the grace window. */
+  private isActive(key: { retiredAtMs?: number }): boolean {
+    if (key.retiredAtMs === undefined) return true;
+    // Grace boundary is inclusive, same as RotatingHmacVerifier (WR-20):
+    // exactly `graceMs` old is still in rotation, 1ms older is out.
+    return this.nowMs() - key.retiredAtMs <= this.graceMs;
+  }
+
+  /** Ids of keys still in rotation (in service or inside grace). */
+  activeKeyIds(): string[] {
+    return this.keys.filter((k) => this.isActive(k)).map((k) => k.id);
+  }
+
+  /** True while any retired key is still inside the grace window — the rotation is in flight. */
+  get rotationInProgress(): boolean {
+    return this.keys.some((k) => k.retiredAtMs !== undefined && this.isActive(k));
+  }
+
+  /**
+   * Seal `plaintext` with the primary downstream public key, stamping its id
+   * as the envelope `kid`. A fresh ephemeral keypair and IV are used per
+   * call — see {@link sealOutboundPayload}.
+   */
+  seal(plaintext: Buffer, innerEncoding?: string): Buffer {
+    return sealOutboundPayload(plaintext, this.primaryKey, innerEncoding, this.primaryId);
   }
 }
