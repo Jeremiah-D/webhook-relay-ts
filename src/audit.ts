@@ -1,7 +1,9 @@
 import { appendFileSync, closeSync, openSync, readFileSync, readSync, statSync } from "node:fs";
 import { isEncryptedPayload, type PayloadEncryptor } from "./encrypt.ts";
+import type { FieldMask } from "./masking.ts";
 
 export type { PayloadEncryptor };
+export type { FieldMask, FieldMaskRule, MaskStrategy } from "./masking.ts";
 
 /** Options for {@link AuditLog}. */
 export interface AuditLogOptions {
@@ -12,6 +14,16 @@ export interface AuditLogOptions {
    * default: payloads are stored as plain JSON.
    */
   payloadEncryptor?: PayloadEncryptor;
+  /**
+   * WR-72: field-level masking for audit payloads. When set, the
+   * `payload` field of an appended event is masked (when JSON-shaped)
+   * *before* `payloadEncryptor` seals it — masking always runs first, so
+   * raw values reach neither the ciphertext nor a plaintext line. The
+   * endpoint comes from the event's `targetUrl` (delivery events) or
+   * `endpoint` field; events naming neither are never masked. Unset by
+   * default: payloads are stored as received.
+   */
+  fieldMask?: FieldMask;
 }
 
 /** Filters for {@link AuditLog.query}. All filters are ANDed together. */
@@ -61,6 +73,42 @@ interface IndexEntry {
   length: number;
 }
 
+/** Parse JSON strictly: only objects/arrays qualify; anything else is not maskable. */
+function tryParseJson(text: string): unknown {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+  return parsed === null || typeof parsed !== "object" ? undefined : parsed;
+}
+
+/**
+ * WR-72: split a payload into its JSON value plus a re-encoder that
+ * restores the original shape (Buffer stays a Buffer, string stays a
+ * string, a parsed value stays parsed). Returns `undefined` when the
+ * payload is not JSON-shaped — field paths cannot apply to it.
+ */
+function maskablePayload(
+  payload: unknown
+): { value: unknown; reencode: (masked: unknown) => unknown } | undefined {
+  if (Buffer.isBuffer(payload)) {
+    const value = tryParseJson(payload.toString("utf8"));
+    if (value === undefined) return undefined;
+    return { value, reencode: (masked) => Buffer.from(JSON.stringify(masked), "utf8") };
+  }
+  if (typeof payload === "string") {
+    const value = tryParseJson(payload);
+    if (value === undefined) return undefined;
+    return { value, reencode: (masked) => JSON.stringify(masked) };
+  }
+  if (payload !== null && typeof payload === "object") {
+    return { value: payload, reencode: (masked) => masked };
+  }
+  return undefined;
+}
+
 /**
  * Append-only JSONL audit log. Each line is a JSON object containing the
  * caller's event fields plus an ISO-8601 `ts` timestamp. Kept dependency-free
@@ -75,6 +123,7 @@ interface IndexEntry {
 export class AuditLog {
   private readonly path: string;
   private readonly payloadEncryptor?: PayloadEncryptor;
+  private fieldMask?: FieldMask;
   private index: IndexEntry[] = [];
   /** Byte offset up to which the file has been indexed. */
   private indexedBytes = 0;
@@ -82,6 +131,7 @@ export class AuditLog {
   constructor(path: string, opts: AuditLogOptions = {}) {
     this.path = path;
     this.payloadEncryptor = opts.payloadEncryptor;
+    this.fieldMask = opts.fieldMask;
   }
 
   /** Whether appended `payload` fields are sealed at rest. */
@@ -89,9 +139,55 @@ export class AuditLog {
     return this.payloadEncryptor !== undefined;
   }
 
+  /**
+   * WR-72: attach (or replace) the field mask after construction. The
+   * server uses this so one mask can back both the audit log and the
+   * retry queue from a single option.
+   */
+  setFieldMask(mask: FieldMask): void {
+    this.fieldMask = mask;
+  }
+
+  /** Whether appended `payload` fields are masked before persistence. */
+  hasFieldMask(): boolean {
+    return this.fieldMask !== undefined;
+  }
+
   append(event: object): void {
-    const line = JSON.stringify({ ts: new Date().toISOString(), ...this.sealPayload(event) });
+    // WR-72: masking runs before sealing — the raw values never reach
+    // the ciphertext or the plaintext line.
+    const line = JSON.stringify({
+      ts: new Date().toISOString(),
+      ...this.sealPayload(this.applyFieldMask(event)),
+    });
     appendFileSync(this.path, line + "\n", "utf8");
+  }
+
+  /**
+   * WR-72: mask configured PII fields in the event's `payload` before it
+   * is persisted. Only JSON-shaped payloads (Buffer, string, or an
+   * already-parsed value) can take field paths; anything else passes
+   * through untouched. Returns the event unchanged when no mask is
+   * configured, the event names no endpoint, or the endpoint has no
+   * rules.
+   */
+  private applyFieldMask(event: object): object {
+    if (this.fieldMask === undefined) return event;
+    const rec = event as Record<string, unknown>;
+    const endpoint =
+      typeof rec.targetUrl === "string"
+        ? rec.targetUrl
+        : typeof rec.endpoint === "string"
+          ? rec.endpoint
+          : undefined;
+    if (endpoint === undefined || !this.fieldMask.hasRules(endpoint)) return event;
+    if (!("payload" in rec)) return event;
+    const maskable = maskablePayload(rec.payload);
+    if (maskable === undefined) return event;
+    return {
+      ...rec,
+      payload: maskable.reencode(this.fieldMask.maskJson(endpoint, maskable.value)),
+    };
   }
 
   /**

@@ -198,6 +198,20 @@ reliability primitives that matter for any signed-payload pipeline.
   `endpoint` fields and byte span, so only matching lines are read back from
   disk; appends are indexed incrementally and truncation/rotation rebuilds the
   index. Malformed lines are skipped by the index.
+- `src/masking.ts` — field-level masking for audit payloads (`FieldMask`):
+  opt-in per-endpoint rules like `{ path: "card_number", strategy: "last4" }`
+  (`"4111111111111111"` → `"****1111"`, irreversible; `"full"` → `"****"`).
+  Paths are dot-separated from the payload root (`payment.card.number`,
+  numeric segments address arrays); invalid paths throw `RangeError` at
+  construction, `__proto__`/`constructor`/`prototype` segments are refused.
+  Masking always runs *before* the WR-11 encryptor seals anything: the
+  `AuditLog` masks JSON-shaped `payload` fields on `append` (per the
+  event's `targetUrl`/`endpoint`), and the queue masks JSON response bodies
+  before they are sealed into `response_summary.capturedBody` — raw values
+  never reach disk, masked or not. `bodyFingerprintSha256` still covers the
+  original bytes. Non-JSON payloads pass through untouched. One mask backs
+  both paths via `createRelayServer({ fieldMask })` (also `new AuditLog(path,
+  { fieldMask })` and `retry.fieldMask` directly).
 - `src/replay.ts` — `ReplayGuard`: nonce + timestamp-window replay protection
   for inbound webhooks. A unique `x-nonce` per delivery is remembered for the
   window (`windowSec`, default 300s); resends are rejected as `duplicate_nonce`,

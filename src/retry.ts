@@ -18,6 +18,7 @@ import {
   type ProbeOptions,
 } from "./downstream-probe.ts";
 import type { EncryptedPayload, PayloadEncryptor } from "./encrypt.ts";
+import type { FieldMask } from "./masking.ts";
 import {
   HttpDeliveryError,
   classifyFailure,
@@ -140,6 +141,7 @@ export type { CircuitBreakerOptions, CircuitState, CircuitStats };
 export type { EncryptedPayload, PayloadEncryptor };
 export type { EndpointLatencyStats, LatencyTrackerOptions };
 export type { SloRiskInfo, SloRiskObservation, SloRiskOptions };
+export type { FieldMask, FieldMaskRule, MaskStrategy };
 export type { QuotaOptions, QuotaStats };
 export type { ReplayEgressOptions };
 export { ReplayEgressGate, DEFAULT_REPLAY_EGRESS_RPS };
@@ -776,6 +778,17 @@ export interface RetryQueueOptions {
    * never carry a body: a failed attempt has nothing worth capturing.
    */
   responseBodyCapture?: boolean;
+  /**
+   * WR-72: field-level masking for captured response bodies (see
+   * `src/masking.ts`). When set and the endpoint has rules, a JSON
+   * response body is masked *before* the WR-11 encryptor seals it into
+   * `response_summary.capturedBody` — raw values never reach the
+   * ciphertext. Non-JSON bodies pass through untouched (field paths
+   * cannot apply). The summary's `bodyFingerprintSha256` still covers
+   * the original bytes, so correlation/dedup keep working on what the
+   * downstream actually sent.
+   */
+  fieldMask?: FieldMask;
   /**
    * Urgent delivery lane for items with `priority: "urgent"` (see
    * {@link DeliveryPriority}). The lane is always available when an item is
@@ -1662,6 +1675,8 @@ export class RetryQueue {
   private readonly payloadEncryptor?: PayloadEncryptor;
   /** WR-54: opt-in sealed response-body capture on `delivered` audit events. */
   private readonly responseBodyCapture: boolean;
+  /** WR-72: field-level masking for captured response bodies. */
+  private readonly fieldMask?: FieldMask;
   private readonly urgentRetryDelayMs: number;
   private readonly urgentLimiter: UrgentRateLimiter;
   private readonly urgentStats = new Map<string, { delivered: number; retried: number; throttled: number }>();
@@ -1927,6 +1942,7 @@ export class RetryQueue {
     // would log them in the clear; refuse at construction, never
     // mid-delivery.
     this.responseBodyCapture = opts.responseBodyCapture ?? false;
+    this.fieldMask = opts.fieldMask;
     if (this.responseBodyCapture && this.payloadEncryptor === undefined) {
       throw new RangeError(
         "responseBodyCapture requires a payloadEncryptor: refusing to audit response bodies in the clear"
@@ -2392,6 +2408,24 @@ export class RetryQueue {
     if (idx >= 0) h.counts[idx] += 1;
     h.sumMs += latencyMs;
     h.count += 1;
+  }
+
+  /**
+   * WR-72: mask configured PII fields in a captured response body *before*
+   * WR-11 sealing. Only JSON bodies can take field paths; anything else is
+   * sealed as-is (a documented limitation, not a silent drop).
+   */
+  private maskResponseBody(endpoint: string, body: Buffer): Buffer {
+    const mask = this.fieldMask;
+    if (mask === undefined || !mask.hasRules(endpoint)) return body;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(body.toString("utf8"));
+    } catch {
+      return body;
+    }
+    if (parsed === null || typeof parsed !== "object") return body;
+    return Buffer.from(JSON.stringify(mask.maskJson(endpoint, parsed)), "utf8");
   }
 
   /** Number of items currently pending (queued or awaiting retry). */
@@ -3355,8 +3389,12 @@ export class RetryQueue {
           // Opt-in full body capture: sealed with the WR-11 encryptor
           // before it ever touches the audit log. The constructor
           // guarantees an encryptor exists when this flag is on.
+          // WR-72: masking runs before sealing — the raw values never
+          // reach the ciphertext.
           const encryptor = this.payloadEncryptor as PayloadEncryptor;
-          responseSummary.capturedBody = encryptor.encrypt(response.body);
+          responseSummary.capturedBody = encryptor.encrypt(
+            this.maskResponseBody(target, response.body)
+          );
         }
         // WR-37: the transport succeeded (2xx); the validator decides
         // whether the body actually means success. A failing verdict

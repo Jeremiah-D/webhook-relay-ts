@@ -24,6 +24,7 @@ import { HttpDeliveryError, parseRetryAfterMs } from "./failure.ts";
 import { installGracefulShutdown } from "./shutdown.ts";
 import { SourceBaselineDetector, type SourceBaselineOptions } from "./source-baseline.ts";
 import type { PayloadEncryptor } from "./encrypt.ts";
+import type { FieldMask } from "./masking.ts";
 import type { ReplayGuard } from "./replay.ts";
 import { DeliveryDeduplicator, type DedupOptions } from "./dedup.ts";
 import { InboundRateLimiter, type InboundRateLimitOptions } from "./ratelimit.ts";
@@ -715,6 +716,16 @@ export interface RelayServerOptions {
    * plaintext webhook bodies on disk are acceptable.
    */
   auditPayloads?: boolean;
+  /**
+   * WR-72: field-level masking for audit payloads (see `src/masking.ts`):
+   * opt-in per-endpoint rules like `card_number → ****1234`. The one mask
+   * backs both the audit log (`payload` fields, masked before the WR-11
+   * encryptor seals them) and the retry queue (the WR-54
+   * `responseBodyCapture` body, masked before sealing). Raw values never
+   * reach disk — masked or not, `bodyFingerprintSha256` still covers the
+   * original bytes. Unset by default: payloads are stored as received.
+   */
+  fieldMask?: FieldMask;
   /**
    * Durable delivery queue (WR-49; see `src/durable-queue.ts`). Opt-in:
    * pending and backoff-waiting deliveries plus the dead-letter list are
@@ -1763,10 +1774,17 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     for (const endpoint of opts.retry?.probe?.endpoints ?? []) knownEndpoints.add(endpoint);
     for (const endpoint of opts.probe?.endpoints ?? []) knownEndpoints.add(endpoint);
   }
+  // WR-72: one field mask backs both the audit log (payload fields) and
+  // the queue (captured response bodies); masking always runs before the
+  // WR-11 encryptor seals anything.
+  if (opts.fieldMask !== undefined) {
+    opts.auditLog.setFieldMask(opts.fieldMask);
+  }
   const queue = new RetryQueue({
     sender: opts.sender ?? defaultSender,
     ...(opts.retry ?? {}),
     payloadEncryptor: opts.payloadEncryptor ?? opts.retry?.payloadEncryptor,
+    fieldMask: opts.fieldMask ?? opts.retry?.fieldMask,
     // WR-49: an explicit server-level `durableQueueDir` wins over the
     // nested `retry.durableQueueDir`; either way the queue owns the
     // journal. Wrap the caller's hook so every recovery is audited as
