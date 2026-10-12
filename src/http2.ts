@@ -8,6 +8,11 @@ import type { Socket } from "node:net";
 import { normalizePin, spkiFingerprint } from "./pinning.ts";
 import { clientCertIdentity, type TlsClientCert } from "./mtls.ts";
 import { tlsSniPoolKeyFragment, type ResolvedTlsSniOverride } from "./tls-sni.ts";
+import {
+  assertTlsVersionMeetsFloor,
+  compareTlsVersions,
+  type MinTlsVersion,
+} from "./tls-version.ts";
 import { createHash } from "node:crypto";
 
 /**
@@ -234,6 +239,10 @@ interface Http2Entry {
   cert: TlsClientCert | undefined;
   /** Effective TLS identity (WR-60); undefined when no override applies. */
   tlsSni: ResolvedTlsSniOverride | undefined;
+  /** TLS version floor (WR-74); undefined when the endpoint sets none. */
+  minTlsVersion: MinTlsVersion | undefined;
+  /** Negotiated version verified at session establishment (floored entries). */
+  verifiedTlsVersion: string | undefined;
   session: ClientHttp2Session | undefined;
   connecting: Promise<ClientHttp2Session> | undefined;
   /** Origin sits out H2 until this timestamp (after a failure). */
@@ -273,12 +282,12 @@ export class Http2SessionPool {
   /**
    * The H2 session serving `url` — established on first use, then shared
    * by every later delivery to the same `(scheme, host, port, pins, cert,
-   * tls identity)`. Concurrent first deliveries share the in-flight
+   * tls identity, tls floor)`. Concurrent first deliveries share the in-flight
    * connect. Throws {@link Http2UnavailableError} when H2 cannot serve the
    * delivery (not eligible, origin in fallback cooldown, connect failed,
-   * or pin verification failed) — the caller falls back to HTTP/1.1.
+   * pin verification failed, or TLS floor rejected) — the caller falls back to HTTP/1.1.
    */
-  async sessionFor(url: URL, pins?: readonly string[], clientCert?: TlsClientCert, tlsSni?: ResolvedTlsSniOverride): Promise<ClientHttp2Session> {
+  async sessionFor(url: URL, pins?: readonly string[], clientCert?: TlsClientCert, tlsSni?: ResolvedTlsSniOverride, minTlsVersion?: MinTlsVersion): Promise<ClientHttp2Session> {
     if (!this.eligibleFor(url)) {
       throw new Http2UnavailableError(`${url.host} is not eligible for HTTP/2`);
     }
@@ -293,13 +302,16 @@ export class Http2SessionPool {
     }
     if (clientCert !== undefined) key += `|cert:${clientCertIdentity(clientCert)}`;
     if (tlsSni !== undefined) key += tlsSniPoolKeyFragment(tlsSni);
+    // WR-74: the floor binds the session key, like the keep-alive pool —
+    // a session handshaked below one endpoint's floor can never serve it.
+    if (minTlsVersion !== undefined) key += `|tlsmin:${minTlsVersion}`;
     let entry = this.entries.get(key);
     if (entry === undefined) {
       entry = {
         key, scheme, host, port, pinned,
         clientCert: clientCert !== undefined,
         pinWhitelist, verifiedPin: undefined, cert: clientCert,
-        tlsSni,
+        tlsSni, minTlsVersion, verifiedTlsVersion: undefined,
         session: undefined, connecting: undefined, cooldownUntil: 0,
         lastUsed: Date.now(),
       };
@@ -318,6 +330,17 @@ export class Http2SessionPool {
         if (verified === undefined || !entry.pinWhitelist.includes(verified)) {
           this.dropSession(entry, live, "pin re-verification failed on reuse");
           throw new Http2UnavailableError(`${key}: cached pin failed re-verification`);
+        }
+      }
+      // WR-74: the floor binds the key, so a reused session was
+      // established at or above the floor — re-verify anyway, cheap and
+      // loud, so a session that somehow drifts below the floor is
+      // dropped instead of serving a delivery over weak TLS.
+      if (entry.minTlsVersion !== undefined) {
+        const verified = entry.verifiedTlsVersion;
+        if (verified === undefined || compareTlsVersions(verified, entry.minTlsVersion) < 0) {
+          this.dropSession(entry, live, "tls version floor re-verification failed on reuse");
+          throw new Http2UnavailableError(`${key}: cached TLS version below floor`);
         }
       }
       entry.lastUsed = Date.now();
@@ -401,6 +424,20 @@ export class Http2SessionPool {
       if (entry.scheme === "https") {
         const sock = session.socket as TLSSocket;
         const verify = (): void => {
+          // WR-74: enforce the endpoint's TLS floor on the negotiated
+          // version before the session serves a stream.
+          if (entry.minTlsVersion !== undefined) {
+            try {
+              entry.verifiedTlsVersion = assertTlsVersionMeetsFloor(entry.key, sock.getProtocol(), entry.minTlsVersion);
+            } catch (err) {
+              // Fail the session, not the delivery: the sender falls
+              // back to HTTP/1.1, whose floor path fails loudly with
+              // TlsVersionRejectedError — one place owns that error and
+              // its audit event.
+              fail(err as Error);
+              return;
+            }
+          }
           if (entry.pinWhitelist === undefined) {
             onReady();
             return;

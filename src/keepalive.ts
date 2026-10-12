@@ -6,6 +6,7 @@ import { createHash } from "node:crypto";
 import { normalizePin } from "./pinning.ts";
 import { createProxiedAgent, proxyPoolKeyFragment } from "./proxy.ts";
 import { tlsSniPoolKeyFragment, type ResolvedTlsSniOverride } from "./tls-sni.ts";
+import type { MinTlsVersion } from "./tls-version.ts";
 
 /**
  * Outbound keep-alive connection pool (WR-24).
@@ -280,10 +281,13 @@ export class OutboundConnectionPool {
    * `tlsSni` (see `resolveTlsSniOverride` in `src/tls-sni.ts`) binds the
    * agent to one effective TLS identity (SNI servername + ALPN offer), so
    * a connection handshaked with one SNI can never serve an endpoint
-   * configured with a different one. Endpoints without an override entry
+   * configured with a different one. `minTlsVersion` (see
+   * `src/tls-version.ts`) binds the agent to one TLS floor, so a
+   * connection handshaked under a lower floor can never serve an
+   * endpoint configured with a higher one. Endpoints without an override entry
    * pass `undefined` and keep the exact historical pool keys.
    */
-  agentFor(url: URL, pins?: readonly string[], proxyUrl?: string, clientCertId?: string, tlsSni?: ResolvedTlsSniOverride): HttpAgent {
+  agentFor(url: URL, pins?: readonly string[], proxyUrl?: string, clientCertId?: string, tlsSni?: ResolvedTlsSniOverride, minTlsVersion?: MinTlsVersion): HttpAgent {
     if (url.protocol !== "http:" && url.protocol !== "https:") {
       throw new Error(`OutboundConnectionPool: unsupported protocol ${url.protocol}`);
     }
@@ -303,6 +307,12 @@ export class OutboundConnectionPool {
     }
     if (clientCertId !== undefined) key += `|cert:${clientCertId}`;
     if (tlsSni !== undefined) key += tlsSniPoolKeyFragment(tlsSni);
+    // WR-74: a floor-configured endpoint gets its own agent, so a
+    // connection handshaked at (say) TLS 1.2 can never be handed to an
+    // endpoint demanding TLS 1.3 — the floor check on `secureConnect`
+    // would reject every delivery over it instead of the handshake
+    // failing once at connect time.
+    if (minTlsVersion !== undefined) key += `|tlsmin:${minTlsVersion}`;
     let entry = this.entries.get(key);
     if (entry === undefined) {
       const agentOpts = {

@@ -52,6 +52,13 @@ import {
   type TlsSniOverride,
 } from "./tls-sni.ts";
 import {
+  assertTlsVersionMeetsFloor,
+  assertValidMinTlsVersion,
+  TlsVersionMonitor,
+  TlsVersionRejectedError,
+  type MinTlsVersion,
+} from "./tls-version.ts";
+import {
   assertValidSecretRotationRules,
   compileSecretRotationRules,
   selectSecretRotation,
@@ -315,6 +322,29 @@ export interface RelayServerOptions {
    * startup.
    */
   tlsClientCerts?: Record<string, TlsClientCert>;
+  /**
+   * Outbound per-endpoint TLS minimum version (WR-74, see
+   * `src/tls-version.ts`): `{ "<exact targetUrl>": "1.2" | "1.3" }`,
+   * keyed by exact delivery `targetUrl`. The floor is enforced
+   * observationally: the handshake runs at whatever the downstream
+   * negotiates and the negotiated version is compared against the floor
+   * on the socket's `secureConnect`, *before* a single payload byte is
+   * written. A negotiation below the floor destroys the request with
+   * `TlsVersionRejectedError`; the attempt follows the normal retry /
+   * dead-letter path and the rejection is audited (`tls_version_rejected`)
+   * plus counted in `relay_tls_version_rejections_total{endpoint,version}`.
+   * Endpoints without an entry keep the exact historical behavior (Node
+   * defaults, minimum TLS 1.2) — `"1.2"` is the default floor and needs
+   * no entry. Orthogonal to `tlsClientCerts` (WR-36, client identity)
+   * and the WR-73 cert-expiry monitor (warns about expiry; this rejects
+   * weak negotiation). The keep-alive pool and the HTTP/2 session pool
+   * bind the floor into their keys, so a connection handshaked under one
+   * floor can never serve an endpoint configured with another. `wss:`
+   * targets are not covered in this round — the WebSocket pool owns its
+   * own handshake (see README). Invalid values throw `RangeError` at
+   * startup.
+   */
+  minTlsVersions?: Record<string, MinTlsVersion>;
   /**
    * Per-endpoint outbound TLS SNI/ALPN overrides (WR-60, see
    * `src/tls-sni.ts`): `{ "<exact targetUrl>": { servername?,
@@ -910,7 +940,9 @@ export function createDefaultSender(
   tlsSniOverrides?: Record<string, TlsSniOverride>,
   responseCompression?: Record<string, ResponseCompressionOptions>,
   forwardHeaders?: Record<string, ForwardHeadersRuleConfig>,
-  certExpiryMonitor?: CertExpiryMonitor
+  certExpiryMonitor?: CertExpiryMonitor,
+  minTlsVersions?: Record<string, MinTlsVersion>,
+  tlsVersionMonitor?: TlsVersionMonitor
 ): PooledSender {
   if (tlsPins !== undefined) {
     for (const [endpoint, pins] of Object.entries(tlsPins)) {
@@ -919,6 +951,19 @@ export function createDefaultSender(
       } catch (err) {
         throw new RangeError(
           `createDefaultSender: invalid TLS pins for ${endpoint}: ${(err as Error).message}`
+        );
+      }
+    }
+  }
+  // WR-74: fail fast on a misconfigured floor — a typo must not silently
+  // leave an endpoint unprotected.
+  if (minTlsVersions !== undefined) {
+    for (const [endpoint, floor] of Object.entries(minTlsVersions)) {
+      try {
+        assertValidMinTlsVersion(floor);
+      } catch (err) {
+        throw new RangeError(
+          `createDefaultSender: invalid minTlsVersion for ${endpoint}: ${(err as Error).message}`
         );
       }
     }
@@ -1168,7 +1213,8 @@ export function createDefaultSender(
     pins: string[] | undefined,
     clientCert: TlsClientCert | undefined,
     proxyUrl: string | undefined,
-    tlsSni: ResolvedTlsSniOverride | undefined
+    tlsSni: ResolvedTlsSniOverride | undefined,
+    minTlsVersion: MinTlsVersion | undefined
   ): Promise<DownstreamResponse | void> =>
     new Promise((resolve, reject) => {
       // WR-54: time-to-first-byte — request-issued timestamp; the diff is
@@ -1192,7 +1238,8 @@ export function createDefaultSender(
           pins,
           proxyUrl,
           clientCert !== undefined ? clientCertIdentity(clientCert) : undefined,
-          tlsSni
+          tlsSni,
+          minTlsVersion
         ) ??
         (proxyUrl !== undefined
           ? (oneOffAgent = createProxiedAgent(
@@ -1368,6 +1415,20 @@ export function createDefaultSender(
         if (url.protocol === "https:" && certExpiryMonitor?.enabled) {
           req.on("socket", (socket) => observeTlsPeer(socket, item.targetUrl));
         }
+        // WR-74: enforce the endpoint's TLS floor on the fresh handshake.
+        // A reused pooled socket was handshaked under this same floor
+        // (the pool key binds it), so its version trivially qualifies.
+        if (minTlsVersion !== undefined && url.protocol === "https:") {
+          req.on("socket", (socket) => {
+            const tlsSocket = socket as TLSSocket;
+            const already = tlsSocket.getPeerCertificate() as { raw?: unknown };
+            if (already && already.raw) {
+              enforceTlsFloor(tlsSocket);
+            } else {
+              tlsSocket.once("secureConnect", () => enforceTlsFloor(tlsSocket));
+            }
+          });
+        }
         writePayload();
         return;
       }
@@ -1377,7 +1438,32 @@ export function createDefaultSender(
       // connection that was handshaked with the (possibly overridden) SNI —
       // the check and the handshake cannot disagree about the peer.
       const allowed = pins.map(normalizePin);
+      /**
+       * WR-74: enforce the endpoint's TLS floor on a handshaked socket,
+       * before any payload byte is written. Returns true when the
+       * connection was destroyed — the caller must stop and not write.
+       * The rejection is recorded on the monitor (audit
+       * `tls_version_rejected` + `relay_tls_version_rejections_total`);
+       * the destroyed request fails the delivery attempt, which then
+       * follows the normal retry / dead-letter path.
+       */
+      const enforceTlsFloor = (tlsSocket: TLSSocket): boolean => {
+        if (minTlsVersion === undefined) return false;
+        try {
+          assertTlsVersionMeetsFloor(item.targetUrl, tlsSocket.getProtocol(), minTlsVersion);
+          return false;
+        } catch (err) {
+          const rejected = err as TlsVersionRejectedError;
+          tlsVersionMonitor?.recordRejection(item.targetUrl, rejected.negotiated, minTlsVersion);
+          req.destroy(rejected);
+          return true;
+        }
+      };
       const verifyFreshPin = (tlsSocket: TLSSocket): void => {
+        // WR-74: floor first — a below-floor peer is rejected before the
+        // pin check runs (both fail the attempt; the floor's audit event
+        // is the more actionable signal for a version regression).
+        if (enforceTlsFloor(tlsSocket)) return;
         let presented: string;
         try {
           const raw = (tlsSocket.getPeerCertificate() as { raw?: unknown }).raw;
@@ -1408,7 +1494,11 @@ export function createDefaultSender(
           // Reused pooled connection: the peer was pinned at handshake
           // time, and the pool key already binds this exact pin whitelist —
           // a cached fingerprint outside the whitelist means a poisoned
-          // socket, so fail loudly instead of delivering over it.
+          // socket, so fail loudly instead of delivering over it. The
+          // pool key likewise binds the TLS floor (WR-74), so the reused
+          // socket's version trivially qualifies — still checked, cheap
+          // and loud, in case a socket ever drifts below the floor.
+          if (enforceTlsFloor(tlsSocket)) return;
           if (allowed.includes(cached)) {
             writePayload();
           } else {
@@ -1445,9 +1535,10 @@ export function createDefaultSender(
     url: URL,
     pins: string[] | undefined,
     clientCert: TlsClientCert | undefined,
-    tlsSni: ResolvedTlsSniOverride | undefined
+    tlsSni: ResolvedTlsSniOverride | undefined,
+    minTlsVersion: MinTlsVersion | undefined
   ): Promise<DownstreamResponse> => {
-    const session = await h2pool!.sessionFor(url, pins, clientCert, tlsSni);
+    const session = await h2pool!.sessionFor(url, pins, clientCert, tlsSni, minTlsVersion);
     h2pool!.acquireStream(session);
     // WR-73: the session's handshake is done by now (established or
     // reused — the monitor edge-triggers per certificate, so a
@@ -1545,6 +1636,11 @@ export function createDefaultSender(
       url.protocol === "https:"
         ? resolveTlsSniOverride(item.targetUrl, url, tlsSniOverrides)
         : undefined;
+    // WR-74: per-endpoint TLS minimum version (exact targetUrl match).
+    // `undefined` for endpoints without an entry — and for non-`https:`
+    // targets — keeps the exact current behavior.
+    const minTlsVersion =
+      url.protocol === "https:" ? minTlsVersions?.[item.targetUrl] : undefined;
     // Outbound proxy for this endpoint: explicit per-endpoint config
     // first, then the environment (read per delivery, so proxy rotation
     // needs no restart; `NO_PROXY` bypasses the env fallback only — an
@@ -1568,15 +1664,15 @@ export function createDefaultSender(
     // H2-level failure falls back to the HTTP/1.1 pool below: a delivery
     // is never lost because of H2.
     if (h2pool !== undefined && proxyUrl === undefined && h2pool.eligibleFor(url)) {
-      return deliverViaHttp2(item, url, pins, clientCert, tlsSni).catch((err) => {
+      return deliverViaHttp2(item, url, pins, clientCert, tlsSni, minTlsVersion).catch((err) => {
         if (err instanceof Http2UnavailableError) {
           h2pool!.noteFallback();
-          return deliverViaHttp1(item, url, pins, clientCert, proxyUrl, tlsSni);
+          return deliverViaHttp1(item, url, pins, clientCert, proxyUrl, tlsSni, minTlsVersion);
         }
         throw err;
       });
     }
-    return deliverViaHttp1(item, url, pins, clientCert, proxyUrl, tlsSni);
+    return deliverViaHttp1(item, url, pins, clientCert, proxyUrl, tlsSni, minTlsVersion);
   } as PooledSender;
   sender.pool = pool;
   sender.http2Pool = h2pool;
@@ -1834,9 +1930,24 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       opts.auditLog.append(event);
     },
   });
+  // WR-74: the TLS floor monitor is always constructed but inert unless
+  // an endpoint configures a floor; every `tls_version_rejected` event
+  // lands in the audit log. Invalid floors throw RangeError at startup
+  // (see createDefaultSender).
+  const tlsVersionMonitor = new TlsVersionMonitor({
+    onRejected: (rejection) => {
+      opts.auditLog.append({
+        event: "tls_version_rejected",
+        endpoint: rejection.endpoint,
+        negotiatedVersion: rejection.negotiatedVersion,
+        requiredMinVersion: rejection.requiredMinVersion,
+        at: rejection.at,
+      });
+    },
+  });
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor)
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor)
       : undefined;
   // WR-50: endpoints the operator may pause/resume over HTTP. The server
   // only ever delivers to these — the intake target plus every
@@ -1866,7 +1977,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     if (validators !== undefined && typeof validators === "object") {
       for (const endpoint of Object.keys(validators)) knownEndpoints.add(endpoint);
     }
-    for (const record of [opts.tlsPins, opts.tlsClientCerts, opts.compressOutbound, opts.proxies, opts.outboundEncryption, opts.responseCompression, opts.forwardHeaders]) {
+    for (const record of [opts.tlsPins, opts.tlsClientCerts, opts.compressOutbound, opts.proxies, opts.outboundEncryption, opts.responseCompression, opts.forwardHeaders, opts.minTlsVersions]) {
       if (record) for (const endpoint of Object.keys(record)) knownEndpoints.add(endpoint);
     }
     for (const endpoint of opts.retry?.probe?.endpoints ?? []) knownEndpoints.add(endpoint);
@@ -2376,7 +2487,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       // configured, keeping the output byte-identical to the legacy shape.
       res
         .writeHead(200, { "content-type": "text/plain; version=0.0.4" })
-        .end(queue.renderMetrics() + versionMetrics.render() + schemaMetrics.render() + ipAclMetrics.render() + certExpiryMonitor.render());
+        .end(queue.renderMetrics() + versionMetrics.render() + schemaMetrics.render() + ipAclMetrics.render() + certExpiryMonitor.render() + tlsVersionMonitor.render());
       return;
     }
     if (isEvents) {

@@ -490,6 +490,30 @@ reliability primitives that matter for any signed-payload pipeline.
   (resumed TLS 1.3 sessions re-send none) are skipped silently. Invalid
   values throw `RangeError` at startup. Zero dependencies (`node:crypto`
   only).
+- `src/tls-version.ts` — outbound per-endpoint TLS minimum version (WR-74):
+  `createRelayServer({ minTlsVersions: { "<exact targetUrl>": "1.2" | "1.3" } })`
+  (also exposed as the fifteenth `createDefaultSender(...)` argument). The
+  floor is enforced *observationally*: the handshake runs at whatever the
+  downstream negotiates and the negotiated version is compared against the
+  floor on the socket's `secureConnect`, *before* a single payload byte is
+  written — deliberately not via `minVersion` on the socket, because a
+  socket-level floor fails the handshake with a generic OpenSSL error and
+  the relay could never attribute the failure. A negotiation below the
+  floor destroys the request with `TlsVersionRejectedError`; the attempt
+  follows the normal retry / dead-letter path and the rejection is audited
+  as `tls_version_rejected` (with `negotiatedVersion` / `requiredMinVersion`)
+  plus `relay_tls_version_rejections_total{endpoint,version}` in
+  `GET /metrics`. Endpoints without an entry keep the exact historical
+  behavior (Node defaults — `"1.2"` is the default floor and needs no
+  entry); an unparseable negotiated protocol fails closed. The keep-alive
+  pool and the H2 session pool bind the floor into their keys
+  (`|tlsmin:<version>`), so a connection handshaked under one floor can
+  never serve an endpoint configured with another. Orthogonal to
+  `tlsClientCerts` (WR-36, client identity) and the WR-73 expiry monitor
+  (warns about expiry; this rejects weak negotiation). Applies to `https:`
+  targets; `wss:` targets are not covered in this round (the WebSocket pool
+  owns its own handshake). Invalid floors throw `RangeError` at startup.
+  Zero dependencies.
 - `src/keepalive.ts` — outbound keep-alive connection pool: deliveries reuse
   TCP/TLS connections per `(scheme, host, port)` instead of paying a handshake
   per attempt. One `http.Agent`/`https.Agent` per origin, with
@@ -1721,6 +1745,10 @@ endpoints (404 when disabled):
 - `relay_probe_consecutive_failures{endpoint}` — current consecutive
   probe-failure streak per endpoint (0 = healthy), only when `probe` is
   configured,
+- `relay_tls_version_rejections_total{endpoint,version}` — outbound
+  deliveries rejected because the negotiated TLS version was below the
+  endpoint's `minTlsVersions` floor (`version` = negotiated, e.g.
+  `TLSv1.2`), only once a rejection has happened,
 - `relay_starvation_guard_activations{endpoint}` — starvation-guard
   activation episodes (urgent dispatches deferred while normal demand was
   backlogged), only for endpoints where the guard engaged,
