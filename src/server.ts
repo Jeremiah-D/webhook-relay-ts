@@ -32,6 +32,13 @@ import { UsageMeter, type UsageOptions } from "./usage.ts";
 import { InboundRateLimiter, type InboundRateLimitOptions } from "./ratelimit.ts";
 import { InboundIpAcl, IpAclMetrics, type IpAclOptions } from "./ip-acl.ts";
 import { InboundApiKeyAuth, type ApiKeyOptions, type EndpointApiKeyRule } from "./api-key.ts";
+import {
+  assertValidOperatorKeys,
+  bearerToken,
+  matchOperatorKey,
+  operatorMay,
+  type OperatorKeyEntry,
+} from "./operator-keys.ts";
 import { resolveTraceId, TRACE_ID_HEADER } from "./trace.ts";
 import {
   deriveIdempotencyKey,
@@ -603,6 +610,29 @@ export interface RelayServerOptions {
    * endpoints are disabled and answer 404 (fail closed).
    */
   operatorToken?: string;
+  /**
+   * Scoped operator API keys (WR-82; see `src/operator-keys.ts`): upgrades
+   * `operatorToken` to a key ring of `{ id, key, scopes? }` entries, where
+   * `scopes` is drawn from exactly two case-sensitive scopes — `read`
+   * (all read-only operator paths: `GET /metrics`, `GET /audit`,
+   * `GET /audit/verify`, `GET /latency`, `GET /slo-risk`, `GET /usage`,
+   * `GET /events`, `GET /events/archive`, `GET /deliveries/:traceId`,
+   * `GET /dead-letter`, `GET /dead-letter/stats`,
+   * `GET /dead-letter/auto-replay/status`, `GET /scheduled`) and `admin`
+   * (everything `read` covers plus every mutating operator path:
+   * dead-letter replays, auto-replay pause/resume/trigger,
+   * `POST /config/endpoint`, endpoint pause/resume, schedule
+   * pause/resume). The legacy `operatorToken` keeps working with full
+   * `admin` semantics when set; when both are configured, either
+   * authenticates. An entry with no `scopes` (or an empty array) is
+   * fail-closed: it authenticates but every operator path answers 403.
+   * Every operator call's audit event carries the key's `keyId` (the
+   * legacy token audits as `"legacy"`). When neither `operatorToken` nor
+   * `operatorKeys` is configured, the operator endpoints stay disabled
+   * and answer 404 (fail closed). Invalid entries (bad scope, empty
+   * id/key, duplicate id, duplicate key) throw `RangeError` at startup.
+   */
+  operatorKeys?: OperatorKeyEntry[];
   /**
    * Operator/intake plane split (WR-56, see `OperatorPortOptions`): serve
    * the operator endpoints on a second listener bound by the relay itself
@@ -2275,6 +2305,26 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   if (opts.fieldMask !== undefined) {
     opts.auditLog.setFieldMask(opts.fieldMask);
   }
+  // WR-82: the operator key id of the request currently running a
+  // mutating operator call, or `undefined` when no operator call is
+  // active. `onConfigChange` / `onEndpointPaused` / `onEndpointResumed`
+  // fire synchronously inside the queue methods the operator branches
+  // call, so setting this around those calls stamps the resulting
+  // `endpoint_config_updated` / `endpoint_paused` / `endpoint_resumed`
+  // audit events with the right `keyId`. Outside operator calls it is
+  // `undefined` and the audit shape is exactly the legacy one (no
+  // `keyId` field).
+  let activeOperatorKeyId: string | undefined;
+  /** Run `fn` as operator `keyId`, stamping any hook-fired audits. */
+  const runAsOperator = <T>(keyId: string, fn: () => T): T => {
+    const prev = activeOperatorKeyId;
+    activeOperatorKeyId = keyId;
+    try {
+      return fn();
+    } finally {
+      activeOperatorKeyId = prev;
+    }
+  };
   const queue = new RetryQueue({
     sender: opts.sender ?? defaultSender,
     ...(opts.retry ?? {}),
@@ -2505,7 +2555,12 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // Wrap the caller's onConfigChange so every runtime config change is
     // audited, not just observed.
     onConfigChange: (endpoint, changes) => {
-      opts.auditLog.append({ event: "endpoint_config_updated", endpoint, changes });
+      opts.auditLog.append({
+        event: "endpoint_config_updated",
+        endpoint,
+        changes,
+        ...(activeOperatorKeyId !== undefined ? { keyId: activeOperatorKeyId } : {}),
+      });
       opts.retry?.onConfigChange?.(endpoint, changes);
     },
     // Wrap the caller's pause hooks so every pause/resume transition is
@@ -2513,11 +2568,19 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // observed. Edge-triggered in the queue — idempotent no-ops audit
     // nothing.
     onEndpointPaused: ({ endpoint }) => {
-      opts.auditLog.append({ event: "endpoint_paused", endpoint });
+      opts.auditLog.append({
+        event: "endpoint_paused",
+        endpoint,
+        ...(activeOperatorKeyId !== undefined ? { keyId: activeOperatorKeyId } : {}),
+      });
       opts.retry?.onEndpointPaused?.({ endpoint });
     },
     onEndpointResumed: ({ endpoint }) => {
-      opts.auditLog.append({ event: "endpoint_resumed", endpoint });
+      opts.auditLog.append({
+        event: "endpoint_resumed",
+        endpoint,
+        ...(activeOperatorKeyId !== undefined ? { keyId: activeOperatorKeyId } : {}),
+      });
       opts.retry?.onEndpointResumed?.({ endpoint });
     },
     // Wrap the caller's onBatch so every flushed batch is audited, not just observed.
@@ -2596,6 +2659,10 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // is pure validation) once at startup, so a bad pattern or key entry
   // can never fail a request mid-flight.
   const apiKeyAuth = opts.apiKeys !== undefined ? new InboundApiKeyAuth(opts.apiKeys) : undefined;
+  // Scoped operator API keys (WR-82): validated once at startup so a bad
+  // scope, empty id/key, or duplicate id/key can never fail a request
+  // mid-flight.
+  assertValidOperatorKeys(opts.operatorKeys);
   // Inbound source baseline anomaly detection (WR-63): validated once at
   // startup so bad config can never fail a request mid-flight. Alert-only
   // — it never rejects — so it is orthogonal to the WR-53 IP ACL above.
@@ -2662,14 +2729,30 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     res: Parameters<Parameters<typeof createServer>[0]>[1],
     pathname: string
   ): Promise<void> => {
-    if (!opts.operatorToken) {
+    // Scoped operator authentication (WR-82): the legacy single
+    // `operatorToken` authenticates with full `admin` semantics (key id
+    // `"legacy"`), or any `operatorKeys` ring entry authenticates with
+    // its own scopes. Neither configured → 404 fail-closed, exactly the
+    // legacy behavior; a non-matching bearer → 403. Key comparison is
+    // constant-time (see `src/operator-keys.ts`).
+    const operatorKeys = opts.operatorKeys ?? [];
+    const operatorEnabled =
+      (opts.operatorToken !== undefined && opts.operatorToken !== "") ||
+      operatorKeys.length > 0;
+    if (!operatorEnabled) {
       respondJson(res, 404, { error: "operator endpoints disabled" });
       return;
     }
-    if (req.headers["authorization"] !== `Bearer ${opts.operatorToken}`) {
+    const identity = matchOperatorKey(
+      bearerToken(req.headers["authorization"]),
+      opts.operatorToken,
+      operatorKeys
+    );
+    if (identity === null) {
       respondJson(res, 403, { error: "forbidden" });
       return;
     }
+    const operatorKeyId = identity.id;
     const isList = pathname === "/dead-letter";
     const isStats = pathname === "/dead-letter/stats";
     const isBatchReplay = pathname === "/dead-letter/replay";
@@ -2748,6 +2831,15 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       respondJson(res, 405, { error: "method not allowed" });
       return;
     }
+    // WR-82 scope check: every recognized GET operator path is read-only
+    // (`read` suffices), every recognized POST operator path is mutating
+    // (needs `admin`) — the method-allowed list above makes GET/POST
+    // disjoint across operator paths. A scopeless key is fail-closed: it
+    // authenticated above, but every operator path answers 403 here.
+    if (!operatorMay(identity, req.method ?? "")) {
+      respondJson(res, 403, { error: "forbidden" });
+      return;
+    }
     if (isBatchReplay) {
       let body: Record<string, unknown>;
       try {
@@ -2799,6 +2891,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       const result = queue.replayDeadLetters(filter);
       opts.auditLog.append({
         event: "dead_letter_batch_replayed",
+        keyId: operatorKeyId,
         replayed: result.replayed,
         failed: result.failed,
         ...(endpoint !== undefined ? { endpoint } : {}),
@@ -2916,6 +3009,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       }
       opts.auditLog.append({
         event: action === "pause" ? "schedule_paused" : "schedule_resumed",
+        keyId: operatorKeyId,
         id: scheduleId,
         ...(action === "resume"
           ? {
@@ -3120,10 +3214,15 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         }
       }
       try {
-        const changes = queue.updateEndpointConfig(
-          endpoint,
-          patch as EndpointConfigPatch,
-          tenant as string | undefined
+        // WR-82: the `onConfigChange` hook fires synchronously inside
+        // `updateEndpointConfig`, so running it as this operator stamps
+        // the `endpoint_config_updated` audit with the right `keyId`.
+        const changes = runAsOperator(operatorKeyId, () =>
+          queue.updateEndpointConfig(
+            endpoint,
+            patch as EndpointConfigPatch,
+            tenant as string | undefined
+          )
         );
         respondJson(res, 200, { endpoint, ...(tenant !== undefined ? { tenant } : {}), changes });
       } catch (err) {
@@ -3170,18 +3269,21 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         respondJson(res, 404, { error: "unknown endpoint" });
         return;
       }
+      // WR-82: the pause/resume hooks fire synchronously inside the
+      // queue calls, so `runAsOperator` stamps the `endpoint_paused` /
+      // `endpoint_resumed` audit with this call's `keyId`.
       if (isEndpointsPause) {
-        queue.pauseEndpoint(endpoint);
+        runAsOperator(operatorKeyId, () => queue.pauseEndpoint(endpoint));
         respondJson(res, 200, { endpoint, paused: true });
       } else {
-        queue.resumeEndpoint(endpoint);
+        runAsOperator(operatorKeyId, () => queue.resumeEndpoint(endpoint));
         respondJson(res, 200, { endpoint, paused: false });
       }
       return;
     }
     const id = decodeURIComponent(replayMatch![1]);
     if (queue.replayDeadLetter(id)) {
-      opts.auditLog.append({ event: "dead_letter_replayed", id });
+      opts.auditLog.append({ event: "dead_letter_replayed", keyId: operatorKeyId, id });
       respondJson(res, 200, { id, replayed: true });
     } else {
       respondJson(res, 404, { error: "unknown dead-letter id" });

@@ -2171,6 +2171,56 @@ returned server also closes the operator plane; graceful shutdown stops
 the operator plane before draining in-flight deliveries, so no manual
 replays or config changes can land mid-drain.
 
+### Scoped operator API keys
+
+The operator plane used to be all-or-nothing: one shared `operatorToken`
+guarded both the read-only endpoints and the mutating ones. `operatorKeys`
+upgrades it to a key ring of `{ id, key, scopes? }` entries (see
+`src/operator-keys.ts`) with exactly two case-sensitive scopes:
+
+- `read` — every read-only operator path: `GET /metrics`, `GET /audit`,
+  `GET /audit/verify`, `GET /latency`, `GET /slo-risk`, `GET /usage`,
+  `GET /events`, `GET /events/archive`, `GET /deliveries/:traceId`,
+  `GET /dead-letter`, `GET /dead-letter/stats`,
+  `GET /dead-letter/auto-replay/status`, `GET /scheduled`.
+- `admin` — everything `read` covers **plus** every mutating operator
+  path: dead-letter replays (`POST /dead-letter/:id/replay`,
+  `POST /dead-letter/replay`), auto-replay `pause` / `resume` /
+  `trigger`, `POST /config/endpoint`, endpoint `pause` / `resume`,
+  schedule `pause` / `resume`.
+
+```ts
+createRelayServer({
+  // ...,
+  operatorKeys: [
+    { id: "monitor", key: "<prometheus-scrape-key>", scopes: ["read"] },
+    { id: "oncall", key: "<human-operator-key>", scopes: ["admin"] },
+    // no `scopes` → fail-closed: authenticates, authorized for nothing.
+    { id: "retired", key: "<revoked-but-still-deployed-key>" },
+  ],
+});
+```
+
+Semantics, deliberately conservative:
+
+- The legacy single `operatorToken` keeps working with full `admin`
+  semantics when set; when both are configured, either credential
+  authenticates. When neither is configured, the operator endpoints stay
+  disabled and answer 404 (fail closed) — exactly the legacy behavior.
+  A non-matching bearer always answers 403; key comparison is
+  constant-time (`crypto.timingSafeEqual`, no early exit on a match).
+- An entry with no `scopes` (or an empty array) is fail-closed: it
+  authenticates but every operator path answers 403.
+- Every operator call's audit event carries the key's `keyId` (the legacy
+  token audits as `"legacy"`), so an incident review can tell the
+  monitoring key apart from the human operator. Read-only requests under
+  a `read`-scoped key return the exact same response bodies as the legacy
+  token.
+- Invalid config — a scope other than `"read"` / `"admin"` (exact,
+  case-sensitive), an empty `id` or `key`, a duplicate key id, or a
+  duplicate key value — throws `RangeError` at startup (fail fast, never
+  mid-request).
+
 ## Run
 
 ```sh
@@ -2310,6 +2360,17 @@ Requires Node 24+ (runs `.ts` directly via type stripping; zero dependencies).
   on persistent failure; heartbeat comments arrive on idle connections; a
   disconnected client stops receiving without breaking the server for the
   remaining subscribers.
+- `test/operator-keys.test.ts` — scoped operator API keys (`operatorKeys`):
+  `read` keys reach every read-only operator path with byte-identical
+  response bodies but get 403 on every mutating path; `admin` keys read and
+  mutate; the legacy `operatorToken` keeps full admin semantics (audited as
+  `keyId: "legacy"`) and coexists with the ring; scopeless keys are
+  fail-closed (403 everywhere); unknown bearers get 403; no credentials
+  configured stays 404 fail-closed; `405` still precedes the scope check and
+  operator-prefix unknown paths still 404; operator audits
+  (`dead_letter_batch_replayed`, `endpoint_paused` / `endpoint_resumed`)
+  carry the key's `keyId`; `RangeError` at startup on bad scopes, duplicate
+  ids, duplicate key values, and empty ids/keys.
 - `test/response-audit.test.ts` — downstream response summaries on
   `delivered` / `dead_letter` audit events: `statusCode` / `responseBytes` /
   `timeToFirstByteMs` / `bodyFingerprintSha256` fields, `"unavailable"`
