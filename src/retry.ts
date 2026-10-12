@@ -30,6 +30,12 @@ import {
   type EndpointLatencyStats,
   type LatencyTrackerOptions,
 } from "./latency.ts";
+import {
+  SloRiskPredictor,
+  type SloRiskInfo,
+  type SloRiskObservation,
+  type SloRiskOptions,
+} from "./slo-risk.ts";
 import { EndpointDeliveryWindow, parseDeliveryWindowSpec, type DeliveryWindowOptions, type DeliveryWindowStats } from "./delivery-window.ts";
 export { parseDeliveryWindowSpec, EndpointDeliveryWindow };
 export type { DeliveryWindowOptions, DeliveryWindowStats };
@@ -100,6 +106,7 @@ import {
   type FailoverMetricsInput,
   type LatencyHistogramInput,
   type ProbeMetricsInput,
+  type SloRiskMetricsInput,
   type StarvationGuardMetricsInput,
   type WeightedMetricsInput,
 } from "./metrics.ts";
@@ -112,7 +119,7 @@ import {
 export { TRACE_ID_HEADER };
 export { renderPrometheus };
 export { TENANT_ID_HEADER, assertValidTenantId, tenantScopeKey, splitTenantScopeKey };
-export type { DeliveryCountersInput, CircuitStateInput, LatencyHistogramInput, StarvationGuardMetricsInput };
+export type { DeliveryCountersInput, CircuitStateInput, LatencyHistogramInput, StarvationGuardMetricsInput, SloRiskMetricsInput };
 export { HttpDeliveryError, classifyFailure, parseRetryAfterMs };
 export type { FailureClass, ClassifiedFailure };
 export type { DownstreamResponseSummary };
@@ -132,6 +139,7 @@ export type {
 export type { CircuitBreakerOptions, CircuitState, CircuitStats };
 export type { EncryptedPayload, PayloadEncryptor };
 export type { EndpointLatencyStats, LatencyTrackerOptions };
+export type { SloRiskInfo, SloRiskObservation, SloRiskOptions };
 export type { QuotaOptions, QuotaStats };
 export type { ReplayEgressOptions };
 export { ReplayEgressGate, DEFAULT_REPLAY_EGRESS_RPS };
@@ -287,10 +295,38 @@ export interface SloMissInfo {
   sloMs: number;
 }
 
-/** {@link LatencyTrackerOptions} plus the SLO-miss hook. */
+/** {@link LatencyTrackerOptions} plus the SLO-miss hook and the SLO-risk predictor. */
 export interface LatencyOptions extends LatencyTrackerOptions {
   /** Called once per delivery whose accepted→delivered latency exceeds `sloMs`. */
   onSloMiss?: (info: SloMissInfo) => void;
+  /**
+   * WR-71: SLO-breach prediction and early warning (see `src/slo-risk.ts`).
+   * When set, every `enqueue` and every delivered sample feeds the
+   * per-endpoint predictor, which fires `onSloRisk` before the budget is
+   * actually breached. Disabled by default (`undefined`) — the relay then
+   * behaves exactly as before, with no predictor instances and no
+   * `relay_slo_risk_seconds` series.
+   */
+  sloRisk?: SloRiskOptions;
+}
+
+/** One row of {@link RetryQueue.getSloRiskStats}. All JSON-serializable. */
+export interface SloRiskStatsRow {
+  endpoint: string;
+  /** Tenant id (WR-48); absent for the default tenant. */
+  tenant?: string;
+  /** Whether the endpoint is currently in the elevated risk state. */
+  atRisk: boolean;
+  /** `max(latencyPressure, backlogPressure)`; 1.0 = predicted breach. */
+  score: number;
+  /** Predicted accepted→delivered latency for a newly accepted delivery, ms. */
+  predictedLatencyMs: number;
+  /** p95 of the rolling latency window behind the prediction, ms. */
+  p95Ms: number;
+  /** Smoothed per-endpoint backlog (queued + in-flight + backoff-waiting). */
+  backlogEwma: number;
+  /** Predicted SLO headroom remaining, in seconds (>= 0). */
+  headroomSeconds: number;
 }
 
 /**
@@ -1646,6 +1682,20 @@ export class RetryQueue {
   private readonly latencyOpts?: LatencyOptions;
   private readonly onSloMiss?: (info: SloMissInfo) => void;
   /**
+   * WR-71: per-tenant SLO-breach predictors, keyed by tenant (`""` =
+   * default) — mirrors `latencies` above.
+   */
+  private readonly sloRisks = new Map<string, SloRiskPredictor>();
+  private readonly sloRiskOpts?: SloRiskOptions;
+  private readonly onSloRisk?: (info: SloRiskInfo) => void;
+  /**
+   * WR-71: per-(tenant, endpoint) pending deliveries (queued + in-flight
+   * + backoff-waiting), keyed by tenant instance key then logical
+   * `targetUrl`. Maintained alongside `queue` so the predictor can read
+   * the backlog in O(1) instead of scanning the queue per observation.
+   */
+  private readonly pendingByEndpoint = new Map<string, Map<string, number>>();
+  /**
    * WR-48: per-tenant quota instances, keyed by tenant (`""` = default).
    * Each tenant gets its own per-endpoint delivery budget.
    */
@@ -1953,6 +2003,14 @@ export class RetryQueue {
           });
     this.latencyOpts = opts.latency;
     this.onSloMiss = opts.latency?.onSloMiss;
+    this.sloRiskOpts = opts.latency?.sloRisk;
+    this.onSloRisk = opts.latency?.sloRisk?.onSloRisk;
+    if (this.sloRiskOpts !== undefined) {
+      // Eager validation: invalid predictor config throws at
+      // construction, never mid-request. (The per-tenant instances stay
+      // lazy, like the latency trackers.)
+      new SloRiskPredictor(this.sloRiskOpts);
+    }
     // WR-48: latency trackers and quotas are per-tenant now; instances are
     // created lazily by `latencyFor()` / `quotaFor()`.
     this.quotaDeliveriesPerMinute = opts.quota?.deliveriesPerMinute;
@@ -2089,6 +2147,7 @@ export class RetryQueue {
       this.durableSkippedLines = rec.skippedLines;
       for (const item of rec.items) {
         this.queue.set(item.id, { ...item, attempt: item.attempt });
+        this.bumpPending(item.tenantId, item.targetUrl, 1);
         if (item.nextAt !== undefined) this.restoredNextAt.set(item.id, item.nextAt);
         // A recovery restarts the accepted→delivered clock: the sample
         // measures the post-restart delivery, not the pre-crash wait.
@@ -2169,6 +2228,66 @@ export class RetryQueue {
       this.latencies.set(key, l);
     }
     return l;
+  }
+
+  /**
+   * WR-71: the calling tenant's SLO-risk predictor; `undefined` when the
+   * predictor is disabled. The queue's `onSloRisk` wrapper re-attaches the
+   * tenant (mirroring how the server wraps `onSloMiss` for auditing).
+   */
+  private sloRiskFor(tenant: string | undefined): SloRiskPredictor | undefined {
+    if (this.sloRiskOpts === undefined) return undefined;
+    const key = tenantInstanceKey(tenant);
+    let p = this.sloRisks.get(key);
+    if (p === undefined) {
+      const onSloRisk = this.onSloRisk;
+      p = new SloRiskPredictor({
+        ...this.sloRiskOpts,
+        onSloRisk:
+          onSloRisk === undefined
+            ? undefined
+            : (info) => onSloRisk({ ...info, ...(tenant === undefined ? {} : { tenant }) }),
+      });
+      this.sloRisks.set(key, p);
+    }
+    return p;
+  }
+
+  /** WR-71: adjust the per-(tenant, endpoint) pending count; zero rows are dropped. */
+  private bumpPending(tenantId: string | undefined, targetUrl: string, delta: number): void {
+    const inner = innerFor(this.pendingByEndpoint, tenantId);
+    const next = (inner.get(targetUrl) ?? 0) + delta;
+    if (next <= 0) inner.delete(targetUrl);
+    else inner.set(targetUrl, next);
+  }
+
+  /** WR-71: current pending count for one (tenant, endpoint). */
+  private pendingFor(tenantId: string | undefined, targetUrl: string): number {
+    return this.pendingByEndpoint.get(tenantInstanceKey(tenantId))?.get(targetUrl) ?? 0;
+  }
+
+  /**
+   * WR-71: feed one observation into the endpoint's SLO-risk predictor.
+   * The endpoint key is the *logical* `targetUrl` — the same key the
+   * pending counters use. In the default single-target setup it coincides
+   * with the physical target the latency samples carry; with failover /
+   * weighted dispatch active the latency side degrades gracefully (no
+   * samples under the logical key → cold-start guard → no latency-driven
+   * risk) while the backlog trend still evaluates.
+   */
+  private evaluateSloRisk(tenantId: string | undefined, endpoint: string): void {
+    const predictor = this.sloRiskFor(tenantId);
+    if (predictor === undefined) return;
+    const tracker = this.latencyFor(tenantId);
+    if (tracker === undefined) return; // Unreachable: sloRisk nests under latency.
+    const row = tracker.stats(endpoint)[0];
+    const obs: SloRiskObservation = {
+      backlog: this.pendingFor(tenantId, endpoint),
+      ...(row === undefined ? {} : { stats: { p95: row.p95, min: row.min, count: row.count } }),
+      concurrency: this.limiterFor(tenantId).maxFor(endpoint),
+      sloMs: tracker.sloMs,
+    };
+    predictor.observe(endpoint, obs);
   }
 
   /**
@@ -2432,6 +2551,7 @@ export class RetryQueue {
     // WR-49: journal before the in-memory mutation, like enqueueNow.
     this.durable?.appendEnqueue(requeued);
     this.queue.set(item.id, requeued);
+    this.bumpPending(item.tenantId, requeued.targetUrl, 1);
     // A replay starts a fresh delivery cycle: restart the latency clock so
     // the sample measures the replayed attempt, not the original one.
     // WR-48: the replay keeps the dead letter's tenant, so the clock
@@ -2728,6 +2848,9 @@ export class RetryQueue {
     // is queued: the batching delay is by design, not lateness.)
     // WR-48: per-tenant tracker.
     this.latencyFor(item.tenantId)?.recordAccepted(item.id);
+    // WR-71: the backlog changed — feed the SLO-risk predictor.
+    this.bumpPending(item.tenantId, stored.targetUrl, 1);
+    this.evaluateSloRisk(item.tenantId, stored.targetUrl);
     if (this.running) {
       this.schedule(item.id, 0);
     }
@@ -3277,6 +3400,7 @@ export class RetryQueue {
           this.compactDurable();
         }
         this.queue.delete(id);
+        this.bumpPending(entry.tenantId, entry.targetUrl, -1);
         this.armedNextAt.delete(id);
         this.recordDelivery(tenant, target, "delivered");
         if (fastLane) this.recordUrgentStat(target, "delivered");
@@ -3298,6 +3422,9 @@ export class RetryQueue {
             sloMs: latency.sloMs,
           });
         }
+        // WR-71: one sample landed and the backlog shrank — re-evaluate
+        // the SLO risk for the logical endpoint.
+        this.evaluateSloRisk(tenant, entry.targetUrl);
         // The hooks see the physical target the delivery actually went to.
         this.onDelivered?.({ ...entry, targetUrl: target }, entry.attempt + 1, responseSummary);
         this.emitDeliveryEvent({
@@ -3512,6 +3639,7 @@ export class RetryQueue {
       this.compactDurable();
     }
     this.queue.delete(id);
+    this.bumpPending(entry.tenantId, entry.targetUrl, -1);
     this.armedNextAt.delete(id);
     this.recordDelivery(entry.tenantId, target, "deadLetter");
     // Never delivered: drop the pending clock without sampling.
@@ -3623,6 +3751,24 @@ export class RetryQueue {
   }
 
   /**
+   * WR-71: per-(tenant, endpoint) SLO-risk snapshot — one row per endpoint
+   * with at least one risk evaluation (endpoints still in cold start are
+   * omitted). Rows carry `tenant` only when set. Empty when the predictor
+   * is disabled or nothing has been evaluated yet.
+   */
+  getSloRiskStats(tenant?: string): SloRiskStatsRow[] {
+    const out: SloRiskStatsRow[] = [];
+    for (const [key, predictor] of this.sloRisks) {
+      if (tenant !== undefined && key !== tenant) continue;
+      const t = key === "" ? undefined : key;
+      for (const row of predictor.snapshot()) {
+        out.push(t === undefined ? row : { ...row, tenant: t });
+      }
+    }
+    return out;
+  }
+
+  /**
    * Prometheus text exposition of the collected metrics (see
    * `src/metrics.ts`): per-endpoint delivery counters
    * (`relay_deliveries_total`), circuit gauges for endpoints that tripped
@@ -3639,7 +3785,9 @@ export class RetryQueue {
    * configured, and the scheduled-delivery counters
    * (`relay_scheduled_total`, `relay_scheduled_due_total`,
    * `relay_scheduled_canceled_total`) once a delivery has actually been
-   * parked for a future deliver_at (WR-57).
+   * parked for a future deliver_at (WR-57), and the SLO-risk headroom gauge
+   * (`relay_slo_risk_seconds`) for endpoints currently elevated by the
+   * WR-71 predictor.
    */
   renderMetrics(): string {
     // WR-48: counters are keyed by (tenant, endpoint); the tenant becomes
@@ -3717,6 +3865,20 @@ export class RetryQueue {
     // actually been parked — activity-gated, like the starvation-guard
     // series, so an untouched relay's exposition is unchanged.
     const scheduledStats = this.scheduler.stats();
+    // WR-71: one gauge series per currently elevated (tenant, endpoint) —
+    // activity-gated the same way, so a relay that never predicted risk
+    // exposes no `relay_slo_risk_seconds` series at all.
+    const sloRisk: SloRiskMetricsInput[] = [];
+    for (const [tenantKey, predictor] of this.sloRisks) {
+      const tenant = tenantKey === "" ? undefined : tenantKey;
+      for (const row of predictor.atRisk()) {
+        sloRisk.push({
+          endpoint: row.endpoint,
+          ...(tenant === undefined ? {} : { tenant }),
+          headroomSeconds: row.headroomSeconds,
+        });
+      }
+    }
     return renderPrometheus({
       deliveries,
       circuits,
@@ -3745,6 +3907,9 @@ export class RetryQueue {
             },
           }
         : {}),
+      // WR-71: activity-gated (see above) — the gauge appears only while
+      // at least one endpoint is elevated.
+      ...(sloRisk.length > 0 ? { sloRisk } : {}),
     });
   }
 

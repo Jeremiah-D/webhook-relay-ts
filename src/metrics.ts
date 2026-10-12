@@ -47,6 +47,10 @@
  *   arrived, and of parked deliveries canceled before it. Present only
  *   once a delivery has actually been parked. No endpoint label — the
  *   delay queue is relay-wide.
+ * - `relay_slo_risk_seconds{endpoint}`: gauge of predicted SLO headroom
+ *   remaining before breach, in seconds (WR-71 early warning). Present
+ *   only for endpoints currently elevated by the SLO-risk predictor —
+ *   absent entirely when the predictor is disabled or nothing is at risk.
  *
  * Cardinality note: labels are per endpoint (`targetUrl`), so a relay
  * fanning out to many distinct downstream URLs grows the series count —
@@ -107,6 +111,12 @@ export interface MetricsInput {
   globalConcurrencyWaits?: number;
   /** Present only once a delivery has been parked for a future deliver_at (WR-57). */
   scheduled?: ScheduledMetricsInput;
+  /**
+   * Present only for endpoints currently elevated by the SLO-risk
+   * predictor (WR-71); absent entirely when the predictor is disabled or
+   * nothing is at risk.
+   */
+  sloRisk?: SloRiskMetricsInput[];
 }
 
 /** One endpoint's starvation-guard activation count, in Prometheus label order. */
@@ -153,6 +163,15 @@ export interface ScheduledMetricsInput {
   due: number;
   /** Cumulative parked deliveries canceled before their deliver_at. */
   canceled: number;
+}
+
+/** One endpoint's predicted SLO headroom (WR-71), in Prometheus label order. */
+export interface SloRiskMetricsInput {
+  endpoint: string;
+  /** Tenant id (WR-48); when set it is rendered as a `tenant` label. */
+  tenant?: string;
+  /** Predicted SLO headroom remaining before breach, in seconds (>= 0). */
+  headroomSeconds: number;
 }
 
 /** Escape a label value per the Prometheus exposition format. */
@@ -287,6 +306,17 @@ export function renderPrometheus(input: MetricsInput): string {
     );
     lines.push("# TYPE relay_scheduled_canceled_total counter");
     lines.push(`relay_scheduled_canceled_total ${input.scheduled.canceled}`);
+  }
+  if (input.sloRisk !== undefined && input.sloRisk.length > 0) {
+    lines.push(
+      "# HELP relay_slo_risk_seconds Predicted SLO headroom remaining before breach, by endpoint (WR-71 early warning; 0 = breach predicted now)."
+    );
+    lines.push("# TYPE relay_slo_risk_seconds gauge");
+    for (const r of input.sloRisk) {
+      lines.push(
+        `relay_slo_risk_seconds{endpoint="${escapeLabelValue(r.endpoint)}"${tenantLabel(r.tenant)}} ${r.headroomSeconds}`
+      );
+    }
   }
   return lines.join("\n") + "\n";
 }

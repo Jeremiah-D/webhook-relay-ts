@@ -1605,6 +1605,7 @@ function isOperatorPath(pathname: string): boolean {
     pathname.startsWith("/dead-letter/") ||
     pathname === "/audit" ||
     pathname === "/latency" ||
+    pathname === "/slo-risk" ||
     pathname === "/events" ||
     pathname === "/events/archive" ||
     pathname === "/metrics" ||
@@ -1851,6 +1852,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       opts.retry?.onCompletionCallbackFailed?.(info);
     },
     // Wrap the caller's onSloMiss so every SLO miss is audited, not just observed.
+    // WR-71: same treatment for onSloRisk — every early-warning
+    // transition is audited as `slo_risk` (state "elevated" / "cleared"),
+    // not just observed.
     latency: latencyOpts
       ? {
           ...latencyOpts,
@@ -1858,6 +1862,17 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
             opts.auditLog.append({ event: "slo_missed", ...info });
             latencyOpts.onSloMiss?.(info);
           },
+          ...(latencyOpts.sloRisk
+            ? {
+                sloRisk: {
+                  ...latencyOpts.sloRisk,
+                  onSloRisk: (info) => {
+                    opts.auditLog.append({ event: "slo_risk", ...info });
+                    latencyOpts.sloRisk?.onSloRisk?.(info);
+                  },
+                },
+              }
+            : {}),
         }
       : undefined,
     onDelivered: (item, attempts, summary) => {
@@ -2116,6 +2131,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     const isBatchReplay = pathname === "/dead-letter/replay";
     const isAudit = pathname === "/audit";
     const isLatency = pathname === "/latency";
+    const isSloRisk = pathname === "/slo-risk";
     const isEvents = pathname === "/events";
     const isEventsArchive = pathname === "/events/archive";
     const isMetrics = pathname === "/metrics";
@@ -2135,6 +2151,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       !isBatchReplay &&
       !isAudit &&
       !isLatency &&
+      !isSloRisk &&
       !isEvents &&
       !isEventsArchive &&
       !isMetrics &&
@@ -2159,6 +2176,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         (isBatchReplay && req.method === "POST") ||
         (isAudit && req.method === "GET") ||
         (isLatency && req.method === "GET") ||
+        (isSloRisk && req.method === "GET") ||
         (isEvents && req.method === "GET") ||
         (isEventsArchive && req.method === "GET") ||
         (isMetrics && req.method === "GET") ||
@@ -2295,6 +2313,15 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
           params.get("tenant") ?? undefined
         )
       );
+      return;
+    }
+    if (isSloRisk) {
+      // WR-71: SLO-breach early-warning snapshot — one row per endpoint
+      // with at least one risk evaluation. Guarded by the same
+      // operator-token check as the other operator endpoints
+      // (fail-closed without operatorToken).
+      const params = new URL(req.url ?? "/slo-risk", "http://internal").searchParams;
+      respondJson(res, 200, queue.getSloRiskStats(params.get("tenant") ?? undefined));
       return;
     }
     if (isScheduledList) {

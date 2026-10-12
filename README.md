@@ -175,6 +175,23 @@ reliability primitives that matter for any signed-payload pipeline.
   rate (`withinSlo / count` against `sloMs`, default 5000ms). Deliveries
   slower than the budget fire `onSloMiss` and are audited as `slo_missed`.
   The clock is injectable for deterministic tests.
+- `src/slo-risk.ts` — SLO-breach prediction and early warning
+  (`SloRiskPredictor`), opt-in under `retry.latency.sloRisk` (disabled by
+  default). Every `enqueue` and every delivered sample feeds a per-endpoint
+  observation; the score is `max(latencyPressure, backlogPressure)` where
+  latency pressure is the rolling p95 against `sloMs` and backlog pressure
+  is a forward queueing projection (backlog EWMA + smoothed trend ×
+  unloaded service time ÷ endpoint concurrency — 0 when concurrency is
+  unbounded). A score of 1.0 is a predicted breach; crossing `warnRatio`
+  (default 0.8) fires `onSloRisk` with `state: "elevated"`, audited as
+  `slo_risk`, and recovery below `warnRatio * clearRatio` (default 0.7)
+  fires `state: "cleared"` — hysteresis, so a hovering score never flaps.
+  Cold start (fewer than `minSamples` delivered samples, default 3) never
+  fires. `getSloRiskStats()` — also served at `GET /slo-risk`
+  (Bearer <redacted>-guarded, optional `?tenant=`) — exposes the snapshot, and
+  `relay_slo_risk_seconds{endpoint}` reports the predicted headroom in
+  seconds while an endpoint is elevated. Event-driven (no timers), so the
+  whole thing is deterministic under an injected clock.
 - `src/audit.ts` — append-only JSONL audit log (`append` / `readAll`) plus an
   indexed query (`query({ event, endpoint, since, until, limit })`): a lazily
   maintained line-offset index maps each complete line to its `ts`/`event`/
@@ -1592,10 +1609,10 @@ value is:
 
 - echoed in the 202 response body (`{"id", "traceId", "status"}`),
 - written on every audit line (`accepted`, `delivered`, `dead_letter`,
-  `rejected`, `duplicate_suppressed`, `slo_missed`, `batch_flushed`,
-  plus `retrying` — one line per failed attempt, carrying the error and
-  the scheduled delay) — `GET /audit?traceId=<id>` pulls one event's
-  whole trail,
+  `rejected`, `duplicate_suppressed`, `slo_missed`, `slo_risk`,
+  `batch_flushed`, plus `retrying` — one line per failed attempt,
+  carrying the error and the scheduled delay) —
+  `GET /audit?traceId=<id>` pulls one event's whole trail,
 - attached to every SSE delivery event frame,
 - forwarded downstream as the `x-trace-id` header, so the next hop can
   correlate with this relay's audit trail.
@@ -1674,7 +1691,11 @@ endpoints (404 when disabled):
   backlogged), only for endpoints where the guard engaged,
 - `relay_retry_budget_depleted_total` — retries parked because the global
   retry budget was exhausted (no endpoint label — the budget is global),
-  only when `retry.retryBudget` is enabled.
+  only when `retry.retryBudget` is enabled,
+- `relay_slo_risk_seconds{endpoint}` — predicted SLO headroom remaining
+  before breach, in seconds (0 = breach predicted now), only for endpoints
+  currently elevated by the SLO-risk predictor, only when
+  `retry.latency.sloRisk` is enabled.
 
 ### Dead-letter auto-replay
 
