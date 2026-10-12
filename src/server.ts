@@ -49,6 +49,13 @@ import {
   type ResolvedTlsSniOverride,
   type TlsSniOverride,
 } from "./tls-sni.ts";
+import {
+  assertValidSecretRotationRules,
+  compileSecretRotationRules,
+  selectSecretRotation,
+  SIGNATURE_VERSION_HEADER,
+  type EndpointSecretRotationRule,
+} from "./secret-rotation.ts";
 import { OutboundConnectionPool, type KeepAlivePoolOptions } from "./keepalive.ts";
 import {
   assertValidProxyUrl,
@@ -182,6 +189,24 @@ export interface RelayServerOptions {
    * rules throw `RangeError` at startup.
    */
   endpointVerifiers?: EndpointVerifierRule[];
+  /**
+   * Inbound HMAC secret dual-version zero-downtime rotation (WR-67, see
+   * `src/secret-rotation.ts`): per-endpoint `currentSecret` +
+   * `previousSecret` in parallel — the old key stays verifiable inside
+   * its grace window while the sender migrates, so no in-flight webhook
+   * fails during the flip. Senders declare the signing side with the
+   * `x-signature-version` header (`"current"` / `"previous"`); without
+   * it the server tries `current` first and falls back to `previous`.
+   * Every `previous`-verified webhook is audited as
+   * `secret_rotation_previous_used`; once the grace window has elapsed
+   * (`RotatingEndpointSecret#isRotationComplete()`), clearing
+   * `previousSecret` completes the rotation. Applies only where the
+   * default HMAC verifier is in force — a custom `verifier`,
+   * `signingKeys`, or a matching `endpointVerifiers` rule takes
+   * precedence and the rotation rule is ignored there. Invalid rules
+   * throw `RangeError` at startup.
+   */
+  secretRotation?: EndpointSecretRotationRule[];
   /**
    * Inbound API version routing (WR-33, see `src/version.ts`): inbound
    * paths may carry a version prefix (`/v1/...`, `/v2/...`) whose payload
@@ -1897,6 +1922,12 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // Per-endpoint verifier rules are validated once at startup so a bad
   // pattern or verifier can never fail a request mid-flight.
   assertValidEndpointVerifierRules(opts.endpointVerifiers);
+  // WR-67: dual-secret rotation rules are validated and compiled once at
+  // startup for the same reason — and compiling once pins the
+  // previous-secret grace window of rules without previousRetiredAtMs to
+  // server start instead of restarting it per request.
+  assertValidSecretRotationRules(opts.secretRotation);
+  const secretRotations = compileSecretRotationRules(opts.secretRotation);
   // API version routes are validated once at startup for the same reason.
   const versionRouter =
     opts.versions !== undefined ? new ApiVersionRouter(opts.versions.routes) : undefined;
@@ -2728,12 +2759,30 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // in api-key-only mode the key gate already authenticated the
     // request, so no signing key id is reported.
     const rotating = !apiKeyAuthenticates && rotatingVerifier;
+    // Dual-secret rotation (WR-67): an endpoint rotation rule applies
+    // only where the default HMAC verifier is in force — a custom
+    // `verifier`, `signingKeys` (WR-20), or a matching per-endpoint
+    // verifier rule (WR-29) takes precedence and the rotation rule is
+    // ignored there. Orthogonal to WR-65: in api-key-only mode the key
+    // gate already authenticated the request; in requireSignature mode
+    // the dual-secret check below is the signature leg.
+    const dualSecret =
+      !apiKeyAuthenticates && !rotatingVerifier && opts.verifier === undefined && !perEndpointVerifier
+        ? selectSecretRotation(pathname, secretRotations)
+        : undefined;
+    const versionHintRaw = headers[SIGNATURE_VERSION_HEADER];
+    const versionHint = Array.isArray(versionHintRaw) ? versionHintRaw[0] : versionHintRaw;
+    let verifiedSecretVersion: "current" | "previous" | undefined;
     if (apiKeyAuthenticates) {
       verified = true;
     } else if (rotatingVerifier) {
       const detail = activeVerifier.verifyDetailed(body, signatureHeader ?? "", { keyId: keyIdHint });
       verified = detail.ok;
       verifiedKeyId = detail.keyId;
+    } else if (dualSecret !== undefined) {
+      const detail = dualSecret.verify(body, signatureHeader ?? "", { version: versionHint });
+      verified = detail.ok;
+      verifiedSecretVersion = detail.version;
     } else {
       verified = activeVerifier.verify(body, signatureHeader ?? "");
     }
@@ -3041,6 +3090,20 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       ...tenantLabel,
       targetUrl: opts.forwardUrl,
     };
+    // WR-67: every webhook that verified with the previous secret is
+    // audited on its own event, so the operator sees how much rotation
+    // traffic still runs on the old key — the signal that the rotation
+    // is (or is not) ready to complete.
+    if (verifiedSecretVersion === "previous") {
+      opts.auditLog.append({
+        ...correlation,
+        event: "secret_rotation_previous_used",
+        id,
+        traceId,
+        ...tenantLabel,
+        endpoint: pathname,
+      });
+    }
     if (version !== undefined) acceptedEvent.version = version;
     if (schema !== undefined) {
       acceptedEvent.schema = schema.name;

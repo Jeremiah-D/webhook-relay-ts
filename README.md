@@ -41,6 +41,27 @@ reliability primitives that matter for any signed-payload pipeline.
   verifier }` rules (exact `/hooks/stripe` or prefix `/hooks/*`, first
   match wins, unmatched paths fall back to the global verifier), so one
   relay can trust Ed25519 for one upstream and HMAC-SHA256 for another.
+- `src/secret-rotation.ts` — inbound HMAC secret dual-version
+  zero-downtime rotation (`RotatingEndpointSecret`, WR-67): one endpoint
+  carries `currentSecret` + `previousSecret` in parallel while the
+  sender migrates, so in-flight webhooks signed with the old key keep
+  verifying instead of 401-storming. Senders declare the signing side
+  with the `x-signature-version` header (`"current"` / `"previous"`);
+  without it the server tries `current` first and falls back to
+  `previous` inside its grace window (default 1h, inclusive boundary,
+  matching the WR-20 convention). An unknown version value fails closed;
+  a per-endpoint verifier rule (WR-29), a custom global `verifier`, or
+  `signingKeys` (WR-20) takes precedence and the rotation rule is
+  ignored there. Wired into the server via `secretRotation:
+  [{ pattern, rotation }]` (same exact/prefix path semantics as the
+  verifier rules); invalid rules throw `RangeError` at startup. Every
+  `previous`-verified webhook is audited as
+  `secret_rotation_previous_used` — the operator's signal for when the
+  rotation is ready to complete — and
+  `RotatingEndpointSecret#isRotationComplete()` reports when the grace
+  window has elapsed so `previousSecret` can be cleared. Orthogonal to
+  WR-65: in API-key-only mode the key gate authenticates; in
+  `requireSignature` mode the dual-secret check is the signature leg.
 - `src/version.ts` — inbound API version routing (`ApiVersionRouter`).
   Version prefixes in the inbound path (`/v1/...`, `/v2/...`, segment
   boundaries only, longest prefix wins) route the payload through a
@@ -660,6 +681,47 @@ reliability primitives that matter for any signed-payload pipeline.
   deliveries to settle. Opt in per server with
   `createRelayServer({ ..., gracefulShutdown: { timeoutMs: 30_000 } })`
   (off by default; the `exit` hook is overridable for embedding/tests).
+
+## HMAC secret rotation (zero-downtime)
+
+Rotate an inbound endpoint's signing secret without a 401 storm: deploy
+the new key as `currentSecret` while the old key keeps verifying inside
+its grace window, cut the sender over, then clear `previousSecret`.
+
+```ts
+const server = createRelayServer({
+  secret, // global fallback for paths with no rotation rule
+  forwardUrl,
+  secretRotation: [
+    {
+      pattern: "/hooks/payments", // exact path or "/hooks/*" prefix
+      rotation: {
+        currentSecret: NEW_SECRET,
+        previousSecret: OLD_SECRET, // clear this once the rotation completes
+        graceSeconds: 3600, // default 3600; 0 disables previous entirely
+        // previousRetiredAtMs: <epoch ms> — pin this for rotations that
+        // span deploys, otherwise the window is assumed to start at
+        // server startup
+      },
+    },
+  ],
+});
+```
+
+Senders declare which key they used with `x-signature-version:
+"current" | "previous"`; without the header the server tries `current`
+first and falls back to `previous` inside the grace window. An unknown
+version fails closed (401). Every webhook that verified with the old key
+is audited as `secret_rotation_previous_used` (with the endpoint path) —
+watch that event stream to know when rotation traffic has drained.
+`new RotatingEndpointSecret(cfg).isRotationComplete()` reports when the
+grace window has fully elapsed; clearing `previousSecret` then finishes
+the rotation. A matching `endpointVerifiers` rule, a custom global
+`verifier`, or `signingKeys` takes precedence over the rotation rule on
+the same path. Invalid rules throw `RangeError` at startup. Orthogonal
+to WR-65 API-key authentication: key-only endpoints never consult the
+secrets; with `requireSignature: true` the dual-secret check is the
+signature leg.
 
 ## Graceful shutdown
 
