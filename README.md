@@ -197,7 +197,17 @@ reliability primitives that matter for any signed-payload pipeline.
   maintained line-offset index maps each complete line to its `ts`/`event`/
   `endpoint` fields and byte span, so only matching lines are read back from
   disk; appends are indexed incrementally and truncation/rotation rebuilds the
-  index. Malformed lines are skipped by the index.
+  index. Malformed lines are skipped by the index. Every line also carries a
+  tamper-evident hash-chain link (`prevHash` / `hash`): SHA-256 over the
+  previous link's hash plus a canonical JSON of the line body — the LG-11
+  convention from ledger-api-go — computed over the sealed line, so a WR-11
+  encrypted `payload` envelope is covered by the chain, never the plaintext.
+  `verifyChain()` recomputes the chain and reports the first break (rewritten
+  line, deleted line, or spliced foreign lines) with its 1-based line number;
+  corrupt lines are reported but skipped without breaking continuity,
+  orthogonally to the index. `GET /audit/verify` (operator token; 404 when no
+  token is configured) returns the verification report — the payment-fintech
+  compliance control that makes post-hoc log edits detectable.
 - `src/masking.ts` — field-level masking for audit payloads (`FieldMask`):
   opt-in per-endpoint rules like `{ path: "card_number", strategy: "last4" }`
   (`"4111111111111111"` → `"****1111"`, irreversible; `"full"` → `"****"`).

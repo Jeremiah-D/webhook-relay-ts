@@ -143,7 +143,7 @@ import {
  * ports: the intake plane (the returned server, bound by the caller with
  * `listen()`) accepts only webhooks, and the operator plane (bound by the
  * relay itself at creation, see `RelayServer.operatorServer`) serves only
- * the operator endpoints (`/dead-letter`, `/audit`, `/metrics`, `/events`,
+ * the operator endpoints (`/dead-letter`, `/audit`, `/audit/verify`, `/metrics`, `/events`,
  * `/config/endpoint`, `/deliveries/:traceId`, ...). Operator paths hit on
  * the intake plane — and webhook posts hit on the operator plane — are
  * answered with a plain 404 that reveals nothing about the other plane.
@@ -1954,6 +1954,7 @@ function isOperatorPath(pathname: string): boolean {
     pathname === "/dead-letter" ||
     pathname.startsWith("/dead-letter/") ||
     pathname === "/audit" ||
+    pathname === "/audit/verify" ||
     pathname === "/latency" ||
     pathname === "/slo-risk" ||
     pathname === "/events" ||
@@ -2537,6 +2538,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     const isStats = pathname === "/dead-letter/stats";
     const isBatchReplay = pathname === "/dead-letter/replay";
     const isAudit = pathname === "/audit";
+    const isAuditVerify = pathname === "/audit/verify";
     const isLatency = pathname === "/latency";
     const isSloRisk = pathname === "/slo-risk";
     const isEvents = pathname === "/events";
@@ -2557,6 +2559,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       !isStats &&
       !isBatchReplay &&
       !isAudit &&
+      !isAuditVerify &&
       !isLatency &&
       !isSloRisk &&
       !isEvents &&
@@ -2582,6 +2585,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         (isStats && req.method === "GET") ||
         (isBatchReplay && req.method === "POST") ||
         (isAudit && req.method === "GET") ||
+        (isAuditVerify && req.method === "GET") ||
         (isLatency && req.method === "GET") ||
         (isSloRisk && req.method === "GET") ||
         (isEvents && req.method === "GET") ||
@@ -2766,6 +2770,13 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         return;
       }
       respondJson(res, 200, entries);
+      return;
+    }
+    if (isAuditVerify) {
+      // WR-77: tamper-evidence report for the audit log's hash chain. Behind
+      // the same operatorToken guard as the other operator endpoints (404
+      // when no operatorToken is configured — fail closed).
+      respondJson(res, 200, opts.auditLog.verifyChain());
       return;
     }
     if (deliveryMatch) {

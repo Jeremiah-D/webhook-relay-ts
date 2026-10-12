@@ -1,4 +1,5 @@
 import { appendFileSync, closeSync, openSync, readFileSync, readSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { isEncryptedPayload, type PayloadEncryptor } from "./encrypt.ts";
 import type { FieldMask } from "./masking.ts";
 
@@ -61,6 +62,91 @@ export interface AuditQuery {
   traceId?: string;
 }
 
+/**
+ * WR-77: the first break in an audit-log hash chain, as reported by
+ * {@link AuditLog.verifyChain}.
+ */
+export interface AuditChainBreak {
+  /** 1-based physical line number in the file where continuity first breaks. */
+  line: number;
+  /**
+   * Machine-readable reason:
+   * - `missing_chain_fields` — the line has no (or malformed) `prevHash`/`hash`
+   *   fields, so nothing can be verified from here on;
+   * - `prev_mismatch` — the line's `prevHash` does not equal the previous
+   *   link's `hash`: a line was deleted, or foreign lines were spliced in;
+   * - `hash_mismatch` — the line's content was rewritten: the stored `hash`
+   *   does not match a recomputation over the line's own fields.
+   */
+  reason: "missing_chain_fields" | "prev_mismatch" | "hash_mismatch";
+}
+
+/** Result of {@link AuditLog.verifyChain}. JSON-serializable for the operator endpoint. */
+export interface AuditChainVerification {
+  /** False when a break was found; corrupt lines alone do not fail verification. */
+  ok: boolean;
+  /** Number of non-blank physical lines scanned. */
+  lines: number;
+  /** Lines whose chain links verified cleanly. */
+  checked: number;
+  /**
+   * 1-based line numbers of segments that were not valid JSON objects.
+   * Reported truthfully, but skipped: a corrupt line never breaks chain
+   * continuity (orthogonal to the WR-04 index, which also skips bad lines).
+   */
+  corruptLines: number[];
+  /** The first break, when `ok` is false. */
+  firstBreak?: AuditChainBreak;
+  /**
+   * Hex SHA-256 of the newest verified link — the trusted head. `ok: false`
+   * reports the head of the trusted prefix; an empty log reports the
+   * genesis value.
+   */
+  head: string;
+}
+
+/**
+ * WR-77: genesis `prevHash` for the first link — 32 zero bytes, hex-encoded,
+ * following the LG-11 hash-chain convention in ledger-api-go.
+ */
+const CHAIN_GENESIS = "00".repeat(32);
+
+const CHAIN_HASH_RE = /^[0-9a-f]{64}$/;
+
+/**
+ * WR-77: deterministic canonical JSON for hashing: object keys sorted
+ * recursively, no insignificant whitespace. Applied to the JSON round-trip
+ * of the line body at both `append` and `verifyChain` time, so key order in
+ * the file can never affect the hash.
+ */
+function canonicalJson(value: unknown): string {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  switch (typeof value) {
+    case "object": {
+      const rec = value as Record<string, unknown>;
+      const keys = Object.keys(rec).sort();
+      return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalJson(rec[k])}`).join(",")}}`;
+    }
+    case "string":
+      return JSON.stringify(value);
+    case "number":
+    case "boolean":
+      return String(value);
+    default:
+      // Unreachable for values that survived a JSON round-trip.
+      return "null";
+  }
+}
+
+/**
+ * WR-77: `SHA-256(prevHash || canonicalBody)` (LG-11 convention). `prevHash`
+ * is a fixed 64-hex-char string, so the concatenation is unambiguous.
+ */
+function hashAuditLink(prevHash: string, canonicalBody: string): string {
+  return createHash("sha256").update(prevHash, "utf8").update(canonicalBody, "utf8").digest("hex");
+}
+
 /** One indexed JSONL line: its searchable fields plus its byte span. */
 interface IndexEntry {
   /** Millisecond epoch of the line's `ts`, or NaN when missing/invalid. */
@@ -114,6 +200,12 @@ function maskablePayload(
  * caller's event fields plus an ISO-8601 `ts` timestamp. Kept dependency-free
  * so the log can be inspected with plain `jq`/text tools.
  *
+ * WR-77: every line also carries a tamper-evident hash-chain link
+ * (`prevHash` / `hash`, SHA-256 over the previous link's hash plus a
+ * canonical JSON of the line body — the LG-11 convention from
+ * ledger-api-go). `verifyChain()` recomputes the chain and reports the
+ * first break (rewritten, deleted, or spliced lines) with its line number.
+ *
  * `query()` filters the log without re-parsing it: a lazily maintained
  * index maps each complete line to its searchable fields (`ts`, `event`,
  * `endpoint`) and its byte span in the file, so only matching lines are
@@ -127,6 +219,15 @@ export class AuditLog {
   private index: IndexEntry[] = [];
   /** Byte offset up to which the file has been indexed. */
   private indexedBytes = 0;
+  /**
+   * WR-77: hex hash of the newest chain link written (by anyone), or null
+   * when unknown. `chainFileBytes` is the file size that tip was derived
+   * from — any size change re-derives the tip, so rotation, truncation, or
+   * another AuditLog instance appending to the same file can never fork
+   * the chain silently.
+   */
+  private chainHead: string | null = null;
+  private chainFileBytes = 0;
 
   constructor(path: string, opts: AuditLogOptions = {}) {
     this.path = path;
@@ -156,11 +257,148 @@ export class AuditLog {
   append(event: object): void {
     // WR-72: masking runs before sealing — the raw values never reach
     // the ciphertext or the plaintext line.
-    const line = JSON.stringify({
+    // WR-77: the WR-11 encryptor seals first, then the chain hashes the
+    // sealed line: the hash covers the ciphertext envelope, never plaintext.
+    const body = {
       ts: new Date().toISOString(),
       ...this.sealPayload(this.applyFieldMask(event)),
-    });
+    };
+    // Hash the JSON round-trip of the body: canonicalJson then sees exactly
+    // what lands on disk, so verifyChain's recomputation matches byte for byte.
+    const canonicalBody = canonicalJson(JSON.parse(JSON.stringify(body)));
+    const prevHash = this.chainPrevHash();
+    const hash = hashAuditLink(prevHash, canonicalBody);
+    const line = JSON.stringify({ ...body, prevHash, hash });
     appendFileSync(this.path, line + "\n", "utf8");
+    this.chainHead = hash;
+    try {
+      this.chainFileBytes = statSync(this.path).size;
+    } catch {
+      this.chainFileBytes = 0;
+    }
+  }
+
+  /**
+   * WR-77: the `prevHash` for the next appended link. Re-derives the tip
+   * from the file whenever this instance has no tip yet or the file size
+   * changed since (rotation, truncation, or another writer appending).
+   */
+  private chainPrevHash(): string {
+    let size = 0;
+    try {
+      size = statSync(this.path).size;
+    } catch {
+      // Missing file: nothing chained yet.
+    }
+    if (this.chainHead === null || size !== this.chainFileBytes) {
+      this.chainHead = this.readTipHash();
+      this.chainFileBytes = size;
+    }
+    return this.chainHead;
+  }
+
+  /**
+   * WR-77: scan the file tail for the newest complete line carrying a
+   * well-formed `hash` link. A newest line that predates the chain (or is
+   * corrupt) restarts the chain at genesis rather than forging continuity.
+   */
+  private readTipHash(): string {
+    let raw: string;
+    try {
+      raw = readFileSync(this.path, "utf8");
+    } catch {
+      return CHAIN_GENESIS;
+    }
+    const segments = raw.split("\n");
+    for (let i = segments.length - 1; i >= 0; i--) {
+      if (segments[i].trim().length === 0) continue;
+      let obj: unknown;
+      try {
+        obj = JSON.parse(segments[i]);
+      } catch {
+        continue;
+      }
+      if (!obj || typeof obj !== "object") continue;
+      const hash = (obj as Record<string, unknown>).hash;
+      if (typeof hash === "string" && CHAIN_HASH_RE.test(hash)) return hash;
+      return CHAIN_GENESIS;
+    }
+    return CHAIN_GENESIS;
+  }
+
+  /**
+   * WR-77: recompute the tamper-evident hash chain over the whole file.
+   * Detects rewritten lines (`hash_mismatch`), deleted lines or spliced-in
+   * foreign lines (`prev_mismatch`), and lines that carry no usable link at
+   * all (`missing_chain_fields`), reporting the 1-based line number of the
+   * first break. Corrupt (non-JSON) lines are reported in `corruptLines`
+   * but skipped: they never break chain continuity, orthogonally to the
+   * WR-04 line-offset index which also skips bad lines. Blank padding
+   * lines are ignored entirely.
+   */
+  verifyChain(): AuditChainVerification {
+    let raw: string;
+    try {
+      raw = readFileSync(this.path, "utf8");
+    } catch {
+      return { ok: true, lines: 0, checked: 0, corruptLines: [], head: CHAIN_GENESIS };
+    }
+    const corruptLines: number[] = [];
+    let expectedPrev = CHAIN_GENESIS;
+    let lines = 0;
+    let checked = 0;
+    let firstBreak: AuditChainBreak | undefined;
+    const segments = raw.split("\n");
+    for (let i = 0; i < segments.length; i++) {
+      const segment = segments[i];
+      if (i === segments.length - 1 && segment.length === 0) break; // trailing newline
+      if (segment.trim().length === 0) continue; // blank padding: ignored
+      const lineNo = i + 1;
+      lines++;
+      let obj: unknown;
+      let wellFormed = true;
+      try {
+        obj = JSON.parse(segment);
+      } catch {
+        wellFormed = false;
+      }
+      if (!wellFormed || !obj || typeof obj !== "object" || Array.isArray(obj)) {
+        corruptLines.push(lineNo);
+        continue;
+      }
+      if (firstBreak !== undefined) continue; // keep scanning: corrupt lines are still reported
+      const rec = obj as Record<string, unknown>;
+      const prevHash = rec.prevHash;
+      const hash = rec.hash;
+      if (
+        typeof prevHash !== "string" ||
+        typeof hash !== "string" ||
+        !CHAIN_HASH_RE.test(prevHash) ||
+        !CHAIN_HASH_RE.test(hash)
+      ) {
+        firstBreak = { line: lineNo, reason: "missing_chain_fields" };
+        continue;
+      }
+      if (prevHash !== expectedPrev) {
+        firstBreak = { line: lineNo, reason: "prev_mismatch" };
+        continue;
+      }
+      const { prevHash: _prev, hash: _hash, ...body } = rec;
+      if (hashAuditLink(prevHash, canonicalJson(body)) !== hash) {
+        firstBreak = { line: lineNo, reason: "hash_mismatch" };
+        continue;
+      }
+      expectedPrev = hash;
+      checked++;
+    }
+    return {
+      ok: firstBreak === undefined,
+      lines,
+      checked,
+      corruptLines,
+      ...(firstBreak === undefined ? {} : { firstBreak }),
+      head: expectedPrev,
+    };
   }
 
   /**
