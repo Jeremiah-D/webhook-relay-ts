@@ -52,6 +52,13 @@ export interface AutoReplayRoundResult {
   replayed: string[];
   /** Entries that could not be re-queued; they stay dead-lettered. */
   failed: DeadLetterBatchReplayResult["failed"];
+  /**
+   * Ids held back by the WR-68 replay egress throttle this round (still
+   * in the dead-letter list; nothing dropped). A round that only
+   * throttled counts as progress for the empty-round accounting — the
+   * backlog is being worked, not poison.
+   */
+  throttled: string[];
   /** Consecutive empty rounds *after* accounting this round. */
   consecutiveEmptyRounds: number;
   /** Whether the scheduler stopped permanently as a result of this round. */
@@ -248,6 +255,7 @@ export class DeadLetterAutoReplayer {
       return {
         replayed: [],
         failed: [],
+        throttled: [],
         consecutiveEmptyRounds: this.consecutiveEmptyRounds,
         stopped: this.stopped,
       };
@@ -310,10 +318,12 @@ export class DeadLetterAutoReplayer {
   private doRound(): AutoReplayRoundResult {
     let replayed: string[] = [];
     let failed: DeadLetterBatchReplayResult["failed"] = [];
+    let throttled: string[] = [];
     try {
       const result = this.replayAll();
       replayed = result.replayed;
       failed = result.failed;
+      throttled = result.throttled ?? [];
     } catch {
       // A replay-layer throw must not kill the scheduler: it counts as an
       // empty round, exactly like a round where every entry failed to
@@ -322,7 +332,10 @@ export class DeadLetterAutoReplayer {
     }
     this.totalReplayed += replayed.length;
     this.lastRunAt = new Date(this.now()).toISOString();
-    if (replayed.length > 0) {
+    // WR-68: a round that only throttled entries counts as progress — the
+    // egress gate paced the backlog, nothing poisoned it — so it resets
+    // the empty-round counter like any round that moved work.
+    if (replayed.length > 0 || throttled.length > 0) {
       this.consecutiveEmptyRounds = 0;
     } else {
       this.consecutiveEmptyRounds += 1;
@@ -343,6 +356,7 @@ export class DeadLetterAutoReplayer {
     return {
       replayed,
       failed,
+      throttled,
       consecutiveEmptyRounds: this.consecutiveEmptyRounds,
       stopped: this.stopped,
     };

@@ -239,8 +239,8 @@ describe("dead-letter batch replay", () => {
   it("returns empty results when nothing matches", async () => {
     const { q, timer } = seedDeadLetters([{ id: "a", targetUrl: EP_A }]);
     await timer.run();
-    assert.deepEqual(q.replayDeadLetters({ endpoint: EP_B }), { replayed: [], failed: [] });
-    assert.deepEqual(q.replayDeadLetters({ ids: [] }), { replayed: [], failed: [] });
+    assert.deepEqual(q.replayDeadLetters({ endpoint: EP_B }), { replayed: [], failed: [], throttled: [] });
+    assert.deepEqual(q.replayDeadLetters({ ids: [] }), { replayed: [], failed: [], throttled: [] });
     assert.deepEqual(q.replayDeadLetters({}, { dryRun: true }).length, 1);
   });
 

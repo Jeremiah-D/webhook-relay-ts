@@ -658,16 +658,21 @@ reliability primitives that matter for any signed-payload pipeline.
   and sealed payloads are never decrypted. A real replay processes the
   matched entries grouped by endpoint, each entry independently (one failure
   cannot stop the others; failures stay dead-lettered), responds
-  `{ replayed: [...], failed: [{ id, error }] }`, and is audited as
-  `dead_letter_batch_replayed`. The opt-in `autoReplay` server option
-  (see *Dead-letter auto-replay* below) replays the whole list on a timer
-  with identical fresh-budget semantics, controlled by
+  `{ replayed: [...], failed: [{ id, error }], throttled: [...] }`, and is
+  audited as `dead_letter_batch_replayed`. The opt-in `replayEgress`
+  server/queue option (see *Replay egress throttling* below) caps the
+  re-queue rate per endpoint so a large backlog replays at a bounded rate
+  instead of stampeding the downstream — entries held back stay
+  dead-lettered (nothing dropped) and are reported in `throttled` plus the
+  cumulative `throttled` counter on `GET /dead-letter/stats`. The opt-in
+  `autoReplay` server option (see *Dead-letter auto-replay* below) replays
+  the whole list on a timer with identical fresh-budget semantics, controlled by
   `POST /dead-letter/auto-replay/pause|resume|trigger` and observed via
   `GET /dead-letter/auto-replay/status`. The opt-in `deadLetterRetention`
   server option (see *Dead-letter retention* below) auto-purges dead
   letters past their per-endpoint TTL on a background sweep — each purge
   audited as `dead_letter_purged` with metadata only, never the payload —
-  and exposes `{ total, purged, byEndpoint }` at
+  and exposes `{ total, purged, throttled, byEndpoint }` at
   `GET /dead-letter/stats`. The same guard protects
   `GET /audit` (`?endpoint=`, `?event=` repeatable, `?since=`/`?until=` ISO-8601,
   `?limit=`), which queries the audit log through its index — delivery
@@ -1670,10 +1675,39 @@ purged mid-shutdown.
 **Operator surface** (same Bearer <redacted>, fail closed to 404 without
 `operatorToken`):
 
-- `GET /dead-letter/stats` — `{ total, purged, byEndpoint }`: live
-  entries, entries auto-purged since startup, and live entries per
-  logical endpoint.
+- `GET /dead-letter/stats` — `{ total, purged, throttled, byEndpoint }`: live
+  entries, entries auto-purged since startup, entries held back by the
+  WR-68 replay egress throttle since startup (cumulative — each is still
+  live in the list until a later replay re-queues it), and live entries
+  per logical endpoint.
 - `GET /audit?event=dead_letter_purged` — the per-purge audit trail.
+
+### Replay egress throttling
+
+Opt-in per-endpoint rate cap on dead-letter *re-queue* admission
+(`src/replay-egress.ts`): with `replayEgress: { replaysPerSecond: 5 }`
+(or `retry.replayEgress` on a raw queue), every replay path — manual
+`replayDeadLetters`, operator `POST /dead-letter/replay`, and the WR-31
+auto-replayer — draws from one shared per-endpoint token bucket
+(`failoverEndpoint ?? targetUrl`, the same logical-endpoint key the
+`/dead-letter/stats` grouping uses), so a big backlog replays at a
+bounded rate instead of stampeding the downstream. The single-id
+`replayDeadLetter(id)` operator escape hatch is deliberately not gated:
+an operator replaying one entry by hand is not a storm.
+
+**Burst semantics.** A replay that matches more entries than the bucket
+currently holds does not drop anything: held-back entries stay in the
+dead-letter list (FIFO position preserved) and are reported in the batch
+result's `throttled` id list and the cumulative `throttled` counter on
+`GET /dead-letter/stats`; the next replay call — manual or an auto-replay
+round — picks them up. Once an entry is re-queued it walks the normal
+delivery path (circuit breaker, quota, weighted dispatch, failover)
+untouched and independent. A WR-31 round that only throttled entries
+counts as progress for the empty-round accounting, so a
+throttled-but-healthy backlog never trips the rounds-exhausted stop.
+Off by default; a present-but-empty object uses the default
+`replaysPerSecond` of 10; invalid values throw `RangeError` at
+construction.
 
 ### Delivery event archive
 

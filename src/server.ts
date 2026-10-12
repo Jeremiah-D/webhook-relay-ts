@@ -19,6 +19,7 @@ import { createBoundAddressSelfCheck } from "./callback.ts";
 import { TENANT_ID_HEADER, assertValidTenantId, tenantScopeKey } from "./tenant.ts";
 import type { AutoReplayOptions } from "./autoreplay.ts";
 import type { DeadLetterRetentionOptions } from "./deadletter-retention.ts";
+import type { ReplayEgressOptions } from "./replay-egress.ts";
 import { HttpDeliveryError, parseRetryAfterMs } from "./failure.ts";
 import { installGracefulShutdown } from "./shutdown.ts";
 import { SourceBaselineDetector, type SourceBaselineOptions } from "./source-baseline.ts";
@@ -507,6 +508,18 @@ export interface RelayServerOptions {
    * `GET /dead-letter/stats`.
    */
   deadLetterRetention?: DeadLetterRetentionOptions;
+  /**
+   * Dead-letter replay egress throttle (WR-68; see
+   * `src/replay-egress.ts` and the `replayEgress` `RetryQueue` option):
+   * opt-in per-endpoint RPS cap on the *re-queue* admission shared by
+   * manual `replayDeadLetters`, operator `POST /dead-letter/replay`, and
+   * WR-31 auto-replay rounds. Entries held back stay dead-lettered
+   * (nothing dropped) and are reported in the batch result's `throttled`
+   * field plus the cumulative `throttled` counter on
+   * `GET /dead-letter/stats`. Off by default — replays admit
+   * immediately. Invalid values throw `RangeError` at startup.
+   */
+  replayEgress?: ReplayEgressOptions;
   /**
    * Delivery completion callbacks (WR-47; see `src/callback.ts`). Opt-in:
    * when a delivery reaches a terminal state (`delivered` or
@@ -1707,6 +1720,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // An explicit server-level `deadLetterRetention` wins over the nested
     // `retry.deadLetterRetention`; either way the queue owns the sweeper.
     deadLetterRetention: opts.deadLetterRetention ?? opts.retry?.deadLetterRetention,
+    // An explicit server-level `replayEgress` wins over the nested
+    // `retry.replayEgress`; either way the queue owns the gate.
+    replayEgress: opts.replayEgress ?? opts.retry?.replayEgress,
     // Wrap the caller's hook so every retention purge is audited as
     // `dead_letter_purged`, not just observed.
     onDeadLetterPurged: (event) => {

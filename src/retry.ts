@@ -44,6 +44,7 @@ import {
 export { ScheduledDeliveryQueue, parseDeliverAtHeader, DELIVER_AT_HEADER };
 export type { ScheduledQueueOptions, ScheduledStats, ScheduledDeliveryInfo };
 import { EndpointQuota, type QuotaOptions, type QuotaStats } from "./quota.ts";
+import { ReplayEgressGate, type ReplayEgressOptions, DEFAULT_REPLAY_EGRESS_RPS } from "./replay-egress.ts";
 import { RetryBudget, type RetryBudgetOptions } from "./retry-budget.ts";
 import {
   AdaptiveBackoffController,
@@ -132,6 +133,8 @@ export type { CircuitBreakerOptions, CircuitState, CircuitStats };
 export type { EncryptedPayload, PayloadEncryptor };
 export type { EndpointLatencyStats, LatencyTrackerOptions };
 export type { QuotaOptions, QuotaStats };
+export type { ReplayEgressOptions };
+export { ReplayEgressGate, DEFAULT_REPLAY_EGRESS_RPS };
 export type { RetryBudgetOptions } from "./retry-budget.ts";
 export { RetryBudget, DEFAULT_RETRY_BUDGET_PER_MINUTE } from "./retry-budget.ts";
 export type { AdaptiveBackoffOptions, AdaptiveBackoffEndpointStats } from "./adaptive-backoff.ts";
@@ -568,6 +571,14 @@ export interface DeadLetterBatchReplayResult {
    * longer decrypts); they stay in the dead-letter list untouched.
    */
   failed: DeadLetterReplayFailure[];
+  /**
+   * Ids matched but held back by the WR-68 replay egress throttle (this
+   * call's per-endpoint budget was exhausted). They stay in the
+   * dead-letter list — nothing is dropped — and the next replay call
+   * (manual or a WR-31 auto round) picks them up. Empty when the egress
+   * gate is not configured.
+   */
+  throttled: string[];
 }
 
 /** Dead-letter observability snapshot (see {@link RetryQueue.getDeadLetterStats}). */
@@ -576,6 +587,12 @@ export interface DeadLetterStats {
   total: number;
   /** Entries auto-purged by the retention sweep (WR-64) since construction. */
   purged: number;
+  /**
+   * Entries held back by the WR-68 replay egress throttle since
+   * construction (cumulative; each is still live in the list until a
+   * later replay re-queues it).
+   */
+  throttled: number;
   /** Live entries per logical endpoint (first-seen order). */
   byEndpoint: Array<{ endpoint: string; count: number }>;
 }
@@ -978,6 +995,25 @@ export interface RetryQueueOptions {
    * users get the hook directly.
    */
   onDeadLetterPurged?: (event: DeadLetterPurgedEvent) => void;
+  /**
+   * Dead-letter replay egress throttle (WR-68; see
+   * `src/replay-egress.ts`). Opt-in per-endpoint RPS cap on the
+   * *re-queue* admission of `replayDeadLetters` — manual, operator
+   * (`POST /dead-letter/replay`), and WR-31 auto-replay rounds all draw
+   * from the same shared bucket, so a big backlog replays at a bounded
+   * rate instead of stampeding the downstream. Entries beyond the
+   * budget are held back in the dead-letter list (nothing dropped, FIFO
+   * preserved) and reported in the batch result's `throttled` field and
+   * `getDeadLetterStats().throttled`; the next replay call picks them
+   * up. The single-id `replayDeadLetter(id)` escape hatch is not gated.
+   * Once re-queued, entries walk the normal path — circuit breaker,
+   * quota, weighted dispatch, failover — untouched and independent.
+   * Disabled by default (absent = unlimited, exactly the pre-WR-68
+   * behavior). A present-but-empty object uses the default
+   * `replaysPerSecond` (10). Invalid values throw `RangeError` at
+   * construction.
+   */
+  replayEgress?: ReplayEgressOptions;
 }
 
 /**
@@ -1707,6 +1743,10 @@ export class RetryQueue {
   /** Entries auto-purged by the retention sweep since construction. */
   private deadLetterPurged = 0;
   private readonly onDeadLetterPurged?: (event: DeadLetterPurgedEvent) => void;
+  /** WR-68: shared replay egress gate; undefined when not configured. */
+  private readonly replayEgress?: ReplayEgressGate;
+  /** WR-68: cumulative entries held back by the egress gate. */
+  private replayEgressThrottled = 0;
   private readonly prober?: DownstreamProber;
   /** WR-39: active/standby target selection; undefined when not configured. */
   private readonly failover?: FailoverManager;
@@ -2005,6 +2045,13 @@ export class RetryQueue {
           onPurged: (event) => this.onDeadLetterPurged?.(event),
         },
       });
+    }
+    if (opts.replayEgress !== undefined) {
+      // WR-68: constructed eagerly so invalid values throw RangeError at
+      // construction, never mid-replay. Manual replays, the operator
+      // `POST /dead-letter/replay`, and the WR-31 auto-replayer all flow
+      // through `replayDeadLetters`, so they share this one gate.
+      this.replayEgress = new ReplayEgressGate(opts.replayEgress);
     }
     if (opts.probe !== undefined) {
       // A probe outcome feeds the circuit breaker exactly like a delivery
@@ -2429,7 +2476,8 @@ export class RetryQueue {
 
   /**
    * Dead-letter observability snapshot: live entry count, entries
-   * auto-purged by the retention sweep since construction, and live
+   * auto-purged by the retention sweep since construction, entries held
+   * back by the WR-68 replay egress throttle (cumulative), and live
    * entries per logical endpoint (first-seen order). Served over HTTP
    * as `GET /dead-letter/stats`.
    */
@@ -2442,8 +2490,17 @@ export class RetryQueue {
     return {
       total: this.deadLetter.length,
       purged: this.deadLetterPurged,
+      throttled: this.replayEgressThrottled,
       byEndpoint: [...byEndpoint].map(([endpoint, count]) => ({ endpoint, count })),
     };
+  }
+
+  /**
+   * The opt-in WR-68 replay egress gate, or `undefined` when no
+   * `replayEgress` option was configured.
+   */
+  getReplayEgressGate(): ReplayEgressGate | undefined {
+    return this.replayEgress;
   }
 
   /**
@@ -2535,10 +2592,26 @@ export class RetryQueue {
       }
       const replayed: string[] = [];
       const failed: DeadLetterReplayFailure[] = [];
+      const throttled: string[] = [];
       const seen = new Set<string>();
       for (const entries of groups.values()) {
         for (const entry of entries) {
           seen.add(entry.id);
+          // WR-68: the shared egress gate throttles re-queue admission.
+          // The bucket is keyed by the *logical* endpoint the entry will
+          // be re-queued on (`failoverEndpoint ?? targetUrl` — the same
+          // key `getDeadLetterStats` groups by), so a standby failover
+          // does not buy extra budget. A held-back entry stays in the
+          // dead-letter list — nothing is dropped, FIFO order is
+          // preserved — and the next replay call picks it up. The gate is
+          // orthogonal to breaker/quota/weighted/limiter: it only paces
+          // re-queue admission, never the delivery path.
+          const egressEndpoint = entry.failoverEndpoint ?? entry.targetUrl;
+          if (this.replayEgress && !this.replayEgress.take(egressEndpoint)) {
+            throttled.push(entry.id);
+            this.replayEgressThrottled += 1;
+            continue;
+          }
           try {
             if (this.replayDeadLetter(entry.id)) {
               replayed.push(entry.id);
@@ -2558,7 +2631,7 @@ export class RetryQueue {
           if (!seen.has(id)) failed.push({ id, error: "unknown dead-letter id" });
         }
       }
-      return { replayed, failed };
+      return { replayed, failed, throttled };
     } finally {
       for (const entry of matched) this.releaseReplay(entry.id);
     }
