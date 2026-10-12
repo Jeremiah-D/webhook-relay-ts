@@ -2196,6 +2196,21 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       opts.auditLog.append(event);
       opts.retry?.onDeadLetterPurged?.(event);
     },
+    // Wrap the caller's hook so every deadline expiry is audited as
+    // `delivery_deadline_exceeded`, not just observed.
+    onDeliveryDeadlineExceeded: (info) => {
+      opts.auditLog.append({
+        event: "delivery_deadline_exceeded",
+        id: info.id,
+        traceId: info.traceId,
+        ...(info.tenant !== undefined ? { tenant: info.tenant } : {}),
+        targetUrl: info.endpoint,
+        attempts: info.attempts,
+        elapsedMs: info.elapsedMs,
+        deadlineMs: info.deadlineMs,
+      });
+      opts.retry?.onDeliveryDeadlineExceeded?.(info);
+    },
     // An explicit server-level `probe` wins over the nested `retry.probe`;
     // either way the queue owns the prober. Wrap the caller's hook so
     // every probe outcome worth auditing lands in the audit log.

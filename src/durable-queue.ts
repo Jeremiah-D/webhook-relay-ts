@@ -75,6 +75,8 @@ export interface JournalEnqueueItem {
   priority?: "normal" | "urgent";
   traceId?: string;
   tenantId?: string;
+  /** WR-76: queue-admission instant (ms epoch); the deadline clock survives restarts. */
+  enqueuedAt?: number;
 }
 
 /** The dead-letter snapshot carried by a `dead_letter` line. */
@@ -209,6 +211,9 @@ export class QueueJournal {
         ...(item.priority !== undefined ? { priority: item.priority } : {}),
         ...(item.traceId !== undefined ? { traceId: item.traceId } : {}),
         ...(item.tenantId !== undefined ? { tenantId: item.tenantId } : {}),
+        // WR-76: preserve the deadline clock across restarts — a crash
+        // does not reset the end-to-end SLO.
+        ...(item.enqueuedAt !== undefined ? { enqueuedAt: item.enqueuedAt } : {}),
       },
     });
   }
@@ -310,6 +315,11 @@ export class QueueJournal {
             tenantId: line.item.tenantId,
             attempt: 0,
             hasRetry: false,
+            // WR-76: keep the pre-crash admission instant when the
+            // journal has one; otherwise the deadline check stamps it
+            // lazily on the next dispatch instead of expiring a
+            // just-restored item.
+            ...(Number.isFinite(line.item.enqueuedAt) ? { enqueuedAt: line.item.enqueuedAt } : {}),
           });
           break;
         }
@@ -500,6 +510,8 @@ export interface CompactItem {
   traceId?: string;
   tenantId?: string;
   attempt: number;
+  /** WR-76: queue-admission instant (ms epoch); the deadline clock survives compaction. */
+  enqueuedAt?: number;
   /** Absolute ms epoch of the armed retry timer, when one is pending. */
   nextAt?: number;
 }

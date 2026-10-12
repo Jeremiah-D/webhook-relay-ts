@@ -131,6 +131,12 @@ export interface MetricsInput {
    * nothing was observed yet.
    */
   certExpiry?: CertExpiryMetricsInput[];
+  /**
+   * Present only for endpoints where a delivery's end-to-end deadline
+   * (WR-76) actually expired; absent entirely when the deadline is
+   * unconfigured or nothing has expired yet.
+   */
+  deliveryDeadlineExceeded?: DeliveryDeadlineExceededInput[];
 }
 
 /** One endpoint's starvation-guard activation count, in Prometheus label order. */
@@ -206,6 +212,15 @@ export interface CompressedBytesSavedInput {
   endpoint: string;
   /** Cumulative payload bytes saved by gzip compression (original minus compressed). */
   bytesSaved: number;
+}
+
+/** One endpoint's delivery-deadline expirations (WR-76), in Prometheus label order. */
+export interface DeliveryDeadlineExceededInput {
+  endpoint: string;
+  /** Tenant id (WR-48); when set it is rendered as a `tenant` label. */
+  tenant?: string;
+  /** Cumulative deliveries dead-lettered because their deadline expired. */
+  exceeded: number;
 }
 
 /**
@@ -387,5 +402,18 @@ export function renderPrometheus(input: MetricsInput): string {
   // WR-73: activity-gated like the slo-risk gauge — the series appears
   // only once the monitor has actually observed a certificate.
   lines.push(...renderCertExpiryBlock(input.certExpiry ?? []));
+  // WR-76: activity-gated the same way — the series appears only once a
+  // delivery deadline has actually expired.
+  if (input.deliveryDeadlineExceeded !== undefined && input.deliveryDeadlineExceeded.length > 0) {
+    lines.push(
+      "# HELP relay_delivery_deadline_exceeded_total Deliveries dead-lettered because the per-endpoint end-to-end delivery deadline (WR-76) expired before delivery."
+    );
+    lines.push("# TYPE relay_delivery_deadline_exceeded_total counter");
+    for (const d of input.deliveryDeadlineExceeded) {
+      lines.push(
+        `relay_delivery_deadline_exceeded_total{endpoint="${escapeLabelValue(d.endpoint)}"${tenantLabel(d.tenant)}} ${d.exceeded}`
+      );
+    }
+  }
   return lines.join("\n") + "\n";
 }

@@ -1903,6 +1903,39 @@ Off by default; a present-but-empty object uses the default
 `replaysPerSecond` of 10; invalid values throw `RangeError` at
 construction.
 
+### Delivery deadline (end-to-end SLO)
+
+Opt-in per-endpoint deadline from queue admission to delivery
+confirmation (`src/retry.ts`, `deliveryDeadline` on `retry` options) —
+the full chain, not a connection or read timeout:
+
+```ts
+const queue = new RetryQueue({
+  sender,
+  deliveryDeadline: {
+    deadlines: { "https://pay.example/hook": 30_000 }, // exact targetUrl match
+    now: () => Date.now(), // injectable clock for tests
+  },
+});
+```
+
+The deadline is an end-to-end SLO, orthogonal to the retry backoff: a
+delivery may retry normally while inside its deadline, and the moment
+the deadline passes the item stops — it is audited as
+`delivery_deadline_exceeded` and dead-lettered immediately with its
+actual attempt count, no further backoff is scheduled, and the remaining
+retry budget is untouched. Time parked in the urgent fast lane, the
+quota hold, the circuit-breaker hold, the manual pause, and the delivery
+window all counts toward the deadline; only the by-design holds before
+queue admission (the batch window, the `deliver_at` delay) do not — the
+same convention as the accepted→delivered latency clock. The expired
+dead-letter entry carries a normal `deadLetteredAt`, so it participates
+in the dead-letter retention sweep like any other dead letter, and
+expirations are counted in
+`relay_delivery_deadline_exceeded_total{endpoint[,tenant]}`. A
+dead-letter replay starts a fresh delivery cycle with a fresh deadline.
+Off by default; invalid values throw `RangeError` at construction.
+
 ### Delivery event archive
 
 Opt-in persistent history for the delivery lifecycle events

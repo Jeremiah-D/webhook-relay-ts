@@ -105,6 +105,7 @@ import {
   type CircuitStateInput,
   type CertExpiryMetricsInput,
   type DeliveryCountersInput,
+  type DeliveryDeadlineExceededInput,
   type FailoverMetricsInput,
   type LatencyHistogramInput,
   type ProbeMetricsInput,
@@ -224,6 +225,16 @@ export interface RetryItem {
    * a missing value as attempt 1 (`(item.attempt ?? 0) + 1`).
    */
   attempt?: number;
+  /**
+   * WR-76: ms epoch when the item entered the deliverable queue
+   * (`enqueueNow`), stamped by the queue — the start of the
+   * end-to-end delivery deadline clock. A caller-supplied value is
+   * honored (hand-built items, tests); otherwise the queue stamps
+   * `deliveryDeadline.now()` at admission. Dead-letter replays refresh
+   * it: a replay starts a fresh delivery cycle with a fresh deadline,
+   * exactly like the WR-13 latency clock restart.
+   */
+  enqueuedAt?: number;
 }
 
 /** Options for the urgent delivery lane (see {@link DeliveryPriority}). */
@@ -634,6 +645,77 @@ export interface DeadLetterStats {
   throttled: number;
   /** Live entries per logical endpoint (first-seen order). */
   byEndpoint: Array<{ endpoint: string; count: number }>;
+}
+
+/**
+ * Per-endpoint end-to-end delivery deadline (WR-76): the SLO clock for a
+ * delivery runs from queue admission (`RetryItem.enqueuedAt`) to delivery
+ * confirmation — the full chain, not a connection or read timeout.
+ *
+ * Design intent: the deadline is an end-to-end SLO, not a retry budget.
+ * It is orthogonal to the retry backoff — a delivery may retry normally
+ * while inside its deadline, and the moment the deadline passes the item
+ * stops: no further backoff is scheduled and the remaining retry budget
+ * is not consumed. Time parked in the urgent fast lane (WR-12), the
+ * quota hold (WR-15), the circuit-breaker hold (WR-10), the manual pause
+ * (WR-50), and the delivery window (WR-52) all counts toward the
+ * deadline — only the by-design holds *before* queue admission (the
+ * WR-09 batch window, the WR-57 deliver_at delay) do not, the same
+ * convention as the WR-13 accepted→delivered latency clock.
+ */
+export interface DeliveryDeadlineOptions {
+  /**
+   * Per-endpoint deadline in ms: exact `targetUrl` (the logical endpoint)
+   * -> milliseconds from queue admission to delivery confirmation.
+   * Endpoints absent from the record have no deadline — the feature is
+   * opt-in per endpoint, unset means off. Every value must be a finite
+   * number > 0; anything else throws `RangeError` at construction.
+   */
+  deadlines?: Record<string, number>;
+  /** Clock in ms; defaults to `Date.now`. Injectable for deterministic tests. */
+  now?: () => number;
+}
+
+/** Fired when a delivery's end-to-end deadline expires before delivery (WR-76). */
+export interface DeliveryDeadlineExceededInfo {
+  /** Delivery id. */
+  id: string;
+  /** End-to-end trace ID. */
+  traceId: string;
+  /** Tenant id (WR-48); absent for the default tenant. */
+  tenant?: string;
+  /** Logical downstream endpoint (`targetUrl`). */
+  endpoint: string;
+  /** Attempts actually consumed before the deadline expired (never fabricated). */
+  attempts: number;
+  /** Milliseconds elapsed from queue admission to expiry. */
+  elapsedMs: number;
+  /** The endpoint's configured deadline in ms. */
+  deadlineMs: number;
+}
+
+/**
+ * The terminal error carried into the dead-letter entry when a
+ * delivery's end-to-end deadline expires (WR-76). Classified
+ * `"retryable"` — the payload was not poison, the relay simply ran out
+ * of SLO — so the dead-letter record reads honestly.
+ */
+export class DeliveryDeadlineExceededError extends Error {
+  /** Logical endpoint whose deadline expired. */
+  readonly endpoint: string;
+  /** Milliseconds elapsed from queue admission to expiry. */
+  readonly elapsedMs: number;
+  /** The endpoint's configured deadline in ms. */
+  readonly deadlineMs: number;
+  constructor(endpoint: string, elapsedMs: number, deadlineMs: number) {
+    super(
+      `delivery deadline exceeded for ${endpoint}: ${Math.round(elapsedMs)}ms elapsed (deadline ${deadlineMs}ms)`
+    );
+    this.name = "DeliveryDeadlineExceededError";
+    this.endpoint = endpoint;
+    this.elapsedMs = elapsedMs;
+    this.deadlineMs = deadlineMs;
+  }
 }
 
 export interface RetryQueueOptions {
@@ -1064,6 +1146,27 @@ export interface RetryQueueOptions {
    * construction.
    */
   replayEgress?: ReplayEgressOptions;
+  /**
+   * Per-endpoint end-to-end delivery deadline (WR-76; see
+   * {@link DeliveryDeadlineOptions}): exact `targetUrl` -> ms from queue
+   * admission to delivery confirmation. When the deadline expires the
+   * item is audited as `delivery_deadline_exceeded` and dead-lettered
+   * immediately with its actual attempt count — no further backoff is
+   * scheduled and the remaining retry budget is untouched. The expired
+   * dead-letter entry carries a normal `deadLetteredAt` timestamp, so it
+   * participates in the WR-64 retention sweep like any other dead
+   * letter. Disabled by default (absent = no deadline, exactly the
+   * pre-WR-76 behavior). Invalid values throw `RangeError` at
+   * construction. Reachable over HTTP via `opts.retry.deliveryDeadline`
+   * on the relay server.
+   */
+  deliveryDeadline?: DeliveryDeadlineOptions;
+  /**
+   * Called once per delivery whose end-to-end deadline expires before
+   * delivery. The server audits these as `delivery_deadline_exceeded`;
+   * library users get the hook directly.
+   */
+  onDeliveryDeadlineExceeded?: (info: DeliveryDeadlineExceededInfo) => void;
 }
 
 /**
@@ -1735,6 +1838,13 @@ export class RetryQueue {
   private readonly scheduledNow: () => number;
   /** Attempts parked outside an endpoint's delivery window. Keyed by scoped key (WR-48). */
   private readonly deliveryWindowStats = new Map<string, Map<string, number>>();
+  /** WR-76: per-endpoint delivery deadline in ms (exact logical `targetUrl` match); undefined when disabled. */
+  private readonly deliveryDeadlines?: Map<string, number>;
+  /** WR-76: clock for the deadline; defaults to `Date.now`. Injectable for deterministic tests. */
+  private readonly deadlineNow: () => number;
+  private readonly onDeliveryDeadlineExceeded?: (info: DeliveryDeadlineExceededInfo) => void;
+  /** WR-76: cumulative deadline expirations per (tenant, endpoint) — see `src/metrics.ts`. */
+  private readonly deliveryDeadlineExceeded = new Map<string, Map<string, number>>();
   /**
    * WR-37: per-endpoint response semantic validators (exact `targetUrl`
    * match) plus an optional global fallback. Validators run after a 2xx
@@ -1924,6 +2034,30 @@ export class RetryQueue {
     if (opts.deliveryWindow !== undefined) {
       this.deliveryWindow = new EndpointDeliveryWindow(opts.deliveryWindow);
     }
+    // WR-76: invalid deadlines throw here, at construction — a typo must
+    // not silently leave an endpoint without its SLO. `undefined` (no
+    // deadlines) keeps the exact pre-WR-76 behavior.
+    if (opts.deliveryDeadline?.deadlines !== undefined) {
+      const deadlines = new Map<string, number>();
+      const raw = opts.deliveryDeadline.deadlines;
+      if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+        throw new RangeError("deliveryDeadline.deadlines must be a record of targetUrl -> ms");
+      }
+      for (const [endpoint, ms] of Object.entries(raw)) {
+        if (endpoint.length === 0) {
+          throw new RangeError("deliveryDeadline.deadlines keys must be non-empty endpoint URLs");
+        }
+        if (typeof ms !== "number" || !Number.isFinite(ms) || ms <= 0) {
+          throw new RangeError(
+            `deliveryDeadline.deadlines[${JSON.stringify(endpoint)}] must be a finite number > 0, got ${String(ms)}`
+          );
+        }
+        deadlines.set(endpoint, ms);
+      }
+      this.deliveryDeadlines = deadlines;
+    }
+    this.deadlineNow = opts.deliveryDeadline?.now ?? Date.now;
+    this.onDeliveryDeadlineExceeded = opts.onDeliveryDeadlineExceeded;
     // WR-57: the deliver_at delay queue is always on; the option only
     // injects clock/timers (the module validates their shapes).
     this.scheduledNow = opts.scheduled?.now ?? Date.now;
@@ -2570,6 +2704,10 @@ export class RetryQueue {
       encryptedPayload,
       payloadBytes: _payloadBytes,
       failoverEndpoint,
+      // WR-76: a replay starts a fresh delivery cycle — drop the original
+      // admission instant and stamp a new one below, exactly like the
+      // WR-13 latency clock restart.
+      enqueuedAt: _enqueuedAt,
       ...item
     } = entry;
     let payload = item.payload;
@@ -2582,7 +2720,13 @@ export class RetryQueue {
     // WR-39: replays re-enter through the logical endpoint so the next
     // dispatch resolves the *current* active target instead of pinning to
     // whatever standby served the dead-lettered attempt.
-    const requeued = { ...item, payload, targetUrl: failoverEndpoint ?? item.targetUrl, attempt: 0 };
+    const requeued = {
+      ...item,
+      payload,
+      targetUrl: failoverEndpoint ?? item.targetUrl,
+      attempt: 0,
+      enqueuedAt: this.deadlineNow(),
+    };
     // WR-49: journal before the in-memory mutation, like enqueueNow.
     this.durable?.appendEnqueue(requeued);
     this.queue.set(item.id, requeued);
@@ -2872,7 +3016,17 @@ export class RetryQueue {
     // `enqueue()` (replayed dead letters keep their original traceId via
     // spread, flushed batches arrive here already traced) still land with a
     // trace ID rather than an undefined one.
-    const stored = { ...item, traceId: item.traceId ?? newTraceId(), attempt: 0 };
+    // WR-76: stamp the queue-admission instant — the start of the
+    // end-to-end delivery deadline clock. A caller-supplied `enqueuedAt`
+    // is honored (hand-built items, deterministic tests); batch-window
+    // and deliver_at parking end here, so by-design holds before this
+    // point never count against the deadline.
+    const stored = {
+      ...item,
+      traceId: item.traceId ?? newTraceId(),
+      attempt: 0,
+      enqueuedAt: item.enqueuedAt ?? this.deadlineNow(),
+    };
     // WR-49: journal before the in-memory mutation — a crash between the
     // two redelivers (at-least-once), never loses.
     this.durable?.appendEnqueue(stored);
@@ -3253,6 +3407,24 @@ export class RetryQueue {
     const logicalEndpoint = entry.targetUrl;
     const weightedTarget = this.weighted?.resolveTarget(logicalEndpoint);
     const target = weightedTarget ?? this.failover?.resolveTarget(logicalEndpoint) ?? logicalEndpoint;
+    // WR-76: the end-to-end delivery deadline is checked before every
+    // dispatch — ahead of the pause/window/quota/circuit gates, because
+    // time parked behind any of them still counts toward the SLO (the
+    // deadline is an end-to-end SLO, not a retry budget). When it fires
+    // the item is audited and dead-lettered immediately with its *actual*
+    // attempt count — no further backoff is scheduled and the remaining
+    // retry budget is untouched. Items predating the feature (a journal
+    // restored from before WR-76) have no admission instant: stamp it now
+    // rather than expiring a just-restored delivery.
+    if (entry.enqueuedAt === undefined) entry.enqueuedAt = this.deadlineNow();
+    const deadlineMs = this.deliveryDeadlines?.get(logicalEndpoint);
+    if (deadlineMs !== undefined) {
+      const elapsedMs = this.deadlineNow() - entry.enqueuedAt;
+      if (elapsedMs >= deadlineMs) {
+        this.expireDeliveryDeadline(entry, id, traceId, tenant, logicalEndpoint, target, elapsedMs, deadlineMs);
+        return;
+      }
+    }
     // WR-50: the pause lands before any gate is touched — a timer that
     // fired in the same tick as the pause parks instead of dispatching,
     // so a paused delivery consumes no quota token, no breaker verdict,
@@ -3627,6 +3799,46 @@ export class RetryQueue {
   }
 
   /**
+   * WR-76: expire one delivery whose end-to-end deadline passed before
+   * its next dispatch. The expiry is audited (`delivery_deadline_exceeded`
+   * via the hook — the server writes the audit event), counted in
+   * `relay_delivery_deadline_exceeded_total`, and the item moves straight
+   * to the dead-letter list with its actual attempt count: no backoff is
+   * scheduled, no retry budget is consumed, and no circuit verdict is
+   * recorded (the endpoint was never attempted — there is no failure
+   * signal to feed the breaker). The dead-letter entry carries a normal
+   * `deadLetteredAt`, so it participates in the WR-64 retention sweep
+   * like any other dead letter.
+   */
+  private expireDeliveryDeadline(
+    entry: RetryItem & { attempt: number },
+    id: string,
+    traceId: string,
+    tenant: string | undefined,
+    logicalEndpoint: string,
+    target: string,
+    elapsedMs: number,
+    deadlineMs: number
+  ): void {
+    const at = new Date().toISOString();
+    const err = new DeliveryDeadlineExceededError(logicalEndpoint, elapsedMs, deadlineMs);
+    const inner = innerFor(this.deliveryDeadlineExceeded, tenant);
+    inner.set(logicalEndpoint, (inner.get(logicalEndpoint) ?? 0) + 1);
+    this.onDeliveryDeadlineExceeded?.({
+      id: entry.id,
+      traceId,
+      ...(tenant === undefined ? {} : { tenant }),
+      endpoint: logicalEndpoint,
+      attempts: entry.attempt,
+      elapsedMs: Math.max(0, Math.round(elapsedMs)),
+      deadlineMs,
+    });
+    // Classified "retryable": the payload was not poison — the relay
+    // simply ran out of SLO — so the dead-letter record reads honestly.
+    this.moveToDeadLetter(entry, id, err, { failureClass: "retryable" }, at, traceId, target);
+  }
+
+  /**
    * Move `entry` to the dead-letter list, recording the failure
    * classification so operators can tell poison payloads (`"non_retryable"`,
    * dead-lettered on the first attempt) from exhausted transient failures
@@ -3918,6 +4130,20 @@ export class RetryQueue {
         });
       }
     }
+    // WR-76: per-(tenant, endpoint) deadline expirations, in first-seen
+    // order — activity-gated, so the series stays absent until a
+    // deadline actually expires.
+    const deliveryDeadlineExceeded: DeliveryDeadlineExceededInput[] = [];
+    for (const [tenantKey, inner] of this.deliveryDeadlineExceeded) {
+      const tenant = tenantKey === "" ? undefined : tenantKey;
+      for (const [endpoint, exceeded] of inner) {
+        deliveryDeadlineExceeded.push({
+          endpoint,
+          ...(tenant === undefined ? {} : { tenant }),
+          exceeded,
+        });
+      }
+    }
     return renderPrometheus({
       deliveries,
       circuits,
@@ -3949,6 +4175,8 @@ export class RetryQueue {
       // WR-71: activity-gated (see above) — the gauge appears only while
       // at least one endpoint is elevated.
       ...(sloRisk.length > 0 ? { sloRisk } : {}),
+      // WR-76: activity-gated (see above).
+      ...(deliveryDeadlineExceeded.length > 0 ? { deliveryDeadlineExceeded } : {}),
     });
   }
 
@@ -4226,6 +4454,8 @@ export class RetryQueue {
         traceId: entry.traceId,
         tenantId: entry.tenantId,
         attempt: entry.attempt,
+        // WR-76: the deadline clock survives compaction restarts.
+        ...(entry.enqueuedAt !== undefined ? { enqueuedAt: entry.enqueuedAt } : {}),
         ...(nextAt !== undefined ? { nextAt } : {}),
       });
     }
