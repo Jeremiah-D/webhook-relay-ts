@@ -1232,6 +1232,34 @@ const server = createRelayServer({
   gzip` is stamped and `Content-Length` reflects the compressed size.
   `x-relay-signature` covers the compressed wire bytes — exactly what the
   downstream receives and verifies.
+- **Guarded compression (`compressThreshold`)** — a stricter per-endpoint
+  variant for downstreams that may not speak gzip:
+
+  ```ts
+  const server = createRelayServer({
+    secret, forwardUrl, auditLog,
+    compressThreshold: {
+      "https://downstream/hook": {
+        thresholdBytes: 2048, // default 1024
+        contentTypeWhitelist: ["application/json"], // default; matched on the media type
+      },
+    },
+  });
+  ```
+
+  Beyond the threshold rule, the payload must pass the content-type
+  whitelist (default `application/json` — batch envelopes and relay
+  payloads are JSON by contract), and when a guarded delivery is answered
+  `415`, the sender resends it once as plaintext *inside the same
+  delivery attempt* — no retry budget consumed, no circuit event — and
+  audits `gzip_fallback_plaintext`. A `415` on the plaintext resend (or
+  any other failure) follows the normal retry / dead-letter path.
+  Compressed bytes saved per endpoint are counted in
+  `relay_compressed_bytes_saved_total`. When both `compressOutbound` and
+  `compressThreshold` configure an endpoint, the guarded path wins. The
+  guarded path engages on the HTTP/1.1 and HTTP/2 transports only —
+  WebSocket deliveries keep their RFC 7692 permessage-deflate story and
+  never pass through here. Invalid values throw `RangeError` at startup.
 - **Inbound** — a webhook posted with `Content-Encoding: gzip` is
   decompressed *after* signature verification (the signature covers the
   raw wire bytes the sender signed) and *before* version routing, replay

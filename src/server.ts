@@ -115,9 +115,15 @@ import {
   DecompressionFailedError,
   DecompressionTooLargeError,
   gunzipCapped,
+  guardedCompressOutbound,
   isGzipContentEncoding,
   maybeCompressOutbound,
+  outboundContentType,
+  OutboundCompressionTracker,
+  assertValidGuardedCompressConfig,
   type CompressOutboundOptions,
+  type GuardedCompressOptions,
+  type GzipFallbackInfo,
 } from "./gzip.ts";
 import {
   assertValidResponseCompressionConfig,
@@ -400,6 +406,22 @@ export interface RelayServerOptions {
    * body. Invalid values throw `RangeError` at startup.
    */
   compressOutbound?: Record<string, CompressOutboundOptions>;
+  /**
+   * Guarded outbound gzip compression (WR-75, see `src/gzip.ts`):
+   * per-endpoint opt-in, keyed by exact delivery `targetUrl`. Beyond the
+   * WR-40 threshold behavior this adds a content-type whitelist (default
+   * `application/json` — batch envelopes and relay payloads are JSON by
+   * contract) and a self-healing fallback: when a guarded-compressed
+   * delivery is answered 415, the sender resends it once as plaintext
+   * inside the same delivery attempt (no retry budget consumed, no
+   * circuit event). Compressed bytes saved per endpoint are counted in
+   * `relay_compressed_bytes_saved_total`. When both `compressOutbound`
+   * and `compressThreshold` configure an endpoint, the guarded path
+   * wins. Applies to the HTTP/1.1 and HTTP/2 delivery paths only —
+   * WebSocket deliveries keep their RFC 7692 permessage-deflate story
+   * (`src/deflate.ts`). Invalid values throw `RangeError` at startup.
+   */
+  compressThreshold?: Record<string, GuardedCompressOptions>;
   /**
    * Outbound response compression negotiation (WR-62, see
    * `src/response-encoding.ts`): per-endpoint opt-in, keyed by exact
@@ -922,6 +944,11 @@ export interface PooledSender extends Sender {
   http2Pool: Http2SessionPool | undefined;
   /** The WebSocket connection pool (always created). */
   wsPool: WebSocketPool;
+  /**
+   * WR-75: cumulative per-endpoint guarded-compression byte savings;
+   * rendered into `GET /metrics` as `relay_compressed_bytes_saved_total`.
+   */
+  compressionStats: OutboundCompressionTracker;
   /** Close all pooled connections and stop the idle reaper. Idempotent. */
   destroy(): void;
 }
@@ -942,7 +969,19 @@ export function createDefaultSender(
   forwardHeaders?: Record<string, ForwardHeadersRuleConfig>,
   certExpiryMonitor?: CertExpiryMonitor,
   minTlsVersions?: Record<string, MinTlsVersion>,
-  tlsVersionMonitor?: TlsVersionMonitor
+  tlsVersionMonitor?: TlsVersionMonitor,
+  /**
+   * WR-75: guarded outbound gzip compression (content-type whitelist +
+   * 415→plaintext fallback + byte-savings accounting). Validated at
+   * startup; `undefined` keeps the WR-40-only behavior.
+   */
+  compressThreshold?: Record<string, GuardedCompressOptions>,
+  /**
+   * WR-75: called once per 415-triggered plaintext fallback resend. The
+   * server audits these as `gzip_fallback_plaintext`; library users get
+   * the hook directly.
+   */
+  onGzipFallback?: (info: GzipFallbackInfo) => void
 ): PooledSender {
   if (tlsPins !== undefined) {
     for (const [endpoint, pins] of Object.entries(tlsPins)) {
@@ -1034,6 +1073,20 @@ export function createDefaultSender(
       );
     }
   }
+  // WR-75: RangeError on invalid values, at startup — never mid-delivery.
+  if (compressThreshold !== undefined) {
+    try {
+      assertValidGuardedCompressConfig(compressThreshold);
+    } catch (err) {
+      throw new RangeError(
+        `createDefaultSender: invalid compressThreshold config: ${(err as Error).message}`
+      );
+    }
+  }
+  // WR-75: the byte-savings tracker is always created (cheap, empty) so
+  // `sender.compressionStats` is available even with no guarded endpoint
+  // configured; its exposition stays absent until the first byte saved.
+  const compressionTracker = new OutboundCompressionTracker();
   // WR-62: RangeError on invalid values, at startup — never mid-delivery.
   if (responseCompression !== undefined) {
     try {
@@ -1127,8 +1180,16 @@ export function createDefaultSender(
    * headers at intake).
    */
   const buildWireRequest = (
-    item: RetryItem
-  ): { headers: Record<string, string | string[]>; body: Buffer } => {
+    item: RetryItem,
+    wireOpts?: { forcePlaintext?: boolean; httpTransport?: boolean }
+  ): {
+    headers: Record<string, string | string[]>;
+    body: Buffer;
+    /** WR-75: true when the guarded path compressed this request. */
+    guardedCompressed: boolean;
+    /** WR-75: payload bytes saved by the guarded compression (0 otherwise). */
+    guardedBytesSaved: number;
+  } => {
     const headers: Record<string, string | string[]> = {};
     // WR-69: per-endpoint header forwarding allowlist. Evaluated on the
     // inbound passthrough headers (already stripped of relay-owned
@@ -1146,13 +1207,40 @@ export function createDefaultSender(
     // delivery with this relay's audit trail (overrides a stale inbound
     // value, which is identical anyway after `resolveTraceId`).
     if (item.traceId) headers[TRACE_ID_HEADER] = item.traceId;
-    // WR-40: per-endpoint opt-in gzip. Compression happens before
-    // signing so `x-relay-signature` covers the exact wire bytes the
-    // downstream receives.
-    const { body: wireBody, contentEncoding } = maybeCompressOutbound(
-      item.payload,
-      compressOutbound?.[item.targetUrl]
-    );
+    // WR-75: the guarded path is decided first — when both records
+    // configure an endpoint it wins outright (safer superset: whitelist +
+    // 415 fallback), so the two compressions never stack or disagree. It
+    // engages only on HTTP transports: WebSocket deliveries keep their
+    // RFC 7692 permessage-deflate story (`src/deflate.ts`) and never pass
+    // through here. The 415 fallback resend forces both compressions off.
+    let wireBody = item.payload;
+    let contentEncoding: "gzip" | undefined;
+    let guardedCompressed = false;
+    let guardedBytesSaved = 0;
+    const forcePlaintext = wireOpts?.forcePlaintext === true;
+    if (!forcePlaintext) {
+      const guardedOpts =
+        wireOpts?.httpTransport === false ? undefined : compressThreshold?.[item.targetUrl];
+      if (guardedOpts !== undefined) {
+        const decision = guardedCompressOutbound(
+          item.payload,
+          outboundContentType(item.headers),
+          guardedOpts
+        );
+        wireBody = decision.body;
+        contentEncoding = decision.contentEncoding;
+        guardedCompressed = decision.contentEncoding === "gzip";
+        guardedBytesSaved = decision.bytesSaved;
+      } else {
+        // WR-40: per-endpoint opt-in gzip (fire-and-forget: no whitelist,
+        // no fallback). Compression happens before signing so
+        // `x-relay-signature` covers the exact wire bytes the downstream
+        // receives.
+        const legacy = maybeCompressOutbound(item.payload, compressOutbound?.[item.targetUrl]);
+        wireBody = legacy.body;
+        contentEncoding = legacy.contentEncoding;
+      }
+    }
     // WR-58: per-endpoint end-to-end encryption. Seals the (possibly
     // compressed) wire body with the downstream's X25519 public key BEFORE
     // signing, so `x-relay-signature` covers the ciphertext wire bytes —
@@ -1199,7 +1287,7 @@ export function createDefaultSender(
       headers["accept-encoding"] = respCompress.acceptEncoding ?? DEFAULT_OUTBOUND_ACCEPT_ENCODING;
     }
     headers["content-length"] = String(body.length);
-    return { headers, body };
+    return { headers, body, guardedCompressed, guardedBytesSaved };
   };
 
   /**
@@ -1215,313 +1303,349 @@ export function createDefaultSender(
     proxyUrl: string | undefined,
     tlsSni: ResolvedTlsSniOverride | undefined,
     minTlsVersion: MinTlsVersion | undefined
-  ): Promise<DownstreamResponse | void> =>
-    new Promise((resolve, reject) => {
-      // WR-54: time-to-first-byte — request-issued timestamp; the diff is
-      // taken when the downstream's first response bytes arrive (the
-      // 'response' handler below). A "首响应头到达耗时" approximation:
-      // connection setup + request write + server think time. It does not
-      // measure kernel-to-user dispatch, and the doc on
-      // `DownstreamResponse.timeToFirstByteMs` says so.
-      const requestIssuedMs = Date.now();
-      // Pooled keep-alive agent for this origin (dedicated agent per pin
-      // whitelist, per proxy, per client identity, and per effective TLS
-      // identity, so a connection pinned, tunneled, authenticated, or
-      // handshaked for one endpoint can never serve another's). With
-      // pooling disabled but a proxy configured, each delivery gets a
-      // one-off tunneled agent — fresh tunnel per delivery, destroyed when
-      // the request settles.
-      let oneOffAgent: HttpAgent | undefined;
-      const agent =
-        pool?.agentFor(
-          url,
-          pins,
-          proxyUrl,
-          clientCert !== undefined ? clientCertIdentity(clientCert) : undefined,
-          tlsSni,
-          minTlsVersion
-        ) ??
-        (proxyUrl !== undefined
-          ? (oneOffAgent = createProxiedAgent(
-              url.protocol === "https:" ? "https" : "http",
-              proxyUrl,
-              { keepAlive: false, maxSockets: 1, maxFreeSockets: 0 }
-            ))
-          : undefined);
-      const onResponse = (res: Parameters<Parameters<typeof httpsRequest>[2]>[0]): void => {
-        // WR-54: the downstream's first response bytes just arrived — this
-        // is the TTFB instant measured against `requestIssuedMs` above.
-        const timeToFirstByteMs = Date.now() - requestIssuedMs;
-        // WR-37: capture the response body (capped) so a per-endpoint
-        // responseValidator can check its semantics after a 2xx
-        // transport success. Non-2xx responses still reject on the
-        // status code alone — the validator never sees them.
-        // WR-62: when the endpoint opted into response compression, the
-        // wire cap is the decompressed-bytes cap (default: the same 64
-        // KiB as the plain capture) — the wire form of a compressed
-        // response is the smaller side, so one cap bounds both.
-        const respCompress = responseCompression?.[item.targetUrl];
-        const wireCap = respCompress?.maxDecompressedBytes ?? RESPONSE_CAPTURE_MAX_BYTES;
-        const chunks: Buffer[] = [];
-        let captured = 0;
-        let truncated = false;
-        res.on("data", (chunk: Buffer) => {
-          if (captured < wireCap) {
-            const room = wireCap - captured;
-            if (chunk.length > room) {
-              chunks.push(chunk.subarray(0, room));
-              captured += room;
-              truncated = true;
-            } else {
-              chunks.push(chunk);
-              captured += chunk.length;
-            }
-          } else {
-            truncated = true;
-          }
-        });
-        res.on("end", () => {
-          if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
-            const statusCode: number = res.statusCode;
-            // WR-62: decode a compressed downstream response before the
-            // WR-37 validator (and the audit summary) see the body. The
-            // decode runs async — a corrupt or over-budget body rejects
-            // the attempt, which the retry layer classifies retryable.
-            // A wire capture cut at the cap cannot be decoded (a
-            // truncated compressed stream is corrupt by definition): the
-            // raw bytes travel on with `truncated: true`, exactly like
-            // the uncompressed path.
-            (async () => {
-              let body = Buffer.concat(chunks);
-              let contentEncoding: string | undefined;
-              if (respCompress !== undefined && !truncated) {
-                const decoded = await decodeResponseBody(
-                  body,
-                  res.headers["content-encoding"],
-                  wireCap
-                );
-                body = decoded.body;
-                contentEncoding = decoded.contentEncoding;
+  ): Promise<DownstreamResponse | void> => {
+    // WR-75: the guarded 415→plaintext fallback needs the compression
+    // decision outside the attempt promise. The decision is deterministic
+    // in (payload, content-type, config), and the Promise executor runs
+    // synchronously, so these are set before `attempt(false)` settles.
+    let guardedApplied = false;
+    let guardedBytesSaved = 0;
+    const attempt = (forcePlaintext: boolean): Promise<DownstreamResponse | void> =>
+      new Promise((resolve, reject) => {
+        // The wire request is built once per attempt: the guarded decision
+        // is deterministic, so building it here gives the fallback check
+        // the same answer the wire builder used — without compressing
+        // twice. The byte savings are noted per guarded-compressed
+        // dispatch (the sender committed to sending it compressed).
+        const wire = buildWireRequest(item, { forcePlaintext, httpTransport: true });
+        if (!forcePlaintext && wire.guardedCompressed) {
+          guardedApplied = true;
+          guardedBytesSaved = wire.guardedBytesSaved;
+          compressionTracker.noteSaved(item.targetUrl, wire.guardedBytesSaved);
+        }
+        // WR-54: time-to-first-byte — request-issued timestamp; the diff is
+        // taken when the downstream's first response bytes arrive (the
+        // 'response' handler below). A "首响应头到达耗时" approximation:
+        // connection setup + request write + server think time. It does not
+        // measure kernel-to-user dispatch, and the doc on
+        // `DownstreamResponse.timeToFirstByteMs` says so.
+        const requestIssuedMs = Date.now();
+        // Pooled keep-alive agent for this origin (dedicated agent per pin
+        // whitelist, per proxy, per client identity, and per effective TLS
+        // identity, so a connection pinned, tunneled, authenticated, or
+        // handshaked for one endpoint can never serve another's). With
+        // pooling disabled but a proxy configured, each delivery gets a
+        // one-off tunneled agent — fresh tunnel per delivery, destroyed when
+        // the request settles.
+        let oneOffAgent: HttpAgent | undefined;
+        const agent =
+          pool?.agentFor(
+            url,
+            pins,
+            proxyUrl,
+            clientCert !== undefined ? clientCertIdentity(clientCert) : undefined,
+            tlsSni,
+            minTlsVersion
+          ) ??
+          (proxyUrl !== undefined
+            ? (oneOffAgent = createProxiedAgent(
+                url.protocol === "https:" ? "https" : "http",
+                proxyUrl,
+                { keepAlive: false, maxSockets: 1, maxFreeSockets: 0 }
+              ))
+            : undefined);
+        const onResponse = (res: Parameters<Parameters<typeof httpsRequest>[2]>[0]): void => {
+          // WR-54: the downstream's first response bytes just arrived — this
+          // is the TTFB instant measured against `requestIssuedMs` above.
+          const timeToFirstByteMs = Date.now() - requestIssuedMs;
+          // WR-37: capture the response body (capped) so a per-endpoint
+          // responseValidator can check its semantics after a 2xx
+          // transport success. Non-2xx responses still reject on the
+          // status code alone — the validator never sees them.
+          // WR-62: when the endpoint opted into response compression, the
+          // wire cap is the decompressed-bytes cap (default: the same 64
+          // KiB as the plain capture) — the wire form of a compressed
+          // response is the smaller side, so one cap bounds both.
+          const respCompress = responseCompression?.[item.targetUrl];
+          const wireCap = respCompress?.maxDecompressedBytes ?? RESPONSE_CAPTURE_MAX_BYTES;
+          const chunks: Buffer[] = [];
+          let captured = 0;
+          let truncated = false;
+          res.on("data", (chunk: Buffer) => {
+            if (captured < wireCap) {
+              const room = wireCap - captured;
+              if (chunk.length > room) {
+                chunks.push(chunk.subarray(0, room));
+                captured += room;
+                truncated = true;
+              } else {
+                chunks.push(chunk);
+                captured += chunk.length;
               }
-              resolve({
-                statusCode,
-                body,
-                truncated,
-                timeToFirstByteMs,
-                ...(contentEncoding !== undefined ? { contentEncoding } : {}),
-              });
-            })().catch(reject);
-          } else {
-            // Structured failure: the retry queue classifies on the status
-            // code (4xx-except-408/429 → immediate dead letter, never
-            // retried) and honors a 429's Retry-After header. The error
-            // message keeps the historical shape.
-            reject(
-              new HttpDeliveryError(
-                res.statusCode ?? 0,
-                parseRetryAfterMs(res.headers["retry-after"])
-              )
-            );
-          }
-        });
-        res.on("error", reject);
-      };
-      // `agent: false` opts out of Node's global agent (which pools
-      // keep-alive connections by default since Node 19): each delivery
-      // gets a one-off agent and therefore a fresh connection.
-      const req =
-        url.protocol === "https:"
-          ? httpsRequest(
-              url,
-              {
-                method: "POST",
-                agent: agent ?? false,
-                ...(pins ? { rejectUnauthorized: false } : {}),
-                // WR-60: per-endpoint TLS SNI/ALPN override. `servername`
-                // and `ALPNProtocols` flow through the agent's
-                // `createConnection` into `tls.connect` — the pooled
-                // `https.Agent`, the one-off agent, and the proxied tunnel
-                // agent all honor them (verified against Node v24). Without
-                // an entry nothing is set: Node's defaults apply, exactly
-                // as before.
-                ...(tlsSni !== undefined
-                  ? {
-                      ...(tlsSni.servername !== undefined
-                        ? { servername: tlsSni.servername }
-                        : {}),
-                      ALPNProtocols: [...tlsSni.alpnProtocols],
-                    }
-                  : {}),
-                // The client certificate rides the TLS handshake (per-request
-                // TLS options apply to connections the pooled agent opens;
-                // the pool key already binds this exact identity, so a
-                // reused socket was authenticated as this same identity).
-                ...(clientCert
-                  ? {
-                      cert: clientCert.cert,
-                      key: clientCert.key,
-                      ...(clientCert.passphrase !== undefined
-                        ? { passphrase: clientCert.passphrase }
-                        : {}),
-                    }
-                  : {}),
-              },
-              onResponse
-            )
-          : httpRequest(url, { method: "POST", agent: agent ?? false }, onResponse);
-      req.on("error", reject);
-
-      if (pool && agent) {
-        req.on("socket", (socket) => pool.noteSocket(agent, socket));
-        // Once the request settles the socket is back in the agent's free
-        // list: stamp it idle and unref it, so a forgotten pool never pins
-        // process exit. Deferred one tick — the agent frees the socket
-        // just before 'close' fires.
-        req.on("close", () => setImmediate(() => pool.markIdle(agent)));
-      }
-      if (oneOffAgent !== undefined) {
-        // No pooling: the tunneled socket must not outlive the delivery.
-        req.on("close", () => oneOffAgent?.destroy());
-      }
-
-      const writePayload = (): void => {
-        const { headers, body: wireBody } = buildWireRequest(item);
-        for (const [k, v] of Object.entries(headers)) req.setHeader(k, v);
-        req.end(wireBody);
-      };
-
-      /**
-       * WR-73: capture the peer certificate's expiry on the TLS handshake
-       * for `https:` targets — the same `getPeerCertificate` read the
-       * WR-21 pin check uses. Runs on the fresh-handshake path; a reused
-       * pooled connection's certificate was already captured when its
-       * handshake ran (the monitor edge-triggers per certificate, so a
-       * re-observation would be a no-op anyway).
-       */
-      const observeTlsPeer = (socket: unknown, endpoint: string): void => {
-        const tlsSocket = socket as TLSSocket;
-        const already = tlsSocket.getPeerCertificate() as { raw?: unknown };
-        if (already && already.raw) {
-          certExpiryMonitor?.observePeerCertificate(tlsSocket, endpoint);
-        } else {
-          tlsSocket.once("secureConnect", () =>
-            certExpiryMonitor?.observePeerCertificate(tlsSocket, endpoint)
-          );
-        }
-      };
-
-      if (pins === undefined) {
-        // WR-73: hook cert-expiry capture for the unpinned https: path too.
-        if (url.protocol === "https:" && certExpiryMonitor?.enabled) {
-          req.on("socket", (socket) => observeTlsPeer(socket, item.targetUrl));
-        }
-        // WR-74: enforce the endpoint's TLS floor on the fresh handshake.
-        // A reused pooled socket was handshaked under this same floor
-        // (the pool key binds it), so its version trivially qualifies.
-        if (minTlsVersion !== undefined && url.protocol === "https:") {
-          req.on("socket", (socket) => {
-            const tlsSocket = socket as TLSSocket;
-            const already = tlsSocket.getPeerCertificate() as { raw?: unknown };
-            if (already && already.raw) {
-              enforceTlsFloor(tlsSocket);
             } else {
-              tlsSocket.once("secureConnect", () => enforceTlsFloor(tlsSocket));
+              truncated = true;
             }
           });
+          res.on("end", () => {
+            if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+              const statusCode: number = res.statusCode;
+              // WR-62: decode a compressed downstream response before the
+              // WR-37 validator (and the audit summary) see the body. The
+              // decode runs async — a corrupt or over-budget body rejects
+              // the attempt, which the retry layer classifies retryable.
+              // A wire capture cut at the cap cannot be decoded (a
+              // truncated compressed stream is corrupt by definition): the
+              // raw bytes travel on with `truncated: true`, exactly like
+              // the uncompressed path.
+              (async () => {
+                let body = Buffer.concat(chunks);
+                let contentEncoding: string | undefined;
+                if (respCompress !== undefined && !truncated) {
+                  const decoded = await decodeResponseBody(
+                    body,
+                    res.headers["content-encoding"],
+                    wireCap
+                  );
+                  body = decoded.body;
+                  contentEncoding = decoded.contentEncoding;
+                }
+                resolve({
+                  statusCode,
+                  body,
+                  truncated,
+                  timeToFirstByteMs,
+                  ...(contentEncoding !== undefined ? { contentEncoding } : {}),
+                });
+              })().catch(reject);
+            } else {
+              // Structured failure: the retry queue classifies on the status
+              // code (4xx-except-408/429 → immediate dead letter, never
+              // retried) and honors a 429's Retry-After header. The error
+              // message keeps the historical shape.
+              reject(
+                new HttpDeliveryError(
+                  res.statusCode ?? 0,
+                  parseRetryAfterMs(res.headers["retry-after"])
+                )
+              );
+            }
+          });
+          res.on("error", reject);
+        };
+        // `agent: false` opts out of Node's global agent (which pools
+        // keep-alive connections by default since Node 19): each delivery
+        // gets a one-off agent and therefore a fresh connection.
+        const req =
+          url.protocol === "https:"
+            ? httpsRequest(
+                url,
+                {
+                  method: "POST",
+                  agent: agent ?? false,
+                  ...(pins ? { rejectUnauthorized: false } : {}),
+                  // WR-60: per-endpoint TLS SNI/ALPN override. `servername`
+                  // and `ALPNProtocols` flow through the agent's
+                  // `createConnection` into `tls.connect` — the pooled
+                  // `https.Agent`, the one-off agent, and the proxied tunnel
+                  // agent all honor them (verified against Node v24). Without
+                  // an entry nothing is set: Node's defaults apply, exactly
+                  // as before.
+                  ...(tlsSni !== undefined
+                    ? {
+                        ...(tlsSni.servername !== undefined
+                          ? { servername: tlsSni.servername }
+                          : {}),
+                        ALPNProtocols: [...tlsSni.alpnProtocols],
+                      }
+                    : {}),
+                  // The client certificate rides the TLS handshake (per-request
+                  // TLS options apply to connections the pooled agent opens;
+                  // the pool key already binds this exact identity, so a
+                  // reused socket was authenticated as this same identity).
+                  ...(clientCert
+                    ? {
+                        cert: clientCert.cert,
+                        key: clientCert.key,
+                        ...(clientCert.passphrase !== undefined
+                          ? { passphrase: clientCert.passphrase }
+                          : {}),
+                      }
+                    : {}),
+                },
+                onResponse
+              )
+            : httpRequest(url, { method: "POST", agent: agent ?? false }, onResponse);
+        req.on("error", reject);
+
+        if (pool && agent) {
+          req.on("socket", (socket) => pool.noteSocket(agent, socket));
+          // Once the request settles the socket is back in the agent's free
+          // list: stamp it idle and unref it, so a forgotten pool never pins
+          // process exit. Deferred one tick — the agent frees the socket
+          // just before 'close' fires.
+          req.on("close", () => setImmediate(() => pool.markIdle(agent)));
         }
-        writePayload();
-        return;
-      }
-      // Normalized once, up front, so the per-handshake path is a plain compare.
-      // WR-60 consistency: this socket comes from a pool agent keyed by the
-      // effective TLS identity, so the pin is always verified on the
-      // connection that was handshaked with the (possibly overridden) SNI —
-      // the check and the handshake cannot disagree about the peer.
-      const allowed = pins.map(normalizePin);
-      /**
-       * WR-74: enforce the endpoint's TLS floor on a handshaked socket,
-       * before any payload byte is written. Returns true when the
-       * connection was destroyed — the caller must stop and not write.
-       * The rejection is recorded on the monitor (audit
-       * `tls_version_rejected` + `relay_tls_version_rejections_total`);
-       * the destroyed request fails the delivery attempt, which then
-       * follows the normal retry / dead-letter path.
-       */
-      const enforceTlsFloor = (tlsSocket: TLSSocket): boolean => {
-        if (minTlsVersion === undefined) return false;
-        try {
-          assertTlsVersionMeetsFloor(item.targetUrl, tlsSocket.getProtocol(), minTlsVersion);
-          return false;
-        } catch (err) {
-          const rejected = err as TlsVersionRejectedError;
-          tlsVersionMonitor?.recordRejection(item.targetUrl, rejected.negotiated, minTlsVersion);
-          req.destroy(rejected);
-          return true;
+        if (oneOffAgent !== undefined) {
+          // No pooling: the tunneled socket must not outlive the delivery.
+          req.on("close", () => oneOffAgent?.destroy());
         }
-      };
-      const verifyFreshPin = (tlsSocket: TLSSocket): void => {
-        // WR-74: floor first — a below-floor peer is rejected before the
-        // pin check runs (both fail the attempt; the floor's audit event
-        // is the more actionable signal for a version regression).
-        if (enforceTlsFloor(tlsSocket)) return;
-        let presented: string;
-        try {
-          const raw = (tlsSocket.getPeerCertificate() as { raw?: unknown }).raw;
-          // WR-73: reuse this handshake's certificate read for the
-          // expiry monitor — no second getPeerCertificate call.
-          certExpiryMonitor?.observePeerCertificateDer(Buffer.from(raw as Buffer), item.targetUrl);
-          presented = spkiFingerprint(Buffer.from(raw as Buffer));
-        } catch {
-          presented = "<unreadable certificate>";
-        }
-        if (allowed.includes(presented)) {
-          // Cache the handshake result on the pooled socket: pinning is
-          // about server identity, and this connection already proved it.
-          pool?.cachePresentedPin(tlsSocket, presented);
-          writePayload();
-        } else {
-          // Fail the delivery attempt: it follows the normal retry /
-          // dead-letter path and the mismatch lands in the audit trail.
-          // The socket is destroyed with the request, so a mismatched
-          // peer is never handed to another delivery from the pool.
-          req.destroy(new TlsPinMismatchError(item.targetUrl, presented));
-        }
-      };
-      req.on("socket", (socket) => {
-        const tlsSocket = socket as TLSSocket;
-        const cached = pool?.presentedPin(socket);
-        if (cached !== undefined) {
-          // Reused pooled connection: the peer was pinned at handshake
-          // time, and the pool key already binds this exact pin whitelist —
-          // a cached fingerprint outside the whitelist means a poisoned
-          // socket, so fail loudly instead of delivering over it. The
-          // pool key likewise binds the TLS floor (WR-74), so the reused
-          // socket's version trivially qualifies — still checked, cheap
-          // and loud, in case a socket ever drifts below the floor.
-          if (enforceTlsFloor(tlsSocket)) return;
-          if (allowed.includes(cached)) {
-            writePayload();
+
+        const writePayload = (): void => {
+          for (const [k, v] of Object.entries(wire.headers)) req.setHeader(k, v);
+          req.end(wire.body);
+        };
+
+        /**
+         * WR-73: capture the peer certificate's expiry on the TLS handshake
+         * for `https:` targets — the same `getPeerCertificate` read the
+         * WR-21 pin check uses. Runs on the fresh-handshake path; a reused
+         * pooled connection's certificate was already captured when its
+         * handshake ran (the monitor edge-triggers per certificate, so a
+         * re-observation would be a no-op anyway).
+         */
+        const observeTlsPeer = (socket: unknown, endpoint: string): void => {
+          const tlsSocket = socket as TLSSocket;
+          const already = tlsSocket.getPeerCertificate() as { raw?: unknown };
+          if (already && already.raw) {
+            certExpiryMonitor?.observePeerCertificate(tlsSocket, endpoint);
           } else {
-            socket.destroy();
-            req.destroy(new TlsPinMismatchError(item.targetUrl, cached));
+            tlsSocket.once("secureConnect", () =>
+              certExpiryMonitor?.observePeerCertificate(tlsSocket, endpoint)
+            );
           }
+        };
+
+        if (pins === undefined) {
+          // WR-73: hook cert-expiry capture for the unpinned https: path too.
+          if (url.protocol === "https:" && certExpiryMonitor?.enabled) {
+            req.on("socket", (socket) => observeTlsPeer(socket, item.targetUrl));
+          }
+          // WR-74: enforce the endpoint's TLS floor on the fresh handshake.
+          // A reused pooled socket was handshaked under this same floor
+          // (the pool key binds it), so its version trivially qualifies.
+          if (minTlsVersion !== undefined && url.protocol === "https:") {
+            req.on("socket", (socket) => {
+              const tlsSocket = socket as TLSSocket;
+              const already = tlsSocket.getPeerCertificate() as { raw?: unknown };
+              if (already && already.raw) {
+                enforceTlsFloor(tlsSocket);
+              } else {
+                tlsSocket.once("secureConnect", () => enforceTlsFloor(tlsSocket));
+              }
+            });
+          }
+          writePayload();
           return;
         }
-        let verified = false;
-        const verifyPin = (): void => {
-          if (verified) return;
-          verified = true;
-          verifyFreshPin(tlsSocket);
+        // Normalized once, up front, so the per-handshake path is a plain compare.
+        // WR-60 consistency: this socket comes from a pool agent keyed by the
+        // effective TLS identity, so the pin is always verified on the
+        // connection that was handshaked with the (possibly overridden) SNI —
+        // the check and the handshake cannot disagree about the peer.
+        const allowed = pins.map(normalizePin);
+        /**
+         * WR-74: enforce the endpoint's TLS floor on a handshaked socket,
+         * before any payload byte is written. Returns true when the
+         * connection was destroyed — the caller must stop and not write.
+         * The rejection is recorded on the monitor (audit
+         * `tls_version_rejected` + `relay_tls_version_rejections_total`);
+         * the destroyed request fails the delivery attempt, which then
+         * follows the normal retry / dead-letter path.
+         */
+        const enforceTlsFloor = (tlsSocket: TLSSocket): boolean => {
+          if (minTlsVersion === undefined) return false;
+          try {
+            assertTlsVersionMeetsFloor(item.targetUrl, tlsSocket.getProtocol(), minTlsVersion);
+            return false;
+          } catch (err) {
+            const rejected = err as TlsVersionRejectedError;
+            tlsVersionMonitor?.recordRejection(item.targetUrl, rejected.negotiated, minTlsVersion);
+            req.destroy(rejected);
+            return true;
+          }
         };
-        const already = tlsSocket.getPeerCertificate() as { raw?: unknown };
-        if (already && already.raw) {
-          // Defensive: a reused agent socket may already be secure.
-          verifyPin();
-        } else {
-          tlsSocket.once("secureConnect", verifyPin);
-        }
+        const verifyFreshPin = (tlsSocket: TLSSocket): void => {
+          // WR-74: floor first — a below-floor peer is rejected before the
+          // pin check runs (both fail the attempt; the floor's audit event
+          // is the more actionable signal for a version regression).
+          if (enforceTlsFloor(tlsSocket)) return;
+          let presented: string;
+          try {
+            const raw = (tlsSocket.getPeerCertificate() as { raw?: unknown }).raw;
+            // WR-73: reuse this handshake's certificate read for the
+            // expiry monitor — no second getPeerCertificate call.
+            certExpiryMonitor?.observePeerCertificateDer(Buffer.from(raw as Buffer), item.targetUrl);
+            presented = spkiFingerprint(Buffer.from(raw as Buffer));
+          } catch {
+            presented = "<unreadable certificate>";
+          }
+          if (allowed.includes(presented)) {
+            // Cache the handshake result on the pooled socket: pinning is
+            // about server identity, and this connection already proved it.
+            pool?.cachePresentedPin(tlsSocket, presented);
+            writePayload();
+          } else {
+            // Fail the delivery attempt: it follows the normal retry /
+            // dead-letter path and the mismatch lands in the audit trail.
+            // The socket is destroyed with the request, so a mismatched
+            // peer is never handed to another delivery from the pool.
+            req.destroy(new TlsPinMismatchError(item.targetUrl, presented));
+          }
+        };
+        req.on("socket", (socket) => {
+          const tlsSocket = socket as TLSSocket;
+          const cached = pool?.presentedPin(socket);
+          if (cached !== undefined) {
+            // Reused pooled connection: the peer was pinned at handshake
+            // time, and the pool key already binds this exact pin whitelist —
+            // a cached fingerprint outside the whitelist means a poisoned
+            // socket, so fail loudly instead of delivering over it. The
+            // pool key likewise binds the TLS floor (WR-74), so the reused
+            // socket's version trivially qualifies — still checked, cheap
+            // and loud, in case a socket ever drifts below the floor.
+            if (enforceTlsFloor(tlsSocket)) return;
+            if (allowed.includes(cached)) {
+              writePayload();
+            } else {
+              socket.destroy();
+              req.destroy(new TlsPinMismatchError(item.targetUrl, cached));
+            }
+            return;
+          }
+          let verified = false;
+          const verifyPin = (): void => {
+            if (verified) return;
+            verified = true;
+            verifyFreshPin(tlsSocket);
+          };
+          const already = tlsSocket.getPeerCertificate() as { raw?: unknown };
+          if (already && already.raw) {
+            // Defensive: a reused agent socket may already be secure.
+            verifyPin();
+          } else {
+            tlsSocket.once("secureConnect", verifyPin);
+          }
+        });
       });
+    // WR-75: the downstream answered 415 to a guarded-compressed request —
+    // it does not speak gzip. Resend once as plaintext *inside the same
+    // delivery attempt*: the queue sees a single attempt, so the fallback
+    // consumes no retry budget and records no circuit verdict. A 415 on
+    // the plaintext resend (or any other failure) follows the normal
+    // classify → retry / dead-letter path instead.
+    return attempt(false).catch((err) => {
+      if (err instanceof HttpDeliveryError && err.statusCode === 415 && guardedApplied) {
+        onGzipFallback?.({
+          id: item.id,
+          traceId: item.traceId,
+          endpoint: item.targetUrl,
+          bytesSaved: guardedBytesSaved,
+        });
+        return attempt(true);
+      }
+      throw err;
     });
+  };
 
   /**
    * HTTP/2 delivery (WR-42): one multiplexed stream on the origin's
@@ -1530,7 +1654,7 @@ export function createDefaultSender(
    * below retries the delivery over HTTP/1.1 — a delivery is never lost
    * because of H2.
    */
-  const deliverViaHttp2 = async (
+  const deliverViaHttp2 = (
     item: RetryItem,
     url: URL,
     pins: string[] | undefined,
@@ -1538,56 +1662,80 @@ export function createDefaultSender(
     tlsSni: ResolvedTlsSniOverride | undefined,
     minTlsVersion: MinTlsVersion | undefined
   ): Promise<DownstreamResponse> => {
-    const session = await h2pool!.sessionFor(url, pins, clientCert, tlsSni, minTlsVersion);
-    h2pool!.acquireStream(session);
-    // WR-73: the session's handshake is done by now (established or
-    // reused — the monitor edge-triggers per certificate, so a
-    // re-observation is a no-op), which is exactly when the peer
-    // certificate is readable. A resumed session re-sends no
-    // certificate; the monitor skips those silently.
-    if (certExpiryMonitor?.enabled) {
-      const sock = session.socket as TLSSocket | undefined;
-      if (sock !== undefined) certExpiryMonitor.observePeerCertificate(sock, item.targetUrl);
-    }
-    try {
-      const { headers, body } = buildWireRequest(item);
-      const res = await runHttp2Stream(session, {
-        method: "POST",
-        path: `${url.pathname}${url.search}`,
-        headers,
-        body,
-        captureMaxBytes: RESPONSE_CAPTURE_MAX_BYTES,
-      });
-      if (res.statusCode >= 200 && res.statusCode < 300) {
-        // WR-62: decode a compressed downstream response before the WR-37
-        // validator sees the body — same contract as the HTTP/1.1 path.
-        // A capture cut at the cap cannot be decoded: the raw bytes
-        // travel on with `truncated: true`.
-        const respCompress = responseCompression?.[item.targetUrl];
-        let body = res.body;
-        let contentEncoding: string | undefined;
-        if (respCompress !== undefined && !res.truncated) {
-          const decoded = await decodeResponseBody(
-            body,
-            res.headers["content-encoding"],
-            respCompress.maxDecompressedBytes ?? RESPONSE_CAPTURE_MAX_BYTES
-          );
-          body = decoded.body;
-          contentEncoding = decoded.contentEncoding;
+    // WR-75: same guarded 415→plaintext fallback as the HTTP/1.1 path —
+    // the resend rides a fresh H2 stream inside the same delivery
+    // attempt, so the queue still sees a single attempt.
+    let guardedApplied = false;
+    let guardedBytesSaved = 0;
+    const attempt = async (forcePlaintext: boolean): Promise<DownstreamResponse> => {
+        const session = await h2pool!.sessionFor(url, pins, clientCert, tlsSni, minTlsVersion);
+        h2pool!.acquireStream(session);
+        // WR-73: the session's handshake is done by now (established or
+        // reused — the monitor edge-triggers per certificate, so a
+        // re-observation is a no-op), which is exactly when the peer
+        // certificate is readable. A resumed session re-sends no
+        // certificate; the monitor skips those silently.
+        if (certExpiryMonitor?.enabled) {
+          const sock = session.socket as TLSSocket | undefined;
+          if (sock !== undefined) certExpiryMonitor.observePeerCertificate(sock, item.targetUrl);
         }
-        return {
-          statusCode: res.statusCode,
-          body,
-          truncated: res.truncated,
-          ...(contentEncoding !== undefined ? { contentEncoding } : {}),
-        };
+        try {
+          const wire = buildWireRequest(item, { forcePlaintext, httpTransport: true });
+          if (!forcePlaintext && wire.guardedCompressed) {
+            guardedApplied = true;
+            guardedBytesSaved = wire.guardedBytesSaved;
+            compressionTracker.noteSaved(item.targetUrl, wire.guardedBytesSaved);
+          }
+          const res = await runHttp2Stream(session, {
+            method: "POST",
+            path: `${url.pathname}${url.search}`,
+            headers: wire.headers,
+            body: wire.body,
+            captureMaxBytes: RESPONSE_CAPTURE_MAX_BYTES,
+          });
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          // WR-62: decode a compressed downstream response before the WR-37
+          // validator sees the body — same contract as the HTTP/1.1 path.
+          // A capture cut at the cap cannot be decoded: the raw bytes
+          // travel on with `truncated: true`.
+          const respCompress = responseCompression?.[item.targetUrl];
+          let body = res.body;
+          let contentEncoding: string | undefined;
+          if (respCompress !== undefined && !res.truncated) {
+            const decoded = await decodeResponseBody(
+              body,
+              res.headers["content-encoding"],
+              respCompress.maxDecompressedBytes ?? RESPONSE_CAPTURE_MAX_BYTES
+            );
+            body = decoded.body;
+            contentEncoding = decoded.contentEncoding;
+          }
+          return {
+            statusCode: res.statusCode,
+            body,
+            truncated: res.truncated,
+            ...(contentEncoding !== undefined ? { contentEncoding } : {}),
+          };
+        }
+        // Structured failure, same as the HTTP/1.1 path: the retry queue
+        // classifies on the status code and honors a 429's Retry-After.
+        throw new HttpDeliveryError(res.statusCode, parseRetryAfterMs(res.headers["retry-after"]));
+      } finally {
+        h2pool!.releaseStream(session);
       }
-      // Structured failure, same as the HTTP/1.1 path: the retry queue
-      // classifies on the status code and honors a 429's Retry-After.
-      throw new HttpDeliveryError(res.statusCode, parseRetryAfterMs(res.headers["retry-after"]));
-    } finally {
-      h2pool!.releaseStream(session);
-    }
+    };
+    return attempt(false).catch((err) => {
+      if (err instanceof HttpDeliveryError && err.statusCode === 415 && guardedApplied) {
+        onGzipFallback?.({
+          id: item.id,
+          traceId: item.traceId,
+          endpoint: item.targetUrl,
+          bytesSaved: guardedBytesSaved,
+        });
+        return attempt(true);
+      }
+      throw err;
+    });
   };
 
   /**
@@ -1602,7 +1750,11 @@ export function createDefaultSender(
     url: URL,
     pins: string[] | undefined
   ): Promise<DownstreamResponse> => {
-    const { headers, body } = buildWireRequest(item);
+    // WR-75: the guarded HTTP gzip path never engages here — WebSocket
+    // deliveries keep their RFC 7692 permessage-deflate story
+    // (`src/deflate.ts`), so the two mechanisms cannot disagree about who
+    // compressed what. WR-40 behavior on this path is unchanged.
+    const { headers, body } = buildWireRequest(item, { httpTransport: false });
     const relayHeaders: Record<string, string> = {};
     for (const [name, value] of Object.entries(headers)) {
       if (typeof value === "string" && name.toLowerCase().startsWith("x-relay-")) {
@@ -1677,6 +1829,7 @@ export function createDefaultSender(
   sender.pool = pool;
   sender.http2Pool = h2pool;
   sender.wsPool = wsPool;
+  sender.compressionStats = compressionTracker;
   sender.destroy = () => {
     pool?.destroy();
     h2pool?.destroy();
@@ -1947,7 +2100,19 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   });
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor)
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, (info) => {
+        // WR-75: a guarded-compressed delivery was answered 415 and resent
+        // as plaintext inside the same attempt — worth an audit line (the
+        // downstream does not speak gzip; the operator may want to drop
+        // the endpoint from `compressThreshold`), not just a counter.
+        opts.auditLog.append({
+          event: "gzip_fallback_plaintext",
+          id: info.id,
+          ...(info.traceId !== undefined ? { traceId: info.traceId } : {}),
+          targetUrl: info.endpoint,
+          bytesSaved: info.bytesSaved,
+        });
+      })
       : undefined;
   // WR-50: endpoints the operator may pause/resume over HTTP. The server
   // only ever delivers to these — the intake target plus every
@@ -1977,7 +2142,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     if (validators !== undefined && typeof validators === "object") {
       for (const endpoint of Object.keys(validators)) knownEndpoints.add(endpoint);
     }
-    for (const record of [opts.tlsPins, opts.tlsClientCerts, opts.compressOutbound, opts.proxies, opts.outboundEncryption, opts.responseCompression, opts.forwardHeaders, opts.minTlsVersions]) {
+    for (const record of [opts.tlsPins, opts.tlsClientCerts, opts.compressOutbound, opts.compressThreshold, opts.proxies, opts.outboundEncryption, opts.responseCompression, opts.forwardHeaders, opts.minTlsVersions]) {
       if (record) for (const endpoint of Object.keys(record)) knownEndpoints.add(endpoint);
     }
     for (const endpoint of opts.retry?.probe?.endpoints ?? []) knownEndpoints.add(endpoint);
@@ -2487,7 +2652,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       // configured, keeping the output byte-identical to the legacy shape.
       res
         .writeHead(200, { "content-type": "text/plain; version=0.0.4" })
-        .end(queue.renderMetrics() + versionMetrics.render() + schemaMetrics.render() + ipAclMetrics.render() + certExpiryMonitor.render() + tlsVersionMonitor.render());
+        .end(queue.renderMetrics() + versionMetrics.render() + schemaMetrics.render() + ipAclMetrics.render() + certExpiryMonitor.render() + tlsVersionMonitor.render() + (defaultSender?.compressionStats.render() ?? ""));
       return;
     }
     if (isEvents) {

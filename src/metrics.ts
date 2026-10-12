@@ -201,11 +201,31 @@ export interface CertExpiryMetricsInput {
   expirySeconds: number;
 }
 
+/** One endpoint's guarded-compression byte savings (WR-75), in Prometheus label order. */
+export interface CompressedBytesSavedInput {
+  endpoint: string;
+  /** Cumulative payload bytes saved by gzip compression (original minus compressed). */
+  bytesSaved: number;
+}
+
 /**
- * Render just the cert-expiry gauge block (WR-73) as exposition lines;
- * `[]` when the series is empty, so callers can keep their output
- * byte-identical until the first certificate is actually observed.
+ * Render just the guarded-compression byte-savings block (WR-75) as
+ * exposition lines; `[]` when the series is empty, so callers can keep
+ * their output byte-identical until the first byte is actually saved.
  */
+export function renderCompressedBytesSavedBlock(series: CompressedBytesSavedInput[]): string[] {
+  if (series.length === 0) return [];
+  const lines = [
+    "# HELP relay_compressed_bytes_saved_total Outbound payload bytes saved by guarded gzip compression (WR-75), by endpoint.",
+    "# TYPE relay_compressed_bytes_saved_total counter",
+  ];
+  for (const s of series) {
+    lines.push(
+      `relay_compressed_bytes_saved_total{endpoint="${escapeLabelValue(s.endpoint)}"} ${s.bytesSaved}`
+    );
+  }
+  return lines;
+}
 export function renderCertExpiryBlock(series: CertExpiryMetricsInput[]): string[] {
   if (series.length === 0) return [];
   const lines = [
