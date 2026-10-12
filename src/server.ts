@@ -58,6 +58,7 @@ import {
   type EndpointSecretRotationRule,
 } from "./secret-rotation.ts";
 import { OutboundConnectionPool, type KeepAlivePoolOptions } from "./keepalive.ts";
+import { warmupOutboundPool, resolveWarmupOptions } from "./warmup.ts";
 import {
   assertValidProxyUrl,
   createProxiedAgent,
@@ -399,6 +400,37 @@ export interface RelayServerOptions {
    * `RangeError` at startup.
    */
   outboundKeepAlive?: KeepAlivePoolOptions | false;
+  /**
+   * Outbound connection warm-up (WR-70, see `src/warmup.ts`): at startup,
+   * pre-establish keep-alive connections for the listed endpoint URLs on
+   * top of the WR-24 pool, so the first deliveries to those origins skip
+   * the TCP/TLS handshake. The warm-up resolves the exact pool agent the
+   * delivery path would use (per pin whitelist, proxy, mTLS identity, and
+   * TLS SNI override), opens `socketsPerOrigin` sockets per origin
+   * (default 1) through the agent's own connection funnel, and parks
+   * them idle — no application bytes are ever sent. TLS pins are verified
+   * against the endpoint's whitelist during warm-up (a mismatch fails
+   * that endpoint's warm-up); the verified fingerprint is cached on the
+   * pooled socket, which the pool's health probe requires before handing
+   * a pinned socket to a delivery.
+   *
+   * Warm-up is fire-and-forget: it never blocks or fails startup. Each
+   * endpoint failure is audited as `warmup_failed` (endpoint + error) and
+   * a summary as `warmup_completed`; a failed warm-up only means the
+   * first delivery pays the handshake it would have paid anyway. Applies
+   * only when the server owns the default sender (an injected `sender`
+   * or `outboundKeepAlive: false` means there is no pool to warm — the
+   * option is then a silent no-op). `http:`/`https:` targets only;
+   * anything else is reported as a per-endpoint failure. Invalid option
+   * shapes throw `RangeError` at startup; invalid URLs inside the list do
+   * not — they are per-endpoint `warmup_failed` audits.
+   */
+  warmup?: {
+    endpoints: string[];
+    timeoutMs?: number;
+    concurrency?: number;
+    socketsPerOrigin?: number;
+  };
   /**
    * Outbound HTTP/2 session reuse (see `src/http2.ts`): on top of the
    * keep-alive pool, per-origin H2 sessions multiplex high-concurrency
@@ -3570,6 +3602,66 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // Remove the signal listeners once the server is gone so an embedded
     // server does not leave process-level handlers behind.
     server.on("close", () => uninstall());
+  }
+
+  // WR-70: outbound connection warm-up. When the server owns the default
+  // sender (so there is a keep-alive pool) and warmup endpoints are
+  // configured, pre-establish pooled connections for them — fire and
+  // forget: warm-up must never block or fail startup. Per-endpoint
+  // failures are audited as `warmup_failed` (a failed warm-up only means
+  // the first delivery to that origin pays the handshake it would have
+  // paid anyway); a summary lands as `warmup_completed`.
+  if (opts.warmup !== undefined) {
+    const warmupCfg = opts.warmup;
+    if (
+      warmupCfg === null ||
+      typeof warmupCfg !== "object" ||
+      !Array.isArray(warmupCfg.endpoints) ||
+      !warmupCfg.endpoints.every((e) => typeof e === "string" && e.length > 0)
+    ) {
+      throw new RangeError("createRelayServer: `warmup.endpoints` must be a non-empty array of URL strings");
+    }
+    const warmupOpts = resolveWarmupOptions(warmupCfg);
+    const pool = defaultSender?.pool;
+    if (pool !== undefined && warmupCfg.endpoints.length > 0) {
+      const endpointCfg = {
+        tlsPins: opts.tlsPins,
+        proxies: opts.proxies,
+        tlsClientCerts: opts.tlsClientCerts,
+        tlsSniOverrides: opts.tlsSniOverrides,
+      };
+      warmupOutboundPool(pool, warmupCfg.endpoints, endpointCfg, warmupOpts).then(
+        (report) => {
+          opts.auditLog.append({
+            event: "warmup_completed",
+            warmed: report.warmed,
+            failed: report.failed,
+            elapsedMs: report.elapsedMs,
+            endpoints: report.results.map((r) => ({
+              endpoint: r.endpoint,
+              ok: r.ok,
+              ...(r.error !== undefined ? { error: r.error } : {}),
+              ...(r.connectMs !== undefined ? { connectMs: r.connectMs } : {}),
+            })),
+          });
+          for (const r of report.results) {
+            if (!r.ok) {
+              opts.auditLog.append({ event: "warmup_failed", endpoint: r.endpoint, error: r.error });
+            }
+          }
+        },
+        (err) => {
+          // Unreachable in practice: warmupOutboundPool reports endpoint
+          // failures as data and never rejects for them — this is the
+          // backstop for a bug in warm-up itself.
+          opts.auditLog.append({
+            event: "warmup_failed",
+            endpoint: "<warmup>",
+            error: String((err as Error)?.message ?? err),
+          });
+        }
+      );
+    }
   }
 
   return server;

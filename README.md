@@ -476,6 +476,29 @@ reliability primitives that matter for any signed-payload pipeline.
   (`close` → `queue.stop()` → pool `destroy()`), covering the
   graceful-shutdown drain path. Invalid option values throw `RangeError` at
   startup.
+- `src/warmup.ts` — outbound connection warm-up (WR-70): pre-connects the
+  keep-alive pool to configured origins at startup so the first deliveries
+  skip the TCP/TLS handshake. `warmupOutboundPool(pool, endpoints, cfg)`
+  resolves the exact pool agent each delivery would use (same pin
+  whitelist, proxy, mTLS identity, and TLS SNI override), opens
+  `socketsPerOrigin` sockets per origin (default 1) through the agent's own
+  connection funnel, and parks them idle in the agent's free list — no
+  application bytes are ever sent. TLS pins *are* verified during warm-up
+  against the endpoint's whitelist (the verified SPKI fingerprint is cached
+  on the pooled socket, which the health probe requires before a pinned
+  socket may serve a delivery); a mismatch fails that endpoint's warm-up
+  with `pin_mismatch` and the socket is destroyed, never parked. Warm-ups
+  run with bounded concurrency, a per-connection `timeoutMs` (default 5s),
+  and per-endpoint error isolation (one endpoint's failure — refused,
+  timeout, DNS, TLS error — never throws and never blocks the others);
+  every result is auditable via `warmup_completed` / `warmup_failed` events
+  when wired through `createRelayServer({ warmup: { endpoints, timeoutMs?,
+  concurrency?, socketsPerOrigin? } })`, which validates the shape with a
+  `RangeError` at startup. Measured numbers in the `bench/warmup-bench.ts`
+  bullet below (localhost: first-delivery p50 0.96 ms → 0.54 ms for HTTP,
+  4.36 ms → 0.85 ms for HTTPS with TLS pinning — the handshake moves from
+  the first delivery into startup, where it is paid once per origin
+  instead of once per cold burst).
 - `src/http2.ts` — outbound HTTP/2 session reuse (WR-42): on top of the
   keep-alive pool, per-origin H2 sessions multiplex high-concurrency
   deliveries over a single connection — one session per `(scheme, host,
@@ -621,6 +644,24 @@ reliability primitives that matter for any signed-payload pipeline.
   HTTPS arm) while H2 multiplexes everything over a single connection —
   ~2x on plain HTTP, ~3–6x when every H1.1 connection also pays a TLS
   handshake.
+- `bench/warmup-bench.ts` (`npm run bench:warmup`) — first-delivery latency
+  to a cold origin vs. a warmed origin: each iteration builds a fresh
+  default sender (fresh keep-alive pool), optionally warms it with
+  `warmupOutboundPool`, then times exactly one delivery to a localhost
+  stub. Measured 2026-10-11, Node v24.20.0, AMD EPYC 9D25, linux x64:
+
+  | scenario | iterations | mean | p50 | p99 |
+  |---|---|---|---|---|
+  | HTTP first delivery, cold | 200 | 1.26 ms | 0.96 ms | 5.81 ms |
+  | HTTP first delivery, warmed | 200 | 0.59 ms | 0.54 ms | 2.39 ms |
+  | HTTPS+pins first delivery, cold | 100 | 4.81 ms | 4.36 ms | 12.74 ms |
+  | HTTPS+pins first delivery, warmed | 100 | 0.95 ms | 0.85 ms | 6.11 ms |
+
+  Takeaway: on localhost the TCP handshake is ~0.4 ms and the pinned TLS
+  handshake ~3.5 ms at p50 — warm-up moves that cost from the first
+  delivery into startup, where it is paid once per origin instead of once
+  per cold burst. (An earlier run gave HTTP p50 1.22 → 0.67 ms and
+  HTTPS+pins p50 4.18 → 0.87 ms; localhost numbers, not a WAN claim.)
 - `src/server.ts` — a minimal `node:http` receiver: read the raw body, verify
   the `x-signature` header with the injected `verifier` (defaults to
   HMAC-SHA256 with `secret`; pass e.g. `new Ed25519Verifier(pem)` to change
