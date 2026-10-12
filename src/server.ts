@@ -111,6 +111,12 @@ import {
   DEFAULT_OUTBOUND_ACCEPT_ENCODING,
   type ResponseCompressionOptions,
 } from "./response-encoding.ts";
+import {
+  resolveForwardHeadersConfig,
+  shouldForwardHeader,
+  type CompiledForwardHeadersRule,
+  type ForwardHeadersRuleConfig,
+} from "./forward-headers.ts";
 
 /**
  * Operator/intake plane split (WR-56). When set, the relay listens on two
@@ -359,6 +365,21 @@ export interface RelayServerOptions {
    * at startup.
    */
   responseCompression?: Record<string, ResponseCompressionOptions>;
+  /**
+   * Outbound request header forwarding allowlist (WR-69; see
+   * `src/forward-headers.ts`): per-endpoint (exact `targetUrl`) gate on
+   * the inbound passthrough headers forwarded downstream. Rules carry
+   * `allow` / `deny` header-name pattern lists (strings compiled as
+   * case-insensitive regexes, or `RegExp`); `deny` wins over `allow`, and
+   * `authorization` / `cookie` are never forwarded by default — an
+   * explicit allow can re-enable them for an endpoint, never an
+   * explicit deny. The relay's own forced headers (`x-trace-id`,
+   * `x-relay-signature` / `x-relay-key-id`, the WR-44 idempotency key,
+   * encodings) are stamped after the gate and always survive. Endpoints
+   * without a rule keep the exact current pass-through behavior.
+   * Invalid rules throw `RangeError` at startup.
+   */
+  forwardHeaders?: Record<string, ForwardHeadersRuleConfig>;
   /**
    * Outbound keep-alive connection pool (see `src/keepalive.ts`): outbound
    * deliveries reuse TCP/TLS connections per `(scheme, host, port)` instead
@@ -811,7 +832,8 @@ export function createDefaultSender(
   websocket?: WebSocketPoolOptions,
   outboundEncryption?: Record<string, OutboundEncryptionConfig>,
   tlsSniOverrides?: Record<string, TlsSniOverride>,
-  responseCompression?: Record<string, ResponseCompressionOptions>
+  responseCompression?: Record<string, ResponseCompressionOptions>,
+  forwardHeaders?: Record<string, ForwardHeadersRuleConfig>
 ): PooledSender {
   if (tlsPins !== undefined) {
     for (const [endpoint, pins] of Object.entries(tlsPins)) {
@@ -891,6 +913,17 @@ export function createDefaultSender(
       );
     }
   }
+  // WR-69: RangeError on invalid values, at startup — never mid-delivery.
+  let forwardHeadersRules: Map<string, CompiledForwardHeadersRule> | undefined;
+  if (forwardHeaders !== undefined) {
+    try {
+      forwardHeadersRules = resolveForwardHeadersConfig(forwardHeaders);
+    } catch (err) {
+      throw new RangeError(
+        `createDefaultSender: invalid forwardHeaders config: ${(err as Error).message}`
+      );
+    }
+  }
   // RangeError on invalid values, at startup — never mid-delivery.
   if (outboundSigning !== undefined) {
     if (typeof outboundSigning.secret !== "string" || outboundSigning.secret === "") {
@@ -955,8 +988,17 @@ export function createDefaultSender(
     item: RetryItem
   ): { headers: Record<string, string | string[]>; body: Buffer } => {
     const headers: Record<string, string | string[]> = {};
+    // WR-69: per-endpoint header forwarding allowlist. Evaluated on the
+    // inbound passthrough headers (already stripped of relay-owned
+    // headers at intake); the relay-forced stamps below (trace id,
+    // x-relay-signature, idempotency key, encodings) are unaffected — they
+    // are always sent. Endpoints without a rule keep the exact current
+    // behavior.
+    const forwardRule = forwardHeadersRules?.get(item.targetUrl);
     for (const [k, v] of Object.entries(item.headers)) {
-      if (v !== undefined) headers[k] = v;
+      if (v === undefined) continue;
+      if (forwardRule !== undefined && !shouldForwardHeader(forwardRule, k)) continue;
+      headers[k] = v;
     }
     // Propagate the trace ID downstream so the next hop can correlate the
     // delivery with this relay's audit trail (overrides a stale inbound
@@ -1652,7 +1694,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // the default sender only; an injected sender signs on its own.
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression)
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders)
       : undefined;
   // WR-50: endpoints the operator may pause/resume over HTTP. The server
   // only ever delivers to these — the intake target plus every
@@ -1682,7 +1724,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     if (validators !== undefined && typeof validators === "object") {
       for (const endpoint of Object.keys(validators)) knownEndpoints.add(endpoint);
     }
-    for (const record of [opts.tlsPins, opts.tlsClientCerts, opts.compressOutbound, opts.proxies, opts.outboundEncryption, opts.responseCompression]) {
+    for (const record of [opts.tlsPins, opts.tlsClientCerts, opts.compressOutbound, opts.proxies, opts.outboundEncryption, opts.responseCompression, opts.forwardHeaders]) {
       if (record) for (const endpoint of Object.keys(record)) knownEndpoints.add(endpoint);
     }
     for (const endpoint of opts.retry?.probe?.endpoints ?? []) knownEndpoints.add(endpoint);

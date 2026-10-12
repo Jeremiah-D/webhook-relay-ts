@@ -1217,6 +1217,47 @@ const server = createRelayServer({
 - Endpoints without an entry send no `Accept-Encoding` and behave
   byte-identically to before.
 
+## Outbound header forwarding allowlist
+
+Per-endpoint opt-in gate on the inbound headers the relay forwards
+downstream (`src/forward-headers.ts`). By default the relay forwards the
+inbound request's headers (minus the relay-owned strips the intake
+applies: `host`, `content-length`, stale `content-encoding`, `x-relay-*`,
+`x-tenant-id`, `x-api-key`) — convenient for trace correlation, but it
+also means a caller's `authorization` or `cookie` header reaches a
+downstream that never asked for it.
+
+```ts
+const server = createRelayServer({
+  secret, forwardUrl, auditLog,
+  forwardHeaders: {
+    "https://downstream/hook": {
+      allow: ["^x-", "content-type"], // strings are case-insensitive regexes
+      deny: ["x-internal-secret"],    // deny always wins over allow
+    },
+  },
+});
+```
+
+- **Precedence** — explicit `deny` > explicit `allow` > default deny >
+  absent `allow` (= forward everything the deny lists do not block). An
+  explicit `allow: []` forwards nothing but the relay-forced headers.
+- **Default deny** — with a rule configured, `authorization` and `cookie`
+  are never forwarded unless the operator explicitly allowlists them (an
+  explicit allow overrides the *default* deny, never an explicit one).
+  Endpoints without a rule keep the exact current pass-through behavior.
+- **Relay-forced headers always survive** — the rule only filters the
+  inbound passthrough set; `x-trace-id`, `x-relay-signature` /
+  `x-relay-key-id` (WR-26), the WR-44 idempotency key, and the
+  WR-40/WR-62 encoding stamps are applied *after* the gate and can
+  neither be dropped by it nor confused by it.
+- **Composes** with WR-26 (signing stamps after the gate, always
+  retained) and WR-36 (mTLS is transport-level, orthogonal); WR-65's
+  `x-api-key` never reaches the gate at all — stripped at intake.
+- Matching is case-insensitive; `RegExp` patterns are rebuilt without
+  the stateful `g`/`y` flags so forwarding is deterministic. Invalid
+  rules throw `RangeError` at startup — never mid-delivery.
+
 ## Outbound end-to-end encryption
 
 Deliveries to sensitive downstreams can be sealed end-to-end per endpoint
