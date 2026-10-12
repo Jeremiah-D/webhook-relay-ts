@@ -51,6 +51,13 @@
  *   remaining before breach, in seconds (WR-71 early warning). Present
  *   only for endpoints currently elevated by the SLO-risk predictor —
  *   absent entirely when the predictor is disabled or nothing is at risk.
+ * - `relay_cert_expiry_seconds{endpoint,kind}`: gauge of seconds until the
+ *   observed TLS certificate expires (negative when already expired;
+ *   WR-73). `kind` is `downstream` (the peer's certificate, captured at
+ *   handshake time) or `client` (the relay's own mTLS client certificate,
+ *   checked at config load). Present only for endpoints whose certificate
+ *   was actually observed — absent entirely when the monitor is disabled
+ *   or nothing was observed yet.
  *
  * Cardinality note: labels are per endpoint (`targetUrl`), so a relay
  * fanning out to many distinct downstream URLs grows the series count —
@@ -117,6 +124,13 @@ export interface MetricsInput {
    * nothing is at risk.
    */
   sloRisk?: SloRiskMetricsInput[];
+  /**
+   * Present only for endpoints whose TLS certificate was observed by the
+   * WR-73 expiry monitor (handshake peer certs plus the relay's own mTLS
+   * client certs); absent entirely when the monitor is disabled or
+   * nothing was observed yet.
+   */
+  certExpiry?: CertExpiryMetricsInput[];
 }
 
 /** One endpoint's starvation-guard activation count, in Prometheus label order. */
@@ -172,6 +186,38 @@ export interface SloRiskMetricsInput {
   tenant?: string;
   /** Predicted SLO headroom remaining before breach, in seconds (>= 0). */
   headroomSeconds: number;
+}
+
+/**
+ * One endpoint's observed TLS certificate expiry (WR-73), in Prometheus
+ * label order.
+ */
+export interface CertExpiryMetricsInput {
+  /** The delivery `targetUrl` (downstream) or the `tlsClientCerts` key (client). */
+  endpoint: string;
+  /** `"downstream"` = the peer's certificate; `"client"` = the relay's own mTLS client certificate. */
+  kind: "downstream" | "client";
+  /** Seconds until the certificate expires (< 0 when already expired). */
+  expirySeconds: number;
+}
+
+/**
+ * Render just the cert-expiry gauge block (WR-73) as exposition lines;
+ * `[]` when the series is empty, so callers can keep their output
+ * byte-identical until the first certificate is actually observed.
+ */
+export function renderCertExpiryBlock(series: CertExpiryMetricsInput[]): string[] {
+  if (series.length === 0) return [];
+  const lines = [
+    "# HELP relay_cert_expiry_seconds Seconds until the observed TLS certificate expires, by endpoint (negative when already expired).",
+    "# TYPE relay_cert_expiry_seconds gauge",
+  ];
+  for (const c of series) {
+    lines.push(
+      `relay_cert_expiry_seconds{endpoint="${escapeLabelValue(c.endpoint)}",kind="${c.kind}"} ${c.expirySeconds}`
+    );
+  }
+  return lines;
 }
 
 /** Escape a label value per the Prometheus exposition format. */
@@ -318,5 +364,8 @@ export function renderPrometheus(input: MetricsInput): string {
       );
     }
   }
+  // WR-73: activity-gated like the slo-risk gauge — the series appears
+  // only once the monitor has actually observed a certificate.
+  lines.push(...renderCertExpiryBlock(input.certExpiry ?? []));
   return lines.join("\n") + "\n";
 }

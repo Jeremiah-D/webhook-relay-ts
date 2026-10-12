@@ -469,6 +469,27 @@ reliability primitives that matter for any signed-payload pipeline.
   empty servernames, IP-literal servernames, and empty/malformed
   `alpnProtocols` throw `RangeError` at startup. Zero dependencies
   (`node:net` + `node:crypto`).
+- `src/cert-expiry.ts` — downstream + own TLS certificate expiry warning (WR-73):
+  `createRelayServer({ tlsCertExpiry: { enabled: true, thresholdSeconds? } })`
+  (also exposed as the fourteenth `createDefaultSender(...)` argument). When
+  enabled, every `https:`/`wss:` handshake feeds the peer certificate's
+  `notAfter` into the monitor — reusing the `getPeerCertificate` read the
+  WR-21 pin check performs, across the keep-alive pool, proxied CONNECT
+  tunnels, the H2 session pool, and the WebSocket pool — and a certificate
+  expiring within `thresholdSeconds` (default 14 days) fires one
+  edge-triggered `cert_expiring` audit event per certificate (not per
+  handshake: a pooled connection serving a thousand deliveries alerts once;
+  a renewed certificate alerts again), plus a
+  `relay_cert_expiry_seconds{endpoint,kind}` gauge in `GET /metrics`
+  (`kind` = `downstream` for the peer, `client` for the relay's own mTLS
+  client certificates, which are checked at config load — an expired client
+  identity fails every handshake and no retry ever fixes it). Off by
+  default: an unconfigured relay behaves exactly as before, and `GET /metrics`
+  stays byte-identical until the first certificate is observed. The monitor
+  is an observer, never a gate: unreadable or empty peer certificates
+  (resumed TLS 1.3 sessions re-send none) are skipped silently. Invalid
+  values throw `RangeError` at startup. Zero dependencies (`node:crypto`
+  only).
 - `src/keepalive.ts` — outbound keep-alive connection pool: deliveries reuse
   TCP/TLS connections per `(scheme, host, port)` instead of paying a handshake
   per attempt. One `http.Agent`/`https.Agent` per origin, with

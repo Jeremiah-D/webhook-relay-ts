@@ -97,6 +97,15 @@ export interface WebSocketPoolOptions {
    * instead of negotiating parameters the relay cannot honor.
    */
   permessageDeflate?: boolean | PerMessageDeflateOptions;
+  /**
+   * WR-73 downstream TLS certificate expiry monitoring (see
+   * `src/cert-expiry.ts`): called with the TLS socket and the delivery
+   * `targetUrl` right after the TLS handshake — the same moment the pin
+   * check reads the peer certificate — so the monitor can capture the
+   * peer's `notAfter`. Optional; the hook must never throw (an observer
+   * must not break a delivery).
+   */
+  onTlsPeerCertificate?: (socket: TLSSocket, targetUrl: string) => void;
 }
 
 /** Validated {@link WebSocketPoolOptions} with defaults applied. */
@@ -106,6 +115,7 @@ export interface ResolvedWebSocketPoolOptions {
   pingIntervalMs: number;
   idleTimeoutMs: number;
   permessageDeflate: ResolvedPerMessageDeflate | undefined;
+  onTlsPeerCertificate: ((socket: TLSSocket, targetUrl: string) => void) | undefined;
 }
 
 /** Validate pool options once, at startup — never mid-delivery. */
@@ -130,7 +140,18 @@ export function resolveWebSocketOptions(opts: WebSocketPoolOptions = {}): Resolv
   } catch (err) {
     fail((err as Error).message);
   }
-  return { timeoutMs, maxMessageBytes, pingIntervalMs, idleTimeoutMs, permessageDeflate };
+  const onTlsPeerCertificate = opts.onTlsPeerCertificate;
+  if (onTlsPeerCertificate !== undefined && typeof onTlsPeerCertificate !== "function") {
+    fail("onTlsPeerCertificate must be a function");
+  }
+  return {
+    timeoutMs,
+    maxMessageBytes,
+    pingIntervalMs,
+    idleTimeoutMs,
+    permessageDeflate,
+    onTlsPeerCertificate,
+  };
 }
 
 // --- RFC 6455 frame codec -------------------------------------------------
@@ -755,6 +776,17 @@ export class WebSocketPool {
       };
 
       const verifyPins = (): void => {
+        // WR-73: capture the peer certificate's expiry at handshake time
+        // (the same getPeerCertificate read the pin check below uses) —
+        // runs before pinning so unpinned endpoints are covered too. The
+        // hook is an observer: it must never break the delivery.
+        if (secure) {
+          try {
+            this.opts.onTlsPeerCertificate?.(socket as TLSSocket, targetUrl);
+          } catch {
+            // Swallowed on purpose — expiry telemetry is never a gate.
+          }
+        }
         if (pins === undefined) {
           handshake();
           return;

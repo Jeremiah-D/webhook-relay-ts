@@ -58,6 +58,11 @@ import {
   SIGNATURE_VERSION_HEADER,
   type EndpointSecretRotationRule,
 } from "./secret-rotation.ts";
+import {
+  CertExpiryMonitor,
+  resolveCertExpiryOptions,
+  type CertExpiryOptions,
+} from "./cert-expiry.ts";
 import { OutboundConnectionPool, type KeepAlivePoolOptions } from "./keepalive.ts";
 import { warmupOutboundPool, resolveWarmupOptions } from "./warmup.ts";
 import {
@@ -334,6 +339,23 @@ export interface RelayServerOptions {
    * empty/malformed `alpnProtocols` throw `RangeError` at startup.
    */
   tlsSniOverrides?: Record<string, TlsSniOverride>;
+  /**
+   * Downstream + own TLS certificate expiry warning (WR-73, see
+   * `src/cert-expiry.ts`): `{ enabled: true, thresholdSeconds? }`. When
+   * enabled, every `https:`/`wss:` handshake feeds the peer certificate's
+   * `notAfter` into the monitor — reusing the `getPeerCertificate` read
+   * the WR-21 pin check performs, across the keep-alive pool, proxied
+   * CONNECT tunnels, the H2 session pool, and the WebSocket pool — and a
+   * certificate expiring within `thresholdSeconds` (default 14 days)
+   * fires one edge-triggered `cert_expiring` audit event per
+   * certificate (not per handshake) plus a
+   * `relay_cert_expiry_seconds{endpoint,kind}` gauge in `GET /metrics`
+   * (`kind` = `downstream` for the peer, `client` for the relay's own
+   * mTLS client certificates, which are checked at config load). Off by
+   * default: an unconfigured relay behaves exactly as before. Invalid
+   * values throw `RangeError` at startup.
+   */
+  tlsCertExpiry?: CertExpiryOptions;
   /**
    * Outbound gzip compression (see `src/gzip.ts`): per-endpoint opt-in,
    * keyed by exact delivery `targetUrl`. When the payload reaches
@@ -851,6 +873,17 @@ export interface RelayServerOptions {
  * Composes with `tlsPins`, `tlsClientCerts`, the keep-alive pool, the H2
  * pool, and proxied endpoints. Invalid values throw `RangeError` at
  * startup.
+ *
+ * `certExpiryMonitor` (WR-73, see `src/cert-expiry.ts`) hooks
+ * certificate-expiry capture into the TLS handshake paths: every
+ * `https:`/`wss:` handshake feeds the peer certificate's `notAfter` into
+ * the monitor (the keep-alive pool, proxied CONNECT tunnels, the H2
+ * session pool, and the WebSocket pool are all covered), and the relay's
+ * own mTLS client certificates are checked at config load here. When
+ * omitted — or when the monitor is disabled — the request path is
+ * untouched. The monitor is owned by the caller (usually the relay
+ * server, which audits `cert_expiring` and renders the
+ * `relay_cert_expiry_seconds` gauge).
  */
 export interface PooledSender extends Sender {
   /** The keep-alive pool, or `undefined` when pooling is disabled. */
@@ -876,7 +909,8 @@ export function createDefaultSender(
   outboundEncryption?: Record<string, OutboundEncryptionConfig>,
   tlsSniOverrides?: Record<string, TlsSniOverride>,
   responseCompression?: Record<string, ResponseCompressionOptions>,
-  forwardHeaders?: Record<string, ForwardHeadersRuleConfig>
+  forwardHeaders?: Record<string, ForwardHeadersRuleConfig>,
+  certExpiryMonitor?: CertExpiryMonitor
 ): PooledSender {
   if (tlsPins !== undefined) {
     for (const [endpoint, pins] of Object.entries(tlsPins)) {
@@ -908,6 +942,15 @@ export function createDefaultSender(
         throw new RangeError(
           `createDefaultSender: invalid TLS client certificate for ${endpoint}: ${(err as Error).message}`
         );
+      }
+    }
+    // WR-73: the relay's own mTLS client identities are checked for
+    // expiry at config load (same audit + gauge treatment as downstream
+    // certificates) — an expired client identity fails every handshake
+    // and no retry ever fixes it. The monitor is inert unless enabled.
+    if (certExpiryMonitor !== undefined) {
+      for (const [endpoint, cert] of Object.entries(tlsClientCerts)) {
+        certExpiryMonitor.checkClientCertificate(cert.cert, endpoint);
       }
     }
   }
@@ -1017,7 +1060,18 @@ export function createDefaultSender(
       : undefined;
   // WebSocket pool (WR-45): always created — a ws:/wss: target just
   // works. RangeError on invalid values, at startup — never mid-delivery.
-  const wsPool = new WebSocketPool(websocket);
+  const wsPool = new WebSocketPool({
+    ...websocket,
+    // WR-73: downstream cert-expiry capture on the wss: handshake (the
+    // pool's verifyPins path feeds the monitor). The monitor is inert
+    // unless enabled, so the request path is untouched when off.
+    ...(certExpiryMonitor !== undefined
+      ? {
+          onTlsPeerCertificate: (socket: TLSSocket, targetUrl: string) =>
+            certExpiryMonitor.observePeerCertificate(socket, targetUrl),
+        }
+      : {}),
+  });
 
   /**
    * Shared outbound request material: passthrough headers, trace id,
@@ -1289,7 +1343,31 @@ export function createDefaultSender(
         req.end(wireBody);
       };
 
+      /**
+       * WR-73: capture the peer certificate's expiry on the TLS handshake
+       * for `https:` targets — the same `getPeerCertificate` read the
+       * WR-21 pin check uses. Runs on the fresh-handshake path; a reused
+       * pooled connection's certificate was already captured when its
+       * handshake ran (the monitor edge-triggers per certificate, so a
+       * re-observation would be a no-op anyway).
+       */
+      const observeTlsPeer = (socket: unknown, endpoint: string): void => {
+        const tlsSocket = socket as TLSSocket;
+        const already = tlsSocket.getPeerCertificate() as { raw?: unknown };
+        if (already && already.raw) {
+          certExpiryMonitor?.observePeerCertificate(tlsSocket, endpoint);
+        } else {
+          tlsSocket.once("secureConnect", () =>
+            certExpiryMonitor?.observePeerCertificate(tlsSocket, endpoint)
+          );
+        }
+      };
+
       if (pins === undefined) {
+        // WR-73: hook cert-expiry capture for the unpinned https: path too.
+        if (url.protocol === "https:" && certExpiryMonitor?.enabled) {
+          req.on("socket", (socket) => observeTlsPeer(socket, item.targetUrl));
+        }
         writePayload();
         return;
       }
@@ -1303,6 +1381,9 @@ export function createDefaultSender(
         let presented: string;
         try {
           const raw = (tlsSocket.getPeerCertificate() as { raw?: unknown }).raw;
+          // WR-73: reuse this handshake's certificate read for the
+          // expiry monitor — no second getPeerCertificate call.
+          certExpiryMonitor?.observePeerCertificateDer(Buffer.from(raw as Buffer), item.targetUrl);
           presented = spkiFingerprint(Buffer.from(raw as Buffer));
         } catch {
           presented = "<unreadable certificate>";
@@ -1368,6 +1449,15 @@ export function createDefaultSender(
   ): Promise<DownstreamResponse> => {
     const session = await h2pool!.sessionFor(url, pins, clientCert, tlsSni);
     h2pool!.acquireStream(session);
+    // WR-73: the session's handshake is done by now (established or
+    // reused — the monitor edge-triggers per certificate, so a
+    // re-observation is a no-op), which is exactly when the peer
+    // certificate is readable. A resumed session re-sends no
+    // certificate; the monitor skips those silently.
+    if (certExpiryMonitor?.enabled) {
+      const sock = session.socket as TLSSocket | undefined;
+      if (sock !== undefined) certExpiryMonitor.observePeerCertificate(sock, item.targetUrl);
+    }
     try {
       const { headers, body } = buildWireRequest(item);
       const res = await runHttp2Stream(session, {
@@ -1736,9 +1826,17 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // close so pooled outbound connections never outlive the server. The
   // outbound-signing config (validated by createDefaultSender) applies to
   // the default sender only; an injected sender signs on its own.
+  // WR-73: the cert-expiry monitor is always constructed but inert
+  // unless enabled; every edge-triggered `cert_expiring` event lands in
+  // the audit log. Invalid values throw RangeError at startup.
+  const certExpiryMonitor = new CertExpiryMonitor(resolveCertExpiryOptions(opts.tlsCertExpiry), {
+    onCertExpiring: (event) => {
+      opts.auditLog.append(event);
+    },
+  });
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders)
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor)
       : undefined;
   // WR-50: endpoints the operator may pause/resume over HTTP. The server
   // only ever delivers to these — the intake target plus every
@@ -2278,7 +2376,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       // configured, keeping the output byte-identical to the legacy shape.
       res
         .writeHead(200, { "content-type": "text/plain; version=0.0.4" })
-        .end(queue.renderMetrics() + versionMetrics.render() + schemaMetrics.render() + ipAclMetrics.render());
+        .end(queue.renderMetrics() + versionMetrics.render() + schemaMetrics.render() + ipAclMetrics.render() + certExpiryMonitor.render());
       return;
     }
     if (isEvents) {

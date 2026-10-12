@@ -103,6 +103,7 @@ import {
 import {
   renderPrometheus,
   type CircuitStateInput,
+  type CertExpiryMetricsInput,
   type DeliveryCountersInput,
   type FailoverMetricsInput,
   type LatencyHistogramInput,
@@ -120,7 +121,7 @@ import {
 export { TRACE_ID_HEADER };
 export { renderPrometheus };
 export { TENANT_ID_HEADER, assertValidTenantId, tenantScopeKey, splitTenantScopeKey };
-export type { DeliveryCountersInput, CircuitStateInput, LatencyHistogramInput, StarvationGuardMetricsInput, SloRiskMetricsInput };
+export type { DeliveryCountersInput, CircuitStateInput, LatencyHistogramInput, StarvationGuardMetricsInput, SloRiskMetricsInput, CertExpiryMetricsInput };
 export { HttpDeliveryError, classifyFailure, parseRetryAfterMs };
 export type { FailureClass, ClassifiedFailure };
 export type { DownstreamResponseSummary };
