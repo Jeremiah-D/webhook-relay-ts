@@ -645,6 +645,13 @@ export interface DeadLetterReplayFilter {
    */
   endpoint?: string;
   /**
+   * WR-86: only entries dead-lettered for this tenant (exact tenant-id
+   * match, WR-48). Unset: every tenant's entries are eligible — including
+   * the default tenant's. A replay that omits `tenant` therefore keeps the
+   * pre-tenant behavior byte-for-byte.
+   */
+  tenant?: string;
+  /**
    * Only these dead-letter ids — a subset of what the filter would
    * otherwise match. Unset: every matched entry is replayed.
    */
@@ -660,6 +667,8 @@ export interface DeadLetterReplayFilter {
 export interface DeadLetterReplayPreview {
   id: string;
   endpoint: string;
+  /** Tenant id (WR-86/WR-48); absent for the default tenant. */
+  tenant?: string;
   attempts: number;
   lastError: string;
   deadLetteredAt: string;
@@ -705,6 +714,14 @@ export interface DeadLetterStats {
   throttled: number;
   /** Live entries per logical endpoint (first-seen order). */
   byEndpoint: Array<{ endpoint: string; count: number }>;
+  /**
+   * WR-86: live entries per (tenant, endpoint) pair (first-seen order).
+   * `tenant` is absent for the default tenant. Operators running several
+   * tenants against one relay can see whose dead letters are whose —
+   * the unscoped `byEndpoint` row stays the sum across tenants, so old
+   * consumers of this shape keep working.
+   */
+  byTenantEndpoint: Array<{ tenant?: string; endpoint: string; count: number }>;
 }
 
 /**
@@ -2966,15 +2983,29 @@ export class RetryQueue {
    */
   getDeadLetterStats(): DeadLetterStats {
     const byEndpoint = new Map<string, number>();
+    const byTenantEndpoint = new Map<string, { tenant?: string; endpoint: string; count: number }>();
     for (const e of this.deadLetter) {
       const endpoint = e.failoverEndpoint ?? e.targetUrl;
       byEndpoint.set(endpoint, (byEndpoint.get(endpoint) ?? 0) + 1);
+      // WR-86: the key separates tenants, so one tenant's dead letters can
+      // never leak into another tenant's count. `\n` cannot appear in a
+      // tenant id (WR-48 charset) or a URL, matching `tenantScopeKey`.
+      const key = e.tenantId === undefined ? endpoint : `${e.tenantId}\n${endpoint}`;
+      const row = byTenantEndpoint.get(key);
+      if (row) row.count += 1;
+      else
+        byTenantEndpoint.set(key, {
+          ...(e.tenantId !== undefined ? { tenant: e.tenantId } : {}),
+          endpoint,
+          count: 1,
+        });
     }
     return {
       total: this.deadLetter.length,
       purged: this.deadLetterPurged,
       throttled: this.replayEgressThrottled,
       byEndpoint: [...byEndpoint].map(([endpoint, count]) => ({ endpoint, count })),
+      byTenantEndpoint: [...byTenantEndpoint.values()],
     };
   }
 
@@ -3014,6 +3045,9 @@ export class RetryQueue {
         (filter.endpoint === undefined ||
           e.targetUrl === filter.endpoint ||
           e.failoverEndpoint === filter.endpoint) &&
+        // WR-86: exact tenant match. Omitting `tenant` keeps the
+        // pre-tenant behavior — every tenant's entries are eligible.
+        (filter.tenant === undefined || e.tenantId === filter.tenant) &&
         (ids === undefined || ids.has(e.id))
     );
   }
@@ -3050,6 +3084,7 @@ export class RetryQueue {
       return this.matchDeadLetters(filter).map((e) => ({
         id: e.id,
         endpoint: e.targetUrl,
+        ...(e.tenantId !== undefined ? { tenant: e.tenantId } : {}),
         attempts: e.attempts,
         lastError: e.lastError,
         deadLetteredAt: e.deadLetteredAt,

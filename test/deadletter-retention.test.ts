@@ -199,7 +199,7 @@ describe("purgeExpiredDeadLetters", () => {
     await sleep(20);
     assert.deepEqual(q.purgeExpiredDeadLetters(), { purged: [], skipped: [] });
     assert.equal(q.getDeadLetter().length, 1);
-    assert.deepEqual(q.getDeadLetterStats(), { total: 1, purged: 0, throttled: 0, byEndpoint: [{ endpoint: EP_A, count: 1 }] });
+    assert.deepEqual(q.getDeadLetterStats(), { total: 1, purged: 0, throttled: 0, byEndpoint: [{ endpoint: EP_A, count: 1 }], byTenantEndpoint: [{ endpoint: EP_A, count: 1 }] });
   });
 
   it("per-endpoint record only purges opted-in endpoints", async () => {
@@ -225,6 +225,7 @@ describe("purgeExpiredDeadLetters", () => {
       purged: 2,
       throttled: 0,
       byEndpoint: [{ endpoint: EP_B, count: 1 }],
+      byTenantEndpoint: [{ endpoint: EP_B, count: 1 }],
     });
   });
 
@@ -393,6 +394,10 @@ describe("purgeExpiredDeadLetters", () => {
         { endpoint: EP_A, count: 2 },
         { endpoint: EP_B, count: 1 },
       ],
+      byTenantEndpoint: [
+        { endpoint: EP_A, count: 2 },
+        { endpoint: EP_B, count: 1 },
+      ],
     });
     await sleep(30);
     q.purgeExpiredDeadLetters();
@@ -401,6 +406,7 @@ describe("purgeExpiredDeadLetters", () => {
       purged: 2,
       throttled: 0,
       byEndpoint: [{ endpoint: EP_B, count: 1 }],
+      byTenantEndpoint: [{ endpoint: EP_B, count: 1 }],
     });
   });
 });

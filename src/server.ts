@@ -3042,9 +3042,13 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         respondJson(res, 400, { error: "body must be a JSON object" });
         return;
       }
-      const { endpoint, ids, dryRun } = body;
+      const { endpoint, tenant, ids, dryRun } = body;
       if (endpoint !== undefined && typeof endpoint !== "string") {
         respondJson(res, 400, { error: "endpoint must be a string" });
+        return;
+      }
+      if (tenant !== undefined && typeof tenant !== "string") {
+        respondJson(res, 400, { error: "tenant must be a string" });
         return;
       }
       if (
@@ -3060,6 +3064,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       }
       const filter = {
         ...(endpoint !== undefined ? { endpoint } : {}),
+        // WR-86: tenant-scoped replay — only this tenant's dead letters
+        // are re-queued; the default tenant's entries stay untouched.
+        ...(tenant !== undefined ? { tenant } : {}),
         ...(ids !== undefined ? { ids: ids as string[] } : {}),
       };
       if (dryRun === true) {
@@ -3078,6 +3085,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         replayed: result.replayed,
         failed: result.failed,
         ...(endpoint !== undefined ? { endpoint } : {}),
+        ...(tenant !== undefined ? { tenant } : {}),
       });
       respondJson(res, 200, { replayed: result.replayed, failed: result.failed });
       return;
