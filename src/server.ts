@@ -30,6 +30,7 @@ import type { FieldMask } from "./masking.ts";
 import type { ReplayGuard } from "./replay.ts";
 import { DeliveryDeduplicator, type DedupOptions } from "./dedup.ts";
 import { UsageMeter, type UsageOptions } from "./usage.ts";
+import { buildHealthSummary } from "./health-summary.ts";
 import { InboundRateLimiter, type InboundRateLimitOptions } from "./ratelimit.ts";
 import { InboundIpAcl, IpAclMetrics, type IpAclOptions } from "./ip-acl.ts";
 import { InboundApiKeyAuth, type ApiKeyOptions, type EndpointApiKeyRule } from "./api-key.ts";
@@ -2181,6 +2182,7 @@ function isOperatorPath(pathname: string): boolean {
     pathname === "/latency" ||
     pathname === "/slo-risk" ||
     pathname === "/usage" ||
+    pathname === "/health/summary" ||
     pathname === "/events" ||
     pathname === "/events/archive" ||
     pathname === "/metrics" ||
@@ -2941,6 +2943,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     const isLatency = pathname === "/latency";
     const isSloRisk = pathname === "/slo-risk";
     const isUsage = pathname === "/usage";
+    const isHealthSummary = pathname === "/health/summary";
     const isEvents = pathname === "/events";
     const isEventsArchive = pathname === "/events/archive";
     const isMetrics = pathname === "/metrics";
@@ -2965,6 +2968,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       !isLatency &&
       !isSloRisk &&
       !isUsage &&
+      !isHealthSummary &&
       !isEvents &&
       !isEventsArchive &&
       !isMetrics &&
@@ -2994,6 +2998,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         (isLatency && req.method === "GET") ||
         (isSloRisk && req.method === "GET") ||
         (isUsage && req.method === "GET") ||
+        (isHealthSummary && req.method === "GET") ||
         (isEvents && req.method === "GET") ||
         (isEventsArchive && req.method === "GET") ||
         (isMetrics && req.method === "GET") ||
@@ -3174,6 +3179,29 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       }
       const params = new URL(req.url ?? "/usage", "http://internal").searchParams;
       respondJson(res, 200, usageMeter.snapshot(params.get("tenant") ?? undefined));
+      return;
+    }
+    if (isHealthSummary) {
+      // WR-87: operator health dashboard — one human-readable aggregate
+      // over the relay's health signals (per-endpoint circuit state and
+      // consecutive-failure streaks, quota exhaustion, downstream probe
+      // state, the global retry-budget headroom, and the top-N tenants by
+      // delivery volume). Same operator-token guard as the other operator
+      // endpoints (404 when no operatorToken — fail closed). Pure read
+      // aggregation with zero write impact; the usage meter is optional —
+      // its rows are empty when unconfigured rather than failing the
+      // whole endpoint.
+      respondJson(
+        res,
+        200,
+        buildHealthSummary({
+          circuits: queue.getCircuitStats(),
+          quotas: queue.getQuotaStats(),
+          probes: queue.getProbeStats(),
+          retryBudget: queue.getRetryBudgetStats(),
+          usage: usageMeter?.snapshot(),
+        })
+      );
       return;
     }
     if (isScheduledList) {

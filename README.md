@@ -787,10 +787,11 @@ reliability primitives that matter for any signed-payload pipeline.
   errors, latency, replay records) are guarded by an `operatorToken` bearer token and
   disabled (404, fail closed) when it is unset. For reconciliation workflows,
   `POST /dead-letter/replay` batch-replays dead letters: the JSON body takes
-  `{ endpoint?, ids?, dryRun? }` — `endpoint` limits the replay to one
-  downstream, `ids` to an explicit subset, and `dryRun: true` returns only a
-  metadata preview (`{ dryRun: true, entries: [...] }` with
-  id/endpoint/attempts/lastError/deadLetteredAt/payloadBytes, never the
+  `{ endpoint?, tenant?, ids?, dryRun? }` — `endpoint` limits the replay to one
+  downstream, `tenant` to one tenant's dead letters (WR-86; omitting it keeps
+  the pre-tenant behavior), `ids` to an explicit subset, and `dryRun: true`
+  returns only a metadata preview (`{ dryRun: true, entries: [...] }` with
+  id/endpoint/tenant/attempts/lastError/deadLetteredAt/payloadBytes, never the
   payload) with zero side effects: nothing is re-queued, nothing is audited,
   and sealed payloads are never decrypted. A real replay processes the
   matched entries grouped by endpoint, each entry independently (one failure
@@ -1872,7 +1873,12 @@ Tenant shows up as a label wherever the relay reports: audit events carry
 `tenant`, Prometheus series gain `tenant="…"`, the SSE `/events` stream
 emits it per delivery event, and the operator endpoints
 (`/audit`, `/latency`, `/dead-letter`, `/events`) all accept `?tenant=` to
-filter to one tenant. Completion-callback receipts carry the tenant too.
+filter to one tenant. Dead letters are tenant-scoped end to end: each
+entry carries its `tenant`, `GET /dead-letter?tenant=` lists one tenant's
+entries, `GET /dead-letter/stats` adds per-(tenant, endpoint) counts in
+`byTenantEndpoint`, and `POST /dead-letter/replay` accepts `tenant` in the
+body so a replay re-queues only that tenant's dead letters (omitting it
+keeps the pre-tenant behavior of replaying everything). Completion-callback receipts carry the tenant too.
 `POST /config/endpoint` accepts an optional `tenant` to hot-reload one
 tenant's endpoint config.
 
@@ -1902,6 +1908,29 @@ drops anything — it is orthogonal to the delivery quota (WR-15), which is
 the protective gate. Memory-bounded: per-tenant samples are capped
 (`maxEventsPerTenant`, oldest dropped first) and the tenant population is
 capped (`maxTenants`, least-recently-active evicted).
+
+### Health summary dashboard
+
+One human-readable call for on-call diagnosis: the operator
+`GET /health/summary` endpoint (Bearer `operatorToken` / scoped `read` key,
+404 fail-closed when operator auth is unconfigured) aggregates every
+health signal the relay already tracks, so a 3 AM page turns into one JSON
+read instead of correlating five series by hand:
+
+- `endpoints` — one row per (tenant, endpoint) with any health signal:
+  WR-10 circuit state + `consecutiveFailures` streak + trip count, WR-15
+  quota `delayed` count, and WR-34 downstream probe state (the prober is
+  endpoint-scoped, so the same probe object repeats on every tenant row of
+  that endpoint). Rows absent from the list are healthy and silent.
+- `retryBudget` — the WR-38 global retry-budget headroom
+  (`retriesPerMinute` / `depleted`); absent when the budget is disabled.
+- `tenantUsageTop` — the top-10 tenants by delivery volume in the WR-78
+  usage window (empty when usage metering is unconfigured).
+
+Pure read aggregation with zero write impact — fetching the summary
+emits no audit event — and the machine-readable complement of the
+`/metrics` exposition (people read the summary, dashboards scrape the
+metrics).
 
 ### Failure classification
 
@@ -2145,11 +2174,13 @@ purged mid-shutdown.
 **Operator surface** (same Bearer <redacted>, fail closed to 404 without
 `operatorToken`):
 
-- `GET /dead-letter/stats` — `{ total, purged, throttled, byEndpoint }`: live
+- `GET /dead-letter/stats` — `{ total, purged, throttled, byEndpoint, byTenantEndpoint }`: live
   entries, entries auto-purged since startup, entries held back by the
   WR-68 replay egress throttle since startup (cumulative — each is still
-  live in the list until a later replay re-queues it), and live entries
-  per logical endpoint.
+  live in the list until a later replay re-queues it), live entries per
+  logical endpoint, and (WR-86) live entries per (tenant, endpoint) pair
+  (default-tenant rows carry no `tenant` field; the unscoped `byEndpoint`
+  row stays the sum across tenants).
 - `GET /audit?event=dead_letter_purged` — the per-purge audit trail.
 
 ### Replay egress throttling
