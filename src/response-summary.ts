@@ -67,6 +67,14 @@ export interface DownstreamResponseSummary {
    * downstream sent one. Omitted on the plain path.
    */
   contentEncoding?: string;
+  /**
+   * WR-89: id of the mTLS client certificate the sender presented
+   * during this delivery's handshake (`tlsClientCertRotation`
+   * endpoint). Copied from {@link DownstreamResponse.clientCertId};
+   * absent for non-rotation endpoints (WR-36 single identities keep
+   * the legacy summary shape).
+   */
+  clientCertId?: string;
 }
 
 /**
@@ -92,6 +100,10 @@ export function summarizeDownstreamResponse(
     ...(response.contentEncoding !== undefined
       ? { contentEncoding: response.contentEncoding }
       : {}),
+    // WR-89: the rotation certificate id rides the summary so the
+    // delivery audits can show which identity authenticated the
+    // delivery — present only for rotation endpoints.
+    ...(response.clientCertId !== undefined ? { clientCertId: response.clientCertId } : {}),
   };
   if (response.body.length > 0) {
     summary.bodyFingerprintSha256 = createHash("sha256")

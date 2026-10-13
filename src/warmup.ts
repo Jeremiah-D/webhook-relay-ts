@@ -3,6 +3,7 @@ import type { Agent as HttpAgent } from "node:http";
 import type { TLSSocket } from "node:tls";
 import { OutboundConnectionPool } from "./keepalive.ts";
 import { type TlsClientCert, clientCertIdentity } from "./mtls.ts";
+import { type RotatingClientCertSet } from "./mtls-rotation.ts";
 import {
   resolveTlsSniOverride,
   type ResolvedTlsSniOverride,
@@ -60,6 +61,12 @@ export interface WarmupEndpointConfig {
   proxies?: Record<string, string>;
   tlsClientCerts?: Record<string, TlsClientCert>;
   tlsSniOverrides?: Record<string, TlsSniOverride>;
+  /**
+   * WR-89: compiled rotation sets per endpoint. A rotation endpoint
+   * warms the primary identity's agent — the agent new handshakes will
+   * actually use.
+   */
+  tlsClientCertRotations?: Map<string, RotatingClientCertSet>;
 }
 
 /** Tuning for {@link warmupOutboundPool}. All values are validated up front. */
@@ -165,7 +172,12 @@ function resolveWarmupTarget(
   // environment (read now — a proxy rotation after startup only affects
   // deliveries, which re-resolve per attempt).
   const pins = url.protocol === "https:" ? cfg.tlsPins?.[endpoint] : undefined;
-  const clientCert = url.protocol === "https:" ? cfg.tlsClientCerts?.[endpoint] : undefined;
+  // WR-89: a rotation endpoint warms the primary identity's agent — the
+  // one new handshakes will use — mirroring defaultSender's lookup.
+  const clientCert =
+    url.protocol === "https:"
+      ? (cfg.tlsClientCertRotations?.get(endpoint)?.primary().cert ?? cfg.tlsClientCerts?.[endpoint])
+      : undefined;
   const tlsSni = url.protocol === "https:" ? resolveTlsSniOverride(endpoint, url, cfg.tlsSniOverrides) : undefined;
   let proxyUrl: string | undefined;
   try {

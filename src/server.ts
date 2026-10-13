@@ -58,6 +58,10 @@ import {
   type TlsClientCert,
 } from "./mtls.ts";
 import {
+  RotatingClientCertSet,
+  type RotatingClientCertConfig,
+} from "./mtls-rotation.ts";
+import {
   assertValidTlsSniOverride,
   resolveTlsSniOverride,
   type ResolvedTlsSniOverride,
@@ -94,6 +98,7 @@ import {
   Http2UnavailableError,
   resolveHttp2PoolOptions,
   runHttp2Stream,
+  type ClientHttp2Session,
   type Http2PoolOptions,
 } from "./http2.ts";
 import { WebSocketPool, type WebSocketPoolOptions } from "./websocket.ts";
@@ -434,6 +439,27 @@ export interface RelayServerOptions {
    * startup.
    */
   tlsClientCerts?: Record<string, TlsClientCert>;
+  /**
+   * Outbound mTLS client certificate rotation (WR-89, see
+   * `src/mtls-rotation.ts`): `{ "<exact targetUrl>": { certificates,
+   * graceMs? } }`, keyed by exact delivery `targetUrl`. Several client
+   * identities coexist per endpoint — the new certificate (declared
+   * first) is presented on new handshakes, retired certificates stay
+   * eligible as handshake fallbacks inside `graceMs` (default 24h,
+   * boundary inclusive, same as WR-20/WR-81), and the id of the
+   * certificate actually used is audited as `clientCertId` on the
+   * `delivered` / `dead_letter` events (and inside `response_summary`).
+   * Cannot be combined with `tlsClientCerts` on the same endpoint —
+   * configuring both throws `RangeError` at startup. Composes with
+   * `tlsPins` (a pin mismatch never falls back — it is not about the
+   * client identity), the keep-alive pool (agents are keyed per
+   * *actually used* certificate identity, so a connection authenticated
+   * as one identity never serves another), the H2 session pool, and the
+   * WR-73 cert-expiry monitor (retired certificates whose grace window
+   * has fully elapsed are no longer warned about). Off by default.
+   * Invalid values throw `RangeError` at startup.
+   */
+  tlsClientCertRotation?: Record<string, RotatingClientCertConfig>;
   /**
    * Outbound per-endpoint TLS minimum version (WR-74, see
    * `src/tls-version.ts`): `{ "<exact targetUrl>": "1.2" | "1.3" }`,
@@ -1079,6 +1105,21 @@ export interface RelayServerOptions {
  * untouched. The monitor is owned by the caller (usually the relay
  * server, which audits `cert_expiring` and renders the
  * `relay_cert_expiry_seconds` gauge).
+ *
+ * `tlsClientCertRotation` is the per-endpoint mTLS client certificate
+ * rotation map (WR-89, see `src/mtls-rotation.ts`): a `Map` of exact
+ * `targetUrl` → compiled `RotatingClientCertSet`. Compile each set once
+ * at startup (`new RotatingClientCertSet(cfg)`) — the set pins the grace
+ * window to its construction, so rebuilding per request would silently
+ * restart it (the WR-67 lesson). New handshakes present the primary
+ * certificate; when a handshake fails in a way attributable to
+ * client-cert rejection (a fatal TLS alert, or a transport reset with no
+ * response received — non-TLS errors never fall back), the same attempt
+ * retries the handshake with each in-grace retired certificate, newest
+ * first. `PooledSender#takeRotationClientCertId` reports the id used by
+ * the latest handshake attempt of a delivery for audit stamping. An
+ * endpoint configured in both this map and `tlsClientCerts` throws
+ * `RangeError` at startup.
  */
 export interface PooledSender extends Sender {
   /** The keep-alive pool, or `undefined` when pooling is disabled. */
@@ -1092,8 +1133,61 @@ export interface PooledSender extends Sender {
    * rendered into `GET /metrics` as `relay_compressed_bytes_saved_total`.
    */
   compressionStats: OutboundCompressionTracker;
+  /**
+   * WR-89: take-and-clear the id of the rotation client certificate most
+   * recently used in a handshake attempt for the delivery `deliveryId`
+   * (the queue's item id) — the primary's id, or a fallback's id when an
+   * attempt rode a retired certificate. Returns `undefined` when the
+   * endpoint has no rotation configured or when no handshake ran for this
+   * delivery. Consuming on read keeps the bookkeeping bounded: each
+   * delivery's entry is taken exactly once, by the terminal `delivered` /
+   * `dead_letter` audit. Optional: custom senders simply don't implement
+   * it.
+   */
+  takeRotationClientCertId?(deliveryId: string): string | undefined;
   /** Close all pooled connections and stop the idle reaper. Idempotent. */
   destroy(): void;
+}
+
+/**
+ * WR-89: whether a failed delivery attempt's error is attributable to the
+ * downstream rejecting the presented client certificate — the only
+ * failure class that warrants retrying the same handshake with the next
+ * rotation certificate.
+ *
+ * Two shapes, both observed against real downstreams:
+ * - a fatal TLS alert (`ERR_SSL_TLSV1_ALERT_*`, "sslv3 alert …" text):
+ *   the peer killed the handshake itself, so no application byte could
+ *   have been processed;
+ * - a transport reset (`ECONNRESET` / `EPROTO` / `EPIPE`, "socket hang
+ *   up") with no response received: TLS 1.3 completes the client's
+ *   handshake view before the server validates the client certificate,
+ *   so a rejection commonly surfaces as a reset right after
+ *   `secureConnect` (notably Node's own https server, which destroys the
+ *   socket instead of sending an alert). The caller pairs this with its
+ *   own "no response received" guard — the zero-payload-byte condition:
+ *   a reset after the downstream started answering is a mid-delivery
+ *   failure, never a cert rejection.
+ *
+ * Structured HTTP failures (`HttpDeliveryError`), pin mismatches, and
+ * TLS-floor rejections are never cert rejections: they prove the
+ * handshake completed and the failure is not about the client identity.
+ * Anything else (DNS, timeouts, refusals) is not a TLS failure at all —
+ * non-TLS errors never fall back.
+ */
+function isClientCertRejectedError(err: unknown): boolean {
+  if (err instanceof HttpDeliveryError) return false;
+  if (err instanceof TlsPinMismatchError) return false;
+  if (err instanceof TlsVersionRejectedError) return false;
+  const code = (err as NodeJS.ErrnoException | undefined)?.code;
+  const message = err instanceof Error ? err.message : String(err);
+  if (typeof code === "string") {
+    if (code.startsWith("ERR_SSL_")) return true;
+    if (code === "ECONNRESET" || code === "EPROTO" || code === "EPIPE") return true;
+  }
+  return /sslv?3 alert|tlsv?1 alert|certificate_unknown|handshake_failure|bad_certificate|socket hang up/i.test(
+    message
+  );
 }
 
 export function createDefaultSender(
@@ -1130,7 +1224,14 @@ export function createDefaultSender(
    * configured (a `keyId`/`previousKeys` entry). The server audits these
    * as `e2ee_key_rotated`; library users get the hook directly.
    */
-  onE2eeKeyRotated?: (info: E2eeKeyRotatedInfo) => void
+  onE2eeKeyRotated?: (info: E2eeKeyRotatedInfo) => void,
+  /**
+   * WR-89: per-endpoint mTLS client certificate rotation — a `Map` of
+   * exact `targetUrl` → compiled `RotatingClientCertSet` (see the
+   * `tlsClientCertRotation` doc above). Validated at startup;
+   * `undefined` keeps the WR-36-only behavior.
+   */
+  tlsClientCertRotation?: Map<string, RotatingClientCertSet>
 ): PooledSender {
   if (tlsPins !== undefined) {
     for (const [endpoint, pins] of Object.entries(tlsPins)) {
@@ -1184,6 +1285,53 @@ export function createDefaultSender(
     if (certExpiryMonitor !== undefined) {
       for (const [endpoint, cert] of Object.entries(tlsClientCerts)) {
         certExpiryMonitor.checkClientCertificate(cert.cert, endpoint);
+      }
+    }
+  }
+  // WR-89: per-endpoint client certificate rotation. The map holds sets
+  // compiled once by the caller at startup — a set's grace window is
+  // pinned to its construction, so rebuilding per request would silently
+  // restart it (the WR-67 lesson). An endpoint with both a single
+  // identity and a rotation set is a config error: fail fast, never let
+  // the two disagree about which identity a handshake presents.
+  if (tlsClientCertRotation !== undefined) {
+    if (!(tlsClientCertRotation instanceof Map)) {
+      throw new RangeError(
+        "createDefaultSender: `tlsClientCertRotation` must be a Map<endpoint, RotatingClientCertSet>"
+      );
+    }
+    for (const [endpoint, set] of tlsClientCertRotation) {
+      if (typeof endpoint !== "string" || endpoint === "") {
+        throw new RangeError(
+          "createDefaultSender: `tlsClientCertRotation` keys must be non-empty endpoint strings"
+        );
+      }
+      if (!(set instanceof RotatingClientCertSet)) {
+        throw new RangeError(
+          `createDefaultSender: invalid tlsClientCertRotation for ${endpoint}: expected a RotatingClientCertSet (compile with new RotatingClientCertSet(cfg))`
+        );
+      }
+      if (tlsClientCerts !== undefined && tlsClientCerts[endpoint] !== undefined) {
+        throw new RangeError(
+          `createDefaultSender: endpoint ${endpoint} configures both tlsClientCerts and tlsClientCertRotation — use one`
+        );
+      }
+    }
+    // WR-73: the relay's own rotation client certificates are checked
+    // for expiry at config load, like the WR-36 single identities — but
+    // a retired certificate whose grace window has fully elapsed is
+    // dead weight: it can never authenticate again, so warning about it
+    // would be unactionable noise (the operator removes it once
+    // isRotationComplete()). `certificatesForExpiryWatch` orders
+    // fallback-first with the primary last, so the monitor's
+    // per-endpoint gauge settles on the primary — the identity doing the
+    // work — while each expiring certificate still gets its own
+    // edge-triggered alert.
+    if (certExpiryMonitor !== undefined) {
+      for (const [endpoint, set] of tlsClientCertRotation) {
+        for (const candidate of set.certificatesForExpiryWatch()) {
+          certExpiryMonitor.checkClientCertificate(candidate.cert.cert, endpoint);
+        }
       }
     }
   }
@@ -1338,6 +1486,17 @@ export function createDefaultSender(
     throw new RangeError(`createDefaultSender: invalid idempotencyKey config: ${(err as Error).message}`);
   }
   const pool = keepAlive === false ? undefined : new OutboundConnectionPool(keepAlive);
+  // WR-89: id of the rotation client certificate most recently used in a
+  // handshake attempt, per delivery (queue item id). Written on every
+  // rotation handshake attempt — primary or fallback — and taken
+  // exactly once by the terminal `delivered` / `dead_letter` audit, so
+  // the audit names the identity that actually authenticated the
+  // delivery. Keyed per delivery, not per endpoint: concurrent
+  // deliveries to the same endpoint must not overwrite each other's
+  // attribution, and a delivery whose attempts never reached a
+  // handshake (DNS failure, refusal) leaves no entry — honestly absent
+  // instead of stale.
+  const rotationClientCertUsed = new Map<string, string>();
   // RangeError on invalid values, at startup — never mid-delivery.
   const http2Opts = http2 === undefined ? undefined : resolveHttp2PoolOptions(http2);
   // No pool when H2 is disabled or no host is eligible for it: `undefined`
@@ -1498,7 +1657,14 @@ export function createDefaultSender(
     clientCert: TlsClientCert | undefined,
     proxyUrl: string | undefined,
     tlsSni: ResolvedTlsSniOverride | undefined,
-    minTlsVersion: MinTlsVersion | undefined
+    minTlsVersion: MinTlsVersion | undefined,
+    /**
+     * WR-89: rotation set for this endpoint. When set, `clientCert`
+     * (above) is undefined — mutual exclusion is enforced at sender
+     * construction — and the handshake runs the primary → fallback
+     * candidate loop below.
+     */
+    clientCertRotation?: RotatingClientCertSet
   ): Promise<DownstreamResponse | void> => {
     // WR-75: the guarded 415→plaintext fallback needs the compression
     // decision outside the attempt promise. The decision is deterministic
@@ -1506,7 +1672,40 @@ export function createDefaultSender(
     // synchronously, so these are set before `attempt(false)` settles.
     let guardedApplied = false;
     let guardedBytesSaved = 0;
-    const attempt = (forcePlaintext: boolean): Promise<DownstreamResponse | void> =>
+    // WR-89: the handshake identity candidates for this delivery — the
+    // rotation primary first, then in-grace retired certificates newest
+    // first. A non-rotation endpoint has exactly one candidate (which may
+    // be "no client certificate"), so the loop below is a no-op for it.
+    const handshakeCandidates = (): { cert: TlsClientCert | undefined; kid: string | undefined }[] => {
+      if (clientCertRotation === undefined) return [{ cert: clientCert, kid: undefined }];
+      const primary = clientCertRotation.primary();
+      return [
+        { cert: primary.cert, kid: primary.id },
+        ...clientCertRotation.fallbacks().map((f) => ({ cert: f.cert, kid: f.id })),
+      ];
+    };
+    // WR-89: the rotation certificate id that completed a handshake for
+    // this delivery (set by the candidate loop). The guarded 415→
+    // plaintext resend reuses it directly instead of re-running the
+    // primary→fallback gauntlet — the downstream already proved it
+    // accepts this identity.
+    let establishedKid: string | undefined;
+    /**
+     * One handshake with one client identity: the pre-WR-89 attempt body,
+     * parameterized by the certificate to present. `kid` is the
+     * rotation certificate id (undefined for non-rotation endpoints);
+     * `state.responseReceived` is set the moment response bytes arrive,
+     * backing the fallback classifier's zero-payload-byte condition;
+     * `state.handshakeCompleted` is set when the client side of the TLS
+     * handshake completes, backing the attribution-honesty rule (no
+     * certificate was offered when the handshake never got that far).
+     */
+    const runWithClientCert = (
+      certToUse: TlsClientCert | undefined,
+      kid: string | undefined,
+      state: { responseReceived: boolean; handshakeCompleted: boolean },
+      forcePlaintext: boolean
+    ): Promise<DownstreamResponse | void> =>
       new Promise((resolve, reject) => {
         // The wire request is built once per attempt: the guarded decision
         // is deterministic, so building it here gives the fallback check
@@ -1539,7 +1738,11 @@ export function createDefaultSender(
             url,
             pins,
             proxyUrl,
-            clientCert !== undefined ? clientCertIdentity(clientCert) : undefined,
+            // WR-89: the pool key binds the *actually used* certificate
+            // identity — the primary's agent and each fallback's agent
+            // are distinct, so a connection authenticated as one
+            // identity can never serve a delivery using another.
+            certToUse !== undefined ? clientCertIdentity(certToUse) : undefined,
             tlsSni,
             minTlsVersion
           ) ??
@@ -1551,6 +1754,10 @@ export function createDefaultSender(
               ))
             : undefined);
         const onResponse = (res: Parameters<Parameters<typeof httpsRequest>[2]>[0]): void => {
+          // WR-89: response bytes arrived — the handshake completed and
+          // the downstream answered, so this attempt's failure (if any)
+          // is never attributable to client-cert rejection.
+          state.responseReceived = true;
           // WR-54: the downstream's first response bytes just arrived — this
           // is the TTFB instant measured against `requestIssuedMs` above.
           const timeToFirstByteMs = Date.now() - requestIssuedMs;
@@ -1611,6 +1818,11 @@ export function createDefaultSender(
                   truncated,
                   timeToFirstByteMs,
                   ...(contentEncoding !== undefined ? { contentEncoding } : {}),
+                  // WR-89: the rotation certificate id that authenticated
+                  // this delivery — copied into `response_summary` and
+                  // stamped top-level on the delivery audits. Present
+                  // only for rotation endpoints.
+                  ...(kid !== undefined ? { clientCertId: kid } : {}),
                 });
               })().catch(reject);
             } else {
@@ -1658,12 +1870,14 @@ export function createDefaultSender(
                   // TLS options apply to connections the pooled agent opens;
                   // the pool key already binds this exact identity, so a
                   // reused socket was authenticated as this same identity).
-                  ...(clientCert
+                  // WR-89: `certToUse` is the rotation candidate for this
+                  // handshake — primary or one in-grace fallback.
+                  ...(certToUse
                     ? {
-                        cert: clientCert.cert,
-                        key: clientCert.key,
-                        ...(clientCert.passphrase !== undefined
-                          ? { passphrase: clientCert.passphrase }
+                        cert: certToUse.cert,
+                        key: certToUse.key,
+                        ...(certToUse.passphrase !== undefined
+                          ? { passphrase: certToUse.passphrase }
                           : {}),
                       }
                     : {}),
@@ -1812,6 +2026,13 @@ export function createDefaultSender(
           const verifyPin = (): void => {
             if (verified) return;
             verified = true;
+            // WR-89: the client side of the TLS handshake completed —
+            // this identity's certificate was offered on the wire
+            // (whenever the server requested one), so the rotation
+            // attribution recorded for this delivery is honest from
+            // here on. Also covers reused pooled sockets, whose
+            // handshake completed when the connection was first made.
+            state.handshakeCompleted = true;
             verifyFreshPin(tlsSocket);
           };
           const already = tlsSocket.getPeerCertificate() as { raw?: unknown };
@@ -1823,6 +2044,66 @@ export function createDefaultSender(
           }
         });
       });
+    /**
+     * WR-89: run one delivery attempt across the rotation candidates —
+     * primary first, then in-grace retired certificates newest first.
+     * A candidate is only tried after the previous one failed in a way
+     * attributable to client-cert rejection (see
+     * `isClientCertRejectedError`); any other failure — an HTTP
+     * response, a pin or TLS-floor rejection, DNS, a timeout — ends the
+     * loop immediately, because those are not about the client identity.
+     * The used certificate id is recorded per delivery for audit
+     * stamping; when `establishedKid` is set (the guarded 415 resend
+     * below), that identity leads — the downstream already proved it
+     * accepts it.
+     */
+    const attempt = (forcePlaintext: boolean): Promise<DownstreamResponse | void> => {
+      const candidates = ((): { cert: TlsClientCert | undefined; kid: string | undefined }[] => {
+        const all = handshakeCandidates();
+        if (establishedKid === undefined) return all;
+        const idx = all.findIndex((c) => c.kid === establishedKid);
+        return idx <= 0 ? all : [all[idx], ...all.slice(0, idx), ...all.slice(idx + 1)];
+      })();
+      const runCandidates = async (): Promise<DownstreamResponse | void> => {
+        let lastErr: unknown;
+        // WR-89: whether any candidate completed the client side of the
+        // TLS handshake. The attribution map is written optimistically
+        // before each attempt; when the loop ends without any handshake
+        // having completed, no certificate was actually offered, so the
+        // entry is dropped instead of stamping a stale id on the audit.
+        let handshakeCompletedAny = false;
+        for (const candidate of candidates) {
+          if (candidate.kid !== undefined) {
+            rotationClientCertUsed.set(item.id, candidate.kid);
+          }
+          const state = { responseReceived: false, handshakeCompleted: false };
+          try {
+            const response = await runWithClientCert(candidate.cert, candidate.kid, state, forcePlaintext);
+            if (candidate.kid !== undefined) establishedKid = candidate.kid;
+            return response;
+          } catch (err) {
+            lastErr = err;
+            if (state.handshakeCompleted) handshakeCompletedAny = true;
+            if (
+              candidate.kid === undefined ||
+              state.responseReceived ||
+              !isClientCertRejectedError(err)
+            ) {
+              if (!handshakeCompletedAny) {
+                rotationClientCertUsed.delete(item.id);
+              }
+              throw err;
+            }
+            // Client-cert rejection: the next candidate retries the same
+            // handshake with a fresh socket on its own identity-keyed
+            // agent. Zero payload bytes were sent (no response was ever
+            // received), so the retry duplicates nothing.
+          }
+        }
+        throw lastErr;
+      };
+      return runCandidates();
+    };
     // WR-75: the downstream answered 415 to a guarded-compressed request —
     // it does not speak gzip. Resend once as plaintext *inside the same
     // delivery attempt*: the queue sees a single attempt, so the fallback
@@ -1856,7 +2137,9 @@ export function createDefaultSender(
     pins: string[] | undefined,
     clientCert: TlsClientCert | undefined,
     tlsSni: ResolvedTlsSniOverride | undefined,
-    minTlsVersion: MinTlsVersion | undefined
+    minTlsVersion: MinTlsVersion | undefined,
+    /** WR-89: rotation set for this endpoint (mutually exclusive with `clientCert`). */
+    clientCertRotation?: RotatingClientCertSet
   ): Promise<DownstreamResponse> => {
     // WR-75: same guarded 415→plaintext fallback as the HTTP/1.1 path —
     // the resend rides a fresh H2 stream inside the same delivery
@@ -1864,7 +2147,41 @@ export function createDefaultSender(
     let guardedApplied = false;
     let guardedBytesSaved = 0;
     const attempt = async (forcePlaintext: boolean): Promise<DownstreamResponse> => {
-        const session = await h2pool!.sessionFor(url, pins, clientCert, tlsSni, minTlsVersion);
+        // WR-89: the rotation candidates — the session pool keys sessions
+        // per certificate identity, so each candidate gets its own
+        // session and a rejected primary never poisons a fallback's
+        // session. A rejected handshake surfaces as
+        // Http2UnavailableError wrapping the TLS failure; anything that
+        // is not a client-cert rejection propagates to the HTTP/1.1
+        // fallback below, exactly as before.
+        const candidates: { cert: TlsClientCert | undefined; kid: string | undefined }[] =
+          clientCertRotation !== undefined
+            ? (() => {
+                const primary = clientCertRotation.primary();
+                return [
+                  { cert: primary.cert, kid: primary.id },
+                  ...clientCertRotation.fallbacks().map((f) => ({ cert: f.cert, kid: f.id })),
+                ];
+              })()
+            : [{ cert: clientCert, kid: undefined }];
+        let session: ClientHttp2Session | undefined;
+        let usedKid: string | undefined;
+        let lastErr: unknown;
+        for (const candidate of candidates) {
+          try {
+            session = await h2pool!.sessionFor(url, pins, candidate.cert, tlsSni, minTlsVersion);
+            usedKid = candidate.kid;
+            break;
+          } catch (err) {
+            lastErr = err;
+            // No response could have been received yet — no stream
+            // exists — so the classifier's no-response condition holds
+            // trivially here.
+            if (candidate.kid === undefined || !isClientCertRejectedError(err)) throw err;
+          }
+        }
+        if (session === undefined) throw lastErr;
+        if (usedKid !== undefined) rotationClientCertUsed.set(item.id, usedKid);
         h2pool!.acquireStream(session);
         // WR-73: the session's handshake is done by now (established or
         // reused — the monitor edge-triggers per certificate, so a
@@ -1911,6 +2228,9 @@ export function createDefaultSender(
             body,
             truncated: res.truncated,
             ...(contentEncoding !== undefined ? { contentEncoding } : {}),
+            // WR-89: the rotation certificate id that authenticated this
+            // delivery — present only for rotation endpoints.
+            ...(usedKid !== undefined ? { clientCertId: usedKid } : {}),
           };
         }
         // Structured failure, same as the HTTP/1.1 path: the retry queue
@@ -1977,6 +2297,11 @@ export function createDefaultSender(
     // downstream can verify the relay. Off by default — endpoints without
     // an entry send no client certificate, exactly as before.
     const clientCert = url.protocol === "https:" ? tlsClientCerts?.[item.targetUrl] : undefined;
+    // WR-89: rotation set for this endpoint (exact targetUrl match).
+    // Mutual exclusion with `tlsClientCerts` is enforced at sender
+    // construction, so at most one of the two is ever set here.
+    const clientCertRotation =
+      url.protocol === "https:" ? tlsClientCertRotation?.get(item.targetUrl) : undefined;
     // WR-60: per-endpoint TLS SNI/ALPN override (exact targetUrl match).
     // `undefined` for endpoints without an entry — and for non-`https:`
     // targets — keeps the exact current behavior.
@@ -2012,20 +2337,28 @@ export function createDefaultSender(
     // H2-level failure falls back to the HTTP/1.1 pool below: a delivery
     // is never lost because of H2.
     if (h2pool !== undefined && proxyUrl === undefined && h2pool.eligibleFor(url)) {
-      return deliverViaHttp2(item, url, pins, clientCert, tlsSni, minTlsVersion).catch((err) => {
+      return deliverViaHttp2(item, url, pins, clientCert, tlsSni, minTlsVersion, clientCertRotation).catch((err) => {
         if (err instanceof Http2UnavailableError) {
           h2pool!.noteFallback();
-          return deliverViaHttp1(item, url, pins, clientCert, proxyUrl, tlsSni, minTlsVersion);
+          return deliverViaHttp1(item, url, pins, clientCert, proxyUrl, tlsSni, minTlsVersion, clientCertRotation);
         }
         throw err;
       });
     }
-    return deliverViaHttp1(item, url, pins, clientCert, proxyUrl, tlsSni, minTlsVersion);
+    return deliverViaHttp1(item, url, pins, clientCert, proxyUrl, tlsSni, minTlsVersion, clientCertRotation);
   } as PooledSender;
   sender.pool = pool;
   sender.http2Pool = h2pool;
   sender.wsPool = wsPool;
   sender.compressionStats = compressionTracker;
+  // WR-89: take-and-clear the rotation certificate id used by a
+  // delivery's latest handshake attempt, for audit stamping (see the
+  // `rotationClientCertUsed` map above).
+  sender.takeRotationClientCertId = (deliveryId: string): string | undefined => {
+    const kid = rotationClientCertUsed.get(deliveryId);
+    rotationClientCertUsed.delete(deliveryId);
+    return kid;
+  };
   sender.destroy = () => {
     pool?.destroy();
     h2pool?.destroy();
@@ -2371,9 +2704,35 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       rotationInProgress: info.rotationInProgress,
     });
   };
+  // WR-89: compile per-endpoint client-cert rotation sets once at
+  // startup — the compiled set pins each rotation's grace window to
+  // server start (same reasoning as WR-67's compileSecretRotationRules:
+  // rebuilding per request would silently restart the grace window).
+  // Invalid values throw RangeError here, never mid-handshake. The
+  // compiled map is shared with the inventory below and passed to the
+  // default sender.
+  let clientCertRotations: Map<string, RotatingClientCertSet> | undefined;
+  if (opts.tlsClientCertRotation !== undefined) {
+    const raw = opts.tlsClientCertRotation;
+    if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+      throw new RangeError(
+        "createRelayServer: `tlsClientCertRotation` must be a record of endpoint -> rotation config"
+      );
+    }
+    clientCertRotations = new Map();
+    for (const [endpoint, cfg] of Object.entries(raw)) {
+      try {
+        clientCertRotations.set(endpoint, new RotatingClientCertSet(cfg));
+      } catch (err) {
+        throw new RangeError(
+          `createRelayServer: invalid tlsClientCertRotation for ${endpoint}: ${(err as Error).message}`
+        );
+      }
+    }
+  }
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit)
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations)
       : undefined;
   // WR-50: endpoints the operator may pause/resume over HTTP. The server
   // only ever delivers to these — the intake target plus every
@@ -2403,7 +2762,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     if (validators !== undefined && typeof validators === "object") {
       for (const endpoint of Object.keys(validators)) knownEndpoints.add(endpoint);
     }
-    for (const record of [opts.tlsPins, opts.tlsClientCerts, opts.compressOutbound, opts.compressThreshold, opts.proxies, opts.outboundEncryption, opts.responseCompression, opts.forwardHeaders, opts.minTlsVersions]) {
+    for (const record of [opts.tlsPins, opts.tlsClientCerts, opts.tlsClientCertRotation, opts.compressOutbound, opts.compressThreshold, opts.proxies, opts.outboundEncryption, opts.responseCompression, opts.forwardHeaders, opts.minTlsVersions]) {
       if (record) for (const endpoint of Object.keys(record)) knownEndpoints.add(endpoint);
     }
     for (const endpoint of opts.retry?.probe?.endpoints ?? []) knownEndpoints.add(endpoint);
@@ -2649,6 +3008,10 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         }
       : undefined,
     onDelivered: (item, attempts, summary) => {
+      // WR-89: the rotation certificate id that authenticated this
+      // delivery — absent for WR-36 single-identity and non-mTLS
+      // endpoints (legacy audit shape).
+      const clientCertId = defaultSender?.takeRotationClientCertId?.(item.id);
       opts.auditLog.append({
         event: "delivered",
         id: item.id,
@@ -2656,6 +3019,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         ...(item.tenantId !== undefined ? { tenant: item.tenantId } : {}),
         targetUrl: item.targetUrl,
         attempts,
+        ...(clientCertId !== undefined ? { clientCertId } : {}),
         // WR-54: downstream response summary — statusCode, responseBytes,
         // timeToFirstByteMs, bodyFingerprintSha256. `capturedBody` (the
         // sealed full body) appears only with the
@@ -2711,6 +3075,10 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       opts.retry?.onAttemptFailed?.(info);
     },
     onDeadLetter: (item, attempts, lastError, failureClass, summary) => {
+      // WR-89: the rotation certificate id used by this delivery's
+      // latest handshake attempt — absent when the endpoint has no
+      // rotation or no handshake ran (legacy audit shape).
+      const clientCertId = defaultSender?.takeRotationClientCertId?.(item.id);
       opts.auditLog.append({
         event: "dead_letter",
         id: item.id,
@@ -2718,6 +3086,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         ...(item.tenantId !== undefined ? { tenant: item.tenantId } : {}),
         targetUrl: item.targetUrl,
         attempts,
+        ...(clientCertId !== undefined ? { clientCertId } : {}),
         error: lastError instanceof Error ? lastError.message : String(lastError),
         // "non_retryable" = poison payload dead-lettered on the first
         // attempt (no retry budget burned); "retryable" = every attempt
@@ -2803,12 +3172,20 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
               : {}),
           },
     signingKeys: (opts.signingKeys ?? []).map((k) => ({ id: k.id })),
-    mtls: Object.fromEntries(
-      Object.entries(opts.tlsClientCerts ?? {}).map(([endpoint, cert]) => [
+    mtls: Object.fromEntries([
+      ...Object.entries(opts.tlsClientCerts ?? {}).map(([endpoint, cert]) => [
         endpoint,
         { certIdentity: clientCertIdentity(cert) },
-      ])
-    ),
+      ]),
+      // WR-89: rotation endpoints enter the inventory under their
+      // primary certificate's identity fingerprint — the identity new
+      // handshakes present — so a primary swap is visible to snapshot
+      // restore's fail-closed drift comparison.
+      ...[...(clientCertRotations ?? [])].map(([endpoint, set]) => [
+        endpoint,
+        { certIdentity: clientCertIdentity(set.primary().cert) },
+      ]),
+    ]),
     tlsPins: { ...(opts.tlsPins ?? {}) },
     proxies: Object.fromEntries(
       Object.entries(opts.proxies ?? {}).map(([endpoint, proxyUrl]) => {
@@ -4895,6 +5272,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         proxies: opts.proxies,
         tlsClientCerts: opts.tlsClientCerts,
         tlsSniOverrides: opts.tlsSniOverrides,
+        // WR-89: rotation endpoints warm the primary identity's agent —
+        // the agent new handshakes will actually use.
+        tlsClientCertRotations: clientCertRotations,
       };
       warmupOutboundPool(pool, warmupCfg.endpoints, endpointCfg, warmupOpts).then(
         (report) => {

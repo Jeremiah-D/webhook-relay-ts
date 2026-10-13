@@ -487,6 +487,16 @@ export interface DownstreamResponse {
    * summary then marks TTFB `"unavailable"` instead of fabricating one.
    */
   timeToFirstByteMs?: number;
+  /**
+   * WR-89: id of the mTLS client certificate the sender actually
+   * presented during this delivery's handshake (a `tlsClientCertRotation`
+   * endpoint). Set only for rotation endpoints — WR-36 single-identity
+   * endpoints keep the legacy shape — so its presence also marks the
+   * delivery as rotation-routed. Copied into
+   * `DownstreamResponseSummary.clientCertId` and stamped top-level as
+   * `clientCertId` on the `delivered` / `dead_letter` audit events.
+   */
+  clientCertId?: string;
 }
 
 /**
