@@ -1382,7 +1382,7 @@ curl -X POST http://relay/ingest/batch \
   Per-endpoint verifier rules and key rotation apply to the batch path.
 - **Full per-item pipeline** — each item then walks the same admission as
   a single webhook: per-item signature → tenant → gzip → version
-  adaptation → schema → replay guard → dedup → enqueue. Item `payload` is
+  adaptation → schema → content routing → replay guard → dedup → enqueue. Item `payload` is
   base64 of the exact bytes the per-item `x-signature` covers, so per-item
   trust semantics are identical to a single `POST`. An item without a
   verifiable signature is rejected `401` exactly like an unsigned webhook.
@@ -1395,6 +1395,65 @@ curl -X POST http://relay/ingest/batch \
   per-item `accepted` / `rejected` / `duplicate_suppressed` events, each
   carrying `batchId` for correlation. A batch-level `x-tenant-id` is
   validated once and inherited; a per-item `x-tenant-id` overrides it.
+
+## Content-based routing
+
+Route an inbound webhook to a target endpoint by matching rules against
+payload JSON fields, instead of sending everything to `forwardUrl`:
+
+```ts
+createRelayServer({
+  secret, forwardUrl, auditLog,
+  contentRoutes: [
+    {
+      id: "express-orders",
+      matchers: [{ field: "order.type", op: "equals", value: "express" }],
+      targetUrl: "https://team-a.example.com/hooks",
+      priority: 10, // optional, default 100 — lower wins
+    },
+    {
+      id: "big-tickets",
+      matchers: [{ field: "amount", op: "range", min: 1000 }],
+      targetUrl: "https://team-b.example.com/hooks",
+    },
+  ],
+  contentRouteDefault: "https://fallback.example.com/hooks", // optional
+});
+```
+
+- **Rule shape** — `{ id, matchers: [{ field, op, value?, min?, max? }], targetUrl, priority? }`.
+  `field` is a dot-path into the parsed JSON (e.g. `"order.type"`).
+  Ops: `equals` (JSON compare, deep-ish for arrays), `contains`
+  (substring for strings, element compare for arrays), `regex` (strings
+  only — non-string fields never match), `exists` (present and not
+  null/undefined), `range` (numeric field, `min <= x <= max`, at least one
+  bound). A rule matches when *all* its matchers match.
+- **Resolution** — rules are sorted by `priority` ascending (stable, ties
+  keep config order); the first fully-matching rule wins. No match →
+  `contentRouteDefault` when configured, otherwise `forwardUrl`. Routing
+  never throws and never rejects an event: a non-JSON body, a missing
+  field, or a throwing matcher just falls through to the fallback.
+- **Placement** — routing runs *after* signature verification (and tenant /
+  gzip / version adaptation / schema) and *before* the replay guard and
+  dedup, on the canonical payload — so dedup is keyed on the routed
+  target (WR-14 semantics unchanged: the same business event suppresses
+  per target, not globally). Batch-ingest items walk the same admission
+  (`admitOneEvent`), so routing applies to them too.
+- **Validation** — illegal rules (empty/duplicate id, unknown op, empty
+  field path, bad regex, bad range bounds, empty targetUrl, empty
+  matchers) throw `RangeError` at startup; a bad
+  `contentRouteDefault` does too.
+- **Hot update** — `GET /routing/rules` lists the live table (read scope);
+  `POST /routing/rules` with `{ rules: [...], defaultTargetUrl?: string }`
+  replaces it wholesale (admin scope): a `RangeError` surfaces as `400`
+  and changes nothing (validate-then-apply), success is `200` plus an
+  audited `routing_rules_updated` event with the operator's `keyId`. Like
+  every operator path, it answers `404` fail-closed when no operator
+  credentials are configured.
+- **Audit** — every admitted event with routing configured emits a
+  `routed` event carrying `ruleId` (the matched rule, or `"default"`)
+  and `targetUrl`; the `accepted` event already carries the routed
+  `targetUrl`.
 
 ## Downstream response compression negotiation
 

@@ -40,6 +40,7 @@ import {
   type OperatorKeyEntry,
 } from "./operator-keys.ts";
 import { resolveTraceId, TRACE_ID_HEADER } from "./trace.ts";
+import { ContentRouteTable, type ContentRouteRule } from "./content-routes.ts";
 import {
   deriveIdempotencyKey,
   IDEMPOTENCY_KEY_HEADER,
@@ -292,6 +293,27 @@ export interface RelayServerOptions {
    * per-version rules (`/v1/admin/*`) still work.
    */
   payloadSchemas?: EndpointSchemaRule[];
+  /**
+   * Content-based routing (WR-84, see `src/content-routes.ts`): route an
+   * inbound webhook to a target endpoint by matching rules against payload
+   * JSON fields (`equals` / `contains` / `regex` / `exists` / `range` on
+   * dot-path fields, e.g. `"order.type"`). Rules are sorted by `priority`
+   * ascending (default 100, stable); the first fully-matching rule wins
+   * and its `targetUrl` is the delivery target. When no rule matches,
+   * `contentRouteDefault` applies if set, otherwise `forwardUrl`. Routing
+   * runs after signature verification and before dedup/enqueue on the
+   * canonical payload (decompressed, version-adapted), and it never
+   * rejects an event — a non-JSON body or an unmatchable payload just
+   * takes the fallback. Rules are hot-swappable via operator
+   * `POST /routing/rules` (admin scope). Invalid rules throw `RangeError`
+   * at startup. Off by default.
+   */
+  contentRoutes?: ContentRouteRule[];
+  /**
+   * Fallback target for content-based routing when no rule matches.
+   * Must be a non-empty string when present; `RangeError` at startup.
+   */
+  contentRouteDefault?: string;
   /**
    * Opt-in active health probing of downstream endpoints (see
    * `src/downstream-probe.ts` and the `probe` `RetryQueue` option): each listed
@@ -2108,6 +2130,7 @@ function isOperatorPath(pathname: string): boolean {
     pathname === "/events/archive" ||
     pathname === "/metrics" ||
     pathname === "/config/endpoint" ||
+    pathname === "/routing/rules" ||
     pathname === "/endpoints/pause" ||
     pathname === "/endpoints/resume" ||
     pathname === "/scheduled" ||
@@ -2218,6 +2241,15 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     ) {
       throw new RangeError("createRelayServer: `operatorPort.host` must be a non-empty string");
     }
+  }
+  // WR-84: content-based routing rule engine — validated once at startup
+  // (`RangeError` fail-fast on bad rules or a bad default), held by the
+  // server closure, hot-swappable atomically via `POST /routing/rules`.
+  // Unset entirely when neither option is configured, so intake is
+  // byte-identical to the legacy single-target behavior.
+  let contentRouteTable: ContentRouteTable | undefined;
+  if (opts.contentRoutes !== undefined || opts.contentRouteDefault !== undefined) {
+    contentRouteTable = new ContentRouteTable(opts.contentRoutes ?? [], opts.contentRouteDefault);
   }
   // When the caller does not inject a sender, the server owns the default
   // sender — and with it the keep-alive pool, which is closed on server
@@ -2782,6 +2814,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     const isAutoResume = pathname === "/dead-letter/auto-replay/resume";
     const isAutoTrigger = pathname === "/dead-letter/auto-replay/trigger";
     const isConfigEndpoint = pathname === "/config/endpoint";
+    const isRoutingRules = pathname === "/routing/rules";
     const isEndpointsPause = pathname === "/endpoints/pause";
     const isEndpointsResume = pathname === "/endpoints/resume";
     const isScheduledList = pathname === "/scheduled";
@@ -2805,6 +2838,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       !isAutoResume &&
       !isAutoTrigger &&
       !isConfigEndpoint &&
+      !isRoutingRules &&
       !isEndpointsPause &&
       !isEndpointsResume &&
       !isScheduledList &&
@@ -2833,6 +2867,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         (isAutoResume && req.method === "POST") ||
         (isAutoTrigger && req.method === "POST") ||
         (isConfigEndpoint && req.method === "POST") ||
+        (isRoutingRules && (req.method === "GET" || req.method === "POST")) ||
         (isEndpointsPause && req.method === "POST") ||
         (isEndpointsResume && req.method === "POST") ||
         (isScheduledList && req.method === "GET") ||
@@ -3245,6 +3280,70 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         }
         throw err;
       }
+      return;
+    }
+    if (isRoutingRules) {
+      // Content-based routing rules (WR-84): `GET` lists the live table
+      // (`{ rules, defaultTargetUrl }`, read scope); `POST` replaces it
+      // wholesale (`{ rules: [...], defaultTargetUrl?: string }`, admin
+      // scope). The body limit applies here too; a `RangeError` from
+      // construction (illegal rules or default) surfaces as a 400 — the
+      // constructor validates before anything is swapped, so a 400 always
+      // means "nothing changed". A successful replacement is audited as
+      // `routing_rules_updated` with the operator's `keyId`.
+      if (req.method === "GET") {
+        const snapshot = contentRouteTable;
+        respondJson(res, 200, {
+          rules: snapshot?.getRules() ?? [],
+          ...(snapshot?.getDefaultTargetUrl() !== undefined
+            ? { defaultTargetUrl: snapshot.getDefaultTargetUrl() }
+            : {}),
+        });
+        return;
+      }
+      let body: Record<string, unknown>;
+      try {
+        const raw = (await readRawBody(req, maxBodyBytes)).toString("utf8");
+        body = raw.trim() === "" ? {} : JSON.parse(raw);
+      } catch (err) {
+        if (err instanceof BodyTooLargeError) {
+          respondJson(res, 413, { error: "request body too large" });
+          return;
+        }
+        respondJson(res, 400, { error: "invalid JSON body" });
+        return;
+      }
+      if (typeof body !== "object" || body === null || Array.isArray(body)) {
+        respondJson(res, 400, { error: "body must be a JSON object" });
+        return;
+      }
+      try {
+        contentRouteTable = new ContentRouteTable(
+          body.rules as ContentRouteRule[],
+          body.defaultTargetUrl as string | undefined
+        );
+      } catch (err) {
+        if (err instanceof RangeError) {
+          respondJson(res, 400, { error: err.message });
+          return;
+        }
+        throw err;
+      }
+      const applied = contentRouteTable;
+      opts.auditLog.append({
+        event: "routing_rules_updated",
+        keyId: operatorKeyId,
+        ruleCount: applied.getRules().length,
+        ...(applied.getDefaultTargetUrl() !== undefined
+          ? { defaultTargetUrl: applied.getDefaultTargetUrl() }
+          : {}),
+      });
+      respondJson(res, 200, {
+        rules: applied.getRules(),
+        ...(applied.getDefaultTargetUrl() !== undefined
+          ? { defaultTargetUrl: applied.getDefaultTargetUrl() }
+          : {}),
+      });
       return;
     }
     if (isEndpointsPause || isEndpointsResume) {
@@ -3816,6 +3915,20 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       }
     }
 
+    // Content-based routing (WR-84): pick the delivery target from the
+    // verified, decompressed, version-adapted body — the canonical bytes
+    // dedup hashes below. Routing only ever picks a target; it never
+    // rejects an event, so a non-JSON body or an unmatchable payload falls
+    // back to `opts.forwardUrl`. Unconfigured → `targetUrl` stays
+    // `opts.forwardUrl` and everything below is byte-identical to before.
+    let targetUrl = opts.forwardUrl;
+    let routeRuleId: string | undefined;
+    if (contentRouteTable !== undefined) {
+      const decision = contentRouteTable.resolve(body);
+      if (decision.targetUrl !== undefined) targetUrl = decision.targetUrl;
+      routeRuleId = decision.ruleId ?? "default";
+    }
+
     if (opts.replay) {
       const nonceHeader = headers["x-nonce"];
       const nonce = Array.isArray(nonceHeader) ? nonceHeader[0] : nonceHeader;
@@ -3842,13 +3955,13 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // tenant's identical business event.
     if (deduplicator) {
       const payloadHash = DeliveryDeduplicator.hashPayload(body);
-      if (deduplicator.check(tenantScopeKey(tenantId, opts.forwardUrl), payloadHash)) {
+      if (deduplicator.check(tenantScopeKey(tenantId, targetUrl), payloadHash)) {
         opts.auditLog.append({ ...correlation,
           event: "duplicate_suppressed",
           id,
           traceId,
           ...tenantLabel,
-          targetUrl: opts.forwardUrl,
+          targetUrl,
         });
         return { status: 202, id, traceId, duplicate: true, tenantId };
       }
@@ -3941,7 +4054,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         // per-tenant isolation scope, like any other delivery.
         ...(tenantId !== undefined ? { tenantId } : {}),
         payload: body,
-        targetUrl: opts.forwardUrl,
+        targetUrl,
         headers: passthrough,
         ...(priority ? { priority } : {}),
       }, cronSource);
@@ -3954,7 +4067,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         // isolation scope (breaker/quota/limiter/latency instances).
         ...(tenantId !== undefined ? { tenantId } : {}),
         payload: body,
-        targetUrl: opts.forwardUrl,
+        targetUrl,
         headers: passthrough,
         ...(priority ? { priority } : {}),
         ...(deliverAt !== undefined ? { deliverAt } : {}),
@@ -3984,7 +4097,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       id,
       traceId,
       ...tenantLabel,
-      targetUrl: opts.forwardUrl,
+      targetUrl,
     };
     // WR-67: every webhook that verified with the previous secret is
     // audited on its own event, so the operator sees how much rotation
@@ -4015,6 +4128,20 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     if (inboundGzip) acceptedEvent.contentEncoding = "gzip";
     if (opts.auditPayloads) acceptedEvent.payload = body;
     opts.auditLog.append(acceptedEvent);
+    // WR-84: the routing decision, audited as its own event so operators
+    // can query `GET /audit?event=routed`. Only emitted when content
+    // routing is configured; `routeRuleId` is the matched rule id, or
+    // "default" when the default / legacy fallback applied.
+    if (contentRouteTable !== undefined) {
+      opts.auditLog.append({ ...correlation,
+        event: "routed",
+        id,
+        traceId,
+        ...tenantLabel,
+        ruleId: routeRuleId ?? "default",
+        targetUrl,
+      });
+    }
     // WR-57: the queue parked the delivery in the delay queue (a future
     // deliver_at) — audit it as its own event so operators can query
     // `GET /audit?event=scheduled`, and tell the sender when to expect it.
@@ -4025,7 +4152,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         id,
         traceId,
         ...tenantLabel,
-        targetUrl: opts.forwardUrl,
+        targetUrl,
         deliverAtMs: scheduledAt,
         deliverAt: new Date(scheduledAt).toISOString(),
       });
@@ -4039,7 +4166,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         id: scheduleId,
         traceId,
         ...tenantLabel,
-        targetUrl: opts.forwardUrl,
+        targetUrl,
         cron: cronSource,
         nextAtMs: nextAt,
         nextAt: nextAt !== undefined ? new Date(nextAt).toISOString() : undefined,
@@ -4124,7 +4251,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
    *     rules apply to the batch path, with key-rotation support.
    *  3. Each item then walks the full per-item pipeline through
    *     `admitOneEvent` (per-item signature → tenant → gzip → version →
-   *     schema → replay → dedup → enqueue) with its own id and its own
+   *     schema → content routing → replay → dedup → enqueue) with its own id and its own
    *     trace ID. Item failures are isolated: one bad item never affects
    *     the rest of the batch.
    *
