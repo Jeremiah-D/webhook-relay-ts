@@ -1303,6 +1303,26 @@ export interface EndpointPauseInfo {
   endpoint: string;
 }
 
+/**
+ * Effective hot-reloadable config for one (tenant, endpoint) — the
+ * WR-88 config-snapshot read shape. Returned by
+ * `RetryQueue.endpointConfig`: `maxConcurrentPerEndpoint` is always the
+ * effective value (override or queue default, `Infinity` when unlimited);
+ * circuit-breaker/quota rows are present only when the endpoint carries
+ * an override; weighted targets only when weighted dispatch is enabled
+ * for the endpoint.
+ */
+export interface EndpointConfigState {
+  /** Effective concurrency limit; `Infinity` when unlimited. */
+  maxConcurrentPerEndpoint: number;
+  /** Effective trip/cooldown thresholds; present only with an override. */
+  circuitBreaker?: { failureThreshold: number; cooldownMs: number };
+  /** Effective per-minute budget; present only with an override. */
+  quota?: { deliveriesPerMinute: number };
+  /** Weighted target list; present only when weighted dispatch is on. */
+  weighted?: { targets: Array<{ targetUrl: string; weight: number }> };
+}
+
 interface Scheduled {
   handle: { clear(): void };
 }
@@ -1394,6 +1414,29 @@ export class EndpointConcurrencyLimiter {
   /** Effective concurrency limit for `endpoint` (override wins over default). */
   maxFor(endpoint: string): number {
     return this.endpointMax.get(endpoint) ?? this.defaultMax;
+  }
+
+  /**
+   * Endpoints carrying a runtime concurrency-limit override (WR-32).
+   * Used by the WR-88 config snapshot to enumerate the configured
+   * keyspace.
+   */
+  configuredEndpoints(): string[] {
+    return [...this.endpointMax.keys()];
+  }
+
+  /** Whether `endpoint` carries a runtime override. */
+  hasEndpointOverride(endpoint: string): boolean {
+    return this.endpointMax.has(endpoint);
+  }
+
+  /**
+   * Drop the runtime override so `endpoint` falls back to the queue
+   * default. Used by the WR-88 apply rollback to restore the exact
+   * pre-apply override state. Never throws for unknown endpoints.
+   */
+  clearEndpointOverride(endpoint: string): void {
+    this.endpointMax.delete(endpoint);
   }
 
   /**
@@ -3505,6 +3548,120 @@ export class RetryQueue {
       jitterMs: this.jitterMs,
       jitterStrategy: this.jitterStrategy,
     };
+  }
+
+  /** Whether the circuit-breaker subsystem is enabled (queue-level). */
+  circuitBreakerConfigured(): boolean {
+    return this.circuitBreakerOpts !== undefined;
+  }
+
+  /** Whether the per-endpoint quota subsystem is enabled (queue-level). */
+  quotaConfigured(): boolean {
+    return this.quotaDeliveriesPerMinute !== undefined;
+  }
+
+  /**
+   * Whether weighted dispatch is enabled for `endpoint`. Tenant-agnostic,
+   * like `updateEndpointConfig`'s weighted path.
+   */
+  weightedHasEndpoint(endpoint: string): boolean {
+    return this.weighted?.hasEndpoint(endpoint) ?? false;
+  }
+
+  /**
+   * Effective hot-reloadable config for one (tenant, endpoint) — the
+   * WR-88 snapshot read path. Reads the same effective values
+   * `updateEndpointConfig` reports as `from`: overrides win over
+   * defaults, and circuit-breaker/quota rows appear only when the
+   * endpoint carries an override. Weighted targets appear when weighted
+   * dispatch is enabled for the endpoint.
+   */
+  endpointConfig(tenant: string | undefined, endpoint: string): EndpointConfigState {
+    const state: EndpointConfigState = {
+      maxConcurrentPerEndpoint: this.limiterFor(tenant).maxFor(endpoint),
+    };
+    const breaker = this.breakerFor(tenant);
+    if (breaker !== undefined && breaker.configuredEndpoints().includes(endpoint)) {
+      const t = breaker.thresholdsFor(endpoint);
+      state.circuitBreaker = { failureThreshold: t.failureThreshold, cooldownMs: t.cooldownMs };
+    }
+    const quota = this.quotaFor(tenant);
+    if (quota !== undefined && quota.configuredEndpoints().includes(endpoint)) {
+      state.quota = { deliveriesPerMinute: quota.limit(endpoint) };
+    }
+    const w = this.weighted?.stats().find((s) => s.endpoint === endpoint);
+    if (w !== undefined) {
+      state.weighted = {
+        targets: w.targets.map((t) => ({ targetUrl: t.targetUrl, weight: t.weight })),
+      };
+    }
+    return state;
+  }
+
+  /**
+   * Every (tenant, endpoint) pair carrying config state — the WR-88
+   * snapshot keyspace. Default-tenant rows omit `tenant`. Weighted
+   * dispatch is endpoint-scoped (not per-tenant), so its rows are
+   * tenant-less.
+   */
+  configuredEndpoints(): Array<{ tenant?: string; endpoint: string }> {
+    const seen = new Set<string>();
+    const out: Array<{ tenant?: string; endpoint: string }> = [];
+    const add = (tenant: string | undefined, endpoint: string): void => {
+      const key = `${tenant ?? ""}\n${endpoint}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      out.push(tenant === undefined ? { endpoint } : { tenant, endpoint });
+    };
+    for (const [key, limiter] of this.limiters) {
+      for (const endpoint of limiter.configuredEndpoints()) add(key === "" ? undefined : key, endpoint);
+    }
+    for (const [key, breaker] of this.breakers) {
+      for (const endpoint of breaker.configuredEndpoints()) add(key === "" ? undefined : key, endpoint);
+    }
+    for (const [key, quota] of this.quotas) {
+      for (const endpoint of quota.configuredEndpoints()) add(key === "" ? undefined : key, endpoint);
+    }
+    if (this.weighted !== undefined) {
+      for (const s of this.weighted.stats()) add(undefined, s.endpoint);
+    }
+    return out;
+  }
+
+  /**
+   * Which hot-reloadable fields carry an explicit runtime override for
+   * one (tenant, endpoint) — the WR-88 apply rollback uses this to
+   * restore the exact pre-apply override state (overrides that did not
+   * exist are removed again, not frozen to their effective value).
+   */
+  endpointConfigOverrides(
+    tenant: string | undefined,
+    endpoint: string
+  ): { maxConcurrentPerEndpoint: boolean; circuitBreaker: boolean; quota: boolean } {
+    return {
+      maxConcurrentPerEndpoint: this.limiterFor(tenant).hasEndpointOverride(endpoint),
+      circuitBreaker: this.breakerFor(tenant)?.hasEndpointOverride(endpoint) ?? false,
+      quota: this.quotaFor(tenant)?.hasEndpointOverride(endpoint) ?? false,
+    };
+  }
+
+  /**
+   * Drop one runtime override so the endpoint falls back to the queue
+   * default. Used by the WR-88 apply rollback. Never throws for unknown
+   * endpoints; `tenant` scopes to that tenant's instance (WR-48).
+   */
+  clearEndpointConfigOverride(
+    tenant: string | undefined,
+    endpoint: string,
+    field: "maxConcurrentPerEndpoint" | "circuitBreaker" | "quota"
+  ): void {
+    if (field === "maxConcurrentPerEndpoint") {
+      this.limiterFor(tenant).clearEndpointOverride(endpoint);
+    } else if (field === "circuitBreaker") {
+      this.breakerFor(tenant)?.clearEndpointOverride(endpoint);
+    } else {
+      this.quotaFor(tenant)?.clearEndpointOverride(endpoint);
+    }
   }
 
   /**

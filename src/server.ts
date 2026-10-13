@@ -112,6 +112,12 @@ import { DeliveryEventArchiver } from "./event-archive.ts";
 import { buildDeliverySnapshot } from "./delivery-status.ts";
 import type { EndpointConfigPatch } from "./hotreload.ts";
 import {
+  exportConfig,
+  applyConfig,
+  ConfigApplyError,
+  type ConfigSnapshotInventory,
+} from "./config-snapshot.ts";
+import {
   ApiVersionRouter,
   VersionMetrics,
   type ApiVersionOptions,
@@ -2187,6 +2193,7 @@ function isOperatorPath(pathname: string): boolean {
     pathname === "/events/archive" ||
     pathname === "/metrics" ||
     pathname === "/config/endpoint" ||
+    pathname === "/config/snapshot" ||
     pathname === "/routing/rules" ||
     pathname === "/endpoints/pause" ||
     pathname === "/endpoints/resume" ||
@@ -2779,6 +2786,52 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     },
   });
   queue.start();
+  // WR-88: declarative inventory for config snapshots — the wiring
+  // `updateEndpointConfig` cannot hot-reload, as identifiers only. Signing
+  // keys contribute key ids (never the HMAC secrets); mTLS contributes the
+  // client-cert identity fingerprint (never PEM bytes); proxies contribute
+  // presence + a credentials flag (never the proxy URL). Snapshot restore
+  // refuses fail-closed when any secret-bearing dimension diverged.
+  const readConfigInventory = (): ConfigSnapshotInventory => ({
+    routing:
+      contentRouteTable === undefined
+        ? null
+        : {
+            rules: contentRouteTable.getRules(),
+            ...(contentRouteTable.getDefaultTargetUrl() !== undefined
+              ? { defaultTargetUrl: contentRouteTable.getDefaultTargetUrl() as string }
+              : {}),
+          },
+    signingKeys: (opts.signingKeys ?? []).map((k) => ({ id: k.id })),
+    mtls: Object.fromEntries(
+      Object.entries(opts.tlsClientCerts ?? {}).map(([endpoint, cert]) => [
+        endpoint,
+        { certIdentity: clientCertIdentity(cert) },
+      ])
+    ),
+    tlsPins: { ...(opts.tlsPins ?? {}) },
+    proxies: Object.fromEntries(
+      Object.entries(opts.proxies ?? {}).map(([endpoint, proxyUrl]) => {
+        let hasCredentials = false;
+        try {
+          const u = new URL(proxyUrl);
+          hasCredentials = u.username !== "" || u.password !== "";
+        } catch {
+          hasCredentials = false;
+        }
+        return [endpoint, { configured: true, hasCredentials }];
+      })
+    ),
+    compression: { ...(opts.compressOutbound ?? {}) },
+    tenants: [
+      ...new Set(
+        queue
+          .configuredEndpoints()
+          .map((e) => e.tenant)
+          .filter((t): t is string => t !== undefined)
+      ),
+    ],
+  });
   // WR-55: persistent delivery-event archive. Subscribes to the queue's
   // delivery events and appends every event to `<dir>/events.jsonl`
   // (survives restarts; served at `GET /events/archive`). Unset by
@@ -2952,6 +3005,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     const isAutoResume = pathname === "/dead-letter/auto-replay/resume";
     const isAutoTrigger = pathname === "/dead-letter/auto-replay/trigger";
     const isConfigEndpoint = pathname === "/config/endpoint";
+    const isConfigSnapshot = pathname === "/config/snapshot";
     const isRoutingRules = pathname === "/routing/rules";
     const isEndpointsPause = pathname === "/endpoints/pause";
     const isEndpointsResume = pathname === "/endpoints/resume";
@@ -2977,6 +3031,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       !isAutoResume &&
       !isAutoTrigger &&
       !isConfigEndpoint &&
+      !isConfigSnapshot &&
       !isRoutingRules &&
       !isEndpointsPause &&
       !isEndpointsResume &&
@@ -3007,6 +3062,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         (isAutoResume && req.method === "POST") ||
         (isAutoTrigger && req.method === "POST") ||
         (isConfigEndpoint && req.method === "POST") ||
+        (isConfigSnapshot && (req.method === "GET" || req.method === "POST")) ||
         (isRoutingRules && (req.method === "GET" || req.method === "POST")) ||
         (isEndpointsPause && req.method === "POST") ||
         (isEndpointsResume && req.method === "POST") ||
@@ -3447,6 +3503,79 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       } catch (err) {
         if (err instanceof RangeError) {
           respondJson(res, 400, { error: err.message });
+          return;
+        }
+        throw err;
+      }
+      return;
+    }
+    if (isConfigSnapshot) {
+      // Declarative config snapshots (WR-88). `GET` exports the current
+      // declarative config (`{ snapshot }`, read scope); `POST` applies a
+      // snapshot (`{ snapshot, dryRun? }`, admin scope) through the WR-32
+      // imperative setter, item by item, rolling back to the pre-apply
+      // state on any mid-apply failure. `dryRun: true` returns the plan
+      // without mutating anything. Secret-bearing inventory (signing
+      // keys, mTLS identities, proxies) refuses the whole apply
+      // fail-closed when it diverged; snapshots carry identifiers only,
+      // never key bytes. The body limit applies here too. Applied and
+      // rolled-back applies are audited as `config_applied` /
+      // `config_rolled_back` with the operator's `keyId`.
+      if (req.method === "GET") {
+        respondJson(res, 200, {
+          snapshot: exportConfig(queue, { readInventory: readConfigInventory }),
+        });
+        return;
+      }
+      let body: Record<string, unknown>;
+      try {
+        const raw = (await readRawBody(req, maxBodyBytes)).toString("utf8");
+        body = raw.trim() === "" ? {} : JSON.parse(raw);
+      } catch (err) {
+        if (err instanceof BodyTooLargeError) {
+          respondJson(res, 413, { error: "request body too large" });
+          return;
+        }
+        respondJson(res, 400, { error: "invalid JSON body" });
+        return;
+      }
+      if (typeof body !== "object" || body === null || Array.isArray(body)) {
+        respondJson(res, 400, { error: "body must be a JSON object" });
+        return;
+      }
+      if (body.snapshot === undefined) {
+        respondJson(res, 400, { error: "body.snapshot is required" });
+        return;
+      }
+      if (body.dryRun !== undefined && typeof body.dryRun !== "boolean") {
+        respondJson(res, 400, { error: "body.dryRun must be a boolean" });
+        return;
+      }
+      try {
+        // WR-82: run as this operator so the `config_applied` /
+        // `config_rolled_back` audit events carry the right `keyId`.
+        const result = runAsOperator(operatorKeyId, () =>
+          applyConfig(queue, body.snapshot, {
+            dryRun: body.dryRun === true,
+            readInventory: readConfigInventory,
+            audit: (event) =>
+              opts.auditLog.append({
+                ...event,
+                ...(activeOperatorKeyId !== undefined ? { keyId: activeOperatorKeyId } : {}),
+              }),
+          })
+        );
+        respondJson(res, 200, result);
+      } catch (err) {
+        if (err instanceof ConfigApplyError) {
+          const status = err.kind === "apply_failed" ? 500 : 400;
+          respondJson(res, status, {
+            error: err.message,
+            kind: err.kind,
+            ...(err.items.length > 0 ? { items: err.items } : {}),
+            ...(err.applied.length > 0 ? { applied: err.applied } : {}),
+            ...(err.rolledBack.length > 0 ? { rolledBack: err.rolledBack } : {}),
+          });
           return;
         }
         throw err;

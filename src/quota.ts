@@ -40,6 +40,28 @@ export class EndpointQuota {
     this.now = now;
   }
 
+  /**
+   * Endpoints carrying a runtime per-minute budget override (WR-32). Used
+   * by the WR-88 config snapshot to enumerate the configured keyspace.
+   */
+  configuredEndpoints(): string[] {
+    return [...this.endpointLimits.keys()];
+  }
+
+  /** Whether `endpoint` carries a runtime override. */
+  hasEndpointOverride(endpoint: string): boolean {
+    return this.endpointLimits.has(endpoint);
+  }
+
+  /**
+   * Drop the runtime override so `endpoint` falls back to the constructor
+   * default. Used by the WR-88 apply rollback. Never throws for unknown
+   * endpoints.
+   */
+  clearEndpointOverride(endpoint: string): void {
+    this.endpointLimits.delete(endpoint);
+  }
+
   /** Configured per-minute budget for `endpoint` (override wins over default). */
   limit(endpoint?: string): number {
     if (endpoint !== undefined) {

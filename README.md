@@ -967,6 +967,55 @@ curl -X POST http://127.0.0.1:PORT/config/endpoint \
 # token · 404 when operator endpoints are disabled (fail closed)
 ```
 
+## Declarative config snapshots (export / apply / rollback)
+
+The hot-reload layer above is imperative; the snapshot layer
+(`src/config-snapshot.ts`) makes it declarative — export what is running,
+review it, and converge back to it later:
+
+```sh
+curl http://127.0.0.1:PORT/config/snapshot \
+  -H "Authorization: Bearer $OPERATOR_TOKEN" > config.json   # GET: export (read scope)
+curl -X POST http://127.0.0.1:PORT/config/snapshot \
+  -H "Authorization: Bearer $OPERATOR_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"snapshot":'"$(cat config.json | jq .snapshot)"',"dryRun":true}'  # POST: apply (admin scope)
+```
+
+- **Exported** — `exportConfig()` captures the hot-reloadable config per
+  `(tenant, endpoint)`: concurrency limit, circuit-breaker thresholds,
+  quota budget, weighted targets, plus the queue-global backoff
+  parameters — and a declarative *inventory* of the wiring the imperative
+  setter cannot change: content-routing rules, signing-key **ids**,
+  mTLS client-cert identity fingerprints, TLS pins, proxy presence,
+  outbound compression, observed tenants.
+- **Apply** — `applyConfig(snapshot, { dryRun })` diffs the snapshot
+  against live config, applies value changes through
+  `updateEndpointConfig`, and *removes* overrides the snapshot no longer
+  carries (the endpoint falls back to the queue defaults). `dryRun: true`
+  returns the plan without mutating anything.
+- **Rollback** — if any step throws mid-apply, every applied item is
+  rolled back to its exact pre-apply state (overrides that did not exist
+  are removed again, not frozen to their effective value) and a
+  `ConfigApplyError` is thrown. Successful applies audit as
+  `config_applied`, rolled-back ones as `config_rolled_back`.
+- **Fail-closed secrets** — snapshots carry identifiers only, never key
+  bytes, PEM blocks, or proxy credentials. A snapshot that claims to
+  carry secret material is refused outright, and an apply is refused
+  (zero mutation) when the live secret-bearing inventory (signing keys,
+  mTLS identities, proxies) diverged from the snapshot — rotate
+  out-of-band and re-export.
+- **Drift detection** — `detectConfigDrift(queue, snapshot)` reports the
+  live-vs-snapshot diff without touching anything; inventory-only diffs
+  (routing rules, pins, compression, tenants) are reported as `pending`
+  on apply since they need a restart or a separate operator action.
+- **Endpoint contract** — `GET /config/snapshot` needs the `read` scope,
+  `POST` needs `admin` (WR-82 convention); both answer 404 fail-closed
+  when operator auth is not configured and 403 without valid credentials.
+  A malformed snapshot is a 400 (`invalid_snapshot`,
+  `secret_material_refused`, `unsupported`); an unexpected mid-apply
+  failure is a 500 after rollback (`apply_failed`).
+
 ## Endpoint pause/resume (operator switch)
 
 An operator hold on a downstream: while an endpoint is paused, its
@@ -2436,6 +2485,17 @@ Requires Node 24+ (runs `.ts` directly via type stripping; zero dependencies).
   patches with bearer auth (400 on illegal values, 403 without the token,
   404 fail-closed without `operatorToken`) and audits
   `endpoint_config_updated`.
+- `test/config-snapshot.test.ts` — declarative config snapshots (WR-88):
+  `exportConfig` captures hot-reloadable config per `(tenant, endpoint)`
+  plus the inventory-only wiring (key ids, never key bytes; `Infinity`
+  JSON-safe); `applyConfig` converges through `updateEndpointConfig`,
+  removes dropped overrides, supports `dryRun`, refuses secret-bearing
+  snapshots and diverged secret inventory fail-closed (`400`), refuses
+  disabled-subsystem patches (`unsupported`), and rolls back applied items
+  to the exact pre-apply state on a mid-apply failure (audited as
+  `config_rolled_back`); `detectConfigDrift` reports live-vs-snapshot
+  diffs read-only; `GET/POST /config/snapshot` operator endpoints (read /
+  admin scopes, 404 fail-closed, 403 without credentials).
 - `test/retry.test.ts` — a flaky sender (fails twice, then succeeds) delivers
   on the third attempt with increasing backoff; a permanently failing sender
   ends in the dead-letter list. Covers the jitter layer: additive jitter with
