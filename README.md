@@ -2212,6 +2212,41 @@ expirations are counted in
 dead-letter replay starts a fresh delivery cycle with a fresh deadline.
 Off by default; invalid values throw `RangeError` at construction.
 
+### Shadow-target dry-run mirroring
+
+Opt-in per-endpoint dry-run mirroring for the downstream-migration /
+contract-verification scenario (`src/shadow.ts`, `shadowTargets` server
+option or `retry.shadowTargets`): after every main delivery attempt
+completes (success or failure), the relay asynchronously mirrors the
+identical wire request to each shadow target — same payload, same
+`x-relay-signature` / `x-relay-key-id`, same `x-relay-idempotency-key`,
+same compression encoding. Each shadow target is served by an
+independent sender copy (own keep-alive pools, own `tlsPins` / mTLS
+client identity per target), so the shadow downstream sees the same
+bytes the production downstream got.
+
+```ts
+const server = createRelayServer({
+  // ...,
+  shadowTargets: {
+    "https://api.example/hook": [
+      {
+        targetUrl: "https://staging.example/hook",
+        tlsPins: ["sha256/<base64>"], // independent pinning per shadow target
+      },
+    ],
+  },
+});
+```
+
+Shadow outcomes are only *observed*: audited as `shadow_delivered` /
+`shadow_failed` and counted in
+`relay_shadow_total{endpoint,shadow_target,result}`. A shadow copy never
+triggers a main retry, never dead-letters, never trips the circuit
+breaker, never consumes a quota token, and never pollutes the main
+delivery counters — a failing shadow is silent (recorded, never
+retried). Off by default; invalid values throw `RangeError` at startup.
+
 ### Delivery event archive
 
 Opt-in persistent history for the delivery lifecycle events

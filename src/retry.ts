@@ -52,6 +52,21 @@ export { ScheduledDeliveryQueue, parseDeliverAtHeader, DELIVER_AT_HEADER };
 export type { ScheduledQueueOptions, ScheduledStats, ScheduledDeliveryInfo };
 export { CRON_HEADER, parseCronExpression, nextCronOccurrence } from "./cron.ts";
 export type { CronExpression } from "./cron.ts";
+import {
+  ShadowDispatcher,
+  type ShadowDeliveredInfo,
+  type ShadowFailedInfo,
+  type ShadowTargetConfig,
+  type ShadowTargetStats,
+  type ShadowTargetsConfig,
+} from "./shadow.ts";
+export type {
+  ShadowDeliveredInfo,
+  ShadowFailedInfo,
+  ShadowTargetConfig,
+  ShadowTargetStats,
+  ShadowTargetsConfig,
+};
 import { EndpointQuota, type QuotaOptions, type QuotaStats } from "./quota.ts";
 import { ReplayEgressGate, type ReplayEgressOptions, DEFAULT_REPLAY_EGRESS_RPS } from "./replay-egress.ts";
 import { RetryBudget, type RetryBudgetOptions } from "./retry-budget.ts";
@@ -111,6 +126,7 @@ import {
   type FailoverMetricsInput,
   type LatencyHistogramInput,
   type ProbeMetricsInput,
+  type ShadowMetricsInput,
   type SloRiskMetricsInput,
   type StarvationGuardMetricsInput,
   type WeightedMetricsInput,
@@ -1212,6 +1228,40 @@ export interface RetryQueueOptions {
    */
   onDeliveryDeadlineExceeded?: (info: DeliveryDeadlineExceededInfo) => void;
   /**
+   * WR-85: shadow-target dry-run mirroring (see `src/shadow.ts`).
+   * Per-endpoint opt-in: exact `targetUrl` -> shadow target list. After
+   * every main delivery *attempt* completes (success or failure), the
+   * relay asynchronously mirrors the identical wire request (same
+   * payload, signature headers, idempotency key, compression encoding —
+   * an independent sender copy rebuilds it from the same item with only
+   * the `targetUrl` swapped) to each shadow target, for downstream
+   * migration / contract verification without touching production
+   * traffic. Shadow outcomes are only *observed*: the
+   * `onShadowDelivered` / `onShadowFailed` hooks (audited as
+   * `shadow_delivered` / `shadow_failed` by the server) and the
+   * `relay_shadow_total` metrics counter. A shadow copy never triggers a
+   * main retry, never dead-letters, never trips the circuit breaker,
+   * never consumes a quota token, and never pollutes the main delivery
+   * counters; a shadow failure is silent (recorded, not retried).
+   * Disabled by default (absent = zero behavior change). Invalid values
+   * throw `RangeError` at construction. Reachable over HTTP via the
+   * `shadowTargets` server option.
+   */
+  shadowTargets?: ShadowTargetsConfig;
+  /**
+   * Called once per mirrored copy a shadow target answers (transport
+   * success). The server audits these as `shadow_delivered`; library
+   * users get the hook directly.
+   */
+  onShadowDelivered?: (info: ShadowDeliveredInfo) => void;
+  /**
+   * Called once per mirrored copy that fails to reach a shadow target.
+   * Silent by design: the failure is recorded (audit + metrics) and
+   * never retried, never escalated. The server audits these as
+   * `shadow_failed`; library users get the hook directly.
+   */
+  onShadowFailed?: (info: ShadowFailedInfo) => void;
+  /**
    * OTLP/HTTP JSON delivery-event export (WR-83; see `src/otlp.ts`).
    * Opt-in: exports the `delivered` / `retrying` / `dead_letter`
    * delivery events (WR-16) plus `slo_missed` latency events (WR-13) to
@@ -1985,6 +2035,11 @@ export class RetryQueue {
   private readonly prober?: DownstreamProber;
   /** WR-83: OTLP delivery-event exporter; undefined when not configured. */
   private readonly otlpExporter?: OtlpExporter;
+  /**
+   * WR-85: shadow-target dry-run mirroring dispatcher; undefined when
+   * `shadowTargets` is unset (zero behavior change).
+   */
+  private readonly shadow?: ShadowDispatcher;
   /** WR-39: active/standby target selection; undefined when not configured. */
   private readonly failover?: FailoverManager;
   private readonly onFailoverSwitch?: (event: FailoverSwitchEvent) => void;
@@ -2120,6 +2175,18 @@ export class RetryQueue {
     this.deadlineNow = opts.deliveryDeadline?.now ?? Date.now;
     this.onDeliveryDeadlineExceeded = opts.onDeliveryDeadlineExceeded;
     // WR-80: cron occurrence audit hook (the server wires it to its audit log).
+    // WR-85: opt-in shadow-target dry-run mirroring. The dispatcher
+    // validates eagerly — `RangeError` at construction, never
+    // mid-delivery. Absent = the relay behaves exactly as before: no
+    // mirror calls, no shadow metrics series, no audit events.
+    this.shadow =
+      opts.shadowTargets !== undefined
+        ? new ShadowDispatcher(opts.shadowTargets, {
+            sender: this.sender,
+            onDelivered: opts.onShadowDelivered,
+            onFailed: opts.onShadowFailed,
+          })
+        : undefined;
     this.onScheduledFired = opts.onScheduledFired;
     // WR-57: the deliver_at delay queue is always on; the option only
     // injects clock/timers (the module validates their shapes).
@@ -3732,10 +3799,35 @@ export class RetryQueue {
         this.park(id, 0);
         return;
       }
+      // WR-85: the exact wire copy this attempt sends. Shadow targets
+      // receive this same item (payload, headers, 0-based `attempt`
+      // index) with only the `targetUrl` swapped, so an independent
+      // sender copy rebuilds the identical wire request (signature,
+      // idempotency key, compression). Captured before the attempt so
+      // the failure path's `entry.attempt += 1` cannot leak into the
+      // mirrored attempt number.
+      const wireCopy: RetryItem = { ...entry, targetUrl: target };
+      // WR-85: mirror-once guard — the success path mirrors right after
+      // the sender settles, but a later throw in the same attempt (e.g.
+      // a failed WR-37 response validation) lands in the catch below,
+      // which mirrors failures: the flag keeps it exactly one mirror per
+      // shadow target per attempt.
+      let shadowMirrored = false;
+      const mirrorShadow = (): void => {
+        if (shadowMirrored) return;
+        shadowMirrored = true;
+        // Fire-and-forget: the main path never waits, and shadow
+        // outcomes never touch retry / dead-letter / circuit / quota
+        // bookkeeping or the main delivery counters.
+        this.shadow?.mirror(logicalEndpoint, wireCopy, tenant, traceId, entry.attempt + 1);
+      };
       try {
         // Pinned copy: the sender sees the physical target chosen above,
         // so a failover switch mid-flight cannot reroute this attempt.
-        const response = await this.sender({ ...entry, targetUrl: target });
+        const response = await this.sender(wireCopy);
+        // WR-85: the main attempt completed — mirror the wire copy to
+        // the shadow targets.
+        mirrorShadow();
         // WR-54: summarize the downstream response for the audit trail. A
         // `void` sender (no response visibility) yields an honest
         // all-"unavailable" summary — never fabricated numbers.
@@ -3839,6 +3931,12 @@ export class RetryQueue {
           attempts: entry.attempt + 1,
         });
       } catch (err) {
+        // WR-85: the main attempt completed as a failure — mirror the
+        // same wire copy before any classification, retry scheduling, or
+        // dead-letter handling; the shadow copy must never influence
+        // those paths. `mirrorShadow` is idempotent per attempt (see
+        // above).
+        mirrorShadow();
         const classified = classifyFailure(err);
         const error = err instanceof Error ? err.message : String(err);
         const at = new Date().toISOString();
@@ -4139,6 +4237,16 @@ export class RetryQueue {
   }
 
   /**
+   * WR-85: per-(tenant, endpoint, shadow target) mirror counters
+   * (`delivered` / `failed`). Empty when the feature is off or no shadow
+   * copy has landed yet. Also rendered as `relay_shadow_total` in
+   * `renderMetrics()`.
+   */
+  getShadowStats(): ShadowTargetStats[] {
+    return this.shadow?.stats() ?? [];
+  }
+
+  /**
    * Install the runtime loop check for completion callbacks (WR-47). The
    * server derives the predicate from the actually bound listen address,
    * so a callback URL that resolves to this relay — even one not declared
@@ -4329,6 +4437,16 @@ export class RetryQueue {
         });
       }
     }
+    // WR-85: one series per (tenant, endpoint, shadow target) that has
+    // actually received a mirrored copy — activity-gated, so the series
+    // stays absent until the first shadow delivery lands.
+    const shadow: ShadowMetricsInput[] = (this.shadow?.stats() ?? []).map((s) => ({
+      endpoint: s.endpoint,
+      ...(s.tenant === undefined ? {} : { tenant: s.tenant }),
+      shadowTarget: s.shadowTarget,
+      delivered: s.delivered,
+      failed: s.failed,
+    }));
     return renderPrometheus({
       deliveries,
       circuits,
@@ -4362,6 +4480,8 @@ export class RetryQueue {
       ...(sloRisk.length > 0 ? { sloRisk } : {}),
       // WR-76: activity-gated (see above).
       ...(deliveryDeadlineExceeded.length > 0 ? { deliveryDeadlineExceeded } : {}),
+      // WR-85: activity-gated (see above).
+      ...(shadow.length > 0 ? { shadow } : {}),
       // WR-83: enabled-gated — the OTLP series appear only when OTLP
       // export is configured, exactly like the probe series.
       ...(this.otlpExporter !== undefined

@@ -14,6 +14,7 @@ import {
 } from "./verify.ts";
 import { RetryQueue, type DeliveryPriority, type DownstreamResponse, type RetryItem, type Sender } from "./retry.ts";
 import { parseDeliverAtHeader, DELIVER_AT_HEADER } from "./retry.ts";
+import type { ShadowDeliveredInfo, ShadowFailedInfo, ShadowTargetConfig, ShadowTargetsConfig } from "./retry.ts";
 import { parseCronExpression, CRON_HEADER } from "./cron.ts";
 import type { CompletionCallbackOptions } from "./callback.ts";
 import { createBoundAddressSelfCheck } from "./callback.ts";
@@ -179,6 +180,36 @@ export interface OperatorPortOptions {
   host?: string;
 }
 
+/**
+ * One shadow downstream for a logical endpoint (WR-85; see `src/shadow.ts`
+ * and the `shadowTargets` server option): the downstream-migration /
+ * contract-verification scenario. After every main delivery attempt
+ * completes, the relay mirrors the identical wire request to this URL.
+ */
+export interface ShadowTargetServerConfig {
+  /**
+   * The shadow downstream URL — the mirrored copy goes here. Must be a
+   * valid absolute `http:`/`https:` URL, and must differ from the logical
+   * endpoint it shadows.
+   */
+  targetUrl: string;
+  /**
+   * Independent TLS pin whitelist for this shadow target (WR-21),
+   * verified against the shadow downstream's certificate — the shadow
+   * sender is a separate copy, so its pins are configured here, not in
+   * the top-level `tlsPins`. Malformed pins throw `RangeError` at
+   * startup.
+   */
+  tlsPins?: string[];
+  /**
+   * Independent mTLS client identity for this shadow target (WR-36) —
+   * the shadow sender presents this certificate during the TLS
+   * handshake with the shadow downstream. Invalid values throw
+   * `RangeError` at startup.
+   */
+  tlsClientCert?: TlsClientCert;
+}
+
 export interface RelayServerOptions {
   /** HMAC secret used to verify incoming webhooks. */
   secret: string;
@@ -338,6 +369,30 @@ export interface RelayServerOptions {
    * `retry.otlp`. Off by default.
    */
   otlp?: OtlpExporterOptions;
+  /**
+   * WR-85: shadow-target dry-run mirroring (see `src/shadow.ts`): the
+   * downstream-migration / contract-verification scenario. Per-endpoint
+   * opt-in — exact `forwardUrl`/endpoint `targetUrl` -> shadow target
+   * list. After every main delivery attempt completes (success or
+   * failure), the relay asynchronously mirrors the identical wire
+   * request (same payload, `x-relay-signature` / `x-relay-key-id`,
+   * `x-relay-idempotency-key`, compression encoding) to each shadow
+   * target. Each target is served by an independent sender copy built
+   * with the same wire config as the main sender — same signing secret,
+   * idempotency-key secret, and compression — but its own keep-alive
+   * pools and its own pinning/mTLS identity (`tlsPins` /
+   * `tlsClientCert` per target). Shadow outcomes are only *observed*:
+   * audited as `shadow_delivered` / `shadow_failed` and counted in
+   * `relay_shadow_total{endpoint,shadow_target,result}` — they never
+   * trigger a main retry, never dead-letter, never trip the circuit
+   * breaker, never consume a quota token, and never pollute the main
+   * delivery counters; a shadow failure is silent (recorded, not
+   * retried). An explicit server-level `shadowTargets` wins over the
+   * nested `retry.shadowTargets` (which takes raw queue-level
+   * `ShadowTargetConfig` entries with pre-built senders). Off by
+   * default; invalid values throw `RangeError` at startup.
+   */
+  shadowTargets?: Record<string, ShadowTargetServerConfig[]>;
   /**
    * Outbound TLS certificate pinning (see `src/pinning.ts`): per-endpoint
    * SPKI fingerprint whitelist, keyed by exact delivery `targetUrl`.
@@ -2279,33 +2334,37 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       });
     },
   });
+  // WR-75: a guarded-compressed delivery was answered 415 and resent
+  // as plaintext inside the same attempt — worth an audit line (the
+  // downstream does not speak gzip; the operator may want to drop the
+  // endpoint from `compressThreshold`), not just a counter. Shared by
+  // the main sender and every WR-85 shadow sender copy below
+  // (`targetUrl` is whichever downstream answered 415).
+  const onGzipFallbackAudit = (info: GzipFallbackInfo) => {
+    opts.auditLog.append({
+      event: "gzip_fallback_plaintext",
+      id: info.id,
+      ...(info.traceId !== undefined ? { traceId: info.traceId } : {}),
+      targetUrl: info.endpoint,
+      bytesSaved: info.bytesSaved,
+    });
+  };
+  // WR-81: an endpoint's E2EE key rotation was picked up at startup —
+  // one audit line naming the new primary and the retired keys still
+  // inside their grace window. Shared with the shadow sender copies.
+  const onE2eeKeyRotatedAudit = (info: E2eeKeyRotatedInfo) => {
+    opts.auditLog.append({
+      event: "e2ee_key_rotated",
+      targetUrl: info.endpoint,
+      primaryKeyId: info.primaryKeyId,
+      previousKeyIds: info.previousKeyIds,
+      graceMs: info.graceMs,
+      rotationInProgress: info.rotationInProgress,
+    });
+  };
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, (info) => {
-        // WR-75: a guarded-compressed delivery was answered 415 and resent
-        // as plaintext inside the same attempt — worth an audit line (the
-        // downstream does not speak gzip; the operator may want to drop
-        // the endpoint from `compressThreshold`), not just a counter.
-        opts.auditLog.append({
-          event: "gzip_fallback_plaintext",
-          id: info.id,
-          ...(info.traceId !== undefined ? { traceId: info.traceId } : {}),
-          targetUrl: info.endpoint,
-          bytesSaved: info.bytesSaved,
-        });
-      }, (info) => {
-        // WR-81: an endpoint's E2EE key rotation was picked up at
-        // startup — one audit line naming the new primary and the
-        // retired keys still inside their grace window.
-        opts.auditLog.append({
-          event: "e2ee_key_rotated",
-          targetUrl: info.endpoint,
-          primaryKeyId: info.primaryKeyId,
-          previousKeyIds: info.previousKeyIds,
-          graceMs: info.graceMs,
-          rotationInProgress: info.rotationInProgress,
-        });
-      })
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit)
       : undefined;
   // WR-50: endpoints the operator may pause/resume over HTTP. The server
   // only ever delivers to these — the intake target plus every
@@ -2367,6 +2426,51 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       activeOperatorKeyId = prev;
     }
   };
+  // WR-85: translate the server-level `shadowTargets` into queue-level
+  // config. Each shadow target gets an independent sender copy — built
+  // with the same wire config as the main sender (signing, idempotency
+  // key, compression, proxies, HTTP/2, E2EE, header forwarding) but its
+  // own keep-alive pools and its own pinning/mTLS identity — so the
+  // shadow downstream sees the identical wire request. Invalid values
+  // throw `RangeError` here, at startup, never mid-delivery. Note: the
+  // copies mirror the *default* sender; with a custom `opts.sender` use
+  // the nested `retry.shadowTargets` with hand-built senders instead.
+  // An explicit server-level `shadowTargets` wins over the nested
+  // `retry.shadowTargets`.
+  const shadowTargets: ShadowTargetsConfig | undefined =
+    opts.shadowTargets !== undefined
+      ? Object.fromEntries(
+          Object.entries(opts.shadowTargets).map(([endpoint, targets]) => [
+            endpoint,
+            targets.map(
+              (t): ShadowTargetConfig => ({
+                targetUrl: t.targetUrl,
+                sender: createDefaultSender(
+                  t.tlsPins !== undefined ? { [t.targetUrl]: t.tlsPins } : undefined,
+                  opts.outboundKeepAlive,
+                  opts.outboundSigning,
+                  opts.proxies,
+                  t.tlsClientCert !== undefined ? { [t.targetUrl]: t.tlsClientCert } : undefined,
+                  opts.compressOutbound,
+                  opts.outboundHttp2,
+                  opts.outboundIdempotencyKey,
+                  undefined,
+                  opts.outboundEncryption,
+                  opts.tlsSniOverrides,
+                  opts.responseCompression,
+                  opts.forwardHeaders,
+                  certExpiryMonitor,
+                  opts.minTlsVersions,
+                  tlsVersionMonitor,
+                  opts.compressThreshold,
+                  onGzipFallbackAudit,
+                  onE2eeKeyRotatedAudit
+                ),
+              })
+            ),
+          ])
+        )
+      : opts.retry?.shadowTargets;
   const queue = new RetryQueue({
     sender: opts.sender ?? defaultSender,
     ...(opts.retry ?? {}),
@@ -2437,6 +2541,37 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // WR-83: an explicit server-level `otlp` wins over the nested
     // `retry.otlp`; either way the queue owns the exporter.
     otlp: opts.otlp ?? opts.retry?.otlp,
+    // WR-85: shadow-target dry-run mirroring. `shadowTargets` (computed
+    // above) wins over the nested `retry.shadowTargets`; either way the
+    // queue owns the dispatcher. Wrap the caller's hooks so every
+    // shadow outcome is audited as `shadow_delivered` / `shadow_failed`,
+    // not just observed.
+    shadowTargets,
+    onShadowDelivered: (info) => {
+      opts.auditLog.append({
+        event: "shadow_delivered",
+        id: info.id,
+        traceId: info.traceId,
+        ...(info.tenant !== undefined ? { tenant: info.tenant } : {}),
+        targetUrl: info.endpoint,
+        shadowTarget: info.shadowTarget,
+        attempts: info.attempts,
+      });
+      opts.retry?.onShadowDelivered?.(info);
+    },
+    onShadowFailed: (info) => {
+      opts.auditLog.append({
+        event: "shadow_failed",
+        id: info.id,
+        traceId: info.traceId,
+        ...(info.tenant !== undefined ? { tenant: info.tenant } : {}),
+        targetUrl: info.endpoint,
+        shadowTarget: info.shadowTarget,
+        attempts: info.attempts,
+        error: info.error,
+      });
+      opts.retry?.onShadowFailed?.(info);
+    },
     onProbeAudit: (event) => {
       opts.auditLog.append(event);
       opts.retry?.onProbeAudit?.(event);

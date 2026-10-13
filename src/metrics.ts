@@ -66,6 +66,11 @@
  *   (`RetryQueueOptions.otlp`).
  * - `relay_otlp_buffered`: gauge of delivery/SLO events currently
  *   buffered for OTLP export. Present only when OTLP export is enabled.
+ * - `relay_shadow_total{endpoint,shadow_target,result}`: counter of
+ *   shadow-target mirrored delivery outcomes (WR-85 dry-run mirroring),
+ *   by logical endpoint and shadow target (`result` = `delivered` /
+ *   `failed`). Present only once a shadow target has actually received a
+ *   mirrored copy — absent entirely when the feature is off.
  *
  * Cardinality note: labels are per endpoint (`targetUrl`), so a relay
  * fanning out to many distinct downstream URLs grows the series count —
@@ -102,6 +107,22 @@ export interface LatencyHistogramInput {
   sum: number;
   /** Total sample count (also the +Inf bucket). */
   count: number;
+}
+
+/**
+ * One shadow target's mirror counters (WR-85), in Prometheus label order.
+ */
+export interface ShadowMetricsInput {
+  /** Logical endpoint (the configured primary `targetUrl`). */
+  endpoint: string;
+  /** Tenant id (WR-48); when set it is rendered as a `tenant` label. */
+  tenant?: string;
+  /** The shadow downstream URL that received the mirrored copy. */
+  shadowTarget: string;
+  /** Cumulative mirrored copies the shadow target answered (transport success). */
+  delivered: number;
+  /** Cumulative mirrored copies that failed (any error — silent, never retried). */
+  failed: number;
 }
 
 export interface MetricsInput {
@@ -145,6 +166,12 @@ export interface MetricsInput {
    * unconfigured or nothing has expired yet.
    */
   deliveryDeadlineExceeded?: DeliveryDeadlineExceededInput[];
+  /**
+   * Present only once a shadow target has actually received a mirrored
+   * copy (WR-85 dry-run mirroring); absent entirely when the feature is
+   * off — the same activity-gated convention as the probe series.
+   */
+  shadow?: ShadowMetricsInput[];
   /**
    * Present only when OTLP delivery-event export (WR-83) is enabled
    * (`RetryQueueOptions.otlp`); absent entirely otherwise — the same
@@ -446,6 +473,21 @@ export function renderPrometheus(input: MetricsInput): string {
       lines.push(
         `relay_delivery_deadline_exceeded_total{endpoint="${escapeLabelValue(d.endpoint)}"${tenantLabel(d.tenant)}} ${d.exceeded}`
       );
+    }
+  }
+  // WR-85: activity-gated like the probe series — the shadow series
+  // appears only once a shadow target has actually received a mirrored
+  // copy, so a relay with the feature off exposes no `relay_shadow_*`
+  // series at all.
+  if (input.shadow !== undefined && input.shadow.length > 0) {
+    lines.push(
+      "# HELP relay_shadow_total Shadow-target mirrored delivery outcomes (WR-85 dry-run mirroring), by logical endpoint and shadow target."
+    );
+    lines.push("# TYPE relay_shadow_total counter");
+    for (const s of input.shadow) {
+      const labels = `endpoint="${escapeLabelValue(s.endpoint)}"${tenantLabel(s.tenant)},shadow_target="${escapeLabelValue(s.shadowTarget)}"`;
+      lines.push(`relay_shadow_total{${labels},result="delivered"} ${s.delivered}`);
+      lines.push(`relay_shadow_total{${labels},result="failed"} ${s.failed}`);
     }
   }
   // WR-83: emitted only when OTLP export is enabled — the same
