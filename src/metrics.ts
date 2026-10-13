@@ -58,6 +58,14 @@
  *   checked at config load). Present only for endpoints whose certificate
  *   was actually observed — absent entirely when the monitor is disabled
  *   or nothing was observed yet.
+ * - `relay_otlp_exports_total{event_type,status}`: counter of delivery/SLO
+ *   events exported to the OTLP collector (WR-83), by event type
+ *   (`delivered` / `retrying` / `dead_letter` / `slo_missed`) and export
+ *   outcome (`success` = collector answered 2xx, `failure` = a failed
+ *   POST attempt). Present only when OTLP export is enabled
+ *   (`RetryQueueOptions.otlp`).
+ * - `relay_otlp_buffered`: gauge of delivery/SLO events currently
+ *   buffered for OTLP export. Present only when OTLP export is enabled.
  *
  * Cardinality note: labels are per endpoint (`targetUrl`), so a relay
  * fanning out to many distinct downstream URLs grows the series count —
@@ -137,6 +145,18 @@ export interface MetricsInput {
    * unconfigured or nothing has expired yet.
    */
   deliveryDeadlineExceeded?: DeliveryDeadlineExceededInput[];
+  /**
+   * Present only when OTLP delivery-event export (WR-83) is enabled
+   * (`RetryQueueOptions.otlp`); absent entirely otherwise — the same
+   * "optional sections only emit series when enabled" convention as the
+   * probe series. `buffered` is the current local export buffer depth;
+   * `exports` carries one row per (event_type, status) pair that
+   * actually exported.
+   */
+  otlp?: {
+    exports: OtlpExportCountInput[];
+    buffered: number;
+  };
 }
 
 /** One endpoint's starvation-guard activation count, in Prometheus label order. */
@@ -221,6 +241,19 @@ export interface DeliveryDeadlineExceededInput {
   tenant?: string;
   /** Cumulative deliveries dead-lettered because their deadline expired. */
   exceeded: number;
+}
+
+/**
+ * One (event_type, status) cumulative OTLP export outcome counter
+ * (WR-83), in Prometheus label order.
+ */
+export interface OtlpExportCountInput {
+  /** Relay event type that was exported. */
+  eventType: "delivered" | "retrying" | "dead_letter" | "slo_missed";
+  /** Export outcome: `success` = the collector answered 2xx. */
+  status: "success" | "failure";
+  /** Cumulative count for this (event_type, status) pair. */
+  count: number;
 }
 
 /**
@@ -414,6 +447,26 @@ export function renderPrometheus(input: MetricsInput): string {
         `relay_delivery_deadline_exceeded_total{endpoint="${escapeLabelValue(d.endpoint)}"${tenantLabel(d.tenant)}} ${d.exceeded}`
       );
     }
+  }
+  // WR-83: emitted only when OTLP export is enabled — the same
+  // "optional sections only emit series when enabled" convention as the
+  // probe series. The buffered gauge is always present then (even at 0);
+  // export counters appear per (event_type, status) pair that exported.
+  if (input.otlp !== undefined) {
+    lines.push(
+      "# HELP relay_otlp_exports_total Delivery/SLO events exported to the OTLP collector (WR-83), by event type and export outcome (success = collector answered 2xx)."
+    );
+    lines.push("# TYPE relay_otlp_exports_total counter");
+    for (const e of input.otlp.exports) {
+      lines.push(
+        `relay_otlp_exports_total{event_type="${e.eventType}",status="${e.status}"} ${e.count}`
+      );
+    }
+    lines.push(
+      "# HELP relay_otlp_buffered Delivery/SLO events currently buffered for OTLP export (WR-83)."
+    );
+    lines.push("# TYPE relay_otlp_buffered gauge");
+    lines.push(`relay_otlp_buffered ${input.otlp.buffered}`);
   }
   return lines.join("\n") + "\n";
 }

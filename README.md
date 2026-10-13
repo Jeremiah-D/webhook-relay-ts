@@ -1593,6 +1593,47 @@ const server = createRelayServer({
   in the relay — the downstream holds its own private keys, and the
   relay never sees them.
 
+## OTLP event export (opt-in)
+
+Delivery lifecycle events can be exported to an OTLP collector as logs
+JSON over HTTP (`Content-Type: application/json`), for operators who
+already run OpenTelemetry infrastructure:
+
+```ts
+const server = createRelayServer({
+  secret, forwardUrl, auditLog,
+  otlp: {
+    endpoint: "http://collector:4318/v1/logs", // full collector URL; required
+    sampleRate: 1.0,      // default 1.0 = export everything
+    maxBuffered: 1000,    // default 1000; local buffer bound
+    serviceName: "webhook-relay-ts", // default; service.name attribute
+  },
+});
+```
+
+- **What is exported** — the `delivered` / `retrying` / `dead_letter`
+  delivery events plus `slo_missed` latency events. Each becomes one
+  OTLP log record: `severityNumber` 9 (`INFO`), 13 (`WARN`) for
+  `dead_letter`; `traceId` is the delivery's trace ID (32-hex values pass
+  through, client-supplied IDs are mapped through SHA-256 to a valid
+  32-hex OTLP trace ID); attributes carry `relay.event_id`,
+  `relay.event_type`, `relay.endpoint`, `relay.attempts`, `relay.error`
+  (failures), `relay.tenant` (multi-tenant only), and
+  `relay.slo_ms` / `relay.latency_ms` (SLO misses).
+- **Never disturbs delivery** — export is off by default; when enabled,
+  `record()` is synchronous buffer work that never throws, the flush
+  runs on an unref'd background timer, and a hung collector cannot pin
+  shutdown (a best-effort flush races a 1s timeout). Failed exports stay
+  in a bounded in-memory buffer (drop-oldest past `maxBuffered`,
+  counted in `getOtlpStats().dropped`) and are retried with capped
+  exponential backoff.
+- **Fail-fast** — a bad endpoint URL, a `sampleRate` outside [0, 1], or a
+  `maxBuffered` below 1 throws `RangeError` at construction.
+- **Observability** — `queue.getOtlpStats()` returns
+  `{ enabled, buffered, dropped, exported, lastError? }`; `GET /metrics`
+  adds `relay_otlp_exports_total{event_type,status}` and
+  `relay_otlp_buffered` only when OTLP export is enabled.
+
 ## Delivery lifecycle
 
 Every accepted webhook walks the same state machine; each transition is

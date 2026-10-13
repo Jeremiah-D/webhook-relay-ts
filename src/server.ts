@@ -122,6 +122,7 @@ import {
   type PayloadSchema,
 } from "./schema.ts";
 import type { ProbeOptions } from "./downstream-probe.ts";
+import type { OtlpExporterOptions } from "./otlp.ts";
 import {
   assertValidCompressOutboundConfig,
   DecompressionFailedError,
@@ -306,6 +307,15 @@ export interface RelayServerOptions {
    * Off by default.
    */
   probe?: ProbeOptions;
+  /**
+   * OTLP/HTTP JSON delivery-event export (WR-83; see `src/otlp.ts` and
+   * the `otlp` `RetryQueue` option): exports the `delivered` /
+   * `retrying` / `dead_letter` delivery events plus `slo_missed`
+   * latency events to a configurable collector endpoint as OTLP logs
+   * JSON. An explicit server-level `otlp` wins over the nested
+   * `retry.otlp`. Off by default.
+   */
+  otlp?: OtlpExporterOptions;
   /**
    * Outbound TLS certificate pinning (see `src/pinning.ts`): per-endpoint
    * SPKI fingerprint whitelist, keyed by exact delivery `targetUrl`.
@@ -2392,6 +2402,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // either way the queue owns the prober. Wrap the caller's hook so
     // every probe outcome worth auditing lands in the audit log.
     probe: opts.probe ?? opts.retry?.probe,
+    // WR-83: an explicit server-level `otlp` wins over the nested
+    // `retry.otlp`; either way the queue owns the exporter.
+    otlp: opts.otlp ?? opts.retry?.otlp,
     onProbeAudit: (event) => {
       opts.auditLog.append(event);
       opts.retry?.onProbeAudit?.(event);

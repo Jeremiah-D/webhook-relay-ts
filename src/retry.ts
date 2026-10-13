@@ -120,6 +120,7 @@ import {
   summarizeDownstreamResponse,
   type DownstreamResponseSummary,
 } from "./response-summary.ts";
+import { OtlpExporter, type OtlpExporterOptions, type OtlpStats } from "./otlp.ts";
 
 export { TRACE_ID_HEADER };
 export { renderPrometheus };
@@ -168,6 +169,7 @@ export type {
   DeadLetterPurgeResult,
 };
 export { DeadLetterRetentionSweeper, resolveRetentionTtl };
+export type { OtlpExporterOptions, OtlpStats } from "./otlp.ts";
 
 /**
  * Delivery priority of an item.
@@ -1209,6 +1211,19 @@ export interface RetryQueueOptions {
    * library users get the hook directly.
    */
   onDeliveryDeadlineExceeded?: (info: DeliveryDeadlineExceededInfo) => void;
+  /**
+   * OTLP/HTTP JSON delivery-event export (WR-83; see `src/otlp.ts`).
+   * Opt-in: exports the `delivered` / `retrying` / `dead_letter`
+   * delivery events (WR-16) plus `slo_missed` latency events (WR-13) to
+   * a configurable collector endpoint as OTLP logs JSON
+   * (`Content-Type: application/json`). Sampling is configurable
+   * (default 1.0 = everything); export failures are buffered locally
+   * (bounded, drop-oldest) and retried on an unref'd background timer,
+   * so export can never block or break the delivery path. Disabled by
+   * default (absent = zero behavior change). Invalid values throw
+   * `RangeError` at construction.
+   */
+  otlp?: OtlpExporterOptions;
 }
 
 /**
@@ -1968,6 +1983,8 @@ export class RetryQueue {
   /** WR-68: cumulative entries held back by the egress gate. */
   private replayEgressThrottled = 0;
   private readonly prober?: DownstreamProber;
+  /** WR-83: OTLP delivery-event exporter; undefined when not configured. */
+  private readonly otlpExporter?: OtlpExporter;
   /** WR-39: active/standby target selection; undefined when not configured. */
   private readonly failover?: FailoverManager;
   private readonly onFailoverSwitch?: (event: FailoverSwitchEvent) => void;
@@ -2200,6 +2217,49 @@ export class RetryQueue {
           });
     this.latencyOpts = opts.latency;
     this.onSloMiss = opts.latency?.onSloMiss;
+    if (opts.otlp !== undefined) {
+      // WR-83: opt-in OTLP export. The exporter validates eagerly —
+      // `RangeError` at construction, never mid-delivery. Delivery
+      // events are observed through the public subscription (the
+      // exporter's `record()` never throws and never blocks), and the
+      // caller's slo-miss hook is wrapped so misses export alongside
+      // delivery events while still firing exactly once.
+      this.otlpExporter = new OtlpExporter(opts.otlp);
+      const exporter = this.otlpExporter;
+      this.subscribeDeliveryEvents((event) => {
+        try {
+          exporter.record({
+            eventType: event.type,
+            eventId: event.id,
+            traceId: event.traceId,
+            endpoint: event.targetUrl,
+            attempts: event.attempts,
+            error: event.error,
+            tenant: event.tenant,
+          });
+        } catch {
+          // Unreachable by contract (`record()` never throws) — the
+          // delivery path must never see an export throw.
+        }
+      });
+      const callerOnSloMiss = this.onSloMiss;
+      this.onSloMiss = (info) => {
+        callerOnSloMiss?.(info);
+        try {
+          exporter.record({
+            eventType: "slo_missed",
+            eventId: info.id,
+            traceId: info.traceId,
+            endpoint: info.endpoint,
+            tenant: info.tenant,
+            sloMs: info.sloMs,
+            latencyMs: info.latencyMs,
+          });
+        } catch {
+          // Same contract as above: export never breaks the hook path.
+        }
+      };
+    }
     this.sloRiskOpts = opts.latency?.sloRisk;
     this.onSloRisk = opts.latency?.sloRisk?.onSloRisk;
     if (this.sloRiskOpts !== undefined) {
@@ -2708,6 +2768,17 @@ export class RetryQueue {
   }
 
   /**
+   * WR-83: OTLP export snapshot (`enabled` / `buffered` / `dropped` /
+   * `exported` / `lastError`). `enabled` is false (and every counter 0)
+   * when the `otlp` option was never set.
+   */
+  getOtlpStats(): OtlpStats {
+    return (
+      this.otlpExporter?.stats() ?? { enabled: false, buffered: 0, dropped: 0, exported: 0 }
+    );
+  }
+
+  /**
    * Move a dead-lettered item back into the queue with a fresh attempt
    * budget (attempts reset to 0, scheduled immediately when running).
    * Returns false when no dead-letter entry matches `id`. A replay that
@@ -3168,6 +3239,9 @@ export class RetryQueue {
     this.retentionSweeper?.start();
     // Opt-in only: undefined when `probe` was never configured.
     this.prober?.start();
+    // WR-83: opt-in only — re-arm a pending OTLP export retry timer
+    // (cleared by `stop()`) when records are still buffered.
+    this.otlpExporter?.resume();
     // WR-57: arm the deliver_at delay queue — parked items whose instant
     // already passed while stopped fire immediately (past-due semantics).
     this.scheduler.arm();
@@ -3178,6 +3252,9 @@ export class RetryQueue {
     this.retentionSweeper?.stop();
     this.prober?.stop();
     this.callbacker?.stop();
+    // WR-83: opt-in only — clear the export retry timer and kick off one
+    // best-effort flush (fire-and-forget; `stop()` is synchronous).
+    this.otlpExporter?.stop();
     // WR-57: disarm the delay-queue timer but keep the heap — parked items
     // stay parked with their absolute deliver_at; the next start() re-arms.
     this.scheduler.disarm();
@@ -3257,6 +3334,11 @@ export class RetryQueue {
     // deliveries genuinely in flight instead of hanging on the gate.
     this.globalGate.releaseWaiters();
     this.durablePendingRetry.clear();
+    // WR-83: best-effort OTLP export flush — bounded (1s) so a dead
+    // collector can never pin shutdown; the exporter clears its own
+    // timers. Buffered records that don't make it are dropped with the
+    // process, exactly like backoff-waiting items.
+    await this.otlpExporter?.shutdown(1000);
     // WR-49: leave the journal compact — a shutdown is the natural
     // checkpoint; the next boot recovers from live state only.
     this.compactDurable(true);
@@ -4280,6 +4362,20 @@ export class RetryQueue {
       ...(sloRisk.length > 0 ? { sloRisk } : {}),
       // WR-76: activity-gated (see above).
       ...(deliveryDeadlineExceeded.length > 0 ? { deliveryDeadlineExceeded } : {}),
+      // WR-83: enabled-gated — the OTLP series appear only when OTLP
+      // export is configured, exactly like the probe series.
+      ...(this.otlpExporter !== undefined
+        ? {
+            otlp: {
+              exports: this.otlpExporter.exportCounts().map((c) => ({
+                eventType: c.eventType,
+                status: c.status,
+                count: c.count,
+              })),
+              buffered: this.otlpExporter.stats().buffered,
+            },
+          }
+        : {}),
     });
   }
 
