@@ -88,6 +88,7 @@ import {
 } from "./cert-expiry.ts";
 import { OutboundConnectionPool, type KeepAlivePoolOptions } from "./keepalive.ts";
 import { warmupOutboundPool, resolveWarmupOptions } from "./warmup.ts";
+import { AuditSink, type AuditSinkOptions } from "./audit-sink.ts";
 import {
   assertValidProxyUrl,
   createProxiedAgent,
@@ -1016,6 +1017,21 @@ export interface RelayServerOptions {
    * Off by default so the server stays a pure library component.
    */
   gracefulShutdown?: { timeoutMs?: number; exit?: (code: number) => void };
+  /**
+   * WR-90: opt-in audit-event webhook sink (see `src/audit-sink.ts`).
+   * Tails the audit log on a background worker and POSTs every new
+   * audit event as signed JSON (`x-relay-audit-signature:
+   * sha256=<hex>`, HMAC-SHA256 over the exact log line) to `url` — or
+   * to a per-tenant URL from `tenantSinks` when the event carries a
+   * tenant (WR-48). Retries with exponential backoff (`maxAttempts`,
+   * default 10); an event that exhausts its retries is recorded as
+   * `audit_sink_dead_letter` in the audit log (never re-forwarded) and
+   * skipped. The worker never touches the delivery path — a slow or
+   * dead sink only delays the cursor, never a webhook — and stops with
+   * the server. Unset by default: no forwarding, byte-identical
+   * behavior.
+   */
+  auditSink?: AuditSinkOptions;
 }
 
 /**
@@ -5195,6 +5211,10 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
 
   server.on("close", () => {
     queue.stop();
+    // WR-90: halt the audit-sink worker with the server — no new polls,
+    // in-flight POSTs abandoned (the cursor does not advance, so the
+    // next start redelivers them).
+    auditSink?.stop();
     // Pooled outbound connections must not outlive the server: close them
     // (and stop the idle reaper) on the same close path that stops the
     // queue — this covers stop() and the graceful-shutdown drain alike.
@@ -5308,6 +5328,16 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         }
       );
     }
+  }
+
+  // WR-90: opt-in audit-event webhook sink. Constructed (and started)
+  // only when configured — unset means zero forwarding and
+  // byte-identical behavior. Invalid options throw RangeError here,
+  // never mid-run. Stopped on the same close path as the queue.
+  let auditSink: AuditSink | undefined;
+  if (opts.auditSink !== undefined) {
+    auditSink = new AuditSink(opts.auditLog, opts.auditSink);
+    auditSink.start();
   }
 
   return server;

@@ -241,6 +241,14 @@ export class AuditLog {
   }
 
   /**
+   * WR-90: file path of the JSONL log. The audit-event webhook sink
+   * (`src/audit-sink.ts`) tails this file; nothing else should need it.
+   */
+  get filePath(): string {
+    return this.path;
+  }
+
+  /**
    * WR-72: attach (or replace) the field mask after construction. The
    * server uses this so one mask can back both the audit log and the
    * retry queue from a single option.

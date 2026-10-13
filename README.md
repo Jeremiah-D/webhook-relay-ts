@@ -1743,6 +1743,63 @@ const server = createRelayServer({
   adds `relay_otlp_exports_total{event_type,status}` and
   `relay_otlp_buffered` only when OTLP export is enabled.
 
+## Audit event webhook sink (opt-in)
+
+The audit log can stream itself to an external webhook as signed JSON
+(`src/audit-sink.ts`, the LG-67 convention from ledger-api-go), for
+operators who want every `accepted` / `delivered` / `dead_letter` /
+`rejected` / operator action in their own SIEM without polling
+`GET /audit`:
+
+```ts
+const server = createRelayServer({
+  secret, forwardUrl, auditLog,
+  auditSink: {
+    url: "https://siem.example.com/relay-audit", // required
+    secret: "shared-hmac-secret",                 // required; signs every delivery
+    tenantSinks: {                               // optional per-tenant URLs (WR-48)
+      acme: { url: "https://acme.example.com/audit", secret: "acme-key" },
+    },
+    maxAttempts: 10,        // default 10; backoff 1s doubling to 60s
+    pollIntervalMs: 1000,   // default 1000
+    httpTimeoutMs: 10000,   // default 10000
+  },
+});
+```
+
+- **Signed** — every delivery carries
+  `x-relay-audit-signature: sha256=<hex>` (HMAC-SHA256 over the exact
+  log line, the WR-26 convention) plus `x-relay-audit-event` (the audit
+  event name) and `x-relay-audit-tenant` (tenant-scoped events only).
+  The body is the exact JSONL audit line — hash-chain fields included —
+  so the downstream can verify authenticity and chain continuity.
+  Sealed (WR-11) payloads stay sealed in transit; the sink never
+  decrypts. An empty secret fails fast at startup: unsigned webhooks can
+  be forged.
+- **Never disturbs delivery** — off by default; when enabled, a
+  background worker tails the log file on unref'd timers, so a slow or
+  dead sink only delays the cursor, never a webhook. It stops with the
+  server.
+- **At-least-once, in order** — an event is delivered (HTTP 2xx), then
+  the byte-offset cursor advances (atomic tmp+rename, survives
+  restarts). A stop mid-retry abandons the event without dead-lettering,
+  so the next start redelivers it. The first start begins at the current
+  log tail: history is not replayed. Head-of-line blocking is honest:
+  one poison URL delays every event behind it until it dead-letters.
+- **Dead letters** — an event that exhausts `maxAttempts` is recorded
+  as `audit_sink_dead_letter` in the audit log (event name, attempts,
+  last status/error, tenant, sink URL) and skipped. Dead-letter lines
+  are never re-forwarded. Alert on `sink.stats().deadLetters`.
+- **Observability** — `sink.stats()` returns
+  `{ sent, failedAttempts, deadLetters }`; `sink.cursorOffset()` is the
+  last forwarded byte offset.
+- **Fail-fast** — a bad URL, empty secret, `maxAttempts < 1`, negative
+  durations, or a bad tenant id throws `RangeError` at construction.
+
+Do not point the sink at this relay's own intake: forwarded events
+carry no valid webhook signature, each rejection audits a new line, and
+the sink would chase its own tail.
+
 ## Delivery lifecycle
 
 Every accepted webhook walks the same state machine; each transition is
