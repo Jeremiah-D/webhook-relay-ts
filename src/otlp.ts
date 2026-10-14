@@ -27,7 +27,7 @@ import { request as httpsRequest } from "node:https";
  */
 
 /** Event types exported to the collector. */
-export type OtlpEventType = "delivered" | "retrying" | "dead_letter" | "slo_missed";
+export type OtlpEventType = "delivered" | "retrying" | "dead_letter" | "slo_missed" | "rate_limited";
 
 /** Export outcome for one (event_type, status) counter pair. */
 export type OtlpExportStatus = "success" | "failure";
@@ -58,6 +58,12 @@ export interface OtlpRecordInput {
    * phase was measurable.
    */
   dominantPhase?: string;
+  /**
+   * WR-97: milliseconds until the (tenant, endpoint) token bucket
+   * refills (`rate_limited` only) — the honest `Retry-After` behind the
+   * rate-limit decision, rendered as `relay.retry_after_ms`.
+   */
+  retryAfterMs?: number;
 }
 
 /** Opt-in OTLP export, embedded in `RetryQueueOptions`. */
@@ -177,6 +183,7 @@ export function buildOtlpPayload(
     if (r.sloMs !== undefined) attributes.push(intAttr("relay.slo_ms", r.sloMs));
     if (r.latencyMs !== undefined) attributes.push(intAttr("relay.latency_ms", r.latencyMs));
     if (r.dominantPhase !== undefined) attributes.push(attr("relay.dominant_phase", r.dominantPhase));
+    if (r.retryAfterMs !== undefined) attributes.push(intAttr("relay.retry_after_ms", r.retryAfterMs));
     return {
       timeUnixNano: nowNano,
       observedTimeUnixNano: nowNano,
@@ -225,6 +232,8 @@ const EXPORT_COUNTER_ORDER: Array<[OtlpEventType, OtlpExportStatus]> = [
   ["dead_letter", "failure"],
   ["slo_missed", "success"],
   ["slo_missed", "failure"],
+  ["rate_limited", "success"],
+  ["rate_limited", "failure"],
 ];
 
 /**

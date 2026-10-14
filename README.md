@@ -1319,6 +1319,60 @@ const queue = new RetryQueue({
   first outcome is recorded; a gauge cannot hold Infinity). Invalid
   options throw `RangeError` at construction.
 
+## Per-tenant outbound rate limiting
+
+One tenant's flood must not starve the shared downstream or crowd out
+another tenant's deliveries. `retry.tenantRateLimit` (opt-in, off by
+default; also accepted as a server-level `tenantRateLimit`, which wins)
+adds a token bucket per **(tenant, endpoint)** scope — `burst` capacity
+refilled at `refillPerSecond` — with per-endpoint overrides of the
+tenant-level defaults:
+
+```ts
+const queue = new RetryQueue({
+  tenantRateLimit: {
+    burst: 50,              // default burst per (tenant, endpoint); required
+    refillPerSecond: 5,     // default refill rate; required
+    endpoints: {
+      // endpoint-level overrides win over the tenant-level defaults,
+      // per field — unset fields fall back to the defaults
+      "https://payments.example.test/hook": { burst: 200 },
+    },
+    mode: "queue",          // or "reject-429"; default "queue"
+  },
+});
+```
+
+- **Two over-limit modes** — `"queue"` (default) enforces at *dispatch*:
+  an over-limit attempt is rescheduled for the next token refill, never
+  dropped, never charged to the retry budget, and never reported to the
+  circuit breaker as an outcome — the WR-15 quota pattern, tenant-scoped.
+  `"reject-429"` enforces at *intake*: an over-limit webhook is answered
+  `429` with a `retry-after` header (the WR-22 convention) and audited
+  as `rejected` with reason `rate_limited`, before it ever enters the
+  queue — the sender gets honest backpressure. The token is consumed at
+  admission in this mode, so the dispatch path never re-checks: one
+  delivery, one token.
+- **WR-91 composition** — in `queue` mode the rescheduled delivery keeps
+  its full lifecycle: it still dispatches through the coalescing sender
+  and may merge with an in-flight identical attempt. Like the WR-15
+  quota, the gate charges per logical delivery dispatch (followers
+  included) — it runs before the coalescer decides leader/follower.
+- **Orthogonal to WR-94 AIMD** — this paces *rate* (deliveries per
+  second), AIMD paces *concurrency* (simultaneous in-flight attempts). A
+  rate-limited wait is never a delivery outcome: it feeds neither the
+  AIMD controller, nor the WR-59 adaptive backoff, nor the circuit
+  breaker.
+- **Observability** — every denial bumps the scope's counter, exported
+  to Prometheus as `relay_tenant_ratelimited_total{endpoint[,tenant]}`
+  (activity-gated — absent until the first denial; the `tenant` label is
+  omitted for the default tenant, per the WR-48 convention) and to OTLP
+  as a `rate_limited` event carrying `relay.retry_after_ms`.
+  `getTenantRateLimitStats()` exposes per-scope denial counts plus the
+  override-resolved `burst` / `refillPerSecond`. Invalid options throw
+  `RangeError` at construction; the clock is injectable for
+  deterministic tests.
+
 ## Endpoint failover (active/standby)
 
 One logical endpoint (the configured primary `targetUrl`) can own an
@@ -1812,14 +1866,16 @@ const server = createRelayServer({
 ```
 
 - **What is exported** — the `delivered` / `retrying` / `dead_letter`
-  delivery events plus `slo_missed` latency events. Each becomes one
+  delivery events, `slo_missed` latency events, and `rate_limited`
+  per-tenant rate-limit decisions (WR-97). Each becomes one
   OTLP log record: `severityNumber` 9 (`INFO`), 13 (`WARN`) for
   `dead_letter`; `traceId` is the delivery's trace ID (32-hex values pass
   through, client-supplied IDs are mapped through SHA-256 to a valid
   32-hex OTLP trace ID); attributes carry `relay.event_id`,
   `relay.event_type`, `relay.endpoint`, `relay.attempts`, `relay.error`
-  (failures), `relay.tenant` (multi-tenant only), and
-  `relay.slo_ms` / `relay.latency_ms` (SLO misses).
+  (failures), `relay.tenant` (multi-tenant only),
+  `relay.slo_ms` / `relay.latency_ms` (SLO misses),
+  `relay.retry_after_ms` (rate-limit decisions).
 - **Never disturbs delivery** — export is off by default; when enabled,
   `record()` is synchronous buffer work that never throws, the flush
   runs on an unref'd background timer, and a hung collector cannot pin
@@ -2212,7 +2268,10 @@ Per (tenant, endpoint), the relay isolates:
 - **circuit breaker** — a tripped breaker only parks its own tenant's
   attempts (probes still feed every tenant's breaker, so shared-downstream
   outages are visible everywhere);
-- **latency tracker** — SLO stats and histograms are per tenant.
+- **latency tracker** — SLO stats and histograms are per tenant;
+- **outbound rate limiter** — token buckets are per (tenant, endpoint),
+  with per-endpoint overrides (`queue` mode paces at dispatch,
+  `reject-429` mode answers 429 at intake).
 
 Deliberately shared: the urgent-lane token bucket, the DRR lane
 scheduler, the global retry budget, failover routing, downstream probes,

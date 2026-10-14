@@ -82,6 +82,14 @@ import {
   type AdaptiveConcurrencyOptions,
 } from "./adaptive-concurrency.ts";
 import {
+  TenantRateLimiter,
+  type TenantRateLimitEndpointOverride,
+  type TenantRateLimitMode,
+  type TenantRateLimitOptions,
+  type TenantRateLimitStats,
+  type TenantRateLimitVerdict,
+} from "./tenant-ratelimit.ts";
+import {
   LatencyPhasesTracker,
   dominantPhaseOf,
   type EndpointLatencyPhaseStats,
@@ -232,6 +240,14 @@ export {
   DEFAULT_ADAPTIVE_FAILURE_RATE_THRESHOLD,
   DEFAULT_ADAPTIVE_WINDOW_SIZE,
 } from "./adaptive-concurrency.ts";
+export type {
+  TenantRateLimitEndpointOverride,
+  TenantRateLimitMode,
+  TenantRateLimitOptions,
+  TenantRateLimitStats,
+  TenantRateLimitVerdict,
+} from "./tenant-ratelimit.ts";
+export { TenantRateLimiter } from "./tenant-ratelimit.ts";
 export type {
   LatencyPhaseName,
   LatencyPhaseOptions,
@@ -947,6 +963,30 @@ export interface RetryQueueOptions {
    * construction.
    */
   adaptiveConcurrency?: AdaptiveConcurrencyOptions;
+  /**
+   * Per-(tenant, endpoint) outbound rate limiting (WR-97; see
+   * `src/tenant-ratelimit.ts`): a token bucket per (tenant, endpoint)
+   * scope — `burst` capacity refilled at `refillPerSecond` — with
+   * per-endpoint overrides of the tenant-level defaults. Two over-limit
+   * modes:
+   *
+   * - `"queue"` (default): enforced at dispatch — an over-limit attempt
+   *   is rescheduled for the next token refill, never dropped, never
+   *   charged to the retry budget, and never reported to the circuit
+   *   breaker or the WR-94 AIMD controller as an outcome. Composes with
+   *   WR-91 coalescing: the rescheduled delivery keeps its full
+   *   lifecycle and still dispatches through the coalescing sender.
+   * - `"reject-429"`: enforced at intake via `admitTenantDelivery()` —
+   *   an over-limit admission is answered 429 with `retry-after`
+   *   instead of entering the queue; the token is consumed at admission
+   *   so the dispatch path never re-checks in this mode.
+   *
+   * Orthogonal to WR-94 AIMD: this paces *rate* (deliveries per second),
+   * AIMD paces *concurrency* (simultaneous in-flight attempts). Disabled
+   * by default (absent = unlimited). Invalid values throw `RangeError`
+   * at construction.
+   */
+  tenantRateLimit?: TenantRateLimitOptions;
   /**
    * Random source in [0, 1) used for jitter; defaults to `Math.random`.
    * Injectable so tests can verify jitter bounds deterministically.
@@ -2228,6 +2268,8 @@ export class RetryQueue {
   private readonly adaptiveBackoffs = new Map<string, AdaptiveBackoffController>();
   /** WR-94: adaptive concurrency options; undefined when disabled. */
   private readonly adaptiveConcurrencyOpts?: AdaptiveConcurrencyOptions;
+  /** WR-97: the shared per-(tenant, endpoint) outbound rate limiter; undefined when disabled. */
+  private readonly tenantRateLimiter?: TenantRateLimiter;
   /** WR-94: per-tenant adaptive concurrency controllers (WR-48 scoping). */
   private readonly adaptiveConcurrencies = new Map<string, AdaptiveConcurrencyController>();
   /** WR-95: latency phase options; undefined when disabled. */
@@ -2689,6 +2731,14 @@ export class RetryQueue {
     this.adaptiveConcurrencyOpts = opts.adaptiveConcurrency;
     if (opts.adaptiveConcurrency !== undefined) {
       this.adaptiveConcurrencyFor(undefined);
+    }
+    // WR-97: opt-in per-(tenant, endpoint) outbound rate limiting. The
+    // limiter validates eagerly so illegal configs throw at
+    // construction, never mid-delivery. Buckets are per (tenant,
+    // endpoint) inside the one shared instance (WR-48 `tenantScopeKey`),
+    // so no per-tenant instances are needed.
+    if (opts.tenantRateLimit !== undefined) {
+      this.tenantRateLimiter = new TenantRateLimiter(opts.tenantRateLimit);
     }
     // WR-95: opt-in latency phase tracking. Same eager-default/lazy-tenant
     // pattern: invalid options throw at construction.
@@ -4203,6 +4253,32 @@ export class RetryQueue {
       this.schedule(id, quota.msUntilToken(target) + this.random() * 50);
       return;
     }
+    // WR-97: per-(tenant, endpoint) outbound rate limiting, "queue" mode.
+    // An over-limit attempt is rescheduled for the next token refill —
+    // never dropped, never charged to the retry budget, and never shown
+    // to the circuit breaker, the WR-59 adaptive backoff, or the WR-94
+    // AIMD controller as an outcome: a throttled wait is not a delivery
+    // outcome, exactly like the quota gate above. WR-91: the rescheduled
+    // delivery keeps its full lifecycle — it still dispatches through
+    // the coalescing sender and may merge with an in-flight identical
+    // attempt. In "reject-429" mode the intake already answered 429 and
+    // consumed the token, so this gate never denies there.
+    const tenantLimiter = this.tenantRateLimiter;
+    if (tenantLimiter !== undefined && tenantLimiter.mode() === "queue") {
+      const rlVerdict = tenantLimiter.take(tenant, target);
+      if (!rlVerdict.ok) {
+        this.recordTenantRateLimitedEvent({
+          eventId: id,
+          traceId,
+          ...(tenant === undefined ? {} : { tenant }),
+          endpoint: target,
+          retryAfterMs: rlVerdict.retryAfterMs,
+        });
+        // A little jitter keeps many delayed items from re-checking in lockstep.
+        this.schedule(id, rlVerdict.retryAfterMs + this.random() * 50);
+        return;
+      }
+    }
     let probe = false;
     const breaker = this.breakerFor(tenant);
     if (breaker) {
@@ -5119,6 +5195,20 @@ export class RetryQueue {
               })),
           }
         : {}),
+      // WR-97: activity-gated — the series appears only once a (tenant,
+      // endpoint) scope has actually denied, so an untouched relay's
+      // exposition is byte-identical.
+      ...(this.tenantRateLimiter !== undefined
+        ? {
+            tenantRateLimited: (this.getTenantRateLimitStats() ?? [])
+              .filter((s) => s.limited > 0)
+              .map((s) => ({
+                endpoint: s.endpoint,
+                ...(s.tenant === undefined ? {} : { tenant: s.tenant }),
+                limited: s.limited,
+              })),
+          }
+        : {}),
       // WR-83: enabled-gated — the OTLP series appear only when OTLP
       // export is configured, exactly like the probe series.
       ...(this.otlpExporter !== undefined
@@ -5342,6 +5432,64 @@ export class RetryQueue {
       }
     }
     return rows;
+  }
+
+  /**
+   * WR-97: intake-time admission check for `reject-429` mode. Returns
+   * `undefined` when per-tenant rate limiting is disabled or in `queue`
+   * mode — the caller then admits unconditionally. Otherwise consumes
+   * one token for (`tenant`, `endpoint`) and returns the verdict; a
+   * denial means the caller answers 429 with `retry-after`. The token is
+   * consumed at admission, so the dispatch path never re-checks in this
+   * mode: one delivery, one token.
+   */
+  admitTenantDelivery(
+    tenant: string | undefined,
+    endpoint: string
+  ): TenantRateLimitVerdict | undefined {
+    const limiter = this.tenantRateLimiter;
+    if (limiter === undefined || limiter.mode() !== "reject-429") return undefined;
+    return limiter.take(tenant, endpoint);
+  }
+
+  /**
+   * WR-97: record one rate-limit decision in OTLP as a `rate_limited`
+   * event (WR-83). No-op when OTLP export is off. Never throws — export
+   * must never break the admission or delivery path.
+   */
+  recordTenantRateLimitedEvent(input: {
+    eventId: string;
+    traceId: string;
+    tenant?: string;
+    endpoint: string;
+    retryAfterMs: number;
+  }): void {
+    const exporter = this.otlpExporter;
+    if (exporter === undefined) return;
+    try {
+      exporter.record({
+        eventType: "rate_limited",
+        eventId: input.eventId,
+        traceId: input.traceId,
+        endpoint: input.endpoint,
+        ...(input.tenant === undefined ? {} : { tenant: input.tenant }),
+        retryAfterMs: input.retryAfterMs,
+      });
+    } catch {
+      // Unreachable by contract (`record()` never throws) — the delivery
+      // path must never see an export throw.
+    }
+  }
+
+  /**
+   * WR-97: per-(tenant, endpoint) outbound rate-limit state — one row
+   * per scope that has taken at least once, in first-seen order, with
+   * the cumulative denial count (`limited`) and the override-resolved
+   * `burst` / `refillPerSecond`. `undefined` when the feature is
+   * disabled. Rows carry `tenant` only when set.
+   */
+  getTenantRateLimitStats(): TenantRateLimitStats[] | undefined {
+    return this.tenantRateLimiter?.stats();
   }
 
   /**

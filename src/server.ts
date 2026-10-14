@@ -38,6 +38,7 @@ import { DeliveryDeduplicator, type DedupOptions } from "./dedup.ts";
 import { UsageMeter, type UsageOptions } from "./usage.ts";
 import { buildHealthSummary } from "./health-summary.ts";
 import { InboundRateLimiter, type InboundRateLimitOptions } from "./ratelimit.ts";
+import type { TenantRateLimitOptions } from "./tenant-ratelimit.ts";
 import { InboundIpAcl, IpAclMetrics, type IpAclOptions } from "./ip-acl.ts";
 import { InboundApiKeyAuth, type ApiKeyOptions, type EndpointApiKeyRule } from "./api-key.ts";
 import {
@@ -994,6 +995,19 @@ export interface RelayServerOptions {
    * nothing. Disabled by default.
    */
   rateLimit?: InboundRateLimitOptions;
+  /**
+   * Per-(tenant, endpoint) outbound rate limiting (WR-97; see
+   * `src/tenant-ratelimit.ts` and `RetryQueueOptions.tenantRateLimit`).
+   * An explicit server-level value wins over the nested
+   * `retry.tenantRateLimit`; either way the queue owns the limiter. In
+   * `queue` mode (default) the limit is enforced at dispatch (over-limit
+   * attempts wait for the next token refill, never dropped); in
+   * `reject-429` mode it is enforced here at intake — an over-limit
+   * webhook is answered 429 with a `retry-after` header and audited as
+   * `rejected` with reason `rate_limited`, before it ever enters the
+   * queue. Disabled by default.
+   */
+  tenantRateLimit?: TenantRateLimitOptions;
   /** Inject queue hooks (e.g. to fail the server fast on dead letters). */
   /**
    * Seals dead-letter payloads at rest (see `RetryQueue` `payloadEncryptor`;
@@ -3104,6 +3118,11 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // WR-83: an explicit server-level `otlp` wins over the nested
     // `retry.otlp`; either way the queue owns the exporter.
     otlp: opts.otlp ?? opts.retry?.otlp,
+    // WR-97: an explicit server-level `tenantRateLimit` wins over the
+    // nested `retry.tenantRateLimit`; either way the queue owns the
+    // limiter (the intake consults it via `admitTenantDelivery()` in
+    // `reject-429` mode).
+    tenantRateLimit: opts.tenantRateLimit ?? opts.retry?.tenantRateLimit,
     // WR-85: shadow-target dry-run mirroring. `shadowTargets` (computed
     // above) wins over the nested `retry.shadowTargets`; either way the
     // queue owns the dispatcher. Wrap the caller's hooks so every
@@ -4558,6 +4577,11 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     tenantId?: string;
     /** The rejection must close the connection (413 flood protection). */
     closeConnection?: boolean;
+    /**
+     * WR-97: honest retry delay in ms for a 429 rejection — rendered as
+     * the `retry-after` response header (ceiling seconds, minimum 1).
+     */
+    retryAfterMs?: number;
   }
 
   /**
@@ -4954,6 +4978,48 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       return { status: 400, id, traceId, reason: "conflicting_schedule", detail: "x-deliver-at and x-schedule-cron are mutually exclusive" };
     }
 
+    // WR-97: per-(tenant, endpoint) outbound rate limiting, `reject-429`
+    // mode. The check runs against the content-route-resolved `targetUrl`
+    // (the same endpoint the dispatch path would pace) and after the
+    // dedup gate, so duplicates suppressed above consume no token — no
+    // new delivery will be attempted for them. On denial the webhook is
+    // answered 429 with `retry-after` (the WR-22 convention) and audited
+    // as `rejected` with reason `rate_limited`; the decision is also
+    // recorded to OTLP as a `rate_limited` event. The token is consumed
+    // now, at admission, so the dispatch path never re-checks in this
+    // mode. In `queue` mode (or when the feature is off)
+    // `admitTenantDelivery` returns undefined and admission proceeds.
+    // WR-80: a cron registration is an admission too — it consumes one
+    // token for the template; per-cycle minted deliveries are paced at
+    // dispatch in `queue` mode and not re-checked here.
+    const tenantVerdict = queue.admitTenantDelivery(tenantId, targetUrl);
+    if (tenantVerdict !== undefined && !tenantVerdict.ok) {
+      opts.auditLog.append({ ...correlation,
+        event: "rejected",
+        id,
+        traceId,
+        ...tenantLabel,
+        targetUrl,
+        reason: "rate_limited",
+        retryAfterMs: tenantVerdict.retryAfterMs,
+      });
+      queue.recordTenantRateLimitedEvent({
+        eventId: id,
+        traceId,
+        ...(tenantId === undefined ? {} : { tenant: tenantId }),
+        endpoint: targetUrl,
+        retryAfterMs: tenantVerdict.retryAfterMs,
+      });
+      return {
+        status: 429,
+        id,
+        traceId,
+        reason: "rate_limited",
+        detail: "Too many requests",
+        retryAfterMs: tenantVerdict.retryAfterMs,
+      };
+    }
+
     let scheduleId: string | undefined;
     let nextAt: number | undefined;
     if (cronSource !== undefined) {
@@ -5153,6 +5219,12 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     }
     const rejHeaders: Record<string, string> = { "content-type": "text/plain" };
     if (outcome.closeConnection === true) rejHeaders["connection"] = "close";
+    // WR-97: a 429 from per-tenant rate limiting carries the honest
+    // retry-after — ceiling seconds, minimum 1 (the WR-22 convention; a
+    // Retry-After of 0 is meaningless).
+    if (outcome.retryAfterMs !== undefined) {
+      rejHeaders["retry-after"] = String(Math.max(1, Math.ceil(outcome.retryAfterMs / 1000)));
+    }
     res.writeHead(outcome.status, rejHeaders).end(outcome.detail ?? "Rejected");
   };
 
@@ -5335,6 +5407,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       };
       if (outcome.reason !== undefined) result.reason = outcome.reason;
       if (outcome.detail !== undefined) result.detail = outcome.detail;
+      // WR-97: a 429'd batch item carries the honest retry delay in the
+      // per-item result (batch responses have no per-item headers).
+      if (outcome.retryAfterMs !== undefined) result.retryAfterMs = outcome.retryAfterMs;
       if (outcome.duplicate === true) result.duplicate = true;
       if (outcome.scheduledAt !== undefined) {
         result.scheduled = true;

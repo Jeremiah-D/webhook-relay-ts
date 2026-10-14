@@ -60,10 +60,10 @@
  *   or nothing was observed yet.
  * - `relay_otlp_exports_total{event_type,status}`: counter of delivery/SLO
  *   events exported to the OTLP collector (WR-83), by event type
- *   (`delivered` / `retrying` / `dead_letter` / `slo_missed`) and export
- *   outcome (`success` = collector answered 2xx, `failure` = a failed
- *   POST attempt). Present only when OTLP export is enabled
- *   (`RetryQueueOptions.otlp`).
+ *   (`delivered` / `retrying` / `dead_letter` / `slo_missed` /
+ *   `rate_limited` — WR-97) and export outcome (`success` = collector
+ *   answered 2xx, `failure` = a failed POST attempt). Present only when
+ *   OTLP export is enabled (`RetryQueueOptions.otlp`).
  * - `relay_otlp_buffered`: gauge of delivery/SLO events currently
  *   buffered for OTLP export. Present only when OTLP export is enabled.
  * - `relay_shadow_total{endpoint,shadow_target,result}`: counter of
@@ -76,6 +76,13 @@
  *   (tenant, endpoint) scope, with a `tenant` label when the scope is
  *   tenant-scoped. Activity-gated: present only for scopes that
  *   actually escalated — absent entirely when the feature is off.
+ * - `relay_tenant_ratelimited_total{endpoint,tenant}`: counter of
+ *   over-limit decisions (denials) by the per-(tenant, endpoint)
+ *   outbound rate limiter (WR-97) — every denied `take()`, in both
+ *   `queue` and `reject-429` modes. Activity-gated: present only for
+ *   scopes that actually denied — absent entirely when the feature is
+ *   off. The `tenant` label is omitted for the default tenant (the
+ *   WR-48 convention).
  *
  * Cardinality note: labels are per endpoint (`targetUrl`), so a relay
  * fanning out to many distinct downstream URLs grows the series count —
@@ -156,6 +163,19 @@ export interface AdaptiveConcurrencyMetricsInput {
   limit: number;
 }
 
+/**
+ * One (tenant, endpoint) scope's outbound rate-limit denials (WR-97), in
+ * Prometheus label order.
+ */
+export interface TenantRateLimitMetricsInput {
+  /** Downstream endpoint (physical `targetUrl` at dispatch). */
+  endpoint: string;
+  /** Tenant id (WR-48); when set it is rendered as a `tenant` label. */
+  tenant?: string;
+  /** Cumulative over-limit decisions (denials) for this scope. */
+  limited: number;
+}
+
 export interface MetricsInput {
   deliveries: DeliveryCountersInput[];
   circuits: CircuitStateInput[];
@@ -229,6 +249,13 @@ export interface MetricsInput {
    * exposition is byte-identical.
    */
   adaptiveConcurrency?: AdaptiveConcurrencyMetricsInput[];
+  /**
+   * Present only when per-tenant outbound rate limiting (WR-97) is
+   * enabled; one counter series per (tenant, endpoint) scope that
+   * actually denied — absent entirely when the feature is off, so an
+   * untouched relay's exposition is byte-identical.
+   */
+  tenantRateLimited?: TenantRateLimitMetricsInput[];
 }
 
 /** One endpoint's starvation-guard activation count, in Prometheus label order. */
@@ -321,7 +348,7 @@ export interface DeliveryDeadlineExceededInput {
  */
 export interface OtlpExportCountInput {
   /** Relay event type that was exported. */
-  eventType: "delivered" | "retrying" | "dead_letter" | "slo_missed";
+  eventType: "delivered" | "retrying" | "dead_letter" | "slo_missed" | "rate_limited";
   /** Export outcome: `success` = the collector answered 2xx. */
   status: "success" | "failure";
   /** Cumulative count for this (event_type, status) pair. */
@@ -374,6 +401,25 @@ export function renderAdaptiveConcurrencyBlock(series: AdaptiveConcurrencyMetric
   for (const s of series) {
     lines.push(
       `relay_adaptive_concurrency_limit{endpoint="${escapeLabelValue(s.endpoint)}"${tenantLabel(s.tenant)}} ${s.limit}`
+    );
+  }
+  return lines;
+}
+
+/**
+ * Render just the per-tenant outbound rate-limit denial block (WR-97) as
+ * exposition lines; `[]` when the series is empty, so callers can keep
+ * their output byte-identical until the first denial actually happens.
+ */
+export function renderTenantRateLimitedBlock(series: TenantRateLimitMetricsInput[]): string[] {
+  if (series.length === 0) return [];
+  const lines = [
+    "# HELP relay_tenant_ratelimited_total Over-limit decisions (denials) by the per-(tenant, endpoint) outbound rate limiter (WR-97), in queue and reject-429 modes.",
+    "# TYPE relay_tenant_ratelimited_total counter",
+  ];
+  for (const s of series) {
+    lines.push(
+      `relay_tenant_ratelimited_total{endpoint="${escapeLabelValue(s.endpoint)}"${tenantLabel(s.tenant)}} ${s.limited}`
     );
   }
   return lines;
@@ -529,6 +575,9 @@ export function renderPrometheus(input: MetricsInput): string {
   // WR-94: activity-gated the same way — the series appears only once an
   // adaptive outcome has been recorded for an endpoint.
   lines.push(...renderAdaptiveConcurrencyBlock(input.adaptiveConcurrency ?? []));
+  // WR-97: activity-gated the same way — the series appears only once a
+  // (tenant, endpoint) scope has actually been rate-limited.
+  lines.push(...renderTenantRateLimitedBlock(input.tenantRateLimited ?? []));
   // WR-76: activity-gated the same way — the series appears only once a
   // delivery deadline has actually expired.
   if (input.deliveryDeadlineExceeded !== undefined && input.deliveryDeadlineExceeded.length > 0) {
