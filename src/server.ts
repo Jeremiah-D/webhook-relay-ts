@@ -138,10 +138,11 @@ import {
 } from "./version.ts";
 import {
   assertValidEndpointSchemaRules,
+  InboundSchemaRegistry,
   SchemaMetrics,
-  selectEndpointSchema,
   type EndpointSchemaRule,
   type PayloadSchema,
+  type SchemaRegistration,
 } from "./schema.ts";
 import type { ProbeOptions } from "./downstream-probe.ts";
 import type { OtlpExporterOptions } from "./otlp.ts";
@@ -342,6 +343,15 @@ export interface RelayServerOptions {
    * `/v2/hooks/...` alike, since every version adapts into the current
    * schema before validation — then against the full inbound path, so
    * per-version rules (`/v1/admin/*`) still work.
+   *
+   * A rule may opt into the WR-96 compatibility corpus
+   * (`compatibilityCorpus`): manually registered sample payloads the
+   * endpoint accepted, and/or auto-accumulated accepted payloads
+   * (bounded). At registration the schema's validator is run against
+   * every corpus sample; a rejected or throwing sample fails the whole
+   * server startup with `RangeError` — and registering a *newer* schema
+   * version for the same pattern is gated the same way, leaving the
+   * currently serving version untouched on failure.
    */
   payloadSchemas?: EndpointSchemaRule[];
   /**
@@ -3473,6 +3483,12 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   const versionMetrics = new VersionMetrics();
   // Schema registry rules are validated once at startup for the same reason.
   assertValidEndpointSchemaRules(opts.payloadSchemas);
+  // WR-96: the schema registry compiles the rules once at startup —
+  // registration runs the opt-in compatibility gate (a failing gate is a
+  // startup RangeError, fail fast) and wires per-pattern auto-accumulated
+  // corpora that later registrations are gated against.
+  const schemaRegistry =
+    opts.payloadSchemas !== undefined ? new InboundSchemaRegistry(opts.payloadSchemas) : undefined;
   const schemaMetrics = new SchemaMetrics();
   const deduplicator = opts.dedup ? new DeliveryDeduplicator(opts.dedup) : undefined;
   const rateLimiter = opts.rateLimit ? new InboundRateLimiter(opts.rateLimit) : undefined;
@@ -3750,7 +3766,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       // configured, keeping the output byte-identical to the legacy shape.
       res
         .writeHead(200, { "content-type": "text/plain; version=0.0.4" })
-        .end(queue.renderMetrics() + versionMetrics.render() + schemaMetrics.render() + ipAclMetrics.render() + certExpiryMonitor.render() + tlsVersionMonitor.render() + (usageMeter?.render() ?? "") + (defaultSender?.compressionStats.render() ?? "") + (defaultSender?.dnsCache?.render() ?? ""));
+        .end(queue.renderMetrics() + versionMetrics.render() + schemaMetrics.render() + (schemaRegistry?.renderMetrics() ?? "") + ipAclMetrics.render() + certExpiryMonitor.render() + tlsVersionMonitor.render() + (usageMeter?.render() ?? "") + (defaultSender?.compressionStats.render() ?? "") + (defaultSender?.dnsCache?.render() ?? ""));
       return;
     }
     if (isEvents) {
@@ -4754,7 +4770,12 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // validate JSON — a non-JSON body fails validation — and a throwing
     // validator is fail-closed (rejected, never admitted).
     let schema: PayloadSchema | undefined;
-    if (opts.payloadSchemas !== undefined) {
+    // WR-96: the active registry registration (for corpus auto-accumulate
+    // bookkeeping) and the parsed adapted payload it validated — both
+    // recorded into the corpus only when the request is accepted below.
+    let schemaRegistration: SchemaRegistration | undefined;
+    let schemaPayload: unknown;
+    if (opts.payloadSchemas !== undefined && schemaRegistry !== undefined) {
       // Compose with WR-33 version routing (see `src/version.ts`): when a
       // version route matched, the schema rule is first tried against the
       // endpoint path with the version prefix stripped — one `/hooks/*`
@@ -4765,13 +4786,12 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       // work. Unversioned requests match against the path as-is.
       const strippedPath =
         versionRoute === undefined ? pathname : pathname.slice(versionRoute.prefix.length) || "/";
-      const rule =
-        selectEndpointSchema(strippedPath, opts.payloadSchemas) ??
-        (strippedPath === pathname
-          ? undefined
-          : selectEndpointSchema(pathname, opts.payloadSchemas));
-      if (rule !== undefined) {
-        schema = rule.schema;
+      const registration =
+        schemaRegistry.select(strippedPath) ??
+        (strippedPath === pathname ? undefined : schemaRegistry.select(pathname));
+      if (registration !== undefined) {
+        schema = registration.schema;
+        schemaRegistration = registration;
         let payload: unknown;
         let parseError: string | undefined;
         try {
@@ -4779,6 +4799,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         } catch {
           parseError = "body is not valid JSON";
         }
+        schemaPayload = payload;
         let errors: string[] | undefined;
         if (parseError !== undefined) {
           errors = [parseError];
@@ -4983,6 +5004,13 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // "rejected" at the gate above.
     if (schema !== undefined) {
       schemaMetrics.record(schema.name, "accepted");
+      // WR-96: feed the opt-in compatibility corpus — accepted payloads
+      // only, so a later schema registration for the same pattern is
+      // gated against shapes the current schema really admitted. A no-op
+      // unless the rule opted into `accumulate`.
+      if (schemaRegistration !== undefined) {
+        schemaRegistry?.noteAcceptedPayload(schemaRegistration, schemaPayload);
+      }
     }
     const acceptedEvent: Record<string, unknown> = { ...correlation,
       event: "accepted",

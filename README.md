@@ -98,7 +98,19 @@ reliability primitives that matter for any signed-payload pipeline.
   `relay_inbound_schema_total{schema,status}`. Ships a minimal built-in
   `createRequiredFieldsSchema(name, version, fields)` for the common
   required-fields gate; bring your own `PayloadSchema` for types, enums,
-  or ranges. Invalid rules throw `RangeError` at startup.
+  or ranges. Invalid rules throw `RangeError` at startup. The opt-in
+  WR-96 compatibility gate (`compatibilityCorpus` on a rule) guards
+  schema evolution: manually registered sample payloads the endpoint
+  historically accepted, and/or auto-accumulated accepted payloads
+  (bounded, oldest-first eviction), are all run through the new
+  validator at registration time — any rejected or throwing sample fails
+  registration with `RangeError` and registers nothing, leaving the
+  currently serving schema for the pattern untouched (EB-95 convention);
+  registering a newer schema version for the same pattern is gated the
+  same way, against samples accumulated while older versions served.
+  Per-schema gate results (`'passed'` / `'not-tested'`) and corpus sizes
+  are exposed via `InboundSchemaRegistry.getStats()` and on `/metrics`
+  (`relay_inbound_schema_compat_gate`, `relay_inbound_schema_corpus_size`).
 - `src/retry.ts` — `RetryQueue` with exponential backoff (`base * 2^attempt`)
   plus jitter, a `maxDelay` cap, a dead-letter list after `maxAttempts`, and an
   injectable sender/timer for deterministic testing. Jitter is configurable:
