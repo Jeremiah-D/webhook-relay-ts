@@ -52,6 +52,12 @@ export interface OtlpRecordInput {
   sloMs?: number;
   /** Observed accepted→delivered latency in ms (`slo_missed` only). */
   latencyMs?: number;
+  /**
+   * WR-95: the phase that dominated the delivery's latency
+   * (`slo_missed` only). Set only when phase tracking is enabled and a
+   * phase was measurable.
+   */
+  dominantPhase?: string;
 }
 
 /** Opt-in OTLP export, embedded in `RetryQueueOptions`. */
@@ -170,6 +176,7 @@ export function buildOtlpPayload(
     if (r.error !== undefined) attributes.push(attr("relay.error", r.error));
     if (r.sloMs !== undefined) attributes.push(intAttr("relay.slo_ms", r.sloMs));
     if (r.latencyMs !== undefined) attributes.push(intAttr("relay.latency_ms", r.latencyMs));
+    if (r.dominantPhase !== undefined) attributes.push(attr("relay.dominant_phase", r.dominantPhase));
     return {
       timeUnixNano: nowNano,
       observedTimeUnixNano: nowNano,

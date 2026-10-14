@@ -82,6 +82,14 @@ import {
   type AdaptiveConcurrencyOptions,
 } from "./adaptive-concurrency.ts";
 import {
+  LatencyPhasesTracker,
+  dominantPhaseOf,
+  type EndpointLatencyPhaseStats,
+  type LatencyPhaseName,
+  type LatencyPhaseOptions,
+  type PhaseDurationsMs,
+} from "./latency-phases.ts";
+import {
   BatchCollector,
   newBatchId,
   resolveBatchOptions,
@@ -224,6 +232,17 @@ export {
   DEFAULT_ADAPTIVE_FAILURE_RATE_THRESHOLD,
   DEFAULT_ADAPTIVE_WINDOW_SIZE,
 } from "./adaptive-concurrency.ts";
+export type {
+  LatencyPhaseName,
+  LatencyPhaseOptions,
+  EndpointLatencyPhaseStats,
+  PhaseDurationsMs,
+} from "./latency-phases.ts";
+export {
+  LatencyPhasesTracker,
+  dominantPhaseOf,
+  LATENCY_PHASES,
+} from "./latency-phases.ts";
 export type { BatchEnvelopeInput, BatchOptions };
 export type { AutoReplayOptions, DeadLetterAutoReplayAuditEvent };
 export type {
@@ -411,6 +430,18 @@ export interface SloMissInfo {
   endpoint: string;
   latencyMs: number;
   sloMs: number;
+  /**
+   * WR-95: the phase that dominated this delivery's latency (largest
+   * measured phase duration). Absent when phase tracking is disabled or
+   * no phase could be measured — never fabricated.
+   */
+  dominantPhase?: LatencyPhaseName;
+  /**
+   * WR-95: the measured phase breakdown for this delivery (only phases
+   * the sender could measure). Absent under the same conditions as
+   * `dominantPhase`.
+   */
+  phaseBreakdown?: PhaseDurationsMs;
 }
 
 /** {@link LatencyTrackerOptions} plus the SLO-miss hook and the SLO-risk predictor. */
@@ -547,6 +578,14 @@ export interface DownstreamResponse {
    * `clientCertId` on the `delivered` / `dead_letter` audit events.
    */
   clientCertId?: string;
+  /**
+   * WR-95: per-phase delivery timing measured by the sender
+   * (dns/connect/tls/firstByte/body, in ms). A phase the sender could not
+   * measure is absent — "unavailable", never fabricated (see
+   * `src/latency-phases.ts` for the measurability rules per transport).
+   * Unset for custom senders, which never measure phases.
+   */
+  phases?: PhaseDurationsMs;
 }
 
 /**
@@ -1051,6 +1090,17 @@ export interface RetryQueueOptions {
    * than `sloMs`. Disabled by default.
    */
   latency?: LatencyOptions;
+  /**
+   * Delivery-latency phase breakdown (WR-95; see
+   * `src/latency-phases.ts`). When set, the queue records per-phase
+   * samples (dns/connect/tls/firstByte/body, as measured by the sender)
+   * into per-endpoint rolling windows and attributes the dominant phase
+   * on every WR-13 SLO miss. Unavailable phases are never fabricated —
+   * the sender reports only what it could measure. Disabled by default
+   * (absent = zero phase bookkeeping). Invalid values throw `RangeError`
+   * at construction.
+   */
+  latencyPhases?: LatencyPhaseOptions;
   /**
    * Per-endpoint delivery quota (see `src/quota.ts`). When set, each send
    * attempt costs one token from the endpoint's per-minute bucket; an
@@ -2180,6 +2230,10 @@ export class RetryQueue {
   private readonly adaptiveConcurrencyOpts?: AdaptiveConcurrencyOptions;
   /** WR-94: per-tenant adaptive concurrency controllers (WR-48 scoping). */
   private readonly adaptiveConcurrencies = new Map<string, AdaptiveConcurrencyController>();
+  /** WR-95: latency phase options; undefined when disabled. */
+  private readonly latencyPhasesOpts?: LatencyPhaseOptions;
+  /** WR-95: per-tenant latency phase trackers (WR-48 scoping). */
+  private readonly latencyPhaseTrackers = new Map<string, LatencyPhasesTracker>();
   private readonly onRetryBudgetDepleted?: (info: RetryBudgetDepletedInfo) => void;
   private readonly onAttemptFailed?: (info: AttemptFailedInfo) => void;
   /** Retries parked because the global retry budget was exhausted. */
@@ -2560,6 +2614,9 @@ export class RetryQueue {
             tenant: info.tenant,
             sloMs: info.sloMs,
             latencyMs: info.latencyMs,
+            // WR-95: the dominant latency phase, when phase tracking is
+            // enabled and a phase was measurable.
+            dominantPhase: info.dominantPhase,
           });
         } catch {
           // Same contract as above: export never breaks the hook path.
@@ -2632,6 +2689,12 @@ export class RetryQueue {
     this.adaptiveConcurrencyOpts = opts.adaptiveConcurrency;
     if (opts.adaptiveConcurrency !== undefined) {
       this.adaptiveConcurrencyFor(undefined);
+    }
+    // WR-95: opt-in latency phase tracking. Same eager-default/lazy-tenant
+    // pattern: invalid options throw at construction.
+    this.latencyPhasesOpts = opts.latencyPhases;
+    if (opts.latencyPhases !== undefined) {
+      this.latencyPhasesFor(undefined);
     }
     this.onAttemptFailed = opts.onAttemptFailed;
     this.onBatch = opts.onBatch;
@@ -2911,6 +2974,20 @@ export class RetryQueue {
   }
 
   /**
+   * WR-95: the calling tenant's latency phase tracker; `undefined` when
+   * phase tracking is off.
+   */
+  private latencyPhasesFor(tenant: string | undefined): LatencyPhasesTracker | undefined {
+    if (this.latencyPhasesOpts === undefined) return undefined;
+    const key = tenantInstanceKey(tenant);
+    let t = this.latencyPhaseTrackers.get(key);
+    if (t === undefined) {
+      t = new LatencyPhasesTracker(this.latencyPhasesOpts);
+      this.latencyPhaseTrackers.set(key, t);
+    }
+    return t;
+  }
+
   /**
    * WR-48: default-tenant views of the per-tenant instances, preserving the
    * pre-tenant private field names (`breaker`, `quota`, `limiter`,
@@ -2934,6 +3011,9 @@ export class RetryQueue {
   }
   private get adaptiveConcurrency(): AdaptiveConcurrencyController | undefined {
     return this.adaptiveConcurrencyFor(undefined);
+  }
+  private get latencyPhases(): LatencyPhasesTracker | undefined {
+    return this.latencyPhasesFor(undefined);
   }
 
   private recordQuotaStat(tenant: string | undefined, endpoint: string): void {
@@ -4344,7 +4424,23 @@ export class RetryQueue {
           // WR-48: the histogram is per (tenant, endpoint).
           this.recordLatencySample(tenant, target, latencyMs);
         }
+        // WR-95: record this delivery's measured phase breakdown.
+        // Leader-only, like the other control-plane verdicts above — one
+        // physical attempt, one phase sample.
+        if (attemptLeads && response !== undefined && response.phases !== undefined) {
+          this.latencyPhasesFor(tenant)?.recordPhases(target, response.phases);
+        }
         if (latencyMs !== undefined && latency && latencyMs > latency.sloMs) {
+          // WR-95: attribute the miss to the phase that dominated this
+          // delivery's latency. Prefer this delivery's own measured
+          // breakdown; fall back to the endpoint's recent phase
+          // distribution (e.g. when this attempt rode a coalesced
+          // leader's physical request).
+          const phaseBreakdown =
+            attemptLeads && response !== undefined ? response.phases : undefined;
+          const phasesTracker = this.latencyPhasesFor(tenant);
+          const dominantPhase =
+            dominantPhaseOf(phaseBreakdown) ?? phasesTracker?.dominantPhase(target);
           this.onSloMiss?.({
             id: entry.id,
             traceId,
@@ -4352,6 +4448,8 @@ export class RetryQueue {
             endpoint: target,
             latencyMs,
             sloMs: latency.sloMs,
+            ...(dominantPhase === undefined ? {} : { dominantPhase }),
+            ...(phaseBreakdown === undefined ? {} : { phaseBreakdown }),
           });
         }
         // WR-71: one sample landed and the backlog shrank — re-evaluate
@@ -5296,6 +5394,22 @@ export class RetryQueue {
   }
 
   /**
+   * WR-95: per-(tenant, endpoint) latency phase distributions (p50/p95
+   * per measurable phase over the rolling window). `undefined` when
+   * phase tracking is disabled. Rows carry `tenant` only when set.
+   */
+  getLatencyPhaseStats(): EndpointLatencyPhaseStats[] | undefined {
+    if (this.latencyPhasesOpts === undefined) return undefined;
+    const rows: EndpointLatencyPhaseStats[] = [];
+    for (const [tenantKey, tracker] of this.latencyPhaseTrackers) {
+      const tenant = tenantKey === "" ? undefined : tenantKey;
+      for (const row of tracker.stats()) {
+        rows.push(tenant === undefined ? row : { ...row, tenant });
+      }
+    }
+    return rows;
+  }
+
   /** Durable delivery queue (WR-49) snapshot. */
   getDurableQueueStats(): DurableQueueStats {
     return {

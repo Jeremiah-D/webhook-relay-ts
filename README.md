@@ -185,6 +185,21 @@ reliability primitives that matter for any signed-payload pipeline.
   rate (`withinSlo / count` against `sloMs`, default 5000ms). Deliveries
   slower than the budget fire `onSloMiss` and are audited as `slo_missed`.
   The clock is injectable for deterministic tests.
+- `src/latency-phases.ts` — delivery-latency phase breakdown
+  (`LatencyPhasesTracker`), opt-in under `retry.latencyPhases` (disabled by
+  default, zero overhead). The sender decomposes each delivery into
+  dns/connect/tls/firstByte/body phases (HTTP/1.1 path; `createRelayServer`
+  enables measurement exactly when the option is set) and the queue samples
+  them into bounded per-endpoint rolling windows (nearest-rank p50/p95,
+  WR-13 convention). A phase the sender could not measure is reported as
+  *unavailable* — never fabricated: DNS is never attributable per-request
+  (it resolves inside the connection machinery), connect/TLS need a fresh
+  direct socket (pooled reuse and proxied tunnels report unavailable), and
+  H2/WebSocket paths report all phases unavailable. On every SLO miss the
+  dominant phase (largest measured duration) is attributed into the
+  `slo_missed` audit event (`dominantPhase` + `phaseBreakdown`) and the
+  OTLP `slo_missed` record. `getLatencyPhaseStats()` exposes the
+  per-endpoint phase distributions.
 - `src/slo-risk.ts` — SLO-breach prediction and early warning
   (`SloRiskPredictor`), opt-in under `retry.latency.sloRisk` (disabled by
   default). Every `enqueue` and every delivered sample feeds a per-endpoint
@@ -1999,7 +2014,10 @@ written to the audit log, so the log is the machine's trace.
   *Downstream response summary* below). When latency tracking is enabled
   (`retry.latency`), the accepted→delivered delay is sampled into the
   endpoint's distribution, and a delivery slower than `sloMs` is additionally
-  audited as `slo_missed` with the measured `latencyMs`.
+  audited as `slo_missed` with the measured `latencyMs`; when phase
+  tracking is also enabled (`retry.latencyPhases`), the miss is attributed
+  to the dominant latency phase (`dominantPhase` + `phaseBreakdown`, see
+  *Delivery-latency phase breakdown* above).
 - `delivering` → **`retrying`** when the attempt fails (non-2xx, timeout,
   or connection error). The next attempt is scheduled after
   `baseDelayMs * 2^attempt` plus jitter, capped at `maxDelayMs`, then the

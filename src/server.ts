@@ -15,6 +15,7 @@ import {
 import { RetryQueue, type DeliveryPriority, type DownstreamResponse, type RetryItem, type Sender } from "./retry.ts";
 import { parseDeliverAtHeader, DELIVER_AT_HEADER } from "./retry.ts";
 import type { ShadowDeliveredInfo, ShadowFailedInfo, ShadowTargetConfig, ShadowTargetsConfig } from "./retry.ts";
+import type { PhaseDurationsMs } from "./retry.ts";
 import { parseCronExpression, CRON_HEADER } from "./cron.ts";
 import type { CompletionCallbackOptions } from "./callback.ts";
 import { createBoundAddressSelfCheck } from "./callback.ts";
@@ -1299,7 +1300,15 @@ export function createDefaultSender(
    * `GET /metrics` via `PooledSender.dnsCache.render()`. `undefined`
    * keeps the OS-resolver behavior. Validated at startup.
    */
-  dnsCache?: DnsCache | DnsCacheOptions
+  dnsCache?: DnsCache | DnsCacheOptions,
+  /**
+   * WR-95: measure per-phase delivery timing (dns/connect/tls/firstByte/
+   * body) on the HTTP/1.1 path and attach it as `phases` on the resolved
+   * `DownstreamResponse`. Off by default — zero measurement overhead when
+   * unset. `createRelayServer` enables it exactly when
+   * `retry.latencyPhases` is configured.
+   */
+  measureLatencyPhases?: boolean
 ): PooledSender {
   if (tlsPins !== undefined) {
     for (const [endpoint, pins] of Object.entries(tlsPins)) {
@@ -1901,11 +1910,31 @@ export function createDefaultSender(
                   body = decoded.body;
                   contentEncoding = decoded.contentEncoding;
                 }
+                // WR-95: phase breakdown for this attempt. `firstByteMs` is
+                // the WR-54 TTFB — on a fresh connection it overlaps
+                // connectMs/tlsMs by construction (documented, not
+                // hidden). `bodyMs` runs first-bytes → response end.
+                // Phases that could not be measured are absent
+                // ("unavailable"), never fabricated.
+                const phases: PhaseDurationsMs | undefined =
+                  measureLatencyPhases === true
+                    ? {
+                        ...(connectAtMs !== undefined
+                          ? { connectMs: Math.max(0, connectAtMs - requestIssuedMs) }
+                          : {}),
+                        ...(tlsAtMs !== undefined && connectAtMs !== undefined
+                          ? { tlsMs: Math.max(0, tlsAtMs - connectAtMs) }
+                          : {}),
+                        firstByteMs: timeToFirstByteMs,
+                        bodyMs: Math.max(0, Date.now() - (requestIssuedMs + timeToFirstByteMs)),
+                      }
+                    : undefined;
                 resolve({
                   statusCode,
                   body,
                   truncated,
                   timeToFirstByteMs,
+                  ...(phases !== undefined ? { phases } : {}),
                   ...(contentEncoding !== undefined ? { contentEncoding } : {}),
                   // WR-89: the rotation certificate id that authenticated
                   // this delivery — copied into `response_summary` and
@@ -1988,6 +2017,31 @@ export function createDefaultSender(
                 onResponse
               );
         req.on("error", reject);
+
+        // WR-95: per-phase delivery timing (opt-in via
+        // `measureLatencyPhases`, which `createRelayServer` enables exactly
+        // when `retry.latencyPhases` is configured). Only a fresh direct
+        // socket can report connect/TLS: a reused pooled socket was
+        // connected long ago, and a proxied tunnel's TCP/TLS belong to the
+        // proxy leg — both report those phases as unavailable, never
+        // fabricated. DNS is never attributable per-request (resolution
+        // happens inside the connection machinery, often served from the
+        // WR-92 cache), so `dnsMs` is unset by design.
+        let connectAtMs: number | undefined;
+        let tlsAtMs: number | undefined;
+        if (measureLatencyPhases === true && proxyUrl === undefined) {
+          req.on("socket", (socket) => {
+            if (!socket.connecting) return;
+            socket.once("connect", () => {
+              connectAtMs = Date.now();
+            });
+            if (url.protocol === "https:") {
+              socket.once("secureConnect", () => {
+                tlsAtMs = Date.now();
+              });
+            }
+          });
+        }
 
         if (pool && agent) {
           req.on("socket", (socket) => pool.noteSocket(agent, socket));
@@ -2850,7 +2904,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   }
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache)
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined)
       : undefined;
   // WR-50: endpoints the operator may pause/resume over HTTP. The server
   // only ever delivers to these — the intake target plus every
@@ -2954,7 +3008,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
                   undefined,
                   // WR-92: shadow senders share the relay's DNS cache
                   // instance — one counter set for main + shadow traffic.
-                  sharedDnsCache
+                  sharedDnsCache,
+                  // WR-95: same phase-measurement gate as the main sender.
+                  opts.retry?.latencyPhases !== undefined
                 ),
               })
             ),
