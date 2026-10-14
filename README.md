@@ -1800,6 +1800,59 @@ Do not point the sink at this relay's own intake: forwarded events
 carry no valid webhook signature, each rejection audits a new line, and
 the sink would chase its own tail.
 
+## In-flight request coalescing (opt-in)
+
+When a burst of deliveries carries the identical logical request — same
+tenant, same physical `targetUrl`, same payload bytes — and their
+attempts overlap in time, the relay sends **one** physical request
+instead of N (`src/coalesce.ts`). The first delivery's attempt is the
+*leader*; the rest *attach* to it and settle with its outcome (response
+or error). This is the retry-storm case: a fan-out retry wave or a
+replayed dead-letter batch must not bombard the downstream N times for
+one logical request.
+
+```ts
+const queue = new RetryQueue({
+  sender,
+  coalesce: true,                    // or { maxFollowers: 512 }
+});
+```
+
+- **Independent books** — every member still runs its own delivery
+  bookkeeping: its own audit events, its own `relay_deliveries_total`
+  counter, its own accepted→delivered latency sample, its own attempt
+  counter and retry schedule. The downstream is hit once; the relay's
+  books still show N deliveries.
+- **Honest control plane** — the circuit breaker, failover / weighted
+  routing, and adaptive backoff are recorded **once per physical
+  attempt, by the leader**. N followers recording the same failure would
+  trip the circuit N× faster than the downstream actually failed. A
+  follower that was granted a half-open probe permit releases it via
+  `cancelProbe` the moment it learns it is a follower (the breaker's
+  settle-exactly-once contract).
+- **Cancellation isolation** — the physical attempt is owned by the
+  coalescer, never by a member. A delivery that never reaches the sender
+  never joins; a joined member always rides the attempt to settlement.
+  Cancelling one delivery cannot cancel or poison the merged attempt for
+  the others.
+- **Tenant boundary** — the coalescing key includes the tenant id, so
+  one tenant's deliveries never ride another tenant's attempt (the WR-48
+  isolation invariant; breaker attribution stays inside the tenant).
+- **Bounded** — `maxFollowers` (default `Infinity`) caps how many
+  deliveries may ride one attempt; overflow starts its own physical
+  attempt instead of joining. Never drops, never waits.
+- **Combinations** — coalescing wraps the fully composed sender, so the
+  merged attempt is the one that checks out a WR-24 keep-alive pooled
+  connection (N logical deliveries, one socket); the WR-21 pin check runs
+  on the physical attempt's TLS handshake before any payload byte, so
+  followers' bytes only ever travel over a pin-verified socket.
+- **Observability** — `queue.getCoalesceStats()` returns
+  `{ physicalAttempts, mergedDeliveries, inFlightKeys }`
+  (`undefined` when disabled).
+- **Fail-fast** — an invalid `maxFollowers` throws `RangeError` at
+  construction. Disabled by default: `coalesce: false` (or absent) keeps
+  one physical attempt per delivery, exactly the pre-WR-91 behavior.
+
 ## Delivery lifecycle
 
 Every accepted webhook walks the same state machine; each transition is

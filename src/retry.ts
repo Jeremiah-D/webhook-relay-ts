@@ -93,6 +93,11 @@ import {
   type CompletionReceipt,
   type TerminalDeliveryState,
 } from "./callback.ts";
+import {
+  OutboundCoalescer,
+  type CoalesceStats,
+  type CoalescingOptions,
+} from "./coalesce.ts";
 import { TENANT_ID_HEADER, assertValidTenantId, tenantScopeKey, splitTenantScopeKey } from "./tenant.ts";
 import { newTraceId, TRACE_ID_HEADER } from "./trace.ts";
 import { QueueJournal, type CompactItem, type QueueRestoredInfo } from "./durable-queue.ts";
@@ -186,6 +191,8 @@ export type {
 };
 export { DeadLetterRetentionSweeper, resolveRetentionTtl };
 export type { OtlpExporterOptions, OtlpStats } from "./otlp.ts";
+export { OutboundCoalescer, coalesceKey } from "./coalesce.ts";
+export type { CoalesceStats, CoalescingOptions } from "./coalesce.ts";
 
 /**
  * Delivery priority of an item.
@@ -808,6 +815,21 @@ export class DeliveryDeadlineExceededError extends Error {
 export interface RetryQueueOptions {
   /** Sender function; defaults to a no-op success sender. Injectable for tests. */
   sender?: Sender;
+  /**
+   * WR-91: in-flight outbound request coalescing (see `src/coalesce.ts`).
+   * When enabled, concurrent attempts carrying the identical logical
+   * request — same tenant, same physical `targetUrl`, same payload
+   * bytes — merge into a single physical outbound attempt: the first
+   * delivery sends, the rest attach to its outcome. Every member still
+   * gets its own audit events, delivery counters, latency sample, and
+   * retry schedule; only the downstream-facing control plane (circuit
+   * breaker, failover/weighted routing, adaptive backoff) is recorded
+   * once, by the leader. `true` enables with defaults, an options
+   * object tunes it; `false`/absent (default) keeps the pre-WR-91
+   * behavior where every delivery is its own attempt. Invalid values
+   * throw `RangeError` at construction.
+   */
+  coalesce?: boolean | CoalescingOptions;
   /** Base delay in ms for the exponential backoff. Default: 1000. Must be > 0. */
   baseDelayMs?: number;
   /** Maximum delay in ms between attempts. Default: 60000. Must be > 0. */
@@ -1876,6 +1898,12 @@ export class LaneScheduler {
 export class RetryQueue {
   private readonly sender: Sender;
   /**
+   * WR-91: in-flight request coalescer, wrapping `sender` when the
+   * `coalesce` option is enabled. `undefined` = every delivery is its
+   * own physical attempt (pre-WR-91 behavior).
+   */
+  private readonly coalescer?: OutboundCoalescer;
+  /**
    * Backoff parameters are deliberately *not* readonly: WR-32 hot reload
    * retunes them at runtime. `delayForAttempt` reads them at schedule
    * time, so retries scheduled before an update keep their old delay and
@@ -2174,6 +2202,18 @@ export class RetryQueue {
 
   constructor(opts: RetryQueueOptions = {}) {
     this.sender = opts.sender ?? noopSender;
+    // WR-91: in-flight request coalescing (see `src/coalesce.ts`). The
+    // wrapper is installed here, before the shadow dispatcher captures
+    // the sender below, so shadow mirrors go through the same coalescing —
+    // keyed by their own (shadow) targetUrl, so they never merge with
+    // main-path attempts. `false`/absent keeps the exact pre-WR-91
+    // behavior; invalid options throw here, at construction.
+    if (opts.coalesce === undefined || opts.coalesce === false) {
+      this.coalescer = undefined;
+    } else {
+      this.coalescer = new OutboundCoalescer(opts.coalesce === true ? {} : opts.coalesce);
+      this.sender = this.coalescer.wrap(this.sender);
+    }
     this.baseDelayMs = opts.baseDelayMs ?? 1000;
     this.maxDelayMs = opts.maxDelayMs ?? 60000;
     this.maxAttempts = opts.maxAttempts ?? 5;
@@ -4023,10 +4063,33 @@ export class RetryQueue {
         // bookkeeping or the main delivery counters.
         this.shadow?.mirror(logicalEndpoint, wireCopy, tenant, traceId, entry.attempt + 1);
       };
+      // WR-91: whether this attempt led the physical outbound request
+      // (true) or rode another delivery's in-flight attempt (false).
+      // Declared outside the try on purpose: Node v24 (V8) has a scope
+      // bug where a `const` declared inside a `try` block is invisible in
+      // its `catch`/`finally` (ReferenceError, not TDZ) — the catch below
+      // reads this flag, so it must be hoisted (same reason as
+      // `releaseGlobalSlot` above).
+      let attemptLeads = true;
       try {
         // Pinned copy: the sender sees the physical target chosen above,
         // so a failover switch mid-flight cannot reroute this attempt.
-        const response = await this.sender(wireCopy);
+        // WR-91: the coalescing wrapper (when enabled) decides
+        // leader/follower synchronously inside the sender call and
+        // records it on the wire copy before the promise is returned, so
+        // the flag is already set when it is read below.
+        const sendPromise = this.sender(wireCopy);
+        attemptLeads = this.coalescer?.wasLeader(wireCopy) ?? true;
+        if (!attemptLeads && probe) {
+          // A follower never records a breaker outcome — the leader owns
+          // the physical attempt's verdict — so a granted half-open probe
+          // permit would dangle unsettled: release it now. `cancelProbe`
+          // is the breaker's exactly-once "the probe never ran"
+          // settlement, keeping the settle-exactly-once contract intact.
+          breaker?.cancelProbe(target);
+          probe = false;
+        }
+        const response = await sendPromise;
         // WR-85: the main attempt completed — mirror the wire copy to
         // the shadow targets.
         mirrorShadow();
@@ -4070,15 +4133,20 @@ export class RetryQueue {
             );
           }
         }
-        breaker?.recordSuccess(target);
-        // WR-59: a delivered attempt cools the endpoint's adaptive base
-        // toward the floor.
-        this.adaptiveBackoffFor(tenant)?.recordOutcome(target, true);
-        this.failover?.recordOutcome(logicalEndpoint, target, true);
-        // WR-66: an answering target is a healthy target — same rule as
-        // failover; non_retryable delivery outcomes feed both routers so
-        // their per-target health counters agree.
-        this.weighted?.recordOutcome(logicalEndpoint, target, true);
+        // WR-91: only the leader records the downstream-facing control
+        // plane — one physical attempt, one breaker verdict. Followers
+        // keep their own audit/counters/latency below, untouched.
+        if (attemptLeads) {
+          breaker?.recordSuccess(target);
+          // WR-59: a delivered attempt cools the endpoint's adaptive base
+          // toward the floor.
+          this.adaptiveBackoffFor(tenant)?.recordOutcome(target, true);
+          this.failover?.recordOutcome(logicalEndpoint, target, true);
+          // WR-66: an answering target is a healthy target — same rule as
+          // failover; non_retryable delivery outcomes feed both routers so
+          // their per-target health counters agree.
+          this.weighted?.recordOutcome(logicalEndpoint, target, true);
+        }
         // WR-49: journal before the in-memory delete — a crash between the
         // two redelivers (at-least-once), never loses.
         if (this.durable !== undefined) {
@@ -4165,23 +4233,33 @@ export class RetryQueue {
           // settles a half-open probe exactly once, as the breaker
           // requires). Failover agrees: an answering target is a healthy
           // target.
-          breaker?.recordSuccess(target);
-          // WR-59: the downstream answered (poison payload, not a sick
-          // endpoint) — cools the adaptive base like any success.
-          this.adaptiveBackoffFor(tenant)?.recordOutcome(target, true);
-          this.failover?.recordOutcome(logicalEndpoint, target, true);
-          this.weighted?.recordOutcome(logicalEndpoint, target, true);
+          // WR-91: leader-only, like the success path above — a follower's
+          // poison-payload verdict is logical (its own dead letter), not
+          // a second physical observation of the endpoint.
+          if (attemptLeads) {
+            breaker?.recordSuccess(target);
+            // WR-59: the downstream answered (poison payload, not a sick
+            // endpoint) — cools the adaptive base like any success.
+            this.adaptiveBackoffFor(tenant)?.recordOutcome(target, true);
+            this.failover?.recordOutcome(logicalEndpoint, target, true);
+            this.weighted?.recordOutcome(logicalEndpoint, target, true);
+          }
           this.recordDelivery(tenant, target, "failed");
           entry.attempt += 1;
           this.moveToDeadLetter(entry, id, err, classified, at, traceId, target);
           return;
         }
-        breaker?.recordFailure(target);
-        // WR-59: a retryable failure heats the endpoint's adaptive base
-        // toward the ceiling.
-        this.adaptiveBackoffFor(tenant)?.recordOutcome(target, false);
-        this.failover?.recordOutcome(logicalEndpoint, target, false);
-        this.weighted?.recordOutcome(logicalEndpoint, target, false);
+        // WR-91: leader-only — one physical failure, one breaker event.
+        // N followers recording the same failure would trip the circuit
+        // N× faster than the downstream actually failed.
+        if (attemptLeads) {
+          breaker?.recordFailure(target);
+          // WR-59: a retryable failure heats the endpoint's adaptive base
+          // toward the ceiling.
+          this.adaptiveBackoffFor(tenant)?.recordOutcome(target, false);
+          this.failover?.recordOutcome(logicalEndpoint, target, false);
+          this.weighted?.recordOutcome(logicalEndpoint, target, false);
+        }
         this.recordDelivery(tenant, target, "failed");
         entry.attempt += 1;
         if (entry.attempt >= this.maxAttempts) {
@@ -4436,6 +4514,14 @@ export class RetryQueue {
    */
   getUrgentStats(): UrgentStats[] {
     return [...this.urgentStats.entries()].map(([endpoint, s]) => ({ endpoint, ...s }));
+  }
+
+  /**
+   * WR-91: coalescing counters (`physicalAttempts` / `mergedDeliveries` /
+   * `inFlightKeys`). `undefined` when coalescing is disabled.
+   */
+  getCoalesceStats(): CoalesceStats | undefined {
+    return this.coalescer?.getStats();
   }
 
   /**
