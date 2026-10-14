@@ -1853,6 +1853,49 @@ const queue = new RetryQueue({
   construction. Disabled by default: `coalesce: false` (or absent) keeps
   one physical attempt per delivery, exactly the pre-WR-91 behavior.
 
+## Outbound DNS resolution cache (opt-in)
+
+Every new connection pays a DNS lookup, and under high fan-out to a
+small set of downstreams that lookup is pure overhead — worse, a
+resolver hiccup can fail deliveries for a reason that has nothing to do
+with the downstream. The cache sits between the relay and the resolver
+(`src/dns-cache.ts`, `node:dns` only): per-hostname entries with a
+configurable TTL (default 60s), served stale-while-revalidate so an
+expired entry keeps working while a background refresh runs.
+
+```ts
+const server = createRelayServer({
+  dnsCache: { ttlMs: 30_000 },   // or a compiled `new DnsCache({...})`
+});
+```
+
+- **Stale-while-revalidate** — an expired entry is still served while
+  exactly one background refresh runs (single-flight: concurrent
+  expired lookups trigger one refresh, never N). A refresh that fails —
+  or resolves empty — never evicts the stale entry; the relay keeps
+  serving it and counts `staleServed` / `refreshFailures`. A DNS error
+  reaches the delivery only when the cache holds *no* entry at all, in
+  which case it follows the normal retry / dead-letter path.
+- **Bounded** — `maxHosts` (default 1024); when full, the soonest-expiring
+  entry is evicted. `ttlMs` / `refreshBackoffMs` (backoff between failed
+  refreshes during a resolver outage, default 5s) validate fail-fast.
+- **Combinations** — the shared instance feeds the WR-24 keep-alive
+  pool (pooled agents resolve through it; the pool key stays the logical
+  `(scheme, host, port)` while sockets are built against the resolved
+  IP), one-off (unpooled) requests, and the WR-34 downstream probes
+  (`probe.lookup`). The opt-in HTTP/2 pool and the WebSocket pool manage
+  their own connections and keep the OS resolver — the DNS cache covers
+  the HTTP/1.1 path and the probes only. One counter set is shared by
+  the main and shadow senders.
+- **Observability** — `GET /metrics` renders `relay_dns_cache_*`
+  (`lookups_total{result="hit"|"miss"|"stale"}`,
+  `refresh_failures_total`, `hosts` gauge), and
+  `sender.dnsCache.getStats()` exposes `hits/misses/staleServed` plus the
+  `hitRate` (share of lookups that avoided a synchronous resolution).
+- **Fail-fast** — invalid `ttlMs` / `refreshBackoffMs` / `maxHosts`
+  throw `RangeError` at startup. Absent by default: with no `dnsCache`
+  configured, every connection uses the OS resolver.
+
 ## Delivery lifecycle
 
 Every accepted webhook walks the same state machine; each transition is

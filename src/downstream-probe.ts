@@ -1,5 +1,6 @@
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
+import type { LookupFunction } from "node:net";
 
 /**
  * Active downstream health probing (WR-34).
@@ -72,6 +73,14 @@ export interface ProbeOptions {
    * network; it must never throw — a throw is counted as a failure.
    */
   probeRequest?: (endpoint: string, method: "HEAD" | "GET") => Promise<boolean>;
+  /**
+   * WR-92: DNS lookup override for the default probe request (e.g. a
+   * shared `DnsCache#lookup`) — probes resolve through it instead of the
+   * OS resolver, so a probe for a hostname mid-DNS-flap gets the same
+   * stale-while-revalidate treatment as deliveries. Ignored when a
+   * custom `probeRequest` is injected. Must be a function when provided.
+   */
+  lookup?: LookupFunction;
 }
 
 /** Payload of the `probe_failed` audit event. */
@@ -117,7 +126,8 @@ function defaultSetTimer(fn: () => void, ms: number): ProbeTimerHandle {
 function defaultProbeRequest(
   endpoint: string,
   method: "HEAD" | "GET",
-  timeoutMs: number
+  timeoutMs: number,
+  lookup?: LookupFunction
 ): Promise<boolean> {
   return new Promise((resolve) => {
     let settled = false;
@@ -140,7 +150,13 @@ function defaultProbeRequest(
     }
     const req = (url.protocol === "https:" ? httpsRequest : httpRequest)(
       url,
-      { method, timeout: timeoutMs },
+      {
+        method,
+        timeout: timeoutMs,
+        // WR-92: probe through the shared DNS cache when one is
+        // configured — same stale-while-revalidate as deliveries.
+        ...(lookup !== undefined ? { lookup } : {}),
+      },
       (res) => {
         res.resume(); // drain a GET body; we only care about the status
         res.on("end", () =>
@@ -222,8 +238,12 @@ export class DownstreamProber {
     this.setTimer = rest.setTimer ?? defaultSetTimer;
     this.clearTimer = rest.clearTimer ?? ((h) => h.clear());
     const timeoutMs = this.timeoutMs;
+    if (rest.lookup !== undefined && typeof rest.lookup !== "function") {
+      throw new RangeError("probe.lookup must be a function");
+    }
     this.probeRequest =
-      rest.probeRequest ?? ((endpoint, method) => defaultProbeRequest(endpoint, method, timeoutMs));
+      rest.probeRequest ??
+      ((endpoint, method) => defaultProbeRequest(endpoint, method, timeoutMs, rest.lookup));
     this.recordOutcome = recordOutcome;
     this.onAudit = onAudit;
     for (const ep of this.endpoints) {

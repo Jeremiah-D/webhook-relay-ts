@@ -87,6 +87,7 @@ import {
   type CertExpiryOptions,
 } from "./cert-expiry.ts";
 import { OutboundConnectionPool, type KeepAlivePoolOptions } from "./keepalive.ts";
+import { DnsCache, type DnsCacheOptions } from "./dns-cache.ts";
 import { warmupOutboundPool, resolveWarmupOptions } from "./warmup.ts";
 import { AuditSink, type AuditSinkOptions } from "./audit-sink.ts";
 import {
@@ -608,6 +609,17 @@ export interface RelayServerOptions {
    * `RangeError` at startup.
    */
   outboundKeepAlive?: KeepAlivePoolOptions | false;
+  /**
+   * WR-92: outbound DNS resolution cache (see `src/dns-cache.ts`) — a
+   * compiled `DnsCache` or options to build one. When set, the default
+   * sender's pooled agents (WR-24) and one-off requests resolve
+   * hostnames through it (stale-while-revalidate, 60s default TTL), and
+   * the WR-34 downstream probes do too. One instance is shared by the
+   * main and shadow senders: a single counter set, a single `/metrics`
+   * block (`relay_dns_cache_*`). `undefined` keeps the OS-resolver
+   * behavior. Invalid values throw `RangeError` at startup.
+   */
+  dnsCache?: DnsCache | DnsCacheOptions;
   /**
    * Outbound connection warm-up (WR-70, see `src/warmup.ts`): at startup,
    * pre-establish keep-alive connections for the listed endpoint URLs on
@@ -1145,6 +1157,13 @@ export interface PooledSender extends Sender {
   /** The WebSocket connection pool (always created). */
   wsPool: WebSocketPool;
   /**
+   * WR-92: the outbound DNS resolution cache, when configured — shared
+   * by the pooled and one-off request paths. `undefined` when the
+   * feature is off. Counters render into `GET /metrics` as
+   * `relay_dns_cache_*` via `render()`.
+   */
+  dnsCache: DnsCache | undefined;
+  /**
    * WR-75: cumulative per-endpoint guarded-compression byte savings;
    * rendered into `GET /metrics` as `relay_compressed_bytes_saved_total`.
    */
@@ -1247,7 +1266,15 @@ export function createDefaultSender(
    * `tlsClientCertRotation` doc above). Validated at startup;
    * `undefined` keeps the WR-36-only behavior.
    */
-  tlsClientCertRotation?: Map<string, RotatingClientCertSet>
+  tlsClientCertRotation?: Map<string, RotatingClientCertSet>,
+  /**
+   * WR-92: outbound DNS resolution cache — a compiled `DnsCache` or
+   * options to build one. When set, pooled agents (WR-24) and one-off
+   * requests resolve through the cache; the counters render into
+   * `GET /metrics` via `PooledSender.dnsCache.render()`. `undefined`
+   * keeps the OS-resolver behavior. Validated at startup.
+   */
+  dnsCache?: DnsCache | DnsCacheOptions
 ): PooledSender {
   if (tlsPins !== undefined) {
     for (const [endpoint, pins] of Object.entries(tlsPins)) {
@@ -1501,7 +1528,28 @@ export function createDefaultSender(
   } catch (err) {
     throw new RangeError(`createDefaultSender: invalid idempotencyKey config: ${(err as Error).message}`);
   }
-  const pool = keepAlive === false ? undefined : new OutboundConnectionPool(keepAlive);
+  // WR-92: compile the DNS cache once — the instance is shared by the
+  // pool and the one-off request path, so both observe the same entries
+  // and counters.
+  let resolvedDnsCache: DnsCache | undefined;
+  if (dnsCache !== undefined) {
+    try {
+      resolvedDnsCache = dnsCache instanceof DnsCache ? dnsCache : new DnsCache(dnsCache);
+    } catch (err) {
+      throw new RangeError(`createDefaultSender: invalid dnsCache: ${(err as Error).message}`);
+    }
+  }
+  // Bound arrow property — no `this` context needed downstream.
+  const dnsLookup = resolvedDnsCache?.lookup;
+  // WR-92: the pool's agents resolve through the DNS cache when one is
+  // configured — connections are built against the resolved IP while the
+  // pool key stays the logical (scheme, host, port).
+  const pool =
+    keepAlive === false
+      ? undefined
+      : new OutboundConnectionPool(
+          dnsLookup === undefined ? keepAlive : { ...(keepAlive ?? {}), lookup: dnsLookup }
+        );
   // WR-89: id of the rotation client certificate most recently used in a
   // handshake attempt, per delivery (queue item id). Written on every
   // rotation handshake attempt — primary or fallback — and taken
@@ -1866,6 +1914,9 @@ export function createDefaultSender(
                 {
                   method: "POST",
                   agent: agent ?? false,
+                  // WR-92: one-off (unpooled) requests resolve through the
+                  // DNS cache too — same stale-while-revalidate as pooled.
+                  ...(dnsLookup !== undefined ? { lookup: dnsLookup } : {}),
                   ...(pins ? { rejectUnauthorized: false } : {}),
                   // WR-60: per-endpoint TLS SNI/ALPN override. `servername`
                   // and `ALPNProtocols` flow through the agent's
@@ -1900,7 +1951,17 @@ export function createDefaultSender(
                 },
                 onResponse
               )
-            : httpRequest(url, { method: "POST", agent: agent ?? false }, onResponse);
+            : httpRequest(
+                url,
+                {
+                  method: "POST",
+                  agent: agent ?? false,
+                  // WR-92: one-off (unpooled) requests resolve through the
+                  // DNS cache too — same stale-while-revalidate as pooled.
+                  ...(dnsLookup !== undefined ? { lookup: dnsLookup } : {}),
+                },
+                onResponse
+              );
         req.on("error", reject);
 
         if (pool && agent) {
@@ -2367,6 +2428,9 @@ export function createDefaultSender(
   sender.http2Pool = h2pool;
   sender.wsPool = wsPool;
   sender.compressionStats = compressionTracker;
+  // WR-92: the shared DNS cache instance (undefined when the feature is
+  // off) — operators read counters via `sender.dnsCache.getStats()`.
+  sender.dnsCache = resolvedDnsCache;
   // WR-89: take-and-clear the rotation certificate id used by a
   // delivery's latest handshake attempt, for audit stamping (see the
   // `rotationClientCertUsed` map above).
@@ -2746,9 +2810,22 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       }
     }
   }
+  // WR-92: one shared DNS cache instance for the main and shadow
+  // senders — a single counter set, a single `relay_dns_cache_*` block
+  // in `GET /metrics`. Built once here (not per sender) so both observe
+  // the same entries.
+  let sharedDnsCache: DnsCache | undefined;
+  if (opts.dnsCache !== undefined) {
+    try {
+      sharedDnsCache =
+        opts.dnsCache instanceof DnsCache ? opts.dnsCache : new DnsCache(opts.dnsCache);
+    } catch (err) {
+      throw new RangeError(`createRelayServer: invalid dnsCache: ${(err as Error).message}`);
+    }
+  }
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations)
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache)
       : undefined;
   // WR-50: endpoints the operator may pause/resume over HTTP. The server
   // only ever delivers to these — the intake target plus every
@@ -2848,7 +2925,11 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
                   tlsVersionMonitor,
                   opts.compressThreshold,
                   onGzipFallbackAudit,
-                  onE2eeKeyRotatedAudit
+                  onE2eeKeyRotatedAudit,
+                  undefined,
+                  // WR-92: shadow senders share the relay's DNS cache
+                  // instance — one counter set for main + shadow traffic.
+                  sharedDnsCache
                 ),
               })
             ),
@@ -2858,6 +2939,13 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   const queue = new RetryQueue({
     sender: opts.sender ?? defaultSender,
     ...(opts.retry ?? {}),
+    // WR-92: downstream health probes (WR-34) resolve through the shared
+    // DNS cache when one is configured — the same stale-while-revalidate
+    // treatment as the delivery path. An explicit `probe.lookup` still
+    // wins (explicit beats ambient).
+    ...(sharedDnsCache !== undefined && opts.retry?.probe !== undefined
+      ? { probe: { lookup: sharedDnsCache.lookup, ...opts.retry.probe } }
+      : {}),
     payloadEncryptor: opts.payloadEncryptor ?? opts.retry?.payloadEncryptor,
     fieldMask: opts.fieldMask ?? opts.retry?.fieldMask,
     // WR-49: an explicit server-level `durableQueueDir` wins over the
@@ -3551,7 +3639,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       // configured, keeping the output byte-identical to the legacy shape.
       res
         .writeHead(200, { "content-type": "text/plain; version=0.0.4" })
-        .end(queue.renderMetrics() + versionMetrics.render() + schemaMetrics.render() + ipAclMetrics.render() + certExpiryMonitor.render() + tlsVersionMonitor.render() + (usageMeter?.render() ?? "") + (defaultSender?.compressionStats.render() ?? ""));
+        .end(queue.renderMetrics() + versionMetrics.render() + schemaMetrics.render() + ipAclMetrics.render() + certExpiryMonitor.render() + tlsVersionMonitor.render() + (usageMeter?.render() ?? "") + (defaultSender?.compressionStats.render() ?? "") + (defaultSender?.dnsCache?.render() ?? ""));
       return;
     }
     if (isEvents) {

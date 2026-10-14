@@ -2,6 +2,7 @@ import { Agent as HttpAgent } from "node:http";
 import { Agent as HttpsAgent } from "node:https";
 import type { ClientRequest, ClientRequestArgs } from "node:http";
 import type { Socket } from "node:net";
+import type { LookupFunction } from "node:net";
 import { createHash } from "node:crypto";
 import { normalizePin } from "./pinning.ts";
 import { createProxiedAgent, proxyPoolKeyFragment } from "./proxy.ts";
@@ -93,6 +94,14 @@ export interface KeepAlivePoolOptions {
    * untouched. Must be a boolean when provided.
    */
   healthProbe?: boolean;
+  /**
+   * WR-92: DNS lookup override for new connections (e.g. a shared
+   * `DnsCache#lookup`). When set, every pooled agent resolves hostnames
+   * through it — the pool key stays the logical `(scheme, host, port)`,
+   * while connections are built against the resolved IP. Must be a
+   * function when provided.
+   */
+  lookup?: LookupFunction;
 }
 
 const DEFAULTS = {
@@ -133,6 +142,7 @@ export interface ResolvedKeepAlivePoolOptions {
   idleTimeoutMs: number;
   keepAliveMsecs: number;
   healthProbe: boolean;
+  lookup: LookupFunction | undefined;
 }
 
 /** Validate pool options the way a constructor would; returns the resolved values. */
@@ -153,7 +163,11 @@ export function resolveKeepAlivePoolOptions(
       `OutboundConnectionPool: healthProbe must be a boolean, got ${healthProbe}`
     );
   }
-  return { maxSocketsPerHost, maxFreeSockets, idleTimeoutMs, keepAliveMsecs, healthProbe };
+  const lookup = opts.lookup ?? undefined;
+  if (lookup !== undefined && typeof lookup !== "function") {
+    throw new RangeError("OutboundConnectionPool: lookup must be a function");
+  }
+  return { maxSocketsPerHost, maxFreeSockets, idleTimeoutMs, keepAliveMsecs, healthProbe, lookup };
 }
 
 /**
@@ -320,6 +334,11 @@ export class OutboundConnectionPool {
         keepAliveMsecs: this.opts.keepAliveMsecs,
         maxSockets: this.opts.maxSocketsPerHost,
         maxFreeSockets: this.opts.maxFreeSockets,
+        // WR-92: when a DNS cache lookup is configured, every new pooled
+        // connection resolves through it — the pool key stays the logical
+        // (scheme, host, port), the socket is built against the resolved
+        // IP.
+        ...(this.opts.lookup !== undefined ? { lookup: this.opts.lookup } : {}),
         // 0 disables Node's internal free-socket reaping: the pool reaps
         // on its own unref'd timer instead, so idle sockets can be
         // unref'd without racing the agent's timer.
