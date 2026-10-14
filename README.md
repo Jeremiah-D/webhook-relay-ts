@@ -2704,6 +2704,37 @@ expirations are counted in
 dead-letter replay starts a fresh delivery cycle with a fresh deadline.
 Off by default; invalid values throw `RangeError` at construction.
 
+#### Deadline-budget propagation (WR-99)
+
+The WR-76 deadline above expires a delivery at the next dispatch once
+the budget is gone — but it never bounded the downstream call itself:
+a delivery dispatched 1ms before its deadline could still run a
+30-second attempt. With `propagateBudget` (default `true` when
+deadlines are configured) the queue stamps the *remaining* budget
+(`deadlineMs - elapsedMs`) on each dispatch's wire copy as
+`RetryItem.deadlineBudgetMs`, and the default sender caps the
+per-attempt downstream call at it — queue wait and the call share one
+SLO pool:
+
+- The HTTP/1.1 path destroys the in-flight request when the budget
+  fires (that path has no other per-attempt timeout); a uniform race in
+  the sender bounds the H2/WS paths. The rejection is a typed
+  `DeadlineBudgetTimeoutError`, routed to the deadline-expiry path
+  (audit + dead letter, actual attempt count, no backoff, no breaker
+  verdict) — never the retry path.
+- When the remaining budget at dispatch is at or below
+  `minAttemptBudgetMs` (default `0`) the delivery expires *without*
+  issuing the outbound call — a call that cannot usefully finish inside
+  its budget is a wasted downstream hit.
+- Budget exhaustion (queued or mid-call) is attributed into the
+  `slo_missed` channel with `deadlineBudgetExhausted: true` and the
+  dominant latency phase (WR-95), so operators see *why* the SLO
+  burned, not just that a dead letter exists.
+
+Custom (injected) senders ignore `deadlineBudgetMs` — the queue-side
+expiry still bounds the delivery, only the per-attempt cap is lost.
+Set `propagateBudget: false` to keep the exact WR-76 behavior.
+
 ### Shadow-target dry-run mirroring
 
 Opt-in per-endpoint dry-run mirroring for the downstream-migration /

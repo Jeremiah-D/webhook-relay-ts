@@ -173,6 +173,12 @@ import {
   summarizeDownstreamResponse,
   type DownstreamResponseSummary,
 } from "./response-summary.ts";
+import {
+  DEFAULT_MIN_ATTEMPT_BUDGET_MS,
+  DeadlineBudgetTimeoutError,
+  assertValidDeadlineBudgetOptions,
+  resolveDeadlineBudget,
+} from "./deadline-budget.ts";
 import { OtlpExporter, type OtlpExporterOptions, type OtlpStats } from "./otlp.ts";
 import {
   resolveOutboundTraceContext,
@@ -366,6 +372,16 @@ export interface RetryItem {
    * exactly like the WR-13 latency clock restart.
    */
   enqueuedAt?: number;
+  /**
+   * WR-99: remaining end-to-end deadline budget (ms) stamped by the queue
+   * at dispatch: `deadlineMs - elapsedMs`. The default sender caps the
+   * per-attempt downstream call at this budget, so queue wait and the
+   * downstream call share one SLO pool instead of each running its own
+   * clock. Absent when no deadline is configured (or propagation is
+   * off) — custom senders ignore it, which only loses the per-attempt
+   * cap, never the queue-side expiry.
+   */
+  deadlineBudgetMs?: number;
 }
 
 /** Options for the urgent delivery lane (see {@link DeliveryPriority}). */
@@ -477,6 +493,13 @@ export interface SloMissInfo {
    * `dominantPhase`.
    */
   phaseBreakdown?: PhaseDurationsMs;
+  /**
+   * WR-99: set when this SLO miss is a deadline-budget exhaustion (the
+   * delivery died because its end-to-end budget ran out, queued or
+   * mid-call) rather than a slow-but-completed delivery. Lets operators
+   * and OTLP consumers distinguish "ran out of SLO" from "was slow".
+   */
+  deadlineBudgetExhausted?: boolean;
 }
 
 /** {@link LatencyTrackerOptions} plus the SLO-miss hook and the SLO-risk predictor. */
@@ -894,6 +917,23 @@ export interface DeliveryDeadlineOptions {
    * number > 0; anything else throws `RangeError` at construction.
    */
   deadlines?: Record<string, number>;
+  /**
+   * WR-99: propagate the remaining deadline budget into the downstream
+   * call — the sender caps the per-attempt timeout at the remaining
+   * budget and short-circuits dispatches whose remaining budget is at or
+   * below `minAttemptBudgetMs`. Default `true`: a deadline that does not
+   * bound the call it guards is not an end-to-end SLO. Set `false` to
+   * keep the exact WR-76 behavior (queue-side expiry only).
+   */
+  propagateBudget?: boolean;
+  /**
+   * WR-99: dispatch floor in ms. When the remaining budget at dispatch is
+   * at or below this value the delivery expires *without* issuing the
+   * outbound call — a call that cannot usefully finish inside its budget
+   * is a wasted downstream hit. Default `0` (expire only once the budget
+   * is fully exhausted, same as WR-76). Must be a finite number >= 0.
+   */
+  minAttemptBudgetMs?: number;
   /** Clock in ms; defaults to `Date.now`. Injectable for deterministic tests. */
   now?: () => number;
 }
@@ -2289,6 +2329,16 @@ export class RetryQueue {
   private readonly deliveryDeadlines?: Map<string, number>;
   /** WR-76: clock for the deadline; defaults to `Date.now`. Injectable for deterministic tests. */
   private readonly deadlineNow: () => number;
+  /**
+   * WR-99: whether the remaining budget is stamped on each dispatch's
+   * wire copy so the sender can cap the per-attempt call. Default true.
+   */
+  private readonly deadlinePropagateBudget: boolean;
+  /**
+   * WR-99: dispatch floor in ms — remaining budget at or below this
+   * expires the delivery without issuing the outbound call.
+   */
+  private readonly deadlineMinAttemptBudgetMs: number;
   private readonly onDeliveryDeadlineExceeded?: (info: DeliveryDeadlineExceededInfo) => void;
   /** WR-80: cron occurrence audit hook. */
   private readonly onScheduledFired?: (event: ScheduledFiredEvent) => void;
@@ -2536,6 +2586,13 @@ export class RetryQueue {
       }
       this.deliveryDeadlines = deadlines;
     }
+    // WR-99: budget-propagation options ride on the deadline config —
+    // validated here so a typo fails fast instead of silently leaving
+    // the per-attempt cap off.
+    assertValidDeadlineBudgetOptions(opts.deliveryDeadline ?? {});
+    this.deadlinePropagateBudget = opts.deliveryDeadline?.propagateBudget ?? true;
+    this.deadlineMinAttemptBudgetMs =
+      opts.deliveryDeadline?.minAttemptBudgetMs ?? DEFAULT_MIN_ATTEMPT_BUDGET_MS;
     this.deadlineNow = opts.deliveryDeadline?.now ?? Date.now;
     this.onDeliveryDeadlineExceeded = opts.onDeliveryDeadlineExceeded;
     // WR-80: cron occurrence audit hook (the server wires it to its audit log).
@@ -4278,14 +4335,28 @@ export class RetryQueue {
     // retry budget is untouched. Items predating the feature (a journal
     // restored from before WR-76) have no admission instant: stamp it now
     // rather than expiring a just-restored delivery.
+    //
+    // WR-99: the check also resolves the *remaining* budget. When it is
+    // at or below `minAttemptBudgetMs` the dispatch is pointless — the
+    // call could not usefully finish inside the budget — so the delivery
+    // expires here, without issuing the outbound call (one wasted
+    // downstream hit saved). Otherwise the remaining budget is stamped
+    // on the wire copy below and the sender caps this attempt at it.
     if (entry.enqueuedAt === undefined) entry.enqueuedAt = this.deadlineNow();
     const deadlineMs = this.deliveryDeadlines?.get(logicalEndpoint);
+    let dispatchBudgetMs: number | undefined;
     if (deadlineMs !== undefined) {
       const elapsedMs = this.deadlineNow() - entry.enqueuedAt;
-      if (elapsedMs >= deadlineMs) {
+      const { expired, remainingMs } = resolveDeadlineBudget(
+        deadlineMs,
+        elapsedMs,
+        this.deadlineMinAttemptBudgetMs
+      );
+      if (expired) {
         this.expireDeliveryDeadline(entry, id, traceId, tenant, logicalEndpoint, target, elapsedMs, deadlineMs);
         return;
       }
+      if (this.deadlinePropagateBudget) dispatchBudgetMs = remainingMs;
     }
     // WR-50: the pause lands before any gate is touched — a timer that
     // fired in the same tick as the pause parks instead of dispatching,
@@ -4446,6 +4517,10 @@ export class RetryQueue {
       // the failure path's `entry.attempt += 1` cannot leak into the
       // mirrored attempt number.
       const wireCopy: RetryItem = { ...entry, targetUrl: target };
+      // WR-99: stamp this dispatch's remaining deadline budget on the
+      // wire copy — the sender caps the per-attempt downstream call at
+      // it, so queue wait and the call share one SLO pool.
+      if (dispatchBudgetMs !== undefined) wireCopy.deadlineBudgetMs = dispatchBudgetMs;
       // WR-85: mirror-once guard — the success path mirrors right after
       // the sender settles, but a later throw in the same attempt (e.g.
       // a failed WR-37 response validation) lands in the catch below,
@@ -4627,6 +4702,33 @@ export class RetryQueue {
         // those paths. `mirrorShadow` is idempotent per attempt (see
         // above).
         mirrorShadow();
+        if (err instanceof DeadlineBudgetTimeoutError) {
+          // WR-99: the remaining deadline budget fired mid-call. The
+          // physical attempt really happened, so the attempt count is
+          // real — then the delivery expires exactly like the WR-76
+          // queue-side path: audited, dead-lettered with its actual
+          // attempt count, no backoff scheduled, no retry budget
+          // consumed. No breaker verdict is recorded either: the
+          // endpoint was cut off by our own SLO, not by a downstream
+          // failure, so there is no failure signal to feed the breaker
+          // (mirroring the WR-76 "never attempted" neutrality).
+          entry.attempt += 1;
+          // `deliveryDeadlines` is construction-time only, so a stamped
+          // budget always has its deadline here; the `?? 0` is purely
+          // defensive.
+          const dl = this.deliveryDeadlines?.get(logicalEndpoint) ?? 0;
+          this.expireDeliveryDeadline(
+            entry,
+            id,
+            traceId,
+            tenant,
+            logicalEndpoint,
+            target,
+            this.deadlineNow() - (entry.enqueuedAt ?? this.deadlineNow()),
+            dl
+          );
+          return;
+        }
         const classified = classifyFailure(err);
         const error = err instanceof Error ? err.message : String(err);
         const at = new Date().toISOString();
@@ -4825,6 +4927,26 @@ export class RetryQueue {
       attempts: entry.attempt,
       elapsedMs: Math.max(0, Math.round(elapsedMs)),
       deadlineMs,
+    });
+    // WR-99: attribute the budget exhaustion into the `slo_missed`
+    // channel (WR-13) so it lands in audits/OTLP with the dominant
+    // latency phase (WR-95), not just as a dead letter. The
+    // `deadlineBudgetExhausted` marker distinguishes "ran out of SLO"
+    // from "was slow but delivered". The phase is read from the
+    // endpoint's recent distribution — the same honest fallback WR-95
+    // uses when no per-attempt breakdown exists — never fabricated.
+    // When latency tracking is not configured `onSloMiss` is undefined
+    // and this degrades to a no-op.
+    const dominantPhase = this.latencyPhasesFor(tenant)?.dominantPhase(target);
+    this.onSloMiss?.({
+      id: entry.id,
+      traceId,
+      ...(tenant === undefined ? {} : { tenant }),
+      endpoint: target,
+      latencyMs: Math.max(0, Math.round(elapsedMs)),
+      sloMs: deadlineMs,
+      deadlineBudgetExhausted: true,
+      ...(dominantPhase === undefined ? {} : { dominantPhase }),
     });
     // Classified "retryable": the payload was not poison — the relay
     // simply ran out of SLO — so the dead-letter record reads honestly.

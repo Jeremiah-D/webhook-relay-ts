@@ -29,6 +29,10 @@ import type { AutoReplayOptions } from "./autoreplay.ts";
 import type { DeadLetterRetentionOptions } from "./deadletter-retention.ts";
 import type { ReplayEgressOptions } from "./replay-egress.ts";
 import { HttpDeliveryError, parseRetryAfterMs } from "./failure.ts";
+import {
+  DeadlineBudgetTimeoutError,
+  readDeadlineBudgetMs,
+} from "./deadline-budget.ts";
 import { installGracefulShutdown } from "./shutdown.ts";
 import { SourceBaselineDetector, type SourceBaselineOptions } from "./source-baseline.ts";
 import type { PayloadEncryptor } from "./encrypt.ts";
@@ -2097,6 +2101,22 @@ export function createDefaultSender(
               );
         req.on("error", reject);
 
+        // WR-99: enforce the propagated deadline budget on this attempt.
+        // The HTTP/1.1 path has no other per-attempt timeout, so without
+        // this a hung downstream would hold a pool slot past the
+        // end-to-end SLO. Destroying the request surfaces the typed
+        // error through the `req.on("error", reject)` above; the timer
+        // is unref'd so it never pins process exit, and cleared on
+        // request close so a settled attempt leaves no timer behind.
+        const attemptBudgetMs = readDeadlineBudgetMs(item);
+        if (attemptBudgetMs !== undefined) {
+          const budgetTimer = setTimeout(() => {
+            req.destroy(new DeadlineBudgetTimeoutError(item.targetUrl, attemptBudgetMs));
+          }, attemptBudgetMs);
+          budgetTimer.unref?.();
+          req.on("close", () => clearTimeout(budgetTimer));
+        }
+
         // WR-95: per-phase delivery timing (opt-in via
         // `measureLatencyPhases`, which `createRelayServer` enables exactly
         // when `retry.latencyPhases` is configured). Only a fresh direct
@@ -2561,26 +2581,64 @@ export function createDefaultSender(
         new Error(`outbound proxy: proxy configured for non-HTTP(S) target ${item.targetUrl}`)
       );
     }
-    // WebSocket (WR-45): ws:/wss: targets ride the pooled RFC 6455 path.
-    // Proxied ws: is rejected above (explicit proxy + non-HTTP(S)
-    // target), same as any other non-HTTP scheme.
-    if (url.protocol === "ws:" || url.protocol === "wss:") {
-      return deliverViaWebSocket(item, url, pins);
-    }
-    // HTTP/2 (WR-42): opt-in per host, never under a proxy — proxied
-    // traffic rides the HTTP/1.1 CONNECT tunnel (see `src/http2.ts`). Any
-    // H2-level failure falls back to the HTTP/1.1 pool below: a delivery
-    // is never lost because of H2.
-    if (h2pool !== undefined && proxyUrl === undefined && h2pool.eligibleFor(url)) {
-      return deliverViaHttp2(item, url, pins, clientCert, tlsSni, minTlsVersion, clientCertRotation).catch((err) => {
-        if (err instanceof Http2UnavailableError) {
-          h2pool!.noteFallback();
-          return deliverViaHttp1(item, url, pins, clientCert, proxyUrl, tlsSni, minTlsVersion, clientCertRotation);
+    // WR-99: the physical attempt dispatch, wrapped below with the
+    // deadline-budget race when the queue stamped a remaining budget.
+    const dispatch = (): Promise<DownstreamResponse | void> => {
+      // WebSocket (WR-45): ws:/wss: targets ride the pooled RFC 6455 path.
+      // Proxied ws: is rejected above (explicit proxy + non-HTTP(S)
+      // target), same as any other non-HTTP scheme.
+      if (url.protocol === "ws:" || url.protocol === "wss:") {
+        return deliverViaWebSocket(item, url, pins);
+      }
+      // HTTP/2 (WR-42): opt-in per host, never under a proxy — proxied
+      // traffic rides the HTTP/1.1 CONNECT tunnel (see `src/http2.ts`). Any
+      // H2-level failure falls back to the HTTP/1.1 pool below: a delivery
+      // is never lost because of H2.
+      if (h2pool !== undefined && proxyUrl === undefined && h2pool.eligibleFor(url)) {
+        return deliverViaHttp2(item, url, pins, clientCert, tlsSni, minTlsVersion, clientCertRotation).catch((err) => {
+          if (err instanceof Http2UnavailableError) {
+            h2pool!.noteFallback();
+            return deliverViaHttp1(item, url, pins, clientCert, proxyUrl, tlsSni, minTlsVersion, clientCertRotation);
+          }
+          throw err;
+        });
+      }
+      return deliverViaHttp1(item, url, pins, clientCert, proxyUrl, tlsSni, minTlsVersion, clientCertRotation);
+    };
+    // WR-99: enforce the propagated deadline budget on the physical
+    // attempt. The race bounds every transport (H1/H2/WS) at the
+    // remaining budget — the HTTP/1.1 path additionally destroys its
+    // in-flight request on budget fire (it has no other per-attempt
+    // timeout; see above), while H2/WS rely on this race plus their own
+    // timeouts. The rejection is typed so the queue routes it to the
+    // deadline-expiry path, not the retry path. No budget stamped —
+    // byte-identical behavior to before.
+    const budgetMs = readDeadlineBudgetMs(item);
+    if (budgetMs === undefined) return dispatch();
+    return new Promise<DownstreamResponse | void>((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        reject(new DeadlineBudgetTimeoutError(item.targetUrl, budgetMs));
+      }, budgetMs);
+      // An SLO timer must never pin process exit.
+      timer.unref?.();
+      dispatch().then(
+        (res) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve(res);
+        },
+        (err) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          reject(err);
         }
-        throw err;
-      });
-    }
-    return deliverViaHttp1(item, url, pins, clientCert, proxyUrl, tlsSni, minTlsVersion, clientCertRotation);
+      );
+    });
   } as PooledSender;
   sender.pool = pool;
   sender.http2Pool = h2pool;
