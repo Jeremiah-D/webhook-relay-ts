@@ -143,6 +143,19 @@ export interface DeadLetterEscalationMetricsInput {
   escalations: number;
 }
 
+/**
+ * One endpoint's adaptive concurrency limit (WR-94), in Prometheus label
+ * order. Only finite limits are rendered — a gauge cannot hold Infinity.
+ */
+export interface AdaptiveConcurrencyMetricsInput {
+  /** Downstream endpoint (physical `targetUrl`). */
+  endpoint: string;
+  /** Tenant id (WR-48); when set it is rendered as a `tenant` label. */
+  tenant?: string;
+  /** The endpoint's current AIMD concurrency limit. */
+  limit: number;
+}
+
 export interface MetricsInput {
   deliveries: DeliveryCountersInput[];
   circuits: CircuitStateInput[];
@@ -209,6 +222,13 @@ export interface MetricsInput {
     exports: OtlpExportCountInput[];
     buffered: number;
   };
+  /**
+   * Present only when adaptive outbound concurrency (WR-94) is enabled;
+   * one gauge series per (tenant, endpoint) with a recorded outcome —
+   * absent entirely when the feature is off, so an untouched relay's
+   * exposition is byte-identical.
+   */
+  adaptiveConcurrency?: AdaptiveConcurrencyMetricsInput[];
 }
 
 /** One endpoint's starvation-guard activation count, in Prometheus label order. */
@@ -335,6 +355,25 @@ export function renderCertExpiryBlock(series: CertExpiryMetricsInput[]): string[
   for (const c of series) {
     lines.push(
       `relay_cert_expiry_seconds{endpoint="${escapeLabelValue(c.endpoint)}",kind="${c.kind}"} ${c.expirySeconds}`
+    );
+  }
+  return lines;
+}
+
+/**
+ * Render just the adaptive-concurrency limit block (WR-94) as exposition
+ * lines; `[]` when the series is empty, so callers can keep their output
+ * byte-identical until the first outcome is actually recorded.
+ */
+export function renderAdaptiveConcurrencyBlock(series: AdaptiveConcurrencyMetricsInput[]): string[] {
+  if (series.length === 0) return [];
+  const lines = [
+    "# HELP relay_adaptive_concurrency_limit Current AIMD outbound concurrency limit by endpoint (WR-94).",
+    "# TYPE relay_adaptive_concurrency_limit gauge",
+  ];
+  for (const s of series) {
+    lines.push(
+      `relay_adaptive_concurrency_limit{endpoint="${escapeLabelValue(s.endpoint)}"${tenantLabel(s.tenant)}} ${s.limit}`
     );
   }
   return lines;
@@ -487,6 +526,9 @@ export function renderPrometheus(input: MetricsInput): string {
   // WR-73: activity-gated like the slo-risk gauge — the series appears
   // only once the monitor has actually observed a certificate.
   lines.push(...renderCertExpiryBlock(input.certExpiry ?? []));
+  // WR-94: activity-gated the same way — the series appears only once an
+  // adaptive outcome has been recorded for an endpoint.
+  lines.push(...renderAdaptiveConcurrencyBlock(input.adaptiveConcurrency ?? []));
   // WR-76: activity-gated the same way — the series appears only once a
   // delivery deadline has actually expired.
   if (input.deliveryDeadlineExceeded !== undefined && input.deliveryDeadlineExceeded.length > 0) {

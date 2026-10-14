@@ -76,6 +76,12 @@ import {
   type AdaptiveBackoffOptions,
 } from "./adaptive-backoff.ts";
 import {
+  AdaptiveConcurrencyController,
+  assertAdaptiveConcurrencyOptions,
+  type AdaptiveConcurrencyEndpointStats,
+  type AdaptiveConcurrencyOptions,
+} from "./adaptive-concurrency.ts";
+import {
   BatchCollector,
   newBatchId,
   resolveBatchOptions,
@@ -205,6 +211,19 @@ export {
   DEFAULT_ADAPTIVE_UP_FACTOR,
   DEFAULT_ADAPTIVE_DOWN_FACTOR,
 } from "./adaptive-backoff.ts";
+export type {
+  AdaptiveConcurrencyOptions,
+  AdaptiveConcurrencyEndpointStats,
+} from "./adaptive-concurrency.ts";
+export {
+  AdaptiveConcurrencyController,
+  assertAdaptiveConcurrencyOptions,
+  DEFAULT_ADAPTIVE_MIN_LIMIT,
+  DEFAULT_ADAPTIVE_INCREASE_STEP,
+  DEFAULT_ADAPTIVE_DECREASE_FACTOR,
+  DEFAULT_ADAPTIVE_FAILURE_RATE_THRESHOLD,
+  DEFAULT_ADAPTIVE_WINDOW_SIZE,
+} from "./adaptive-concurrency.ts";
 export type { BatchEnvelopeInput, BatchOptions };
 export type { AutoReplayOptions, DeadLetterAutoReplayAuditEvent };
 export type {
@@ -878,6 +897,18 @@ export interface RetryQueueOptions {
    */
   adaptiveBackoff?: AdaptiveBackoffOptions;
   /**
+   * Adaptive outbound concurrency (WR-94; see `src/adaptive-concurrency.ts`):
+   * an outcome-driven AIMD cap per endpoint — additive increase per
+   * healthy outcome window, multiplicative decrease per congested window.
+   * The effective per-endpoint limit is `min(maxConcurrentPerEndpoint,
+   * adaptive)`: the adaptive cap can only ever tighten the fixed WR-06
+   * cap, never exceed it. Orthogonal to WR-59 adaptive backoff (backoff
+   * tunes delay, AIMD tunes concurrency). Disabled by default (absent =
+   * the fixed cap alone). Invalid values throw `RangeError` at
+   * construction.
+   */
+  adaptiveConcurrency?: AdaptiveConcurrencyOptions;
+  /**
    * Random source in [0, 1) used for jitter; defaults to `Math.random`.
    * Injectable so tests can verify jitter bounds deterministically.
    */
@@ -1497,17 +1528,33 @@ export class EndpointConcurrencyLimiter {
    * an override use `defaultMax`.
    */
   private readonly endpointMax = new Map<string, number>();
+  /**
+   * WR-94: optional outcome-driven adaptive cap per endpoint. When set,
+   * the effective limit is `min(fixed, adaptive)` — the adaptive cap can
+   * only ever tighten the fixed cap, never exceed it.
+   */
+  private readonly adaptiveLimitFor?: (endpoint: string) => number;
   private readonly inFlight = new Map<string, number>();
   private readonly waiters = new Map<string, Array<() => void>>();
 
-  constructor(maxConcurrentPerEndpoint: number = Infinity) {
+  constructor(
+    maxConcurrentPerEndpoint: number = Infinity,
+    opts: { adaptiveLimitFor?: (endpoint: string) => number } = {}
+  ) {
     assertConcurrencyLimit(maxConcurrentPerEndpoint);
     this.defaultMax = maxConcurrentPerEndpoint;
+    this.adaptiveLimitFor = opts.adaptiveLimitFor;
   }
 
-  /** Effective concurrency limit for `endpoint` (override wins over default). */
+  /**
+   * Effective concurrency limit for `endpoint`: the WR-32 override wins
+   * over the default, and the WR-94 adaptive cap (when configured)
+   * tightens whichever of those applies.
+   */
   maxFor(endpoint: string): number {
-    return this.endpointMax.get(endpoint) ?? this.defaultMax;
+    const fixed = this.endpointMax.get(endpoint) ?? this.defaultMax;
+    const adaptive = this.adaptiveLimitFor?.(endpoint);
+    return adaptive === undefined ? fixed : Math.min(fixed, adaptive);
   }
 
   /**
@@ -2129,6 +2176,10 @@ export class RetryQueue {
   private readonly adaptiveBackoffOpts?: AdaptiveBackoffOptions;
   /** WR-59: per-tenant adaptive backoff controllers (WR-48 scoping). */
   private readonly adaptiveBackoffs = new Map<string, AdaptiveBackoffController>();
+  /** WR-94: adaptive concurrency options; undefined when disabled. */
+  private readonly adaptiveConcurrencyOpts?: AdaptiveConcurrencyOptions;
+  /** WR-94: per-tenant adaptive concurrency controllers (WR-48 scoping). */
+  private readonly adaptiveConcurrencies = new Map<string, AdaptiveConcurrencyController>();
   private readonly onRetryBudgetDepleted?: (info: RetryBudgetDepletedInfo) => void;
   private readonly onAttemptFailed?: (info: AttemptFailedInfo) => void;
   /** Retries parked because the global retry budget was exhausted. */
@@ -2572,6 +2623,16 @@ export class RetryQueue {
     if (opts.adaptiveBackoff !== undefined) {
       this.adaptiveBackoffFor(undefined);
     }
+    // WR-94: opt-in adaptive concurrency. The default tenant's
+    // controller is created eagerly so invalid options throw at
+    // construction, never mid-delivery; other tenants' controllers stay
+    // lazy (WR-48). The ceiling defaults to the fixed
+    // `maxConcurrentPerEndpoint`, so the adaptive limit can never exceed
+    // the fixed cap even without explicit configuration.
+    this.adaptiveConcurrencyOpts = opts.adaptiveConcurrency;
+    if (opts.adaptiveConcurrency !== undefined) {
+      this.adaptiveConcurrencyFor(undefined);
+    }
     this.onAttemptFailed = opts.onAttemptFailed;
     this.onBatch = opts.onBatch;
     const histBuckets = opts.metrics?.histogramBucketsMs ?? [50, 100, 250, 500, 1000, 2500, 5000, 10000];
@@ -2724,7 +2785,14 @@ export class RetryQueue {
     const key = tenantInstanceKey(tenant);
     let l = this.limiters.get(key);
     if (l === undefined) {
-      l = new EndpointConcurrencyLimiter(this.maxConcurrentPerEndpoint);
+      // WR-94: the limiter consults the tenant's adaptive controller for
+      // the outcome-driven cap; effective limit = min(fixed, adaptive).
+      // When adaptive concurrency is disabled the callback yields
+      // Infinity, so behavior is byte-identical to the fixed cap alone.
+      l = new EndpointConcurrencyLimiter(this.maxConcurrentPerEndpoint, {
+        adaptiveLimitFor: (endpoint) =>
+          this.adaptiveConcurrencyFor(tenant)?.limitFor(endpoint) ?? Infinity,
+      });
       this.limiters.set(key, l);
     }
     return l;
@@ -2820,6 +2888,30 @@ export class RetryQueue {
   }
 
   /**
+   * WR-94: the calling tenant's adaptive concurrency controller;
+   * `undefined` when adaptive concurrency is disabled. Outcomes are keyed
+   * by the physical target — the same key the concurrency limiter uses —
+   * so the limit tracks the downstream that was actually hit. The
+   * controller's ceiling defaults to the queue's fixed
+   * `maxConcurrentPerEndpoint`, so the adaptive limit can never exceed
+   * the fixed cap.
+   */
+  private adaptiveConcurrencyFor(tenant: string | undefined): AdaptiveConcurrencyController | undefined {
+    if (this.adaptiveConcurrencyOpts === undefined) return undefined;
+    const key = tenantInstanceKey(tenant);
+    let c = this.adaptiveConcurrencies.get(key);
+    if (c === undefined) {
+      c = new AdaptiveConcurrencyController(
+        this.adaptiveConcurrencyOpts,
+        this.maxConcurrentPerEndpoint
+      );
+      this.adaptiveConcurrencies.set(key, c);
+    }
+    return c;
+  }
+
+  /**
+  /**
    * WR-48: default-tenant views of the per-tenant instances, preserving the
    * pre-tenant private field names (`breaker`, `quota`, `limiter`,
    * `latency`) that white-box tests reach for. New code should use the
@@ -2839,6 +2931,9 @@ export class RetryQueue {
   }
   private get adaptiveBackoff(): AdaptiveBackoffController | undefined {
     return this.adaptiveBackoffFor(undefined);
+  }
+  private get adaptiveConcurrency(): AdaptiveConcurrencyController | undefined {
+    return this.adaptiveConcurrencyFor(undefined);
   }
 
   private recordQuotaStat(tenant: string | undefined, endpoint: string): void {
@@ -4220,6 +4315,9 @@ export class RetryQueue {
           // WR-59: a delivered attempt cools the endpoint's adaptive base
           // toward the floor.
           this.adaptiveBackoffFor(tenant)?.recordOutcome(target, true);
+          // WR-94: a delivered attempt cools the endpoint's adaptive
+          // concurrency limit (additive increase on a healthy window).
+          this.adaptiveConcurrencyFor(tenant)?.recordOutcome(target, true);
           this.failover?.recordOutcome(logicalEndpoint, target, true);
           // WR-66: an answering target is a healthy target — same rule as
           // failover; non_retryable delivery outcomes feed both routers so
@@ -4320,6 +4418,10 @@ export class RetryQueue {
             // WR-59: the downstream answered (poison payload, not a sick
             // endpoint) — cools the adaptive base like any success.
             this.adaptiveBackoffFor(tenant)?.recordOutcome(target, true);
+            // WR-94: a non-retryable downstream rejection is not a
+            // congestion signal — the endpoint answered — so it feeds the
+            // adaptive controller as a success, like the breaker verdict.
+            this.adaptiveConcurrencyFor(tenant)?.recordOutcome(target, true);
             this.failover?.recordOutcome(logicalEndpoint, target, true);
             this.weighted?.recordOutcome(logicalEndpoint, target, true);
           }
@@ -4336,6 +4438,11 @@ export class RetryQueue {
           // WR-59: a retryable failure heats the endpoint's adaptive base
           // toward the ceiling.
           this.adaptiveBackoffFor(tenant)?.recordOutcome(target, false);
+          // WR-94: a retryable failure (429/5xx/timeout) is a congestion
+          // signal — it feeds the adaptive concurrency controller, which
+          // cuts the endpoint's limit multiplicatively once a full
+          // outcome window looks congested.
+          this.adaptiveConcurrencyFor(tenant)?.recordOutcome(target, false);
           this.failover?.recordOutcome(logicalEndpoint, target, false);
           this.weighted?.recordOutcome(logicalEndpoint, target, false);
         }
@@ -4900,6 +5007,20 @@ export class RetryQueue {
       ...(shadow.length > 0 ? { shadow } : {}),
       // WR-93: activity-gated (see above).
       ...(escalation.length > 0 ? { escalation } : {}),
+      // WR-94: activity-gated — the gauge appears only once an adaptive
+      // outcome has been recorded for an endpoint. Non-finite limits are
+      // skipped: a Prometheus gauge cannot hold Infinity.
+      ...(this.adaptiveConcurrencyOpts !== undefined
+        ? {
+            adaptiveConcurrency: (this.getAdaptiveConcurrencyStats() ?? [])
+              .filter((s) => Number.isFinite(s.limit))
+              .map((s) => ({
+                endpoint: s.endpoint,
+                ...(s.tenant === undefined ? {} : { tenant: s.tenant }),
+                limit: s.limit,
+              })),
+          }
+        : {}),
       // WR-83: enabled-gated — the OTLP series appear only when OTLP
       // export is configured, exactly like the probe series.
       ...(this.otlpExporter !== undefined
@@ -5155,6 +5276,26 @@ export class RetryQueue {
     return rows;
   }
 
+  /**
+   * WR-94: per-(tenant, endpoint) adaptive concurrency state — the
+   * current AIMD limit each endpoint's recent outcomes have earned.
+   * `undefined` when adaptive concurrency is disabled. Rows carry
+   * `tenant` only when set. Endpoints with no recorded outcomes are
+   * absent: they use the initial limit (default = the fixed cap).
+   */
+  getAdaptiveConcurrencyStats(): AdaptiveConcurrencyEndpointStats[] | undefined {
+    if (this.adaptiveConcurrencyOpts === undefined) return undefined;
+    const rows: AdaptiveConcurrencyEndpointStats[] = [];
+    for (const [tenantKey, controller] of this.adaptiveConcurrencies) {
+      const tenant = tenantKey === "" ? undefined : tenantKey;
+      for (const row of controller.stats()) {
+        rows.push(tenant === undefined ? row : { ...row, tenant });
+      }
+    }
+    return rows;
+  }
+
+  /**
   /** Durable delivery queue (WR-49) snapshot. */
   getDurableQueueStats(): DurableQueueStats {
     return {

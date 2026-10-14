@@ -114,6 +114,16 @@ reliability primitives that matter for any signed-payload pipeline.
   exponent, jitter strategy, and cap keep working as before; it composes
   orthogonally with the global retry budget (WR-38, which gates first),
   and `getAdaptiveBackoffStats()` exposes each endpoint's current base.
+  The opt-in adaptive concurrency (`adaptiveConcurrency`, WR-94, off by
+  default) adds an outcome-driven AIMD cap per endpoint — additive
+  increase per healthy outcome window, multiplicative decrease per
+  congested one — and the effective per-endpoint limit becomes
+  `min(maxConcurrentPerEndpoint, adaptive)`: the adaptive cap can only
+  ever tighten the fixed cap, never exceed it. 429/5xx/timeout outcomes
+  heat the controller; answering rejections (including non-retryable 4xx)
+  cool it; `getAdaptiveConcurrencyStats()` exposes each endpoint's
+  current limit, and `relay_adaptive_concurrency_limit{endpoint}` exports
+  it to Prometheus.
   Dead-lettered items carry `attempts`, `lastError`, and
   `deadLetteredAt`, and can be re-queued with a fresh attempt budget via
   `replayDeadLetter(id)` / `replayAllDeadLetters()`. Per-endpoint concurrency
@@ -1227,6 +1237,60 @@ queue.getGlobalConcurrencyStats();
   to unref); `stop()`/`shutdown()` wake every waiter, whose liveness
   check bails it out instead of dispatching, so a shutdown waits only
   for genuinely in-flight deliveries.
+
+## Adaptive outbound concurrency (AIMD)
+
+The fixed per-endpoint cap (`maxConcurrentPerEndpoint`, WR-06) is static:
+the same number that is right for a healthy downstream over-commits
+against a struggling one and throttles a strong one below its real
+capacity. `retry.adaptiveConcurrency` (opt-in, off by default) adds a
+second, *outcome-driven* cap per endpoint using classic AIMD:
+
+```ts
+const queue = new RetryQueue({
+  maxConcurrentPerEndpoint: 32, // fixed cap (WR-06)
+  adaptiveConcurrency: {
+    minLimit: 1,               // floor; default 1
+    maxLimit: 32,              // ceiling; default = the fixed cap above
+    initialLimit: 32,          // start; default = maxLimit (behave like
+                               // the fixed cap until congestion is seen)
+    increaseStep: 1,           // +N per healthy window; default 1
+    decreaseFactor: 0.5,       // ×N per congested window; default 0.5
+    failureRateThreshold: 0.2, // window failure rate that marks
+                               // congestion; default 0.2
+    windowSize: 20,            // outcomes per adjustment step; default 20
+  },
+});
+```
+
+- **AIMD** — outcomes accumulate in a rolling window of `windowSize` per
+  endpoint. A full window whose failure rate stays below the threshold
+  grows the limit additively (`+increaseStep`, clamped at `maxLimit`); a
+  full window at or above the threshold cuts it multiplicatively
+  (`×decreaseFactor`, floored at `minLimit`). Each full window triggers
+  exactly one step, then clears — the same failures never punish twice.
+  No clock, no randomness: the same outcome sequence always yields the
+  same limits.
+- **What counts as failure** — the same convention as the circuit
+  breaker, WR-59, failover, and weighted dispatch: retryable failures
+  (429/5xx/timeout/DNS) heat the controller; successes — including a
+  downstream that answered with a *non-retryable* rejection (an answering
+  endpoint is a healthy endpoint) — cool it. WR-30 4xx semantic
+  rejections are never congestion signals.
+- **Composition** — the effective per-endpoint limit is
+  `min(maxConcurrentPerEndpoint, adaptive)`: the adaptive cap can only
+  tighten the fixed cap, never exceed it. A WR-32 hot-reload that lowers
+  the fixed cap takes effect through the same `min`. Urgent deliveries
+  bypass the limiter (their bound stays the token bucket), but their
+  outcomes still feed the controller. Orthogonal to WR-59 (backoff tunes
+  *delay*, AIMD tunes *concurrency*) — both read the same outcome
+  stream, and both record leader-only under WR-91 coalescing.
+- **Observability** — `getAdaptiveConcurrencyStats()` exposes each
+  endpoint's current limit plus window fill (`windowOutcomes` /
+  `windowFailures` / `windowSize`); `relay_adaptive_concurrency_limit{endpoint[,tenant]}`
+  exports finite limits to Prometheus (activity-gated — absent until the
+  first outcome is recorded; a gauge cannot hold Infinity). Invalid
+  options throw `RangeError` at construction.
 
 ## Endpoint failover (active/standby)
 
