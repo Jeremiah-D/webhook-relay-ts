@@ -18,6 +18,11 @@ import type { ShadowDeliveredInfo, ShadowFailedInfo, ShadowTargetConfig, ShadowT
 import { parseCronExpression, CRON_HEADER } from "./cron.ts";
 import type { CompletionCallbackOptions } from "./callback.ts";
 import { createBoundAddressSelfCheck } from "./callback.ts";
+import type {
+  DeadLetterEscalatedInfo,
+  DeadLetterEscalationFailedInfo,
+  DeadLetterEscalationOptions,
+} from "./escalation.ts";
 import { TENANT_ID_HEADER, assertValidTenantId, tenantScopeKey } from "./tenant.ts";
 import type { AutoReplayOptions } from "./autoreplay.ts";
 import type { DeadLetterRetentionOptions } from "./deadletter-retention.ts";
@@ -826,6 +831,26 @@ export interface RelayServerOptions {
    * enter the retry queue or the dead-letter list. Off by default.
    */
   completionCallback?: CompletionCallbackOptions;
+  /**
+   * Dead-letter storm escalation alerts (WR-93; see `src/escalation.ts`
+   * and the `escalation` `RetryQueue` option). Opt-in, off by default:
+   * when the dead-letter count for one (tenant, endpoint) scope inside
+   * the sliding window (`windowMs`, default 10 minutes) reaches
+   * `threshold` (default 20), the relay POSTs one HMAC-SHA256-signed
+   * JSON alert (`x-relay-signature`, WR-26 style) to the operator's
+   * `url`.
+   *
+   * The aggregate counterpart to the per-delivery `completionCallback`
+   * receipts above: completion callbacks notify the *caller* of every
+   * terminal delivery; storm escalation notifies the *operator* once per
+   * threshold crossing. Escalations are edge-triggered with a cooldown
+   * (`cooldownMs`, default 1 hour) — one storm, one alert — and are
+   * audited as `dead_letter_escalated` (dispatched) /
+   * `dead_letter_escalation_failed` (alert POST gave up). The queue's
+   * `getEscalationStats()` exposes the per-scope state, and the operator
+   * can acknowledge a scope to rearm it.
+   */
+  deadLetterEscalation?: DeadLetterEscalationOptions;
   /**
    * Replay protection for inbound webhooks. When set, each accepted POST must
    * carry a unique `x-nonce` header: a nonce seen inside the guard's window is
@@ -3087,6 +3112,36 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       });
       opts.retry?.onCompletionCallbackFailed?.(info);
     },
+    // WR-93: an explicit server-level `deadLetterEscalation` wins over
+    // the nested `retry.escalation`; either way the queue owns the
+    // escalator. Wrap the caller's hooks so every dispatched alert is
+    // audited as `dead_letter_escalated` and every exhausted alert as
+    // `dead_letter_escalation_failed`, not just observed. A failing
+    // alert never enters the retry queue or the dead-letter list — it
+    // cannot recurse into the machinery it observes.
+    escalation: opts.deadLetterEscalation ?? opts.retry?.escalation,
+    onDeadLetterEscalated: (info: DeadLetterEscalatedInfo) => {
+      opts.auditLog.append({
+        event: "dead_letter_escalated",
+        ...(info.tenant !== undefined ? { tenant: info.tenant } : {}),
+        endpoint: info.endpoint,
+        deadLetters: info.deadLetters,
+        threshold: info.threshold,
+        windowMs: info.windowMs,
+        alertedAt: info.alertedAt,
+      });
+      opts.retry?.onDeadLetterEscalated?.(info);
+    },
+    onDeadLetterEscalationFailed: (info: DeadLetterEscalationFailedInfo) => {
+      opts.auditLog.append({
+        event: "dead_letter_escalation_failed",
+        ...(info.tenant !== undefined ? { tenant: info.tenant } : {}),
+        endpoint: info.endpoint,
+        attempts: info.attempts,
+        error: info.error,
+      });
+      opts.retry?.onDeadLetterEscalationFailed?.(info);
+    },
     // Wrap the caller's onSloMiss so every SLO miss is audited, not just observed.
     // WR-71: same treatment for onSloRisk — every early-warning
     // transition is audited as `slo_risk` (state "elevated" / "cleared"),
@@ -5323,6 +5378,19 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // WR-56: the check only needs the intake listener — the operator plane
   // 404s webhooks, so a callback pointed at it can never re-enter intake.
   queue.setCompletionCallbackSelfCheck(
+    createBoundAddressSelfCheck(() => {
+      const addr = server.address();
+      if (addr === null || typeof addr === "string") return addr;
+      return { address: addr.address, port: addr.port };
+    })
+  );
+
+  // WR-93 runtime loop check: a storm-alert URL that resolves to this
+  // relay's own listener would re-enter intake on every threshold
+  // crossing and amplify the storm it reports. Same derivation as the
+  // WR-47 check above — the configuration-time check (declared
+  // `selfOrigins`) ran at queue construction.
+  queue.setEscalationSelfCheck(
     createBoundAddressSelfCheck(() => {
       const addr = server.address();
       if (addr === null || typeof addr === "string") return addr;

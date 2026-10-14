@@ -71,6 +71,11 @@
  *   by logical endpoint and shadow target (`result` = `delivered` /
  *   `failed`). Present only once a shadow target has actually received a
  *   mirrored copy — absent entirely when the feature is off.
+ * - `relay_dead_letter_escalations_total{endpoint}`: counter of
+ *   dead-letter storm escalation alerts (WR-93) dispatched per
+ *   (tenant, endpoint) scope, with a `tenant` label when the scope is
+ *   tenant-scoped. Activity-gated: present only for scopes that
+ *   actually escalated — absent entirely when the feature is off.
  *
  * Cardinality note: labels are per endpoint (`targetUrl`), so a relay
  * fanning out to many distinct downstream URLs grows the series count —
@@ -125,6 +130,19 @@ export interface ShadowMetricsInput {
   failed: number;
 }
 
+/**
+ * One (tenant, endpoint) scope's dead-letter storm escalation count
+ * (WR-93), in Prometheus label order.
+ */
+export interface DeadLetterEscalationMetricsInput {
+  /** Downstream endpoint whose dead letters piled up. */
+  endpoint: string;
+  /** Tenant id (WR-48); when set it is rendered as a `tenant` label. */
+  tenant?: string;
+  /** Cumulative escalation alerts dispatched for this scope. */
+  escalations: number;
+}
+
 export interface MetricsInput {
   deliveries: DeliveryCountersInput[];
   circuits: CircuitStateInput[];
@@ -172,6 +190,13 @@ export interface MetricsInput {
    * off — the same activity-gated convention as the probe series.
    */
   shadow?: ShadowMetricsInput[];
+  /**
+   * Present only for (tenant, endpoint) scopes that actually dispatched a
+   * dead-letter storm escalation alert (WR-93); absent entirely when the
+   * feature is off — the same activity-gated convention as the probe
+   * series.
+   */
+  escalation?: DeadLetterEscalationMetricsInput[];
   /**
    * Present only when OTLP delivery-event export (WR-83) is enabled
    * (`RetryQueueOptions.otlp`); absent entirely otherwise — the same
@@ -488,6 +513,20 @@ export function renderPrometheus(input: MetricsInput): string {
       const labels = `endpoint="${escapeLabelValue(s.endpoint)}"${tenantLabel(s.tenant)},shadow_target="${escapeLabelValue(s.shadowTarget)}"`;
       lines.push(`relay_shadow_total{${labels},result="delivered"} ${s.delivered}`);
       lines.push(`relay_shadow_total{${labels},result="failed"} ${s.failed}`);
+    }
+  }
+  // WR-93: activity-gated like the probe series — the series appears only
+  // for scopes that actually dispatched an escalation alert, so a relay
+  // with the feature off exposes no `relay_dead_letter_escalations_total`
+  // series at all.
+  if (input.escalation !== undefined && input.escalation.length > 0) {
+    lines.push(
+      "# HELP relay_dead_letter_escalations_total Dead-letter storm escalation alerts (WR-93) dispatched per (tenant, endpoint) scope."
+    );
+    lines.push("# TYPE relay_dead_letter_escalations_total counter");
+    for (const s of input.escalation) {
+      const labels = `endpoint="${escapeLabelValue(s.endpoint)}"${tenantLabel(s.tenant)}`;
+      lines.push(`relay_dead_letter_escalations_total{${labels}} ${s.escalations}`);
     }
   }
   // WR-83: emitted only when OTLP export is enabled — the same

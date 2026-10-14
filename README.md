@@ -2046,6 +2046,61 @@ and again before every POST against the actually bound address (so even an
 undeclared self-target is refused). A refused target fails fast and is
 audited as `callback_failed` — it is never POSTed.
 
+### Dead-letter storm escalation
+
+Completion callbacks (above) are *per-delivery* receipts to the *caller's*
+URL — one signed POST per terminal delivery. Dead-letter storm escalation
+is the *aggregate* counterpart: it notifies the *operator's* URL once per
+storm, so an operator drowning in per-delivery `dead_letter` receipts gets
+one alert instead of a thousand.
+
+When `deadLetterEscalation` is set (off by default), the relay watches the
+dead-letter count per (tenant, endpoint) inside a sliding window
+(`windowMs`, default 10 minutes). The first crossing of `threshold`
+(default 20) dispatches one signed JSON alert to the operator's `url`:
+
+```json
+{
+  "event": "dead_letter_escalation",
+  "endpoint": "https://downstream.example/hook",
+  "deadLetters": 20,
+  "threshold": 20,
+  "windowMs": 600000,
+  "alertedAt": "2026-10-13T12:00:00.000Z"
+}
+```
+
+(`tenant` appears when the storming scope is tenant-scoped.) The alert
+carries the WR-26 trust headers — `x-relay-signature: sha256=<hex>`
+(HMAC-SHA256 of the body under `signingSecret`, **required** so the
+operator side can verify the alert really came from this relay) and
+`x-relay-key-id` when `keyId` is set. A failed alert is retried with a
+short backoff (`maxAttempts`, default 2, capped at 3), then reported once
+and audited as `dead_letter_escalation_failed`; a dispatched alert is
+audited as `dead_letter_escalated`. Alerts never enter the retry queue or
+the dead-letter list — a failing alert cannot recurse into the machinery
+it observes.
+
+**Edge-triggered with a cooldown.** One storm produces one alert: while a
+scope is `alerted`, further dead letters are silent. The scope rearms when
+the operator acknowledges it (`RetryQueue.acknowledgeDeadLetterEscalation`)
+or when the sliding-window count falls back below the threshold on its
+own. `cooldownMs` (default 1 hour) is the anti-flap guard between
+episodes: a new episode starting inside the previous alert's cooldown stays
+silent.
+
+**Loop protection** works exactly like completion callbacks: the operator
+URL is checked at configuration time against declared `selfOrigins` and
+again before every POST against the actually bound address — an alert
+posted back into this relay's own intake would amplify the storm it
+reports.
+
+Observability: `RetryQueue.getEscalationStats()` returns one row per scope
+(endpoint, tenant, in-window count, threshold, alerted state, last alert,
+cumulative escalations), and `GET /metrics` exposes
+`relay_dead_letter_escalations_total{endpoint[,tenant]}` (activity-gated —
+absent until the first alert fires).
+
 ### Multi-tenant isolation
 
 One relay can serve many tenants without them stepping on each other. An

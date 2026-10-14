@@ -94,6 +94,15 @@ import {
   type TerminalDeliveryState,
 } from "./callback.ts";
 import {
+  DeadLetterStormEscalator,
+  resolveDeadLetterEscalationConfig,
+  isSelfEscalationTarget,
+  type DeadLetterEscalationFailedInfo,
+  type DeadLetterEscalationOptions,
+  type DeadLetterEscalationStatsRow,
+  type DeadLetterEscalatedInfo,
+} from "./escalation.ts";
+import {
   OutboundCoalescer,
   type CoalesceStats,
   type CoalescingOptions,
@@ -135,6 +144,7 @@ import {
   type SloRiskMetricsInput,
   type StarvationGuardMetricsInput,
   type WeightedMetricsInput,
+  type DeadLetterEscalationMetricsInput,
 } from "./metrics.ts";
 import {
   summarizeDeadLetterFailure,
@@ -147,6 +157,7 @@ export { TRACE_ID_HEADER };
 export { renderPrometheus };
 export { TENANT_ID_HEADER, assertValidTenantId, tenantScopeKey, splitTenantScopeKey };
 export type { DeliveryCountersInput, CircuitStateInput, LatencyHistogramInput, StarvationGuardMetricsInput, SloRiskMetricsInput, CertExpiryMetricsInput };
+export type { DeadLetterEscalationMetricsInput };
 export { HttpDeliveryError, classifyFailure, parseRetryAfterMs };
 export type { FailureClass, ClassifiedFailure };
 export type { DownstreamResponseSummary };
@@ -161,6 +172,19 @@ export type {
   CompletionCallbackOptions,
   CompletionReceipt,
   TerminalDeliveryState,
+};
+export {
+  DeadLetterStormEscalator,
+  resolveDeadLetterEscalationConfig,
+  isSelfEscalationTarget,
+};
+export type {
+  DeadLetterEscalationAlert,
+  DeadLetterEscalatedInfo,
+  DeadLetterEscalationFailedInfo,
+  DeadLetterEscalationOptions,
+  DeadLetterEscalationStatsRow,
+  EscalationPostResult,
 };
 
 export type { CircuitBreakerOptions, CircuitState, CircuitStats };
@@ -1137,6 +1161,44 @@ export interface RetryQueueOptions {
    * dead-letter list — a failing callback cannot recurse.
    */
   onCompletionCallbackFailed?: (info: CompletionCallbackFailedInfo) => void;
+  /**
+   * Dead-letter storm escalation alerts (WR-93; see `src/escalation.ts`).
+   * Opt-in, disabled by default: when the dead-letter count for one
+   * (tenant, endpoint) scope inside the sliding window (`windowMs`,
+   * default 10 minutes) reaches `threshold` (default 20), the relay
+   * POSTs one HMAC-SHA256-signed JSON alert (`x-relay-signature`,
+   * WR-26 style; `x-relay-key-id` when `keyId` is set) to the
+   * operator's `url`.
+   *
+   * This is the aggregate counterpart to the WR-47 completion
+   * callbacks: completion callbacks are per-delivery receipts to the
+   * *caller's* URL (one POST per terminal delivery); storm escalation
+   * is per-scope storm telemetry to the *operator's* URL (one POST per
+   * threshold crossing). An operator drowning in per-delivery
+   * `dead_letter` receipts gets one alert here instead.
+   *
+   * Edge-triggered with a cooldown: one storm produces one alert; the
+   * scope rearms when the operator acknowledges (see
+   * {@link RetryQueue.acknowledgeDeadLetterEscalation}) or when the
+   * sliding-window count falls back below the threshold on its own.
+   * A new episode starting inside `cooldownMs` (default 1 hour) of the
+   * previous alert stays silent. Invalid values throw `RangeError` at
+   * construction.
+   */
+  escalation?: DeadLetterEscalationOptions;
+  /**
+   * Called once when a storm alert is dispatched for a scope. The server
+   * audits these as `dead_letter_escalated`.
+   */
+  onDeadLetterEscalated?: (info: DeadLetterEscalatedInfo) => void;
+  /**
+   * Called once when a storm alert exhausts its POST attempts
+   * (`maxAttempts`, at most 3). The server audits these as
+   * `dead_letter_escalation_failed`. A failing alert never enters the
+   * retry queue or the dead-letter list — alert delivery must not
+   * recurse into the machinery it observes.
+   */
+  onDeadLetterEscalationFailed?: (info: DeadLetterEscalationFailedInfo) => void;
   /**
    * Durable delivery queue (WR-49; see `src/durable-queue.ts`). Opt-in:
    * when set to a directory path, pending and backoff-waiting deliveries
@@ -2150,6 +2212,8 @@ export class RetryQueue {
   private readonly weighted?: WeightedDispatcher;
   /** WR-47: completion-receipt sender; undefined when the feature is off. */
   private readonly callbacker?: CompletionCallbacker;
+  /** WR-93: dead-letter storm escalator; undefined when the feature is off. */
+  private readonly escalation?: DeadLetterStormEscalator;
 
   private readonly queue = new Map<string, RetryItem & { attempt: number }>();
   private readonly timers = new Map<string, Scheduled>();
@@ -2391,6 +2455,20 @@ export class RetryQueue {
         ? undefined
         : new CompletionCallbacker(callbackConfig, {
             onFailed: (info) => opts.onCompletionCallbackFailed?.(info),
+          });
+    // WR-93: invalid escalation configs throw here, at construction —
+    // never mid-delivery. The runtime loop check (against the actually
+    // bound address) is installed later via `setEscalationSelfCheck`,
+    // because the server does not know its listen port yet at this
+    // point. Off by default — no alert POSTs unless the operator opts
+    // in explicitly.
+    const escalationConfig = resolveDeadLetterEscalationConfig(opts.escalation);
+    this.escalation =
+      escalationConfig === undefined
+        ? undefined
+        : new DeadLetterStormEscalator(escalationConfig, {
+            onEscalated: (info) => opts.onDeadLetterEscalated?.(info),
+            onFailed: (info) => opts.onDeadLetterEscalationFailed?.(info),
           });
     this.latencyOpts = opts.latency;
     this.onSloMiss = opts.latency?.onSloMiss;
@@ -3447,6 +3525,7 @@ export class RetryQueue {
     this.retentionSweeper?.stop();
     this.prober?.stop();
     this.callbacker?.stop();
+    this.escalation?.stop();
     // WR-83: opt-in only — clear the export retry timer and kick off one
     // best-effort flush (fire-and-forget; `stop()` is synchronous).
     this.otlpExporter?.stop();
@@ -4483,6 +4562,10 @@ export class RetryQueue {
       attempts: entry.attempt,
       error,
     });
+    // WR-93: feed the storm escalator (opt-in) — one record per dead
+    // letter; the escalator decides whether the scope crossed its
+    // threshold. Aggregate storm alert, not a per-delivery receipt.
+    this.escalation?.recordDeadLetter({ tenant: entry.tenantId, endpoint: target });
   }
 
   /** Per-(tenant, endpoint) concurrency snapshot: in-flight and queued deliveries. Rows carry `tenant` only when set. */
@@ -4543,6 +4626,39 @@ export class RetryQueue {
    */
   setCompletionCallbackSelfCheck(fn: (url: string) => boolean): void {
     this.callbacker?.setSelfCheck(fn);
+  }
+
+  /**
+   * Install the runtime loop check for dead-letter storm alerts (WR-93).
+   * The server derives the predicate from the actually bound listen
+   * address, so an operator URL that resolves to this relay — even one
+   * not declared in `selfOrigins` — is refused before every POST: an
+   * alert re-entering intake would amplify the storm it reports.
+   * No-op when escalation is not configured.
+   */
+  setEscalationSelfCheck(fn: (url: string) => boolean): void {
+    this.escalation?.setSelfCheck(fn);
+  }
+
+  /**
+   * Dead-letter storm escalation observability (WR-93): one row per
+   * (tenant, endpoint) scope that has seen at least one dead letter —
+   * current in-window count, threshold, edge state, last alert, and
+   * cumulative escalations. Empty when the feature is off. Rows carry
+   * `tenant` only when set.
+   */
+  getEscalationStats(): DeadLetterEscalationStatsRow[] {
+    return this.escalation?.stats() ?? [];
+  }
+
+  /**
+   * Manually acknowledge a scope's dead-letter storm (WR-93): the scope
+   * returns to quiet and the next threshold crossing dispatches a fresh
+   * alert (subject to the cooldown). No-op when the feature is off or
+   * the scope is unknown.
+   */
+  acknowledgeDeadLetterEscalation(tenant: string | undefined, endpoint: string): void {
+    this.escalation?.acknowledge(tenant, endpoint);
   }
 
   /**
@@ -4735,6 +4851,18 @@ export class RetryQueue {
       delivered: s.delivered,
       failed: s.failed,
     }));
+    // WR-93: one series per (tenant, endpoint) scope that actually
+    // dispatched a storm alert — activity-gated, so the series stays
+    // absent until the first escalation fires. The escalator's
+    // cumulative counts are the source; the queue keeps no parallel
+    // counter.
+    const escalation: DeadLetterEscalationMetricsInput[] = (this.escalation?.stats() ?? [])
+      .filter((s) => s.escalations > 0)
+      .map((s) => ({
+        endpoint: s.endpoint,
+        ...(s.tenant === undefined ? {} : { tenant: s.tenant }),
+        escalations: s.escalations,
+      }));
     return renderPrometheus({
       deliveries,
       circuits,
@@ -4770,6 +4898,8 @@ export class RetryQueue {
       ...(deliveryDeadlineExceeded.length > 0 ? { deliveryDeadlineExceeded } : {}),
       // WR-85: activity-gated (see above).
       ...(shadow.length > 0 ? { shadow } : {}),
+      // WR-93: activity-gated (see above).
+      ...(escalation.length > 0 ? { escalation } : {}),
       // WR-83: enabled-gated — the OTLP series appear only when OTLP
       // export is configured, exactly like the probe series.
       ...(this.otlpExporter !== undefined
