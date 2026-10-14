@@ -1734,6 +1734,54 @@ const server = createRelayServer({
   the stateful `g`/`y` flags so forwarding is deterministic. Invalid
   rules throw `RangeError` at startup — never mid-delivery.
 
+## W3C trace-context propagation (opt-in)
+
+Distributed-tracing glue between the relay's own end-to-end trace IDs
+(`x-trace-id`, always minted at intake) and the W3C `traceparent` /
+`tracestate` headers the downstream ecosystem speaks
+(`src/trace-context.ts`):
+
+```ts
+const server = createRelayServer({
+  secret, forwardUrl, auditLog,
+  traceContext: {
+    sampled: true, // default; the sampled flag on relay-generated traceparents
+  },
+});
+```
+
+- **Inbound** — a valid `traceparent` is parsed and its trace-id becomes
+  the event's trace ID, so the relay's OTLP span, audit trail, and the
+  downstream trace share one trace id; the sampled flag and a
+  well-formed `tracestate` ride along for propagation. An invalid
+  `traceparent` is ignored outright — never a 400, never a behavior
+  change. A valid `traceparent` with a malformed `tracestate` still
+  propagates; only the `tracestate` is dropped.
+- **Outbound** — every HTTP delivery stamps `traceparent` (forced, like
+  `x-trace-id`: a stale inbound value in the passthrough set is
+  overridden) with a fresh child span id per attempt — each attempt is
+  its own span in the downstream trace. A caller-propagated context
+  keeps its trace id and sampled flag untouched and forwards
+  `tracestate` verbatim; otherwise the traceparent is generated from the
+  delivery's trace ID (32-hex values pass through, anything else is
+  mapped with the same deterministic SHA-256 the OTLP export applies,
+  so the injected trace id always equals the relay span's OTLP
+  `trace_id`) with the configured `sampled` flag.
+- **Span correlation** — the span id is derived deterministically from
+  (trace id, 1-based attempt), so delivery events and the OTLP export
+  name the exact span the wire carried: events carry it as `traceSpan`,
+  and OTLP log records render `trace.trace_id` / `trace.span_id` /
+  `trace.sampled` attributes (2xx and failed attempts alike — a
+  `dead_letter` record points at the span of its final attempt).
+- **Zero overhead when off** — unset (the default) means no inbound
+  parsing, no outbound stamping, no extra allocations on the delivery
+  path; the wire shape is byte-identical to before.
+- **Composes** with WR-69 (the forced stamp is applied after the
+  forwarding gate, like the other relay-owned headers), the WR-85
+  shadow senders (mirrored requests propagate identically), and the
+  durable journal (a propagated context survives restarts). Invalid
+  option values throw `RangeError` at startup — never mid-delivery.
+
 ## Outbound end-to-end encryption
 
 Deliveries to sensitive downstreams can be sealed end-to-end per endpoint
@@ -1875,7 +1923,10 @@ const server = createRelayServer({
   `relay.event_type`, `relay.endpoint`, `relay.attempts`, `relay.error`
   (failures), `relay.tenant` (multi-tenant only),
   `relay.slo_ms` / `relay.latency_ms` (SLO misses),
-  `relay.retry_after_ms` (rate-limit decisions).
+  `relay.retry_after_ms` (rate-limit decisions), and — when W3C
+  trace-context propagation is enabled — `trace.trace_id` /
+  `trace.span_id` / `trace.sampled`, naming the exact downstream span
+  the attempt stamped on the wire (see "W3C trace-context propagation").
 - **Never disturbs delivery** — export is off by default; when enabled,
   `record()` is synchronous buffer work that never throws, the flush
   runs on an unref'd background timer, and a hung collector cannot pin

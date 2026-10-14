@@ -59,6 +59,23 @@ export interface OtlpRecordInput {
    */
   dominantPhase?: string;
   /**
+   * WR-98: W3C trace-context span correlation (`delivered` / `retrying` /
+   * `dead_letter` only). Set when trace-context propagation resolved a
+   * context for the delivery: the record renders `trace.trace_id`,
+   * `trace.span_id`, and `trace.sampled` attributes so the relay's OTLP
+   * span joins the downstream trace's spans — `trace.trace_id` always
+   * equals the injected `traceparent`'s trace id, and `trace.span_id`
+   * names the exact parent-id the relay stamped on that attempt's wire
+   * request. Absent = the attributes are not rendered (zero payload
+   * change for operators not using trace context).
+   */
+  traceSpanId?: string;
+  /**
+   * WR-98: the sampled flag of the delivery's trace context. Rendered as
+   * the `trace.sampled` attribute only together with `traceSpanId`.
+   */
+  traceSampled?: boolean;
+  /**
    * WR-97: milliseconds until the (tenant, endpoint) token bucket
    * refills (`rate_limited` only) — the honest `Retry-After` behind the
    * rate-limit decision, rendered as `relay.retry_after_ms`.
@@ -184,6 +201,15 @@ export function buildOtlpPayload(
     if (r.latencyMs !== undefined) attributes.push(intAttr("relay.latency_ms", r.latencyMs));
     if (r.dominantPhase !== undefined) attributes.push(attr("relay.dominant_phase", r.dominantPhase));
     if (r.retryAfterMs !== undefined) attributes.push(intAttr("relay.retry_after_ms", r.retryAfterMs));
+    // WR-98: W3C trace-context span correlation — only when the delivery
+    // resolved a trace context, so the default payload shape is unchanged.
+    if (r.traceSpanId !== undefined) {
+      attributes.push(attr("trace.trace_id", mapOtlpTraceId(r.traceId)));
+      attributes.push(attr("trace.span_id", r.traceSpanId));
+      if (r.traceSampled !== undefined) {
+        attributes.push(attr("trace.sampled", r.traceSampled ? "true" : "false"));
+      }
+    }
     return {
       timeUnixNano: nowNano,
       observedTimeUnixNano: nowNano,

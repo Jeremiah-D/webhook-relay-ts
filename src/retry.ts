@@ -174,6 +174,15 @@ import {
   type DownstreamResponseSummary,
 } from "./response-summary.ts";
 import { OtlpExporter, type OtlpExporterOptions, type OtlpStats } from "./otlp.ts";
+import {
+  resolveOutboundTraceContext,
+  resolveTraceContextOptions,
+  traceAttemptSpanId,
+  type ResolvedTraceContextOptions,
+  type TraceContext,
+  type TraceContextOptions,
+} from "./trace-context.ts";
+export type { TraceContext, TraceContextOptions };
 
 export { TRACE_ID_HEADER };
 export { renderPrometheus };
@@ -301,6 +310,16 @@ export interface RetryItem {
    * path and in dead-letter entries.
    */
   traceId?: string;
+  /**
+   * WR-98: caller-propagated W3C trace context (see `src/trace-context.ts`),
+   * from the inbound `traceparent` / `tracestate` headers. When the
+   * trace-context option is enabled, outbound deliveries stamp a
+   * `traceparent` derived from this (trace id and sampled flag pass
+   * through; a fresh child span id is stamped per attempt) instead of a
+   * relay-generated one. Unset = no caller context; the relay generates
+   * the traceparent from `traceId` when the option is enabled.
+   */
+  traceContext?: TraceContext;
   /**
    * Tenant id (WR-48; see `src/tenant.ts`), from the inbound `x-tenant-id`
    * header. Scopes the per-(tenant, endpoint) isolation primitives
@@ -530,6 +549,17 @@ export interface DeliveryEvent {
   at: string;
   /** Failure message; present for `retrying` and `dead_letter`. */
   error?: string;
+  /**
+   * WR-98: W3C trace-context span reference for the wire attempt this
+   * event describes. Set only when trace-context propagation is enabled
+   * and a context resolved for the delivery: `spanId` is the parent-id
+   * the relay stamped in that attempt's outbound `traceparent`, so the
+   * event joins the downstream trace's spans on (`traceId`, `spanId`)
+   * (the OTLP export renders these as `trace.trace_id` /
+   * `trace.span_id` attributes). Absent = trace context off or no
+   * context resolved; subscribers must not assume it.
+   */
+  traceSpan?: { spanId: string; sampled: boolean };
 }
 
 /** Fired every time a batch is flushed (one merged item enqueued). */
@@ -1506,6 +1536,17 @@ export interface RetryQueueOptions {
    * `RangeError` at construction.
    */
   otlp?: OtlpExporterOptions;
+  /**
+   * WR-98: W3C Trace Context propagation (see `src/trace-context.ts`).
+   * Opt-in: outbound deliveries stamp `traceparent` / `tracestate`
+   * (caller-propagated context keeps its sampled flag; otherwise the
+   * traceparent is generated from the delivery's trace ID with the
+   * configured `sampled` flag), and delivery events carry the wire
+   * span reference for OTLP correlation. Disabled by default (absent =
+   * zero behavior change — no parsing, no stamping). Invalid values
+   * throw `RangeError` at construction.
+   */
+  traceContext?: TraceContextOptions;
 }
 
 /**
@@ -2203,6 +2244,8 @@ export class RetryQueue {
    */
   private readonly latencies = new Map<string, LatencyTracker>();
   private readonly latencyOpts?: LatencyOptions;
+  /** WR-98: resolved trace-context option; `undefined` = feature off. */
+  private readonly traceContextOpts?: ResolvedTraceContextOptions;
   private readonly onSloMiss?: (info: SloMissInfo) => void;
   /**
    * WR-71: per-tenant SLO-breach predictors, keyed by tenant (`""` =
@@ -2619,6 +2662,10 @@ export class RetryQueue {
           });
     this.latencyOpts = opts.latency;
     this.onSloMiss = opts.latency?.onSloMiss;
+    // WR-98: opt-in W3C trace-context propagation. Resolved (and
+    // validated) eagerly — `RangeError` at construction, never
+    // mid-delivery. `undefined` keeps the exact pre-WR-98 behavior.
+    this.traceContextOpts = resolveTraceContextOptions(opts.traceContext);
     if (opts.otlp !== undefined) {
       // WR-83: opt-in OTLP export. The exporter validates eagerly —
       // `RangeError` at construction, never mid-delivery. Delivery
@@ -2638,6 +2685,10 @@ export class RetryQueue {
             attempts: event.attempts,
             error: event.error,
             tenant: event.tenant,
+            // WR-98: W3C trace-context span correlation attributes.
+            ...(event.traceSpan === undefined
+              ? {}
+              : { traceSpanId: event.traceSpan.spanId, traceSampled: event.traceSpan.sampled }),
           });
         } catch {
           // Unreachable by contract (`record()` never throws) — the
@@ -3169,6 +3220,22 @@ export class RetryQueue {
 
   private emitDeliveryEvent(event: DeliveryEvent): void {
     for (const listener of this.deliveryEventListeners) listener(event);
+  }
+
+  /**
+   * WR-98: the W3C span reference for one delivery attempt, for delivery
+   * events and the OTLP export. `undefined` when trace-context
+   * propagation is off or no context resolved for the item (zero-overhead
+   * skip). `attempt1Based` is the 1-based attempt number the wire
+   * `traceparent` was stamped with.
+   */
+  private traceSpanFor(
+    entry: RetryItem,
+    attempt1Based: number
+  ): { spanId: string; sampled: boolean } | undefined {
+    const ctx = resolveOutboundTraceContext(entry, this.traceContextOpts);
+    if (ctx === undefined) return undefined;
+    return { spanId: traceAttemptSpanId(ctx.traceId, attempt1Based), sampled: ctx.sampled };
   }
 
   /**
@@ -4533,6 +4600,7 @@ export class RetryQueue {
         this.evaluateSloRisk(tenant, entry.targetUrl);
         // The hooks see the physical target the delivery actually went to.
         this.onDelivered?.({ ...entry, targetUrl: target }, entry.attempt + 1, responseSummary);
+        const deliveredTraceSpan = this.traceSpanFor(entry, entry.attempt + 1);
         this.emitDeliveryEvent({
           type: "delivered",
           id: entry.id,
@@ -4542,6 +4610,7 @@ export class RetryQueue {
           attempts: entry.attempt + 1,
           bytesOut: entry.payload.length,
           at: new Date().toISOString(),
+          ...(deliveredTraceSpan === undefined ? {} : { traceSpan: deliveredTraceSpan }),
         });
         // WR-47: terminal state — fire the completion receipt (opt-in).
         this.callbacker?.notifyDelivered({
@@ -4645,6 +4714,7 @@ export class RetryQueue {
             }
           }
           this.recordDelivery(tenant, target, "retried");
+          const retryingTraceSpan = this.traceSpanFor(entry, entry.attempt);
           this.emitDeliveryEvent({
             type: "retrying",
             id: entry.id,
@@ -4655,6 +4725,7 @@ export class RetryQueue {
             bytesOut: entry.payload.length,
             at,
             error,
+            ...(retryingTraceSpan === undefined ? {} : { traceSpan: retryingTraceSpan }),
           });
           // WR-38: gate every newly scheduled retry on the global retry
           // budget. When the budget is exhausted the retry is parked
@@ -4823,6 +4894,7 @@ export class RetryQueue {
     // usable body and no meaningful TTFB, so those stay "unavailable".
     const responseSummary = summarizeDeadLetterFailure(err);
     this.onDeadLetter?.({ ...entry, targetUrl: target }, entry.attempt, err, classified.failureClass, responseSummary);
+    const deadLetterTraceSpan = this.traceSpanFor(entry, entry.attempt);
     this.emitDeliveryEvent({
       type: "dead_letter",
       id: entry.id,
@@ -4833,6 +4905,7 @@ export class RetryQueue {
       bytesOut: entry.payload.length,
       at,
       error,
+      ...(deadLetterTraceSpan === undefined ? {} : { traceSpan: deadLetterTraceSpan }),
     });
     // WR-47: terminal state — fire the completion receipt (opt-in).
     this.callbacker?.notifyDeadLetter({
@@ -5594,6 +5667,10 @@ export class RetryQueue {
         traceId: entry.traceId,
         tenantId: entry.tenantId,
         attempt: entry.attempt,
+        // WR-98: the caller-propagated W3C trace context survives
+        // compaction restarts, so post-restart retries keep propagating
+        // the same trace instead of generating a new one.
+        ...(entry.traceContext !== undefined ? { traceContext: entry.traceContext } : {}),
         // WR-76: the deadline clock survives compaction restarts.
         ...(entry.enqueuedAt !== undefined ? { enqueuedAt: entry.enqueuedAt } : {}),
         ...(nextAt !== undefined ? { nextAt } : {}),

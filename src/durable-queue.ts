@@ -77,6 +77,24 @@ export interface JournalEnqueueItem {
   tenantId?: string;
   /** WR-76: queue-admission instant (ms epoch); the deadline clock survives restarts. */
   enqueuedAt?: number;
+  /** WR-98: caller-propagated W3C trace context; validated on restore. */
+  traceContext?: unknown;
+}
+
+/**
+ * WR-98: defensive shape check for a journaled trace context — the
+ * journal is untrusted input (it may predate the feature or be
+ * hand-edited), so a malformed value is dropped rather than trusted.
+ */
+function isTraceContext(value: unknown): value is { traceId: string; spanId: string; sampled: boolean; traceState?: string } {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const v = value as Record<string, unknown>;
+  return (
+    typeof v.traceId === "string" &&
+    typeof v.spanId === "string" &&
+    typeof v.sampled === "boolean" &&
+    (v.traceState === undefined || typeof v.traceState === "string")
+  );
 }
 
 /** The dead-letter snapshot carried by a `dead_letter` line. */
@@ -315,6 +333,10 @@ export class QueueJournal {
             tenantId: line.item.tenantId,
             attempt: 0,
             hasRetry: false,
+            // WR-98: restore the caller-propagated W3C trace context when
+            // the journal has a well-formed one; otherwise retries after
+            // the restart generate from the trace id as usual.
+            ...(isTraceContext(line.item.traceContext) ? { traceContext: line.item.traceContext } : {}),
             // WR-76: keep the pre-crash admission instant when the
             // journal has one; otherwise the deadline check stamps it
             // lazily on the next dispatch instead of expiring a
@@ -510,6 +532,12 @@ export interface CompactItem {
   traceId?: string;
   tenantId?: string;
   attempt: number;
+  /**
+   * WR-98: caller-propagated W3C trace context (plain JSON). Restored
+   * verbatim; validated shape is the writer's contract (the queue only
+   * ever writes what `parseInboundTraceContext` produced).
+   */
+  traceContext?: { traceId: string; spanId: string; sampled: boolean; traceState?: string };
   /** WR-76: queue-admission instant (ms epoch); the deadline clock survives compaction. */
   enqueuedAt?: number;
   /** Absolute ms epoch of the armed retry timer, when one is pending. */

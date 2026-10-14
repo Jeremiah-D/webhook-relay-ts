@@ -49,6 +49,18 @@ import {
   type OperatorKeyEntry,
 } from "./operator-keys.ts";
 import { resolveTraceId, TRACE_ID_HEADER } from "./trace.ts";
+import {
+  formatTraceparent,
+  parseInboundTraceContext,
+  resolveOutboundTraceContext,
+  resolveTraceContextOptions,
+  traceAttemptSpanId,
+  TRACEPARENT_HEADER,
+  TRACESTATE_HEADER,
+  type ResolvedTraceContextOptions,
+  type TraceContext,
+  type TraceContextOptions,
+} from "./trace-context.ts";
 import { ContentRouteTable, type ContentRouteRule } from "./content-routes.ts";
 import {
   deriveIdempotencyKey,
@@ -400,6 +412,20 @@ export interface RelayServerOptions {
    * `retry.otlp`. Off by default.
    */
   otlp?: OtlpExporterOptions;
+  /**
+   * W3C Trace Context propagation (WR-98; see `src/trace-context.ts` and
+   * the `traceContext` `RetryQueue` option): opt-in `traceparent` /
+   * `tracestate` handling. A valid inbound `traceparent` becomes the
+   * event's trace ID (its sampled flag and `tracestate` ride along);
+   * every outbound delivery stamps `traceparent` with a fresh child span
+   * id per attempt — caller-propagated contexts keep their sampled flag,
+   * relay-generated ones use the configured `sampled` (default `true`).
+   * An invalid inbound `traceparent` is ignored (never a 400). An
+   * explicit server-level `traceContext` wins over the nested
+   * `retry.traceContext`. Off by default: unset means no parsing, no
+   * stamping, zero behavior change.
+   */
+  traceContext?: TraceContextOptions;
   /**
    * WR-85: shadow-target dry-run mirroring (see `src/shadow.ts`): the
    * downstream-migration / contract-verification scenario. Per-endpoint
@@ -1332,7 +1358,16 @@ export function createDefaultSender(
    * unset. `createRelayServer` enables it exactly when
    * `retry.latencyPhases` is configured.
    */
-  measureLatencyPhases?: boolean
+  measureLatencyPhases?: boolean,
+  /**
+   * WR-98: W3C Trace Context propagation (see `src/trace-context.ts`).
+   * When set, every delivery built by this sender stamps `traceparent`
+   * (fresh child span id per attempt; caller-propagated contexts keep
+   * their sampled flag, generated ones use the configured `sampled`) and
+   * forwards a caller-supplied `tracestate` verbatim. `undefined` keeps
+   * the exact pre-WR-98 wire shape. Validated at startup.
+   */
+  traceContext?: TraceContextOptions
 ): PooledSender {
   if (tlsPins !== undefined) {
     for (const [endpoint, pins] of Object.entries(tlsPins)) {
@@ -1506,6 +1541,15 @@ export function createDefaultSender(
       );
     }
   }
+  // WR-98: RangeError on invalid values, at startup — never mid-delivery.
+  let senderTraceContextOpts: ResolvedTraceContextOptions | undefined;
+  try {
+    senderTraceContextOpts = resolveTraceContextOptions(traceContext);
+  } catch (err) {
+    throw new RangeError(
+      `createDefaultSender: invalid traceContext config: ${(err as Error).message}`
+    );
+  }
   // RangeError on invalid values, at startup — never mid-delivery.
   if (outboundSigning !== undefined) {
     if (typeof outboundSigning.secret !== "string" || outboundSigning.secret === "") {
@@ -1678,6 +1722,17 @@ export function createDefaultSender(
     // delivery with this relay's audit trail (overrides a stale inbound
     // value, which is identical anyway after `resolveTraceId`).
     if (item.traceId) headers[TRACE_ID_HEADER] = item.traceId;
+    // WR-98: W3C trace-context propagation — a forced stamp like
+    // `x-trace-id`: a stale inbound `traceparent` in the passthrough set
+    // is overridden with a fresh child span id per attempt, and a
+    // caller-supplied `tracestate` rides along verbatim. When the option
+    // is off this resolves `undefined` and the wire shape is untouched.
+    const outboundTrace = resolveOutboundTraceContext(item, senderTraceContextOpts);
+    if (outboundTrace !== undefined) {
+      const spanId = traceAttemptSpanId(outboundTrace.traceId, (item.attempt ?? 0) + 1);
+      headers[TRACEPARENT_HEADER] = formatTraceparent(outboundTrace.traceId, spanId, outboundTrace.sampled);
+      if (outboundTrace.traceState !== undefined) headers[TRACESTATE_HEADER] = outboundTrace.traceState;
+    }
     // WR-75: the guarded path is decided first — when both records
     // configure an endpoint it wins outright (safer superset: whitelist +
     // 415 fallback), so the two compressions never stack or disagree. It
@@ -2831,6 +2886,16 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   if (opts.contentRoutes !== undefined || opts.contentRouteDefault !== undefined) {
     contentRouteTable = new ContentRouteTable(opts.contentRoutes ?? [], opts.contentRouteDefault);
   }
+  // WR-98: W3C trace-context propagation — validated once at startup
+  // (`RangeError` fail-fast on bad values), held by the server closure.
+  // `undefined` keeps the exact pre-WR-98 behavior: the intake never
+  // parses `traceparent` and the sender never stamps one.
+  let traceContextOpts: ReturnType<typeof resolveTraceContextOptions>;
+  try {
+    traceContextOpts = resolveTraceContextOptions(opts.traceContext ?? opts.retry?.traceContext);
+  } catch (err) {
+    throw new RangeError(`createRelayServer: invalid traceContext config: ${(err as Error).message}`);
+  }
   // When the caller does not inject a sender, the server owns the default
   // sender — and with it the keep-alive pool, which is closed on server
   // close so pooled outbound connections never outlive the server. The
@@ -2928,7 +2993,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   }
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined)
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext)
       : undefined;
   // WR-50: endpoints the operator may pause/resume over HTTP. The server
   // only ever delivers to these — the intake target plus every
@@ -3034,7 +3099,11 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
                   // instance — one counter set for main + shadow traffic.
                   sharedDnsCache,
                   // WR-95: same phase-measurement gate as the main sender.
-                  opts.retry?.latencyPhases !== undefined
+                  opts.retry?.latencyPhases !== undefined,
+                  // WR-98: shadow deliveries mirror the identical wire
+                  // request, so they propagate trace context like the main
+                  // sender.
+                  opts.traceContext ?? opts.retry?.traceContext
                 ),
               })
             ),
@@ -3123,6 +3192,10 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // limiter (the intake consults it via `admitTenantDelivery()` in
     // `reject-429` mode).
     tenantRateLimit: opts.tenantRateLimit ?? opts.retry?.tenantRateLimit,
+    // WR-98: an explicit server-level `traceContext` wins over the nested
+    // `retry.traceContext`; either way the queue owns span-reference
+    // resolution for delivery events and the OTLP export.
+    traceContext: opts.traceContext ?? opts.retry?.traceContext,
     // WR-85: shadow-target dry-run mirroring. `shadowTargets` (computed
     // above) wins over the nested `retry.shadowTargets`; either way the
     // queue owns the dispatcher. Wrap the caller's hooks so every
@@ -4604,7 +4677,13 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     headers: Record<string, string | string[] | undefined>,
     pathname: string,
     correlation: Record<string, unknown>,
-    apiKey?: { keyId: string; rule: EndpointApiKeyRule }
+    apiKey?: { keyId: string; rule: EndpointApiKeyRule },
+    /**
+     * WR-98: caller-propagated W3C trace context for this event (from the
+     * inbound `traceparent` / `tracestate`); rides the queued item so
+     * outbound deliveries propagate it. `undefined` = no caller context.
+     */
+    inboundTrace?: TraceContext
   ): Promise<AdmitOutcome> => {
     const signatureHeader = headers["x-signature"];
     const keyIdHeader = headers["x-key-id"];
@@ -5045,6 +5124,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         // WR-48: the validated tenant rides the item into the per-tenant
         // isolation scope (breaker/quota/limiter/latency instances).
         ...(tenantId !== undefined ? { tenantId } : {}),
+        // WR-98: the caller-propagated W3C trace context rides the item
+        // so every delivery attempt propagates it downstream.
+        ...(inboundTrace !== undefined ? { traceContext: inboundTrace } : {}),
         payload: body,
         targetUrl,
         headers: passthrough,
@@ -5182,12 +5264,23 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       return;
     }
     const id = randomUUID();
+    // WR-98: parse the inbound W3C trace context before any admission
+    // decision — gated on the option, so an unset option means zero
+    // parsing overhead. A valid `traceparent` promotes its trace-id to
+    // the event's trace ID, so the relay's OTLP span, audit trail, and
+    // the downstream trace share one trace id; an invalid `traceparent`
+    // is ignored outright, never a 400.
+    const inboundTrace =
+      traceContextOpts === undefined
+        ? undefined
+        : parseInboundTraceContext(req.headers[TRACEPARENT_HEADER], req.headers[TRACESTATE_HEADER]);
     // Resolve the trace ID before any admission decision so even rejections
-    // are traceable; a client-supplied x-trace-id is honored, otherwise fresh.
-    const traceId = resolveTraceId(req.headers[TRACE_ID_HEADER]);
+    // are traceable; a propagated W3C trace id wins, then a client-supplied
+    // x-trace-id is honored, otherwise fresh.
+    const traceId = inboundTrace?.traceId ?? resolveTraceId(req.headers[TRACE_ID_HEADER]);
     const gates = await runIntakeGates(req, res, pathname, id, traceId);
     if (gates === undefined) return;
-    const outcome = await admitOneEvent(id, traceId, gates.body, req.headers, pathname, {}, gates.apiKey);
+    const outcome = await admitOneEvent(id, traceId, gates.body, req.headers, pathname, {}, gates.apiKey, inboundTrace);
     const tenantLabel = outcome.tenantId === undefined ? {} : { tenant: outcome.tenantId };
     if (outcome.status === 202) {
       res
@@ -5358,13 +5451,27 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     for (let index = 0; index < events.length; index++) {
       const itemId = randomUUID();
       const checked = checkIngestBatchItem(events[index]);
-      // Per-item trace IDs are independent: an item's own `x-trace-id`
-      // is honored, otherwise a fresh one — never the batch's.
-      const itemTraceId = resolveTraceId(
-        "item" in checked && checked.item.headers !== undefined
-          ? checked.item.headers[TRACE_ID_HEADER]
-          : undefined
-      );
+      // WR-98: per-item W3C trace context, like the single-event intake —
+      // gated on the option; an invalid item-level `traceparent` is
+      // ignored, never a 400 for the item.
+      const itemTrace =
+        traceContextOpts === undefined || !("item" in checked) || checked.item.headers === undefined
+          ? undefined
+          : parseInboundTraceContext(
+              checked.item.headers[TRACEPARENT_HEADER],
+              checked.item.headers[TRACESTATE_HEADER]
+            );
+      // Per-item trace IDs are independent: a valid item-level W3C
+      // traceparent promotes its trace-id, then an item's own
+      // `x-trace-id` is honored, otherwise a fresh one — never the
+      // batch's.
+      const itemTraceId =
+        itemTrace?.traceId ??
+        resolveTraceId(
+          "item" in checked && checked.item.headers !== undefined
+            ? checked.item.headers[TRACE_ID_HEADER]
+            : undefined
+        );
       if (!("item" in checked)) {
         opts.auditLog.append({
           event: "rejected",
@@ -5397,7 +5504,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         checked.body,
         itemHeaders,
         "/ingest/batch",
-        correlation
+        correlation,
+        undefined,
+        itemTrace
       );
       const result: Record<string, unknown> = {
         index,
