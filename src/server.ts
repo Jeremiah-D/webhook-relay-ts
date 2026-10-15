@@ -1,5 +1,5 @@
 import { Agent as HttpAgent, createServer, request as httpRequest } from "node:http";
-import { request as httpsRequest } from "node:https";
+import { request as httpsRequest, createServer as createHttpsServer } from "node:https";
 import type { Server } from "node:http";
 import { randomUUID } from "node:crypto";
 import {
@@ -77,13 +77,26 @@ import {
   type IdempotencyKeyOptions,
   type ResolvedIdempotencyKeyConfig,
 } from "./idempotency-key.ts";
-import type { TLSSocket } from "node:tls";
+import type { TLSSocket, Server as TlsServer } from "node:tls";
 import { assertValidPins, normalizePin, spkiFingerprint, TlsPinMismatchError } from "./pinning.ts";
 import {
   assertValidClientCert,
   clientCertIdentity,
   type TlsClientCert,
 } from "./mtls.ts";
+import {
+  applyInboundMtlsConfigPatch,
+  decideInboundMtls,
+  extractPeerCertInfo,
+  inboundMtlsSecureContext,
+  inboundMtlsServerOptions,
+  resolveInboundMtlsConfig,
+  type InboundMtlsConfig,
+  type InboundMtlsConfigPatch,
+  type InboundMtlsIdentity,
+  type ResolvedInboundMtlsConfig,
+} from "./inbound-mtls.ts";
+import type { ConfigChange } from "./hotreload.ts";
 import {
   RotatingClientCertSet,
   type RotatingClientCertConfig,
@@ -498,6 +511,47 @@ export interface RelayServerOptions {
    * startup.
    */
   tlsClientCerts?: Record<string, TlsClientCert>;
+  /**
+   * Inbound mTLS — client-certificate authentication for the relay's own
+   * listeners (WR-103, see `src/inbound-mtls.ts`). The relay's listeners
+   * are plain HTTP by default; configuring this makes the listeners that
+   * can require a client certificate terminate TLS themselves (Node
+   * `https` with `requestCert: true`, `rejectUnauthorized: false`):
+   *
+   * - `key` / `cert`: the relay's own TLS identity (PEM strings held in
+   *   memory — no file paths, so rotation is a config change). Required:
+   *   a listener that enforces mTLS must terminate TLS.
+   * - `ca`: the client CA chain (PEM string or array) that presented
+   *   client certificates must chain to.
+   * - `requireCert` (default `true`): every route requires a client
+   *   certificate. Set `false` with `operatorMtls: true` to require
+   *   certificates only on operator routes while webhook ingest stays
+   *   open.
+   * - `clientFingerprints`: optional whitelist of whole-certificate
+   *   SHA-256 fingerprints (`"sha256/<base64>"`, `"sha256:<base64>"`, or
+   *   bare base64 — the WR-21 spellings). A chain-valid certificate
+   *   whose fingerprint is not listed is rejected.
+   * - `operatorMtls` (default `false`): operator routes (`/dead-letter`,
+   *   `/metrics`, `/events`, …) independently require a client
+   *   certificate.
+   *
+   * The handshake never aborts on a missing/invalid certificate —
+   * enforcement happens at request time, so a rejected caller gets a
+   * proper HTTP 401 (`reason` `client_cert_required` /
+   * `client_cert_invalid`, audited as `rejected` like the other intake
+   * gates) instead of a bare TLS alert. A verified caller's
+   * `clientCertFingerprint` / `clientCertSubject` ride the `accepted` /
+   * `rejected` audit events.
+   *
+   * Hot-reload: `server.updateInboundMtlsConfig(patch)` swaps the CA,
+   * key/cert, whitelist, and policy at runtime (new TLS handshakes only;
+   * established connections keep the previous secure context).
+   * *Enabling* or *disabling* inbound mTLS needs a restart — a bound
+   * listener cannot change between plain HTTP and HTTPS at runtime.
+   * Off by default: unset means plain-HTTP listeners and zero behavior
+   * change. Invalid values throw `RangeError` at startup.
+   */
+  inboundMtls?: InboundMtlsConfig;
   /**
    * Outbound mTLS client certificate rotation (WR-89, see
    * `src/mtls-rotation.ts`): `{ "<exact targetUrl>": { certificates,
@@ -3026,6 +3080,21 @@ export interface RelayServer extends Server {
    * operator path, so it can never accept a webhook.
    */
   operatorServer?: Server;
+  /**
+   * WR-103: hot-swap the inbound mTLS configuration at runtime
+   * (CA chain, server key/cert, fingerprint whitelist, `requireCert` /
+   * `operatorMtls` policy). Validation runs against the merged config
+   * before anything applies — an illegal patch throws `RangeError` and
+   * the live config is untouched. TLS material is pushed into the live
+   * listeners via `setSecureContext()`, so it takes effect on *new* TLS
+   * handshakes; already-established connections keep the previous
+   * secure context until they reconnect. Enabling or disabling inbound
+   * mTLS is NOT hot-swappable and throws `Error`: the listener is
+   * created as HTTPS or plain HTTP at startup and a bound socket cannot
+   * change modes at runtime. Only set when `inboundMtls` was configured
+   * at startup.
+   */
+  updateInboundMtlsConfig?: (patch: InboundMtlsConfigPatch) => ConfigChange[];
 }
 
 /**
@@ -3159,6 +3228,19 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       (typeof operatorPlane.host !== "string" || operatorPlane.host.length === 0)
     ) {
       throw new RangeError("createRelayServer: `operatorPort.host` must be a non-empty string");
+    }
+  }
+  // WR-103: inbound mTLS — validated once at startup (`RangeError`
+  // fail-fast on a bad server identity, CA chain, or whitelist);
+  // `undefined` keeps the exact pre-WR-103 behavior (plain HTTP
+  // listeners, no certificate checks). `let` so
+  // `updateInboundMtlsConfig` can hot-swap the resolved config.
+  let inboundMtls: ResolvedInboundMtlsConfig | undefined;
+  if (opts.inboundMtls !== undefined) {
+    try {
+      inboundMtls = resolveInboundMtlsConfig(opts.inboundMtls);
+    } catch (err) {
+      throw new RangeError(`createRelayServer: invalid inboundMtls config: ${(err as Error).message}`);
     }
   }
   // WR-84: content-based routing rule engine — validated once at startup
@@ -5611,7 +5693,13 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   const handleInbound = async (
     req: Parameters<Parameters<typeof createServer>[0]>[0],
     res: Parameters<Parameters<typeof createServer>[0]>[1],
-    pathname: string
+    pathname: string,
+    /**
+     * WR-103: the verified client identity from the inbound mTLS gate.
+     * Rides every `accepted` / `rejected` audit event through the
+     * admission correlation spread.
+     */
+    mtlsIdentity?: InboundMtlsIdentity
   ): Promise<void> => {
     if (req.method !== "POST") {
       res.writeHead(405, { "content-type": "text/plain" }).end("Method not allowed");
@@ -5620,7 +5708,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // WR-61: batch ingestion rides the intake plane like any webhook —
     // one envelope signature, then per-item admission.
     if (pathname === "/ingest/batch") {
-      await handleIngestBatch(req, res);
+      await handleIngestBatch(req, res, mtlsIdentity);
       return;
     }
     const id = randomUUID();
@@ -5640,7 +5728,13 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     const traceId = inboundTrace?.traceId ?? resolveTraceId(req.headers[TRACE_ID_HEADER]);
     const gates = await runIntakeGates(req, res, pathname, id, traceId);
     if (gates === undefined) return;
-    const outcome = await admitOneEvent(id, traceId, gates.body, req.headers, pathname, {}, gates.apiKey, inboundTrace, gates.maxBodyBytes);
+    // WR-103: the verified client identity rides every `accepted` /
+    // `rejected` audit event through the admission correlation spread.
+    const mtlsCorrelation =
+      mtlsIdentity === undefined
+        ? {}
+        : { clientCertFingerprint: mtlsIdentity.fingerprint, clientCertSubject: mtlsIdentity.subject };
+    const outcome = await admitOneEvent(id, traceId, gates.body, req.headers, pathname, mtlsCorrelation, gates.apiKey, inboundTrace, gates.maxBodyBytes);
     const tenantLabel = outcome.tenantId === undefined ? {} : { tenant: outcome.tenantId };
     if (outcome.status === 202) {
       res
@@ -5718,7 +5812,14 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
    */
   const handleIngestBatch = async (
     req: Parameters<Parameters<typeof createServer>[0]>[0],
-    res: Parameters<Parameters<typeof createServer>[0]>[1]
+    res: Parameters<Parameters<typeof createServer>[0]>[1],
+    /**
+     * WR-103: the verified client identity from the inbound mTLS gate
+     * (undefined when mTLS is unconfigured or the request presented no
+     * verifiable certificate). Rides the `batch_ingested` event and every
+     * per-item `accepted` / `rejected` event via `correlation`.
+     */
+    mtlsIdentity?: InboundMtlsIdentity
   ): Promise<void> => {
     const batchId = randomUUID();
     const batchTraceId = resolveTraceId(req.headers[TRACE_ID_HEADER]);
@@ -5805,7 +5906,13 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       return;
     }
 
-    const correlation = { batchId };
+    const correlation = { batchId,
+      // WR-103: the verified client identity rides every per-item audit
+      // event (`accepted` / `rejected`) through the correlation spread.
+      ...(mtlsIdentity !== undefined
+        ? { clientCertFingerprint: mtlsIdentity.fingerprint, clientCertSubject: mtlsIdentity.subject }
+        : {}),
+    };
     const results: Array<Record<string, unknown>> = [];
     let accepted = 0;
     for (let index = 0; index < events.length; index++) {
@@ -5905,6 +6012,10 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       accepted,
       rejected: events.length - accepted,
       ...(batchTenantId !== undefined ? { tenant: batchTenantId } : {}),
+      // WR-103: verified client identity on the batch-level audit event.
+      ...(mtlsIdentity !== undefined
+        ? { clientCertFingerprint: mtlsIdentity.fingerprint, clientCertSubject: mtlsIdentity.subject }
+        : {}),
     });
     res
       .writeHead(accepted === events.length ? 202 : 207, {
@@ -5940,40 +6051,150 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     res.writeHead(404, { "content-type": "text/plain" }).end("Not found");
   };
 
+  /**
+   * WR-103: inbound mTLS gate — the outermost check on every request a
+   * listener serves, before plane dispatch, operator auth, and the intake
+   * gates, so an unauthenticated caller costs zero bandwidth and zero
+   * downstream state. `isOperatorRoute` selects the independent
+   * operator-route policy (`operatorMtls`); on the split intake plane the
+   * cross-plane 404 above runs first, so the operator plane's existence
+   * is never revealed by a 401.
+   *
+   * A missing certificate where one is required is answered 401
+   * (`client_cert_required`); a presented certificate whose chain does
+   * not verify against the configured CA — or whose fingerprint is not
+   * whitelisted — is answered 401 (`client_cert_invalid`). Both are
+   * audited as `rejected` with the reason code (the presented
+   * certificate's fingerprint/subject ride along when there is one), and
+   * both close the connection: the caller must re-handshake with a
+   * different certificate, which needs a fresh connection anyway.
+   *
+   * Returns the verified client identity for the audit trail when the
+   * request may proceed.
+   */
+  const enforceInboundMtls = (
+    req: Parameters<Parameters<typeof createServer>[0]>[0],
+    res: Parameters<Parameters<typeof createServer>[0]>[1],
+    pathname: string,
+    isOperatorRoute: boolean
+  ): { proceed: true; identity?: InboundMtlsIdentity } | { proceed: false } => {
+    const cfg = inboundMtls;
+    if (cfg === undefined) return { proceed: true };
+    const peer = extractPeerCertInfo(req.socket as TLSSocket);
+    const decision = decideInboundMtls(cfg, peer, isOperatorRoute);
+    if (decision.allowed) {
+      return decision.identity === undefined ? { proceed: true } : { proceed: true, identity: decision.identity };
+    }
+    const id = randomUUID();
+    // Resolve the trace ID the same way the intake pipeline does, so the
+    // rejection stays traceable.
+    const inboundTrace =
+      traceContextOpts === undefined
+        ? undefined
+        : parseInboundTraceContext(req.headers[TRACEPARENT_HEADER], req.headers[TRACESTATE_HEADER]);
+    const traceId = inboundTrace?.traceId ?? resolveTraceId(req.headers[TRACE_ID_HEADER]);
+    opts.auditLog.append({
+      event: "rejected",
+      id,
+      traceId,
+      reason: decision.reason,
+      path: pathname,
+      ...(decision.fingerprint !== undefined
+        ? { clientCertFingerprint: decision.fingerprint, clientCertSubject: decision.subject ?? "" }
+        : {}),
+    });
+    res
+      .writeHead(401, { "content-type": "application/json", connection: "close" })
+      .end(
+        JSON.stringify({
+          error:
+            decision.reason === "client_cert_required"
+              ? "client certificate required"
+              : "client certificate invalid",
+          reason: decision.reason,
+        })
+      );
+    return { proceed: false };
+  };
+
+  // WR-103: which listeners terminate TLS. The mTLS gate above is
+  // enforced at request time, so a listener only needs TLS when some
+  // route it serves can require a client certificate:
+  // - `requireCert` → every route on every listener requires one, so
+  //   both planes become HTTPS;
+  // - `operatorMtls` alone → only the operator listener becomes HTTPS;
+  //   on the legacy single plane the shared listener must become HTTPS
+  //   (operator paths live on it) while ingest routes stay open without
+  //   a certificate.
+  // Untouched when `inboundMtls` is unconfigured: plain HTTP everywhere,
+  // exactly the pre-WR-103 behavior.
+  const mtlsCfg = inboundMtls;
+  const inboundMtlsListenerOpts =
+    mtlsCfg !== undefined ? inboundMtlsServerOptions(mtlsCfg) : undefined;
+  const intakeListenerTls =
+    mtlsCfg !== undefined &&
+    (mtlsCfg.requireCert || (operatorPlane === undefined && mtlsCfg.operatorMtls));
+  const operatorListenerTls =
+    mtlsCfg !== undefined && (mtlsCfg.requireCert || mtlsCfg.operatorMtls);
+  /** HTTPS listeners, for `setSecureContext()` on hot-reload. */
+  const tlsListeners: TlsServer[] = [];
+  const createListener = (
+    handler: (
+      req: Parameters<Parameters<typeof createServer>[0]>[0],
+      res: Parameters<Parameters<typeof createServer>[0]>[1]
+    ) => Promise<void>,
+    useTls: boolean
+  ): RelayServer => {
+    if (useTls && inboundMtlsListenerOpts !== undefined) {
+      const httpsServer = createHttpsServer(inboundMtlsListenerOpts, handler);
+      tlsListeners.push(httpsServer);
+      return httpsServer as unknown as RelayServer;
+    }
+    return createServer(handler) as RelayServer;
+  };
+
   let server: RelayServer;
   let operatorServer: Server | undefined;
   if (operatorPlane === undefined) {
     // Legacy single-plane behavior: one listener serves operator paths
     // and webhooks alike.
-    server = createServer(async (req, res) => {
+    server = createListener(async (req, res) => {
       const pathname = new URL(req.url ?? "/", "http://internal").pathname;
       if (isOperatorPath(pathname)) {
+        const gate = enforceInboundMtls(req, res, pathname, true);
+        if (!gate.proceed) return;
         await guardOperator(req, res, pathname);
         return;
       }
-      await handleInbound(req, res, pathname);
-    });
+      const gate = enforceInboundMtls(req, res, pathname, false);
+      if (!gate.proceed) return;
+      await handleInbound(req, res, pathname, gate.identity);
+    }, intakeListenerTls);
   } else {
     // Split plane (WR-56): operator paths hit on the intake listener are
     // indistinguishable from unknown paths — the operator plane's
     // existence is not revealed — and the operator listener 404s anything
     // that is not an operator path, so it can never accept a webhook.
-    server = createServer(async (req, res) => {
+    server = createListener(async (req, res) => {
       const pathname = new URL(req.url ?? "/", "http://internal").pathname;
       if (isOperatorPath(pathname)) {
         crossPlaneNotFound(res);
         return;
       }
-      await handleInbound(req, res, pathname);
-    });
-    operatorServer = createServer(async (req, res) => {
+      const gate = enforceInboundMtls(req, res, pathname, false);
+      if (!gate.proceed) return;
+      await handleInbound(req, res, pathname, gate.identity);
+    }, intakeListenerTls);
+    operatorServer = createListener(async (req, res) => {
       const pathname = new URL(req.url ?? "/", "http://internal").pathname;
       if (!isOperatorPath(pathname)) {
         crossPlaneNotFound(res);
         return;
       }
+      const gate = enforceInboundMtls(req, res, pathname, true);
+      if (!gate.proceed) return;
       await guardOperator(req, res, pathname);
-    });
+    }, operatorListenerTls) as unknown as Server;
     server.operatorServer = operatorServer;
     // The operator port is fully specified in the options, so the relay
     // binds it itself at creation; the caller only ever binds the intake
@@ -6124,6 +6345,36 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     auditSink = new AuditSink(opts.auditLog, opts.auditSink);
     auditSink.start();
   }
+
+  // WR-103: inbound mTLS hot-reload. The request-time policy
+  // (`requireCert` / `operatorMtls` / whitelist) swaps atomically for
+  // every subsequent request; the TLS material (key/cert/CA) is pushed
+  // into the live HTTPS listeners via `setSecureContext()`, so new
+  // handshakes pick it up while already-established connections keep
+  // the previous secure context until they reconnect. Enabling or
+  // disabling inbound mTLS is NOT hot-swappable (a bound listener
+  // cannot change between plain HTTP and HTTPS) and throws `Error`.
+  server.updateInboundMtlsConfig = (patch: InboundMtlsConfigPatch): ConfigChange[] => {
+    const cfg = inboundMtls;
+    if (cfg === undefined) {
+      throw new Error(
+        "updateInboundMtlsConfig: inbound mTLS is not configured — enabling it requires a restart: " +
+          "the listener is created as plain HTTP or HTTPS at startup and a bound socket cannot change modes at runtime"
+      );
+    }
+    // Validate-then-apply: an illegal patch throws RangeError and the
+    // live config is left completely intact.
+    const { next, changes } = applyInboundMtlsConfigPatch(cfg, patch);
+    inboundMtls = next;
+    const secureContext = inboundMtlsSecureContext(next);
+    for (const listener of tlsListeners) listener.setSecureContext(secureContext);
+    // Key material never lands in the audit trail — only field names.
+    opts.auditLog.append({
+      event: "inbound_mtls_config_updated",
+      fields: changes.map((c) => c.field),
+    });
+    return changes;
+  };
 
   return server;
 }

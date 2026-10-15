@@ -508,6 +508,24 @@ reliability primitives that matter for any signed-payload pipeline.
   destroys the socket, and the checkout probe culls it, so it is never handed
   to another delivery). Empty cert/key, unparseable PEM, and cert/key mismatch
   throw `RangeError` at startup. Zero dependencies (`node:crypto` + `node:tls`).
+- `src/inbound-mtls.ts` — inbound mTLS client-certificate authentication
+  (WR-103): `createRelayServer({ inboundMtls: { key, cert, ca,
+  requireCert?, clientFingerprints?, operatorMtls? } })` turns the
+  listeners that can require a client certificate into Node `https`
+  servers (`requestCert: true`, `rejectUnauthorized: false`), so
+  enforcement happens at request time: a missing certificate is answered
+  401 (`client_cert_required`), an untrusted or non-whitelisted one 401
+  (`client_cert_invalid`), both audited as `rejected`; a verified
+  caller's `clientCertFingerprint` / `clientCertSubject` ride the
+  `accepted` / `rejected` audit events. `requireCert: false` +
+  `operatorMtls: true` locks down only the operator routes while ingest
+  stays open (with a split operator plane the intake listener stays
+  plain HTTP). `server.updateInboundMtlsConfig(patch)` hot-swaps the CA,
+  key/cert, whitelist, and policy for new handshakes (audited as
+  `inbound_mtls_config_updated`); enabling/disabling needs a restart —
+  documented, not faked. Invalid values throw `RangeError` at startup;
+  unset means plain HTTP and zero behavior change. Zero dependencies
+  (`node:crypto` + `node:tls`).
 - `src/tls-sni.ts` — per-endpoint outbound TLS SNI/ALPN overrides (WR-60):
   `tlsSniOverrides: { "<exact targetUrl>": { servername?, alpnProtocols? } }`
   (also exposed as `createRelayServer({ tlsSniOverrides })` and the eleventh
@@ -2294,6 +2312,65 @@ const server = createRelayServer({
   `responderTimeoutMs` throws `RangeError` at startup. Off by default:
   endpoints without an entry behave exactly as before, and no
   `relay_ocsp_*` series appears until the first check runs.
+
+## Inbound mTLS (opt-in)
+
+Outbound mTLS (`tlsClientCerts`) proves the *relay's* identity to a
+downstream; inbound mTLS proves the *caller's* identity to the relay.
+`createRelayServer({ inboundMtls })` (`src/inbound-mtls.ts`) turns the
+relay's listeners into client-certificate gates:
+
+```ts
+createRelayServer({
+  // ... secret, forwardUrl, auditLog ...
+  inboundMtls: {
+    key: SERVER_KEY_PEM,      // relay's own TLS identity (PEM strings,
+    cert: SERVER_CERT_PEM,     // in memory — no file paths)
+    ca: CLIENT_CA_PEM,         // client CA chain (string or string[])
+    requireCert: true,         // default: every route needs a cert
+    clientFingerprints: ["sha256/<base64>", /* … */], // optional whitelist
+    operatorMtls: false,       // default: operator routes follow requireCert
+  },
+});
+```
+
+- **Request-time enforcement, not handshake aborts** — the listeners run
+  Node `https` with `requestCert: true` and `rejectUnauthorized: false`,
+  so the handshake *requests* a certificate but never aborts on a
+  missing/invalid one. A missing certificate is answered **401**
+  (`reason: "client_cert_required"`); a certificate whose chain does not
+  verify against `ca`, or whose fingerprint is not whitelisted, is
+  answered **401** (`reason: "client_cert_invalid"`). Both are audited as
+  `rejected` like the other intake gates (a presented certificate's
+  fingerprint/subject ride along), and both close the connection — the
+  caller must re-handshake with a different certificate anyway.
+- **Identity on the audit trail** — a verified caller's
+  `clientCertFingerprint` (base64 SHA-256 of the DER certificate) and
+  `clientCertSubject` (e.g. `CN=relay-client`) are recorded on the
+  `accepted` / `rejected` audit events.
+- **Operator routes can require mTLS independently** —
+  `requireCert: false` + `operatorMtls: true` locks down `/dead-letter`,
+  `/metrics`, `/events`, … while webhook ingest stays open without a
+  certificate. With a split operator plane (`operatorPort`) the operator
+  listener alone becomes HTTPS and the intake plane stays plain HTTP;
+  on the legacy single plane the shared listener becomes HTTPS but
+  ingest routes still accept cert-less requests.
+- **Hot-reload** — `server.updateInboundMtlsConfig(patch)` swaps the CA
+  chain, server key/cert, fingerprint whitelist, and the
+  `requireCert` / `operatorMtls` policy at runtime (validated before
+  apply; illegal patches throw `RangeError` and leave the live config
+  untouched; changes audit as `inbound_mtls_config_updated` with field
+  names only — key material never lands in the audit trail). Two honest
+  limitations: TLS material is pushed via `setSecureContext()`, so it
+  takes effect on *new* handshakes only (established keep-alive
+  connections keep the previous context until they reconnect), and
+  *enabling/disabling* inbound mTLS needs a restart — a bound listener
+  cannot change between plain HTTP and HTTPS at runtime.
+- **Fail-fast** — empty/garbage `key`/`cert`/`ca` PEM, a key/cert
+  mismatch, a non-boolean `requireCert`/`operatorMtls`, or a malformed
+  (or empty) `clientFingerprints` whitelist throws `RangeError` at
+  startup. Off by default: unset means plain-HTTP listeners and zero
+  behavior change. Zero dependencies (`node:crypto` + `node:tls`).
 
 ## Delivery lifecycle
 
