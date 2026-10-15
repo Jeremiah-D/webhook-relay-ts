@@ -14,6 +14,7 @@ import {
   type ResolvedPerMessageDeflate,
 } from "./deflate.ts";
 import type { DownstreamResponse } from "./retry.ts";
+import { renderWebSocketBlock, type WebSocketOriginMetricsInput } from "./metrics.ts";
 
 /**
  * WebSocket downstream delivery (WR-45).
@@ -249,6 +250,13 @@ export function wsAcceptKey(key: string): string {
   return createHash("sha1").update(key + WS_GUID).digest("base64");
 }
 
+/** Arithmetic mean of a non-empty sample list. */
+function mean(samples: number[]): number {
+  let sum = 0;
+  for (const s of samples) sum += s;
+  return sum / samples.length;
+}
+
 // --- connection ------------------------------------------------------------
 
 /** Per-origin pool key: reused connections never cross origins or pin sets. */
@@ -263,6 +271,8 @@ function poolKey(url: URL, pins: string[] | undefined): string {
 interface PooledWsConnection {
   socket: Socket;
   reader: WsFrameReader;
+  /** Origin grouping key (`<scheme>//<host>`) for WR-105 per-origin metrics. */
+  origin: string;
   /** Last time this connection was checked back in (ms epoch). */
   idleSince: number;
   /** True while a delivery owns it. */
@@ -291,7 +301,64 @@ export interface WebSocketPoolStats {
   deflatedOut: number;
   /** Deliveries whose reply arrived RSV1-compressed and was inflated. */
   deflatedIn: number;
+  /** Per-origin breakdown (WR-105), sorted by origin. */
+  origins: WebSocketOriginStats[];
 }
+
+/**
+ * One origin's WebSocket gateway counters (WR-105). The origin grouping
+ * key is `<scheme>//<host>` (host includes the port); connections to
+ * the same origin under different pin whitelists share the row — pins
+ * are a trust detail, not a traffic identity.
+ */
+export interface WebSocketOriginStats {
+  /** Origin grouping key: `<scheme>//<host>`. */
+  origin: string;
+  /** Live pooled connections for this origin right now (idle + busy). */
+  activeConnections: number;
+  /** Delivery messages sent over this origin's connections. */
+  messagesOut: number;
+  /** Delivery replies received over this origin's connections. */
+  messagesIn: number;
+  /** Pool checkouts that opened a fresh connection. */
+  created: number;
+  /** Pool checkouts that reused a pooled connection. */
+  reused: number;
+  /** Deliveries whose outbound frame was permessage-deflate compressed. */
+  deflatedOut: number;
+  /** Replies that arrived permessage-deflate compressed and were inflated. */
+  deflatedIn: number;
+  /**
+   * Mean recent keep-alive ping RTT in ms (bounded recent window).
+   * Absent when no probe has completed yet for this origin.
+   */
+  pingRttMs?: number;
+  /**
+   * Mean permessage-deflate wire/plain byte ratio over compressed
+   * outbound deliveries, in (0, 1] — smaller means better compression.
+   * Absent when nothing was compressed for this origin yet.
+   */
+  compressionRatio?: number;
+}
+
+/** Cumulative per-origin counters behind {@link WebSocketOriginStats}. */
+interface OriginCounters {
+  messagesOut: number;
+  messagesIn: number;
+  created: number;
+  reused: number;
+  deflatedOut: number;
+  deflatedIn: number;
+  /** Plaintext bytes of compressed outbound messages (for the ratio). */
+  deflatePlainBytes: number;
+  /** Wire bytes of compressed outbound messages (for the ratio). */
+  deflateWireBytes: number;
+  /** Recent keep-alive ping RTTs in ms, oldest-first, bounded. */
+  pingRtts: number[];
+}
+
+/** Recent ping RTT samples kept per origin (WR-105). */
+const MAX_PING_RTT_SAMPLES = 32;
 
 /**
  * Pooled RFC 6455 connections (WR-24 combo for the WebSocket path).
@@ -313,6 +380,8 @@ export class WebSocketPool {
     deflatedOut: 0,
     deflatedIn: 0,
   };
+  /** Cumulative per-origin counters (WR-105); rows survive connection churn. */
+  private readonly originCounters = new Map<string, OriginCounters>();
   private probeTimer?: NodeJS.Timeout;
   private destroyed = false;
 
@@ -333,7 +402,89 @@ export class WebSocketPool {
         else idle++;
       }
     }
-    return { ...this.stats, idle, busy };
+    return { ...this.stats, idle, busy, origins: this.getOriginStats() };
+  }
+
+  /**
+   * Per-origin gateway counters (WR-105), sorted by origin. Rows exist
+   * for every origin the pool has ever served; `activeConnections` is
+   * the live count right now, the rest are cumulative.
+   */
+  getOriginStats(): WebSocketOriginStats[] {
+    const active = new Map<string, number>();
+    for (const list of this.conns.values()) {
+      for (const c of list) {
+        if (!c.dead && !c.socket.destroyed) {
+          active.set(c.origin, (active.get(c.origin) ?? 0) + 1);
+        }
+      }
+    }
+    const out: WebSocketOriginStats[] = [];
+    for (const [origin, row] of this.originCounters) {
+      out.push({
+        origin,
+        activeConnections: active.get(origin) ?? 0,
+        messagesOut: row.messagesOut,
+        messagesIn: row.messagesIn,
+        created: row.created,
+        reused: row.reused,
+        deflatedOut: row.deflatedOut,
+        deflatedIn: row.deflatedIn,
+        ...(row.pingRtts.length > 0 ? { pingRttMs: mean(row.pingRtts) } : {}),
+        ...(row.deflatePlainBytes > 0
+          ? { compressionRatio: row.deflateWireBytes / row.deflatePlainBytes }
+          : {}),
+      });
+    }
+    out.sort((a, b) => (a.origin < b.origin ? -1 : a.origin > b.origin ? 1 : 0));
+    return out;
+  }
+
+  /**
+   * Prometheus exposition block for the WebSocket gateway (WR-105):
+   * per-origin connections, message counters, ping RTT, deflate ratio,
+   * and pool checkout/reuse. Empty string while no origin has been
+   * observed, so an untouched relay's `/metrics` output stays
+   * byte-identical.
+   */
+  renderMetrics(): string {
+    const series: WebSocketOriginMetricsInput[] = this.getOriginStats().map((s) => ({
+      origin: s.origin,
+      activeConnections: s.activeConnections,
+      messagesOut: s.messagesOut,
+      messagesIn: s.messagesIn,
+      created: s.created,
+      reused: s.reused,
+      ...(s.pingRttMs !== undefined ? { pingRttSeconds: s.pingRttMs / 1000 } : {}),
+      ...(s.compressionRatio !== undefined ? { compressionRatio: s.compressionRatio } : {}),
+    }));
+    const lines = renderWebSocketBlock(series);
+    return lines.length === 0 ? "" : lines.join("\n") + "\n";
+  }
+
+  /** Origin grouping key for `url`: `<scheme>//<host>` (WR-105). */
+  private static originOf(url: URL): string {
+    return `${url.protocol}//${url.host}`;
+  }
+
+  /** Cumulative per-origin counter row, created on first use. */
+  private originRow(origin: string): OriginCounters {
+    let row = this.originCounters.get(origin);
+    if (row === undefined) {
+      row = {
+        messagesOut: 0,
+        messagesIn: 0,
+        created: 0,
+        reused: 0,
+        deflatedOut: 0,
+        deflatedIn: 0,
+        deflatePlainBytes: 0,
+        deflateWireBytes: 0,
+        pingRtts: [],
+      };
+      this.originCounters.set(origin, row);
+    }
+    return row;
   }
 
   /** Close every pooled connection and stop the prober. Idempotent. */
@@ -388,6 +539,7 @@ export class WebSocketPool {
     targetUrl: string
   ): Promise<PooledWsConnection> {
     const key = poolKey(url, pins);
+    const origin = WebSocketPool.originOf(url);
     const list = this.conns.get(key);
     if (list !== undefined) {
       for (const c of list) {
@@ -398,16 +550,26 @@ export class WebSocketPool {
           const idle = (c as { idleHandler?: (chunk: Buffer) => void }).idleHandler;
           if (idle !== undefined) c.socket.off("data", idle);
           this.stats.reused++;
+          this.originRow(origin).reused++;
           return c;
         }
       }
     }
     const conn = await this.open(url, relayHeaders, pins, targetUrl);
+    if (this.destroyed) {
+      // The pool was destroyed while the handshake was in flight: the
+      // fresh connection never entered `this.conns`, so `destroy()` could
+      // not kill it — do it here instead of leaking an orphan socket that
+      // would pin the peer's server close forever.
+      this.kill(conn);
+      throw new Error("websocket: pool destroyed");
+    }
     conn.busy = true;
     const arr = this.conns.get(key) ?? [];
     arr.push(conn);
     this.conns.set(key, arr);
     this.stats.created++;
+    this.originRow(origin).created++;
     return conn;
   }
 
@@ -471,7 +633,14 @@ export class WebSocketPool {
       );
       wire = out.bytes;
       rsv1 = out.compressed;
-      if (rsv1) this.stats.deflatedOut++;
+      if (rsv1) {
+        this.stats.deflatedOut++;
+        // WR-105: per-origin deflate accounting for the compression ratio.
+        const row = this.originRow(conn.origin);
+        row.deflatedOut++;
+        row.deflatePlainBytes += body.length;
+        row.deflateWireBytes += wire.length;
+      }
     }
     return new Promise<DownstreamResponse>((resolve, reject) => {
       const { socket, reader } = conn;
@@ -521,6 +690,7 @@ export class WebSocketPool {
       const finishText = (): void => {
         const payload = Buffer.concat(text);
         if (!replyCompressed) {
+          this.originRow(conn.origin).messagesIn++;
           done({ statusCode: 200, body: payload, truncated });
           return;
         }
@@ -535,8 +705,12 @@ export class WebSocketPool {
           return;
         }
         this.stats.deflatedIn++;
+        this.originRow(conn.origin).deflatedIn++;
         decompressMessage(payload).then(
-          (plain) => done({ statusCode: 200, body: plain, truncated: false }),
+          (plain) => {
+            this.originRow(conn.origin).messagesIn++;
+            done({ statusCode: 200, body: plain, truncated: false });
+          },
           (err) => fail(err as Error)
         );
       };
@@ -617,6 +791,8 @@ export class WebSocketPool {
       socket.once("close", onClose);
       socket.write(encodeWsFrame(OP_TEXT, wire, true, rsv1), (err) => {
         if (err) fail(err);
+        // WR-105: the delivery frame is on the wire — count it as sent.
+        else this.originRow(conn.origin).messagesOut++;
       });
     });
   }
@@ -704,12 +880,19 @@ export class WebSocketPool {
         resolve(false);
         return;
       }
+      // WR-105: measure the keep-alive round trip for the per-origin
+      // ping-RTT gauge (bounded recent window).
+      const start = Date.now();
       const timer = setTimeout(() => {
         conn.pongWaiter = undefined;
         resolve(false);
       }, this.opts.timeoutMs);
       conn.pongWaiter = () => {
         clearTimeout(timer);
+        const rtt = Date.now() - start;
+        const row = this.originRow(conn.origin);
+        row.pingRtts.push(rtt);
+        if (row.pingRtts.length > MAX_PING_RTT_SAMPLES) row.pingRtts.shift();
         resolve(true);
       };
       conn.socket.write(encodeWsFrame(OP_PING, Buffer.alloc(0), true), (err) => {
@@ -769,6 +952,7 @@ export class WebSocketPool {
       const conn: PooledWsConnection = {
         socket,
         reader,
+        origin: WebSocketPool.originOf(url),
         idleSince: Date.now(),
         busy: false,
         dead: false,

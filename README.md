@@ -762,7 +762,25 @@ reliability primitives that matter for any signed-payload pipeline.
   (default 30s, `0` disables) and reaped after `idleTimeoutMs` (default
   60s), so a dead socket never serves a delivery; `timeoutMs` (default 10s)
   bounds the TCP+TLS+handshake phase and the reply wait separately).
-  Invalid option values throw `RangeError` at startup.
+  Invalid option values throw `RangeError` at startup. WR-105 adds
+  per-origin gateway observability: `getStats().origins` /
+  `getOriginStats()` report one row per `<scheme>//<host>` origin —
+  `activeConnections` (live pooled conns right now), `messagesOut` /
+  `messagesIn` (delivery frames sent / replies received), `created` /
+  `reused` (pool checkout results), `deflatedOut` / `deflatedIn`,
+  `pingRttMs` (mean recent keep-alive ping RTT, once a probe completes),
+  and `compressionRatio` (mean deflate wire/plain byte ratio, once
+  something is compressed). The same rows render into `GET /metrics` as
+  `relay_websocket_connections{origin}`,
+  `relay_websocket_messages_{out,in}_total{origin}`,
+  `relay_websocket_checkouts_total{origin,result}`,
+  `relay_websocket_ping_rtt_seconds{origin}` and
+  `relay_websocket_deflate_ratio{origin}` — the block is empty until the
+  first WebSocket delivery runs, so non-WebSocket relays see no new
+  series. Also hardened: `destroy()` during an in-flight handshake now
+  kills the fresh connection instead of leaking an orphan socket (the
+  handshake future resolves after the pool is gone, so `checkout`
+  re-checks `destroyed` before the connection can enter the pool).
 - `src/deflate.ts` — WebSocket permessage-deflate (RFC 7692, WR-46),
   opt-in per pool via the `permessageDeflate` WebSocket option (`true` for
   defaults, `{ thresholdBytes? }` to tune the payload size at which
@@ -2817,6 +2835,16 @@ endpoints (404 when disabled):
 - `relay_endpoint_circuit_error_rate{endpoint}` — rolling-window failure
   rate in [0, 1] (WR-104 error-rate trip mode; only error-rate-mode
   endpoints with at least one recorded outcome),
+- `relay_websocket_connections{origin}` — active pooled WebSocket
+  connections (WR-105); `relay_websocket_messages_out_total{origin}` /
+  `relay_websocket_messages_in_total{origin}` — delivery messages sent /
+  replies received; `relay_websocket_checkouts_total{origin,result}` —
+  pool checkouts (`created` / `reused`); `relay_websocket_ping_rtt_seconds
+  {origin}` — mean recent keep-alive ping RTT (only origins with a
+  completed probe); `relay_websocket_deflate_ratio{origin}` — mean
+  permessage-deflate wire/plain byte ratio (only origins with a
+  compressed delivery). The whole block is absent until the first
+  WebSocket delivery runs,
 - `relay_delivery_latency_seconds_{bucket,sum,count}{endpoint}` —
   accepted→delivered latency histogram, only when `retry.latency` is
   enabled; bucket bounds via `retry.metrics.histogramBucketsMs`

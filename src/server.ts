@@ -4268,9 +4268,12 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       // the other operator endpoints (fail closed without operatorToken).
       // The version-routing counters render "" when versioning was never
       // configured, keeping the output byte-identical to the legacy shape.
+      // WR-105: the WebSocket pool renders "" until the first ws:/wss:
+      // delivery runs, so a relay that never touches WebSocket sees no
+      // new series. Absent entirely with a custom sender (no pool).
       res
         .writeHead(200, { "content-type": "text/plain; version=0.0.4" })
-        .end(queue.renderMetrics() + versionMetrics.render() + schemaMetrics.render() + (schemaRegistry?.renderMetrics() ?? "") + ipAclMetrics.render() + certExpiryMonitor.render() + tlsVersionMonitor.render() + (ocspMonitor?.render() ?? "") + (usageMeter?.render() ?? "") + (defaultSender?.compressionStats.render() ?? "") + (defaultSender?.dnsCache?.render() ?? ""));
+        .end(queue.renderMetrics() + versionMetrics.render() + schemaMetrics.render() + (schemaRegistry?.renderMetrics() ?? "") + ipAclMetrics.render() + certExpiryMonitor.render() + tlsVersionMonitor.render() + (ocspMonitor?.render() ?? "") + (usageMeter?.render() ?? "") + (defaultSender?.compressionStats.render() ?? "") + (defaultSender?.dnsCache?.render() ?? "") + (defaultSender?.wsPool.renderMetrics() ?? ""));
       return;
     }
     if (isEvents) {

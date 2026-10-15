@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { request as httpRequest, type Server } from "node:http";
+import { createServer as createNetServer, type Socket } from "node:net";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,6 +9,7 @@ import { RetryQueue, type Sender } from "../src/retry.ts";
 import { createRelayServer } from "../src/server.ts";
 import { signSha256 } from "../src/verify.ts";
 import { AuditLog } from "../src/audit.ts";
+import { encodeWsFrame, wsAcceptKey } from "../src/websocket.ts";
 
 const URL = "http://localhost:9999/hook";
 const SECRET = "relay-secret";
@@ -384,5 +386,190 @@ describe("circuit error-rate gauge (WR-104)", () => {
     q.enqueue({ ...ITEM, id: "e-2" });
     await timer.run();
     assert.ok(!q.renderMetrics().includes("relay_endpoint_circuit_error_rate"));
+  });
+});
+
+describe("WebSocket gateway metrics block (WR-105)", () => {
+  it("renders per-origin series, optional gauges only when present", async () => {
+    const { renderWebSocketBlock } = await import("../src/metrics.ts");
+    const lines = renderWebSocketBlock([
+      {
+        origin: "ws://127.0.0.1:9001",
+        activeConnections: 2,
+        messagesOut: 10,
+        messagesIn: 9,
+        created: 3,
+        reused: 7,
+        pingRttSeconds: 0.012,
+      },
+      {
+        origin: "wss://hooks.example.com",
+        activeConnections: 0,
+        messagesOut: 1,
+        messagesIn: 1,
+        created: 1,
+        reused: 0,
+        compressionRatio: 0.25,
+      },
+    ]);
+    const out = lines.join("\n");
+    assert.ok(out.includes('relay_websocket_connections{origin="ws://127.0.0.1:9001"} 2'));
+    assert.ok(out.includes('relay_websocket_messages_out_total{origin="ws://127.0.0.1:9001"} 10'));
+    assert.ok(out.includes('relay_websocket_messages_in_total{origin="ws://127.0.0.1:9001"} 9'));
+    assert.ok(
+      out.includes('relay_websocket_checkouts_total{origin="ws://127.0.0.1:9001",result="created"} 3')
+    );
+    assert.ok(
+      out.includes('relay_websocket_checkouts_total{origin="ws://127.0.0.1:9001",result="reused"} 7')
+    );
+    // Optional gauges appear only for the origins that have them.
+    assert.equal(
+      out.split("\n").filter((l) => l.startsWith("relay_websocket_ping_rtt_seconds{")).length,
+      1
+    );
+    assert.ok(out.includes('relay_websocket_ping_rtt_seconds{origin="ws://127.0.0.1:9001"} 0.012'));
+    assert.equal(
+      out.split("\n").filter((l) => l.startsWith("relay_websocket_deflate_ratio{")).length,
+      1
+    );
+    assert.ok(out.includes('relay_websocket_deflate_ratio{origin="wss://hooks.example.com"} 0.25'));
+  });
+
+  it("renders nothing for an empty series", async () => {
+    const { renderWebSocketBlock } = await import("../src/metrics.ts");
+    assert.deepEqual(renderWebSocketBlock([]), []);
+  });
+});
+
+describe("WebSocket gateway in GET /metrics (WR-105)", () => {
+  function postHook(port: number) {
+    return new Promise<number>((resolve, reject) => {
+      const r = httpRequest(
+        {
+          host: "127.0.0.1",
+          port,
+          path: "/",
+          method: "POST",
+          headers: { "x-signature": signSha256(BODY, SECRET) },
+        },
+        (res) => {
+          res.resume();
+          res.on("end", () => resolve(res.statusCode ?? 0));
+        }
+      );
+      r.on("error", reject);
+      r.end(BODY);
+    });
+  }
+
+  /** Minimal ws stub: handshake + echo text frames + auto-pong. */
+  async function startWsStub(): Promise<{ url: string; port: number; close: () => Promise<void> }> {
+    const server = createNetServer();
+    server.on("connection", (socket: Socket) => {
+      let head = Buffer.alloc(0);
+      let handshook = false;
+      let buf = Buffer.alloc(0);
+      const drain = (): void => {
+        for (;;) {
+          if (buf.length < 2) return;
+          const opcode = buf[0] & 0x0f;
+          const masked = (buf[1] & 0x80) !== 0;
+          let len = buf[1] & 0x7f;
+          let hlen = 2;
+          if (len === 126) {
+            if (buf.length < 4) return;
+            len = buf.readUInt16BE(2);
+            hlen = 4;
+          }
+          const mlen = masked ? 4 : 0;
+          if (buf.length < hlen + mlen + len) return;
+          let payload = buf.subarray(hlen + mlen, hlen + mlen + len);
+          if (masked) {
+            const mask = buf.subarray(hlen, hlen + 4);
+            const out = Buffer.alloc(len);
+            for (let i = 0; i < len; i++) out[i] = payload[i] ^ mask[i % 4];
+            payload = out;
+          }
+          buf = buf.subarray(hlen + mlen + len);
+          if (opcode === 0x1) socket.write(encodeWsFrame(0x1, payload, false));
+          else if (opcode === 0x9) socket.write(encodeWsFrame(0xa, payload, false));
+          else if (opcode === 0x8) socket.end();
+        }
+      };
+      socket.on("data", (chunk: Buffer) => {
+        if (!handshook) {
+          head = Buffer.concat([head, chunk]);
+          const end = head.indexOf("\r\n\r\n");
+          if (end < 0) return;
+          const key = head
+            .subarray(0, end)
+            .toString("latin1")
+            .split("\r\n")
+            .find((l) => l.toLowerCase().startsWith("sec-websocket-key:"))
+            ?.split(":")[1]
+            .trim();
+          socket.write(
+            "HTTP/1.1 101 Switching Protocols\r\n" +
+              "Upgrade: websocket\r\n" +
+              "Connection: Upgrade\r\n" +
+              `Sec-WebSocket-Accept: ${wsAcceptKey(key ?? "")}\r\n\r\n`
+          );
+          handshook = true;
+          buf = head.subarray(end + 4);
+          drain();
+          return;
+        }
+        buf = Buffer.concat([buf, chunk]);
+        drain();
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const addr = server.address();
+    assert.ok(addr && typeof addr === "object");
+    return {
+      url: `ws://127.0.0.1:${addr.port}/hook`,
+      port: addr.port,
+      close: () =>
+        new Promise<void>((resolve, reject) => server.close((e) => (e ? reject(e) : resolve()))),
+    };
+  }
+
+  it("exposes per-origin WebSocket series after a ws: delivery", async () => {
+    const stub = await startWsStub();
+    const dir = mkdtempSync(join(tmpdir(), "metrics-ws-"));
+    const audit = new AuditLog(join(dir, "audit.jsonl"));
+    // No custom sender: the default sender's WebSocket pool serves the
+    // ws: forwardUrl, so its counters must show up in /metrics.
+    const server = createRelayServer({
+      secret: SECRET,
+      forwardUrl: stub.url,
+      auditLog: audit,
+      operatorToken: "op-token",
+    });
+    const port = await listen(server);
+    try {
+      assert.equal(await postHook(port), 202);
+      const origin = `ws://127.0.0.1:${stub.port}`;
+      const deadline = Date.now() + 8000;
+      let text = "";
+      for (;;) {
+        const res = await get(port, "/metrics", { authorization: "Bearer op-token" });
+        assert.equal(res.status, 200);
+        text = res.text;
+        if (text.includes("relay_websocket_messages_out_total") || Date.now() > deadline) break;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      assert.ok(text.includes(`relay_websocket_messages_out_total{origin="${origin}"} 1`), text);
+      assert.ok(text.includes(`relay_websocket_messages_in_total{origin="${origin}"} 1`), text);
+      assert.ok(text.includes(`relay_websocket_connections{origin="${origin}"} 1`), text);
+      assert.ok(
+        text.includes(`relay_websocket_checkouts_total{origin="${origin}",result="created"} 1`),
+        text
+      );
+    } finally {
+      server.close();
+      await new Promise((r) => server.once("close", r));
+      await stub.close();
+    }
   });
 });

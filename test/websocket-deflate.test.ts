@@ -379,3 +379,28 @@ test("pooled connection reuses the negotiated deflate", async () => {
   assert.equal(stats.deflatedOut, 3);
   assert.equal(stats.deflatedIn, 3);
 });
+
+test("deflated deliveries feed the per-origin compression ratio (WR-105)", async () => {
+  const srv = await trackServer(await startStub({ negotiate: true }));
+  const pool = trackPool(new WebSocketPool({ pingIntervalMs: 0, permessageDeflate: true }));
+  const body = Buffer.from("event-payload ".repeat(500)); // 7000 bytes, compressible
+  const res = await pool.deliver(new URL(srv.url()), body, {}, undefined, srv.url());
+  assert.equal(res.statusCode, 200);
+  const rows = pool.getOriginStats();
+  assert.equal(rows.length, 1);
+  const row = rows[0];
+  assert.equal(row.origin, `${new URL(srv.url()).protocol}//${new URL(srv.url()).host}`);
+  assert.equal(row.deflatedOut, 1);
+  assert.equal(row.deflatedIn, 1);
+  assert.ok(
+    row.compressionRatio !== undefined && row.compressionRatio > 0 && row.compressionRatio < 1,
+    `ratio=${row.compressionRatio}`
+  );
+  const exposition = pool.renderMetrics();
+  assert.ok(
+    exposition.includes(`relay_websocket_deflate_ratio{origin="${row.origin}"} ${row.compressionRatio}`),
+    exposition
+  );
+  // No probe ran (pingIntervalMs 0): the RTT gauge stays absent.
+  assert.ok(!exposition.includes("relay_websocket_ping_rtt_seconds"));
+});

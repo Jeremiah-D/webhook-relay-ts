@@ -15,6 +15,17 @@
  * - `relay_endpoint_circuit_error_rate{endpoint}`: gauge, the rolling-window
  *   failure rate in [0, 1] (WR-104 error-rate trip mode). Present only for
  *   error-rate-mode endpoints with at least one recorded outcome.
+ * - `relay_websocket_connections{origin}`: gauge, active pooled WebSocket
+ *   connections (WR-105). `relay_websocket_messages_out_total` /
+ *   `relay_websocket_messages_in_total{origin}`: counters of delivery
+ *   messages sent and replies received. `relay_websocket_checkouts_total
+ *   {origin,result}`: pool checkouts (`result` = `created` / `reused`).
+ *   `relay_websocket_ping_rtt_seconds{origin}`: gauge, mean recent
+ *   keep-alive ping RTT (only origins with a completed probe).
+ *   `relay_websocket_deflate_ratio{origin}`: gauge, mean permessage-deflate
+ *   wire/plain byte ratio (only origins with a compressed delivery).
+ *   All present only once a WebSocket delivery has actually run — absent
+ *   entirely otherwise.
  * - `relay_delivery_latency_seconds_{bucket,sum,count}{endpoint}`:
  *   histogram of accepted→delivered latency (seconds). Present only when
  *   latency tracking is enabled (`RetryQueueOptions.latency`); bucket
@@ -511,6 +522,95 @@ export function renderOcspBlock(series: OcspMetricsInput[]): string[] {
   return lines;
 }
 
+/**
+ * One origin's WebSocket gateway counters (WR-105), in Prometheus label
+ * order. The origin key is `<scheme>//<host>` (host includes the port).
+ */
+export interface WebSocketOriginMetricsInput {
+  /** Origin grouping key: `<scheme>//<host>`. */
+  origin: string;
+  /** Live pooled connections for this origin right now. */
+  activeConnections: number;
+  /** Delivery messages sent. */
+  messagesOut: number;
+  /** Delivery replies received. */
+  messagesIn: number;
+  /** Pool checkouts that opened a fresh connection. */
+  created: number;
+  /** Pool checkouts that reused a pooled connection. */
+  reused: number;
+  /**
+   * Mean recent keep-alive ping RTT in seconds; absent when no probe has
+   * completed yet for this origin.
+   */
+  pingRttSeconds?: number;
+  /**
+   * Mean permessage-deflate wire/plain byte ratio in (0, 1]; absent when
+   * nothing was compressed for this origin yet.
+   */
+  compressionRatio?: number;
+}
+
+/**
+ * Render just the WebSocket gateway block (WR-105) as exposition lines;
+ * `[]` when the series is empty, so callers can keep their output
+ * byte-identical until the first WebSocket delivery actually runs.
+ */
+export function renderWebSocketBlock(series: WebSocketOriginMetricsInput[]): string[] {
+  if (series.length === 0) return [];
+  const originOf = (s: WebSocketOriginMetricsInput): string =>
+    `origin="${escapeLabelValue(s.origin)}"`;
+  const lines = [
+    "# HELP relay_websocket_connections Active pooled WebSocket connections by origin.",
+    "# TYPE relay_websocket_connections gauge",
+  ];
+  for (const s of series) {
+    lines.push(`relay_websocket_connections{${originOf(s)}} ${s.activeConnections}`);
+  }
+  lines.push(
+    "# HELP relay_websocket_messages_out_total WebSocket delivery messages sent, by origin."
+  );
+  lines.push("# TYPE relay_websocket_messages_out_total counter");
+  for (const s of series) {
+    lines.push(`relay_websocket_messages_out_total{${originOf(s)}} ${s.messagesOut}`);
+  }
+  lines.push(
+    "# HELP relay_websocket_messages_in_total WebSocket delivery replies received, by origin."
+  );
+  lines.push("# TYPE relay_websocket_messages_in_total counter");
+  for (const s of series) {
+    lines.push(`relay_websocket_messages_in_total{${originOf(s)}} ${s.messagesIn}`);
+  }
+  lines.push(
+    "# HELP relay_websocket_checkouts_total WebSocket pool checkouts by origin and result (created = opened a fresh connection, reused = served from the pool)."
+  );
+  lines.push("# TYPE relay_websocket_checkouts_total counter");
+  for (const s of series) {
+    lines.push(`relay_websocket_checkouts_total{${originOf(s)},result="created"} ${s.created}`);
+    lines.push(`relay_websocket_checkouts_total{${originOf(s)},result="reused"} ${s.reused}`);
+  }
+  const withRtt = series.filter((s) => s.pingRttSeconds !== undefined);
+  if (withRtt.length > 0) {
+    lines.push(
+      "# HELP relay_websocket_ping_rtt_seconds Mean recent keep-alive ping round-trip time, by origin."
+    );
+    lines.push("# TYPE relay_websocket_ping_rtt_seconds gauge");
+    for (const s of withRtt) {
+      lines.push(`relay_websocket_ping_rtt_seconds{${originOf(s)}} ${s.pingRttSeconds}`);
+    }
+  }
+  const withRatio = series.filter((s) => s.compressionRatio !== undefined);
+  if (withRatio.length > 0) {
+    lines.push(
+      "# HELP relay_websocket_deflate_ratio Mean permessage-deflate wire/plain byte ratio by origin (smaller = better compression)."
+    );
+    lines.push("# TYPE relay_websocket_deflate_ratio gauge");
+    for (const s of withRatio) {
+      lines.push(`relay_websocket_deflate_ratio{${originOf(s)}} ${s.compressionRatio}`);
+    }
+  }
+  return lines;
+}
 /**
  * Render just the error-rate gauge block (WR-104) as exposition lines;
  * `[]` when the series is empty, so callers can keep their output
