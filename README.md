@@ -1727,6 +1727,44 @@ const relayB = createRelayServer({
   `RangeError` at startup. Shadow-target mirrors (WR-85) never stamp hops:
   a mirror is not a mesh traversal.
 
+## Pluggable dedup store (opt-in)
+
+The payload-hash deduplicator (WR-14) suppresses repeat deliveries of the
+same business event inside a time window — e.g. a retried payment callback
+that must not charge twice. Its backing window is now pluggable, so a
+fleet of relay processes can share one dedup window (Redis, …) instead of
+each keeping a private in-memory one:
+
+```ts
+import { createRelayServer } from "./src/server.ts";
+import type { DedupStore } from "./src/dedup.ts";
+
+const redisStore: DedupStore = {
+  // Return true when `key` was seen inside [nowMs - windowMs, nowMs].
+  async checkAndRemember(key, nowMs, windowMs) { /* SETNX + PEXPIRE … */ },
+  async size() { /* DBSIZE … */ },
+};
+const server = createRelayServer({
+  secret, forwardUrl, auditLog,
+  dedup: { windowMs: 300_000, maxEntries: 10_000, store: redisStore },
+});
+```
+
+- **Contract** — `checkAndRemember(key, nowMs, windowMs)` owns expiry and
+  eviction and must honor the caller-supplied `nowMs` (never its own
+  clock), so behavior stays deterministic and testable; `size()` feeds
+  observability. Both may be async. The deduplicator keeps the key shape
+  (`<endpoint>\n<sha256(payload)>`, tenant-scoped upstream) and the
+  checked/suppressed counters, so WR-14 semantics, window, and TTL are
+  unchanged.
+- **Default unchanged** — without `store`, the built-in
+  `InMemoryDedupStore` behaves exactly as before (same keys, same
+  oldest-eviction, same lazy expiry), including the WR-79 crash journal.
+- **`store` and `journalDir` are mutually exclusive** — a custom store
+  owns its own durability (Redis persistence, …); combining both throws
+  `RangeError` at startup, as does a `store` that does not implement the
+  interface (`TypeError`).
+
 ## Payload gzip compression
 
 Outbound deliveries can be gzipped per endpoint (opt-in), and inbound

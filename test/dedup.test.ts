@@ -47,48 +47,48 @@ describe("DeliveryDeduplicator", () => {
     assert.match(a, /^[0-9a-f]{64}$/);
   });
 
-  it("first sight is new, every repeat inside the window is a duplicate", () => {
+  it("first sight is new, every repeat inside the window is a duplicate", async () => {
     let now = 0;
     const d = new DeliveryDeduplicator({ windowMs: 60_000, now: () => now });
     const hash = DeliveryDeduplicator.hashPayload(BODY);
-    assert.equal(d.check(URL, hash), false);
-    assert.equal(d.check(URL, hash), true);
-    assert.equal(d.check(URL, hash), true); // every repeat stays suppressed
-    assert.deepEqual(d.stats(), { checked: 3, suppressed: 2, tracked: 1 });
+    assert.equal(await d.check(URL, hash), false);
+    assert.equal(await d.check(URL, hash), true);
+    assert.equal(await d.check(URL, hash), true); // every repeat stays suppressed
+    assert.deepEqual(await d.stats(), { checked: 3, suppressed: 2, tracked: 1 });
   });
 
-  it("different payloads and different endpoints are independent deliveries", () => {
+  it("different payloads and different endpoints are independent deliveries", async () => {
     const d = new DeliveryDeduplicator({ windowMs: 60_000 });
     const h1 = DeliveryDeduplicator.hashPayload(BODY);
     const h2 = DeliveryDeduplicator.hashPayload(Buffer.from("other"));
-    assert.equal(d.check(URL, h1), false);
-    assert.equal(d.check(URL, h2), false); // different payload
-    assert.equal(d.check(URL + "/b", h1), false); // different endpoint
-    assert.equal(d.stats().tracked, 3);
+    assert.equal(await d.check(URL, h1), false);
+    assert.equal(await d.check(URL, h2), false); // different payload
+    assert.equal(await d.check(URL + "/b", h1), false); // different endpoint
+    assert.equal((await d.stats()).tracked, 3);
   });
 
-  it("a pair seen again after the window expires counts as new", () => {
+  it("a pair seen again after the window expires counts as new", async () => {
     let now = 0;
     const d = new DeliveryDeduplicator({ windowMs: 1000, now: () => now });
     const hash = DeliveryDeduplicator.hashPayload(BODY);
-    assert.equal(d.check(URL, hash), false);
+    assert.equal(await d.check(URL, hash), false);
     now = 999;
-    assert.equal(d.check(URL, hash), true); // still inside the window
+    assert.equal(await d.check(URL, hash), true); // still inside the window
     now = 1000;
-    assert.equal(d.check(URL, hash), false); // window elapsed: redeliver
-    assert.equal(d.check(URL, hash), true); // and the new window suppresses
-    assert.equal(d.stats().tracked, 1); // expired entry replaced, not duplicated
+    assert.equal(await d.check(URL, hash), false); // window elapsed: redeliver
+    assert.equal(await d.check(URL, hash), true); // and the new window suppresses
+    assert.equal((await d.stats()).tracked, 1); // expired entry replaced, not duplicated
   });
 
-  it("oldest entries are evicted past maxEntries so memory stays bounded", () => {
+  it("oldest entries are evicted past maxEntries so memory stays bounded", async () => {
     const d = new DeliveryDeduplicator({ windowMs: 60_000, maxEntries: 2 });
     const hashes = ["a", "b", "c"].map((s) => DeliveryDeduplicator.hashPayload(Buffer.from(s)));
-    assert.equal(d.check(URL, hashes[0]), false);
-    assert.equal(d.check(URL, hashes[1]), false);
-    assert.equal(d.check(URL, hashes[2]), false); // evicts the oldest ("a")
-    assert.equal(d.stats().tracked, 2);
-    assert.equal(d.check(URL, hashes[1]), true); // "b" still tracked: duplicate
-    assert.equal(d.check(URL, hashes[0]), false); // "a" was evicted: new again
+    assert.equal(await d.check(URL, hashes[0]), false);
+    assert.equal(await d.check(URL, hashes[1]), false);
+    assert.equal(await d.check(URL, hashes[2]), false); // evicts the oldest ("a")
+    assert.equal((await d.stats()).tracked, 2);
+    assert.equal(await d.check(URL, hashes[1]), true); // "b" still tracked: duplicate
+    assert.equal(await d.check(URL, hashes[0]), false); // "a" was evicted: new again
   });
 
   it("rejects invalid configuration", () => {
@@ -195,40 +195,40 @@ describe("DeliveryDeduplicator journal (WR-79)", () => {
     return join(dir, DEDUP_JOURNAL_FILE);
   }
 
-  it("is off by default: no journal files are created", () => {
+  it("is off by default: no journal files are created", async () => {
     const dir = mkdtempSync(join(tmpdir(), "dedup-off-"));
     const d = new DeliveryDeduplicator({ windowMs: 60_000 });
-    assert.equal(d.check(URL, HASH), false);
-    assert.equal(d.stats().journal, undefined);
+    assert.equal(await d.check(URL, HASH), false);
+    assert.equal((await d.stats()).journal, undefined);
     assert.deepEqual(readdirSync(dir), []);
   });
 
-  it("survives restarts: duplicates stay suppressed after reconstructing", () => {
+  it("survives restarts: duplicates stay suppressed after reconstructing", async () => {
     const dir = mkdtempSync(join(tmpdir(), "dedup-restart-"));
     let now = 1_000_000;
     const d1 = new DeliveryDeduplicator({ windowMs: 60_000, now: () => now, journalDir: dir });
-    assert.equal(d1.check(URL, HASH), false);
-    assert.equal(d1.stats().journal?.journaled, 1);
+    assert.equal(await d1.check(URL, HASH), false);
+    assert.equal((await d1.stats()).journal?.journaled, 1);
     // Simulate a process restart: a brand-new instance over the same dir.
     const d2 = new DeliveryDeduplicator({ windowMs: 60_000, now: () => now, journalDir: dir });
-    assert.equal(d2.stats().journal?.recovered, 1);
-    assert.equal(d2.stats().journal?.corruptLines, 0);
-    assert.equal(d2.check(URL, HASH), true); // still suppressed — no double charge
-    assert.equal(d2.check("http://localhost:9999/other", HASH), false); // different endpoint: new
+    assert.equal((await d2.stats()).journal?.recovered, 1);
+    assert.equal((await d2.stats()).journal?.corruptLines, 0);
+    assert.equal(await d2.check(URL, HASH), true); // still suppressed — no double charge
+    assert.equal(await d2.check("http://localhost:9999/other", HASH), false); // different endpoint: new
   });
 
-  it("does not recover pairs whose window already expired", () => {
+  it("does not recover pairs whose window already expired", async () => {
     const dir = mkdtempSync(join(tmpdir(), "dedup-expire-"));
     let now = 0;
     const d1 = new DeliveryDeduplicator({ windowMs: 60_000, now: () => now, journalDir: dir });
-    assert.equal(d1.check(URL, HASH), false);
+    assert.equal(await d1.check(URL, HASH), false);
     now = 60_000; // exactly at the window edge: expired, same as in-memory
     const d2 = new DeliveryDeduplicator({ windowMs: 60_000, now: () => now, journalDir: dir });
-    assert.equal(d2.stats().journal?.recovered, 0);
-    assert.equal(d2.check(URL, HASH), false); // fresh window: delivered
+    assert.equal((await d2.stats()).journal?.recovered, 0);
+    assert.equal(await d2.check(URL, HASH), false); // fresh window: delivered
   });
 
-  it("skips corrupt lines and counts them", () => {
+  it("skips corrupt lines and counts them", async () => {
     const dir = mkdtempSync(join(tmpdir(), "dedup-corrupt-"));
     const key = Buffer.from(`${URL}\n${HASH}`, "utf8").toString("base64");
     const valid = JSON.stringify({
@@ -242,12 +242,12 @@ describe("DeliveryDeduplicator journal (WR-79)", () => {
       ["not json at all", "", valid, '{"v":1,"op":"bogus"}', '{"v":2,"op":"seen"}'].join("\n") + "\n"
     );
     const d = new DeliveryDeduplicator({ windowMs: 60_000, journalDir: dir });
-    assert.equal(d.stats().journal?.recovered, 1);
-    assert.equal(d.stats().journal?.corruptLines, 3);
-    assert.equal(d.check(URL, HASH), true); // the one good line still protects
+    assert.equal((await d.stats()).journal?.recovered, 1);
+    assert.equal((await d.stats()).journal?.corruptLines, 3);
+    assert.equal(await d.check(URL, HASH), true); // the one good line still protects
   });
 
-  it("seals journaled keys when a journalEncryptor is configured", () => {
+  it("seals journaled keys when a journalEncryptor is configured", async () => {
     const dir = mkdtempSync(join(tmpdir(), "dedup-enc-"));
     const key = randomAes256Key();
     let now = 1_000_000;
@@ -257,7 +257,7 @@ describe("DeliveryDeduplicator journal (WR-79)", () => {
       journalDir: dir,
       journalEncryptor: new AesGcmEncryptor(key),
     });
-    assert.equal(d1.check(URL, HASH), false);
+    assert.equal(await d1.check(URL, HASH), false);
     // The endpoint URL never lands on disk in the clear.
     assert.ok(!readFileSync(journalPath(dir), "utf8").includes("localhost:9999"));
     const d2 = new DeliveryDeduplicator({
@@ -266,8 +266,8 @@ describe("DeliveryDeduplicator journal (WR-79)", () => {
       journalDir: dir,
       journalEncryptor: new AesGcmEncryptor(key),
     });
-    assert.equal(d2.stats().journal?.recovered, 1);
-    assert.equal(d2.check(URL, HASH), true);
+    assert.equal((await d2.stats()).journal?.recovered, 1);
+    assert.equal(await d2.check(URL, HASH), true);
     // A rotated-away key cannot open the sealed lines: counted as corrupt,
     // never fatal, nothing recovered.
     const d3 = new DeliveryDeduplicator({
@@ -276,12 +276,12 @@ describe("DeliveryDeduplicator journal (WR-79)", () => {
       journalDir: dir,
       journalEncryptor: new AesGcmEncryptor(randomAes256Key()),
     });
-    assert.equal(d3.stats().journal?.recovered, 0);
-    assert.equal(d3.stats().journal?.corruptLines, 1);
-    assert.equal(d3.check(URL, HASH), false);
+    assert.equal((await d3.stats()).journal?.recovered, 0);
+    assert.equal((await d3.stats()).journal?.corruptLines, 1);
+    assert.equal(await d3.check(URL, HASH), false);
   });
 
-  it("caps recovered state at maxEntries, newest first", () => {
+  it("caps recovered state at maxEntries, newest first", async () => {
     const dir = mkdtempSync(join(tmpdir(), "dedup-cap-"));
     let now = 0;
     const d1 = new DeliveryDeduplicator({
@@ -293,20 +293,20 @@ describe("DeliveryDeduplicator journal (WR-79)", () => {
     // maxEntries bounds memory, but every first sight is journaled.
     for (const ep of ["http://a/", "http://b/", "http://c/"]) {
       now += 1;
-      assert.equal(d1.check(ep, HASH), false);
+      assert.equal(await d1.check(ep, HASH), false);
     }
-    assert.equal(d1.stats().tracked, 2);
+    assert.equal((await d1.stats()).tracked, 2);
     const d2 = new DeliveryDeduplicator({
       windowMs: 60_000,
       maxEntries: 2,
       now: () => now,
       journalDir: dir,
     });
-    assert.equal(d2.stats().journal?.recovered, 2);
-    assert.equal(d2.stats().tracked, 2);
-    assert.equal(d2.check("http://b/", HASH), true);
-    assert.equal(d2.check("http://c/", HASH), true);
-    assert.equal(d2.check("http://a/", HASH), false); // evicted oldest: fresh again
+    assert.equal((await d2.stats()).journal?.recovered, 2);
+    assert.equal((await d2.stats()).tracked, 2);
+    assert.equal(await d2.check("http://b/", HASH), true);
+    assert.equal(await d2.check("http://c/", HASH), true);
+    assert.equal(await d2.check("http://a/", HASH), false); // evicted oldest: fresh again
   });
 
   it("an uncreatable journal directory throws at construction", () => {

@@ -5646,7 +5646,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // tenant's identical business event.
     if (deduplicator) {
       const payloadHash = DeliveryDeduplicator.hashPayload(body);
-      if (deduplicator.check(tenantScopeKey(tenantId, targetUrl), payloadHash)) {
+      // WR-108: `check()` is async — a custom DedupStore may answer from
+      // across the network (e.g. Redis). `admitOneEvent` is already async.
+      if (await deduplicator.check(tenantScopeKey(tenantId, targetUrl), payloadHash)) {
         opts.auditLog.append({ ...correlation,
           event: "duplicate_suppressed",
           id,
