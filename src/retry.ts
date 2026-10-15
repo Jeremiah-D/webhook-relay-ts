@@ -76,6 +76,23 @@ export type {
   ShadowTargetStats,
   ShadowTargetsConfig,
 };
+export {
+  QuorumFanoutSet,
+  assertValidQuorumConfig,
+};
+export type {
+  QuorumAcknowledgedInfo,
+  QuorumConfig,
+  QuorumDeadTarget,
+  QuorumDispatchedInfo,
+  QuorumFailedInfo,
+  QuorumFanoutConfig,
+  QuorumFanoutStats,
+  QuorumFanoutStatus,
+  QuorumMetricsInput,
+  QuorumSatisfiedInfo,
+  QuorumTargetDeadLetteredInfo,
+};
 import { EndpointQuota, type QuotaOptions, type QuotaStats } from "./quota.ts";
 import { ReplayEgressGate, type ReplayEgressOptions, DEFAULT_REPLAY_EGRESS_RPS } from "./replay-egress.ts";
 import { RetryBudget, type RetryBudgetOptions } from "./retry-budget.ts";
@@ -153,6 +170,21 @@ import {
   type FailoverSwitchEvent,
 } from "./failover.ts";
 import {
+  QuorumFanoutSet,
+  assertValidQuorumConfig,
+  type QuorumAcknowledgedInfo,
+  type QuorumConfig,
+  type QuorumDeadTarget,
+  type QuorumDispatchedInfo,
+  type QuorumFailedInfo,
+  type QuorumFanoutConfig,
+  type QuorumFanoutStats,
+  type QuorumFanoutStatus,
+  type QuorumMetricsInput,
+  type QuorumSatisfiedInfo,
+  type QuorumTargetDeadLetteredInfo,
+} from "./quorum.ts";
+import {
   WeightedDispatcher,
   type WeightedConfig,
   type WeightedEndpointStats,
@@ -172,6 +204,7 @@ import {
   type FailoverMetricsInput,
   type LatencyHistogramInput,
   type ProbeMetricsInput,
+  type QuorumMetricsInput,
   type ShadowMetricsInput,
   type SloRiskMetricsInput,
   type StarvationGuardMetricsInput,
@@ -1614,6 +1647,54 @@ export interface RetryQueueOptions {
    */
   onShadowFailed?: (info: ShadowFailedInfo) => void;
   /**
+   * WR-106: quorum fan-out — M-of-N downstream acknowledgement (see
+   * `src/quorum.ts`). Per-endpoint opt-in: exact `targetUrl` -> fan-out
+   * config (`targets` + `quorum`). Admit one event for a configured
+   * endpoint via `enqueueFanout()` (not `enqueue()`) and the queue
+   * dispatches one member item per target; M member acknowledgements
+   * settle the fan-out as `satisfied`. Each member keeps the relay's
+   * normal per-endpoint machinery — backoff, the WR-12 urgent lane
+   * (priority rides the admitted item into every member), the circuit
+   * breaker, quota, the retry budget, and the dead-letter list — because
+   * each member *is* a normal queue item. The quorum layer never
+   * schedules its own retries: unacknowledged members are retried by the
+   * queue, and a member that exhausts its budget (or fails non-retryable
+   * per WR-30) dead-letters individually — the fan-out itself never
+   * becomes a single dead-letter entry. Disabled by default (absent =
+   * zero behavior change). Invalid values throw `RangeError` at
+   * construction. Reachable over HTTP via the `quorum` server option.
+   */
+  quorum?: QuorumConfig;
+  /**
+   * Called once per quorum fan-out dispatch (one admission -> N member
+   * items). The server audits these as `quorum_dispatched`; library
+   * users get the hook directly.
+   */
+  onQuorumDispatched?: (info: QuorumDispatchedInfo) => void;
+  /**
+   * Called once per member acknowledgement. The server audits these as
+   * `quorum_acknowledged`; library users get the hook directly.
+   */
+  onQuorumAcknowledged?: (info: QuorumAcknowledgedInfo) => void;
+  /**
+   * Called once when a fan-out reaches its quorum. The server audits
+   * these as `quorum_satisfied`; library users get the hook directly.
+   */
+  onQuorumSatisfied?: (info: QuorumSatisfiedInfo) => void;
+  /**
+   * Called once when a fan-out's quorum becomes unreachable. The server
+   * audits these as `quorum_failed`; library users get the hook
+   * directly.
+   */
+  onQuorumFailed?: (info: QuorumFailedInfo) => void;
+  /**
+   * Called once per member that exhausts its own retry lifecycle, with
+   * the WR-30 classification of the final failure. The server audits
+   * these as `quorum_target_dead_lettered`; library users get the hook
+   * directly.
+   */
+  onQuorumTargetDeadLettered?: (info: QuorumTargetDeadLetteredInfo) => void;
+  /**
    * OTLP/HTTP JSON delivery-event export (WR-83; see `src/otlp.ts`).
    * Opt-in: exports the `delivered` / `retrying` / `dead_letter`
    * delivery events (WR-16) plus `slo_missed` latency events (WR-13) to
@@ -2542,6 +2623,7 @@ export class RetryQueue {
    * `shadowTargets` is unset (zero behavior change).
    */
   private readonly shadow?: ShadowDispatcher;
+  private readonly quorum?: QuorumFanoutSet;
   /** WR-39: active/standby target selection; undefined when not configured. */
   private readonly failover?: FailoverManager;
   private readonly onFailoverSwitch?: (event: FailoverSwitchEvent) => void;
@@ -2714,6 +2796,20 @@ export class RetryQueue {
             sender: this.sender,
             onDelivered: opts.onShadowDelivered,
             onFailed: opts.onShadowFailed,
+          })
+        : undefined;
+    // WR-106: opt-in quorum fan-out (M-of-N downstream acknowledgement).
+    // The set validates eagerly — `RangeError` at construction, never
+    // mid-delivery. Absent = the relay behaves exactly as before: no
+    // fan-outs, no quorum metrics series, no audit events.
+    this.quorum =
+      opts.quorum !== undefined
+        ? new QuorumFanoutSet(opts.quorum, {
+            onDispatched: opts.onQuorumDispatched,
+            onAcknowledged: opts.onQuorumAcknowledged,
+            onSatisfied: opts.onQuorumSatisfied,
+            onFailed: opts.onQuorumFailed,
+            onTargetDeadLettered: opts.onQuorumTargetDeadLettered,
           })
         : undefined;
     this.onScheduledFired = opts.onScheduledFired;
@@ -3873,12 +3969,39 @@ export class RetryQueue {
       return;
     }
     // The urgent lane is never batched: an urgent delivery must go out
-    // immediately, not wait for a batch window.
-    if (this.batcher && traced.priority !== "urgent") {
+    // immediately, not wait for a batch window. WR-106 quorum members
+    // are never batched either: a batch merge rewrites the item id
+    // (`newBatchId`), which would destroy the member's ack attribution —
+    // the quorum set maps member ids to (fanout, target), and a merged
+    // batch carries neither.
+    if (this.batcher && traced.priority !== "urgent" && !this.quorum?.isMemberId(traced.id)) {
       this.batcher.add(traced);
       return;
     }
     this.enqueueNow(traced);
+  }
+
+  /**
+   * WR-106: whether `targetUrl` has a quorum fan-out configured. The
+   * server consults this at admission to decide between `enqueue()` and
+   * `enqueueFanout()`.
+   */
+  hasQuorumConfig(targetUrl: string): boolean {
+    return this.quorum?.hasConfig(targetUrl) ?? false;
+  }
+
+  /**
+   * WR-106: admit one event for a quorum-configured endpoint — one member
+   * item per target, each riding the queue's normal machinery (backoff /
+   * urgent lane / circuit / quota / retry budget / dead-letter) as its own
+   * delivery. Returns the fan-out id (the admitted item's id). Throws
+   * when the endpoint has no quorum config or the id is already live.
+   */
+  enqueueFanout(item: RetryItem): string {
+    if (this.quorum === undefined || !this.quorum.hasConfig(item.targetUrl)) {
+      throw new Error(`no quorum fan-out configured for ${item.targetUrl}`);
+    }
+    return this.quorum.dispatch(item, (member) => this.enqueue(member));
   }
 
   /**
@@ -4882,6 +5005,13 @@ export class RetryQueue {
         this.evaluateSloRisk(tenant, entry.targetUrl);
         // The hooks see the physical target the delivery actually went to.
         this.onDelivered?.({ ...entry, targetUrl: target }, entry.attempt + 1, responseSummary);
+        // WR-106: count the member's ack toward its fan-out quorum.
+        // Unknown ids (non-members) are ignored.
+        this.quorum?.recordDelivered(entry.id, {
+          targetUrl: target,
+          traceId,
+          ...(tenant === undefined ? {} : { tenant }),
+        });
         const deliveredTraceSpan = this.traceSpanFor(entry, entry.attempt + 1);
         this.emitDeliveryEvent({
           type: "delivered",
@@ -5228,6 +5358,11 @@ export class RetryQueue {
     // usable body and no meaningful TTFB, so those stay "unavailable".
     const responseSummary = summarizeDeadLetterFailure(err);
     this.onDeadLetter?.({ ...entry, targetUrl: target }, entry.attempt, err, classified.failureClass, responseSummary);
+    // WR-106: the WR-30 classification of the final failure rides into
+    // the fan-out's loss record (audit + stats). The member's own
+    // retry/backoff/dead-letter lifecycle already ran to completion
+    // above; unknown ids (non-members) are ignored.
+    this.quorum?.recordDeadLetter(entry.id, classified.failureClass, error);
     const deadLetterTraceSpan = this.traceSpanFor(entry, entry.attempt);
     this.emitDeliveryEvent({
       type: "dead_letter",
@@ -5303,6 +5438,16 @@ export class RetryQueue {
    */
   getShadowStats(): ShadowTargetStats[] {
     return this.shadow?.stats() ?? [];
+  }
+
+  /**
+   * WR-106: per-fanout acknowledgement progress (`fanoutId`, `endpoint`,
+   * `targets`, `acked`, `status`, lost targets), in dispatch order. Empty
+   * when the feature is off or no fan-out has been dispatched yet. Also
+   * rendered as `relay_quorum_*` in `renderMetrics()`.
+   */
+  getQuorumStats(): QuorumFanoutStats[] {
+    return this.quorum?.stats() ?? [];
   }
 
   /**
@@ -5557,6 +5702,17 @@ export class RetryQueue {
       delivered: s.delivered,
       failed: s.failed,
     }));
+    // WR-106: one row per (tenant, endpoint) with a recorded
+    // acknowledgement or loss — activity-gated, so the series stays
+    // absent until the first ack or dead member.
+    const quorum: QuorumMetricsInput[] = (this.quorum?.metricsRows() ?? []).map((s) => ({
+      endpoint: s.endpoint,
+      ...(s.tenant === undefined ? {} : { tenant: s.tenant }),
+      satisfied: s.satisfied,
+      failed: s.failed,
+      acknowledged: s.acknowledged,
+      targetDeadLetters: s.targetDeadLetters,
+    }));
     // WR-93: one series per (tenant, endpoint) scope that actually
     // dispatched a storm alert — activity-gated, so the series stays
     // absent until the first escalation fires. The escalator's
@@ -5614,6 +5770,9 @@ export class RetryQueue {
       ...(deliveryDeadlineExceeded.length > 0 ? { deliveryDeadlineExceeded } : {}),
       // WR-85: activity-gated (see above).
       ...(shadow.length > 0 ? { shadow } : {}),
+      // WR-106: activity-gated (see above) — the quorum series stays
+      // absent until the first acknowledgement or loss.
+      ...(quorum.length > 0 ? { quorum } : {}),
       // WR-93: activity-gated (see above).
       ...(escalation.length > 0 ? { escalation } : {}),
       // WR-100: activity-gated (see above).

@@ -18,6 +18,14 @@ import {
 import { RetryQueue, type DeliveryPriority, type DownstreamResponse, type RetryItem, type Sender } from "./retry.ts";
 import { parseDeliverAtHeader, DELIVER_AT_HEADER } from "./retry.ts";
 import type { ShadowDeliveredInfo, ShadowFailedInfo, ShadowTargetConfig, ShadowTargetsConfig } from "./retry.ts";
+import type {
+  QuorumAcknowledgedInfo,
+  QuorumConfig,
+  QuorumDispatchedInfo,
+  QuorumFailedInfo,
+  QuorumSatisfiedInfo,
+  QuorumTargetDeadLetteredInfo,
+} from "./retry.ts";
 import type { PhaseDurationsMs } from "./retry.ts";
 import type { StalePauseOptions } from "./retry.ts";
 import { parseCronExpression, CRON_HEADER } from "./cron.ts";
@@ -477,6 +485,22 @@ export interface RelayServerOptions {
    * default; invalid values throw `RangeError` at startup.
    */
   shadowTargets?: Record<string, ShadowTargetServerConfig[]>;
+  /**
+   * WR-106: quorum fan-out — M-of-N downstream acknowledgement (see
+   * `src/quorum.ts`): the multi-settlement-channel / redundant-notification
+   * scenario. Per-endpoint opt-in — exact `forwardUrl`/endpoint
+   * `targetUrl` -> `{ targets, quorum }`. An admitted event for a
+   * configured endpoint is dispatched to every target (each through the
+   * relay's main sender, with the full per-endpoint retry/backoff/circuit/
+   * quota/dead-letter machinery); M acknowledgements settle the fan-out
+   * as delivered. Progress is observable via `GET /quorum`, audited as
+   * `quorum_dispatched` / `quorum_acknowledged` / `quorum_satisfied` /
+   * `quorum_failed` / `quorum_target_dead_lettered`, and counted in
+   * `relay_quorum_*`. An explicit server-level `quorum` wins over the
+   * nested `retry.quorum`. Off by default; invalid values throw
+   * `RangeError` at startup.
+   */
+  quorum?: QuorumConfig;
   /**
    * Outbound TLS certificate pinning (see `src/pinning.ts`): per-endpoint
    * SPKI fingerprint whitelist, keyed by exact delivery `targetUrl`.
@@ -3111,6 +3135,7 @@ function isOperatorPath(pathname: string): boolean {
     pathname === "/audit/verify" ||
     pathname === "/latency" ||
     pathname === "/slo-risk" ||
+    pathname === "/quorum" ||
     pathname === "/usage" ||
     pathname === "/health/summary" ||
     pathname === "/events" ||
@@ -3630,6 +3655,76 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       });
       opts.retry?.onShadowFailed?.(info);
     },
+    // WR-106: quorum fan-out (M-of-N downstream acknowledgement). An
+    // explicit server-level `quorum` wins over the nested `retry.quorum`;
+    // either way the queue owns the fan-out set. Wrap the caller's hooks
+    // so every quorum outcome is audited, not just observed.
+    quorum: opts.quorum ?? opts.retry?.quorum,
+    onQuorumDispatched: (info: QuorumDispatchedInfo) => {
+      opts.auditLog.append({
+        event: "quorum_dispatched",
+        id: info.fanoutId,
+        traceId: info.traceId,
+        ...(info.tenant !== undefined ? { tenant: info.tenant } : {}),
+        targetUrl: info.endpoint,
+        targets: info.targets,
+        quorum: info.quorum,
+      });
+      opts.retry?.onQuorumDispatched?.(info);
+    },
+    onQuorumAcknowledged: (info: QuorumAcknowledgedInfo) => {
+      opts.auditLog.append({
+        event: "quorum_acknowledged",
+        id: info.fanoutId,
+        traceId: info.traceId,
+        ...(info.tenant !== undefined ? { tenant: info.tenant } : {}),
+        targetUrl: info.endpoint,
+        ackTarget: info.targetUrl,
+        acked: info.acked,
+        targets: info.targets,
+      });
+      opts.retry?.onQuorumAcknowledged?.(info);
+    },
+    onQuorumSatisfied: (info: QuorumSatisfiedInfo) => {
+      opts.auditLog.append({
+        event: "quorum_satisfied",
+        id: info.fanoutId,
+        traceId: info.traceId,
+        ...(info.tenant !== undefined ? { tenant: info.tenant } : {}),
+        targetUrl: info.endpoint,
+        acked: info.acked,
+        targets: info.targets,
+      });
+      opts.retry?.onQuorumSatisfied?.(info);
+    },
+    onQuorumFailed: (info: QuorumFailedInfo) => {
+      opts.auditLog.append({
+        event: "quorum_failed",
+        id: info.fanoutId,
+        traceId: info.traceId,
+        ...(info.tenant !== undefined ? { tenant: info.tenant } : {}),
+        targetUrl: info.endpoint,
+        acked: info.acked,
+        targets: info.targets,
+        reason: info.reason,
+      });
+      opts.retry?.onQuorumFailed?.(info);
+    },
+    onQuorumTargetDeadLettered: (info: QuorumTargetDeadLetteredInfo) => {
+      opts.auditLog.append({
+        event: "quorum_target_dead_lettered",
+        id: info.fanoutId,
+        traceId: info.traceId,
+        ...(info.tenant !== undefined ? { tenant: info.tenant } : {}),
+        targetUrl: info.endpoint,
+        deadTarget: info.targetUrl,
+        failureClass: info.failureClass,
+        error: info.lastError,
+        acked: info.acked,
+        targets: info.targets,
+      });
+      opts.retry?.onQuorumTargetDeadLettered?.(info);
+    },
     onProbeAudit: (event) => {
       opts.auditLog.append(event);
       opts.retry?.onProbeAudit?.(event);
@@ -4107,6 +4202,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     const isAuditVerify = pathname === "/audit/verify";
     const isLatency = pathname === "/latency";
     const isSloRisk = pathname === "/slo-risk";
+    const isQuorum = pathname === "/quorum";
     const isUsage = pathname === "/usage";
     const isHealthSummary = pathname === "/health/summary";
     const isEvents = pathname === "/events";
@@ -4133,6 +4229,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       !isAuditVerify &&
       !isLatency &&
       !isSloRisk &&
+      !isQuorum &&
       !isUsage &&
       !isHealthSummary &&
       !isEvents &&
@@ -4164,6 +4261,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         (isAuditVerify && req.method === "GET") ||
         (isLatency && req.method === "GET") ||
         (isSloRisk && req.method === "GET") ||
+        (isQuorum && req.method === "GET") ||
         (isUsage && req.method === "GET") ||
         (isHealthSummary && req.method === "GET") ||
         (isEvents && req.method === "GET") ||
@@ -4335,6 +4433,14 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       // (fail-closed without operatorToken).
       const params = new URL(req.url ?? "/slo-risk", "http://internal").searchParams;
       respondJson(res, 200, queue.getSloRiskStats(params.get("tenant") ?? undefined));
+      return;
+    }
+    if (isQuorum) {
+      // WR-106: per-fanout acknowledgement progress (`fanoutId`,
+      // `endpoint`, `targets`, `acked`, `status`, lost targets), in
+      // dispatch order. Same operator-token guard as the other operator
+      // endpoints (fail-closed without operatorToken).
+      respondJson(res, 200, queue.getQuorumStats());
       return;
     }
     if (isUsage) {
@@ -5562,6 +5668,25 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         ...(priority ? { priority } : {}),
       }, cronSource);
       nextAt = queue.nextScheduleFire(scheduleId);
+    } else if (queue.hasQuorumConfig(targetUrl)) {
+      // WR-106: one admission fans out to every configured target; each
+      // member keeps the admitted priority (WR-12: an urgent admission
+      // puts every member on the fast lane) and the shared trace id.
+      queue.enqueueFanout({
+        id,
+        traceId,
+        // WR-48: the validated tenant rides the item into the per-tenant
+        // isolation scope (breaker/quota/limiter/latency instances).
+        ...(tenantId !== undefined ? { tenantId } : {}),
+        // WR-98: the caller-propagated W3C trace context rides the item
+        // so every delivery attempt propagates it downstream.
+        ...(inboundTrace !== undefined ? { traceContext: inboundTrace } : {}),
+        payload: body,
+        targetUrl,
+        headers: passthrough,
+        ...(priority ? { priority } : {}),
+        ...(deliverAt !== undefined ? { deliverAt } : {}),
+      });
     } else {
       queue.enqueue({
         id,

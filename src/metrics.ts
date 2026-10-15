@@ -112,6 +112,16 @@
  *   scopes that actually denied — absent entirely when the feature is
  *   off. The `tenant` label is omitted for the default tenant (the
  *   WR-48 convention).
+ * - `relay_quorum_total{endpoint,status}`: counter of quorum fan-outs
+ *   (WR-106 M-of-N downstream acknowledgement) by terminal state
+ *   (`status` = `satisfied` / `failed`).
+ *   `relay_quorum_acknowledged_total{endpoint}`: counter of target
+ *   acknowledgements across fan-outs.
+ *   `relay_quorum_target_dead_letters_total{endpoint}`: counter of
+ *   fan-out targets that exhausted their own retry lifecycle without
+ *   acknowledging. All activity-gated: present only for endpoints with a
+ *   recorded acknowledgement or loss — absent entirely when the feature
+ *   is off.
  *
  * Cardinality note: labels are per endpoint (`targetUrl`), so a relay
  * fanning out to many distinct downstream URLs grows the series count —
@@ -324,6 +334,13 @@ export interface MetricsInput {
    * untouched relay's exposition is byte-identical.
    */
   tenantRateLimited?: TenantRateLimitMetricsInput[];
+  /**
+   * Present only when quorum fan-out (WR-106) is enabled; one series per
+   * (tenant, endpoint) with a recorded acknowledgement or loss — absent
+   * entirely when the feature is off, so an untouched relay's exposition
+   * is byte-identical.
+   */
+  quorum?: QuorumMetricsInput[];
 }
 
 /** One endpoint's starvation-guard activation count, in Prometheus label order. */
@@ -517,6 +534,63 @@ export function renderOcspBlock(series: OcspMetricsInput[]): string[] {
   for (const s of series) {
     lines.push(
       `relay_ocsp_total{endpoint="${escapeLabelValue(s.endpoint)}",status="${s.status}"} ${s.count}`
+    );
+  }
+  return lines;
+}
+
+/**
+ * One endpoint's quorum fan-out counters (WR-106), in Prometheus label
+ * order.
+ */
+export interface QuorumMetricsInput {
+  /** The logical endpoint (the admitted `targetUrl`). */
+  endpoint: string;
+  /** Tenant id (WR-48); when set it is rendered as a `tenant` label. */
+  tenant?: string;
+  /** Cumulative fan-outs that reached their quorum. */
+  satisfied: number;
+  /** Cumulative fan-outs whose quorum became unreachable. */
+  failed: number;
+  /** Cumulative target acknowledgements across fan-outs. */
+  acknowledged: number;
+  /** Cumulative targets that exhausted their retry lifecycle. */
+  targetDeadLetters: number;
+}
+
+/**
+ * Render just the quorum fan-out block (WR-106) as exposition lines;
+ * `[]` when the series is empty, so callers keep their output
+ * byte-identical until the first acknowledgement or loss is actually
+ * recorded.
+ */
+export function renderQuorumBlock(series: QuorumMetricsInput[]): string[] {
+  if (series.length === 0) return [];
+  const lines = [
+    "# HELP relay_quorum_total Quorum fan-outs (WR-106 M-of-N downstream acknowledgement) by logical endpoint and terminal state (satisfied = M targets acknowledged, failed = quorum became unreachable).",
+    "# TYPE relay_quorum_total counter",
+  ];
+  for (const s of series) {
+    const labels = `endpoint="${escapeLabelValue(s.endpoint)}"${tenantLabel(s.tenant)}`;
+    lines.push(`relay_quorum_total{${labels},status="satisfied"} ${s.satisfied}`);
+    lines.push(`relay_quorum_total{${labels},status="failed"} ${s.failed}`);
+  }
+  lines.push(
+    "# HELP relay_quorum_acknowledged_total Cumulative target acknowledgements across quorum fan-outs (WR-106), by logical endpoint."
+  );
+  lines.push("# TYPE relay_quorum_acknowledged_total counter");
+  for (const s of series) {
+    lines.push(
+      `relay_quorum_acknowledged_total{endpoint="${escapeLabelValue(s.endpoint)}"${tenantLabel(s.tenant)}} ${s.acknowledged}`
+    );
+  }
+  lines.push(
+    "# HELP relay_quorum_target_dead_letters_total Cumulative fan-out targets (WR-106) that exhausted their own retry lifecycle without acknowledging, by logical endpoint."
+  );
+  lines.push("# TYPE relay_quorum_target_dead_letters_total counter");
+  for (const s of series) {
+    lines.push(
+      `relay_quorum_target_dead_letters_total{endpoint="${escapeLabelValue(s.endpoint)}"${tenantLabel(s.tenant)}} ${s.targetDeadLetters}`
     );
   }
   return lines;
@@ -787,6 +861,10 @@ export function renderPrometheus(input: MetricsInput): string {
   // WR-97: activity-gated the same way — the series appears only once a
   // (tenant, endpoint) scope has actually been rate-limited.
   lines.push(...renderTenantRateLimitedBlock(input.tenantRateLimited ?? []));
+  // WR-106: activity-gated the same way — the quorum series appears only
+  // once a target has actually acknowledged or died, so a relay with the
+  // feature off exposes no `relay_quorum_*` series at all.
+  lines.push(...renderQuorumBlock(input.quorum ?? []));
   // WR-76: activity-gated the same way — the series appears only once a
   // delivery deadline has actually expired.
   if (input.deliveryDeadlineExceeded !== undefined && input.deliveryDeadlineExceeded.length > 0) {
