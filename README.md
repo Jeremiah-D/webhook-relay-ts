@@ -1620,6 +1620,62 @@ const server = createRelayServer({
   lists, empty/duplicate `targetUrl`s, and non-positive or non-finite
   weights.
 
+## Quorum fan-out: M-of-N downstream acknowledgement (opt-in)
+
+Where weighted mode answers "how is traffic *shared*", quorum fan-out
+answers "how many confirmations is *enough*": the multi-settlement-channel /
+redundant-notification scenario. One admitted event fans out to N
+downstream targets, and M successful acknowledgements settle the fan-out
+as delivered — the remaining targets keep their own delivery lifecycle
+(at-least-once is never revoked by the quorum verdict).
+
+```ts
+const server = createRelayServer({
+  secret, forwardUrl, auditLog,
+  quorum: {
+    "https://api/payments/hook": {
+      targets: [
+        "https://settle-a/hook",
+        "https://settle-b/hook",
+        "https://notify-c/hook",
+      ],
+      quorum: 2,   // 1 <= quorum <= targets.length
+    },
+  },
+});
+```
+
+- **One admission, N member deliveries** — the event is admitted and
+  audited once; each target gets its own queue item (`<id>:quorum:<i>`)
+  carrying the admitted priority (WR-12: an urgent admission puts every
+  member on the fast lane), headers, trace id, and tenant. Members are
+  never batched: a batch merge rewrites the item id and would destroy
+  ack attribution.
+- **Normal per-endpoint machinery per member** — each member rides the
+  relay's standard retry/backoff, circuit breaker, quota, global retry
+  budget, and dead-letter machinery as its own delivery. The quorum layer
+  never schedules its own retries: an unacknowledged member is retried by
+  the queue, and a member that exhausts its budget (or fails non-retryable
+  per WR-30) dead-letters individually. The fan-out itself never becomes a
+  single dead-letter entry.
+- **Terminal semantics** — `satisfied`: M targets acknowledged (late acks
+  are still recorded but never change the settled state). `failed`: M
+  became unreachable (`acked + live < M`); live members still finish
+  their own lifecycle. `partial`: at least one target dead-lettered
+  while M is still reachable — degraded, still working.
+- **Observability** — `GET /quorum` shows per-fanout
+  `{ fanoutId, endpoint, targets, acked, status, deadLettered }`; audited
+  as `quorum_dispatched` / `quorum_acknowledged` / `quorum_satisfied` /
+  `quorum_failed` / `quorum_target_dead_lettered`; counted in
+  `relay_quorum_total{endpoint,status}`,
+  `relay_quorum_acknowledged_total{endpoint}`, and
+  `relay_quorum_target_dead_letters_total{endpoint}` (all activity-gated:
+  absent until the first ack or loss).
+- **Invalid configs throw `RangeError` at startup** — empty/duplicate/
+  non-`http(s)` targets, fanning out to the logical endpoint itself
+  (double-delivery), or a quorum outside `[1, targets.length]`. Absent =
+  zero behavior change.
+
 ## Payload gzip compression
 
 Outbound deliveries can be gzipped per endpoint (opt-in), and inbound
