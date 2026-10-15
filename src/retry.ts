@@ -10,6 +10,14 @@ import {
   type DeadLetterPurgedEvent,
   type DeadLetterRetentionOptions,
 } from "./deadletter-retention.ts";
+import {
+  StalePauseSweeper,
+  resolveStaleAfterMs,
+  MS_PER_DAY,
+  type StaleEndpointPausedEvent,
+  type StalePauseOptions,
+  type StalePauseSweepResult,
+} from "./stale-pause.ts";
 import { EndpointCircuitBreaker, type CircuitBreakerOptions, type CircuitState, type CircuitStats } from "./circuit.ts";
 import {
   DownstreamProber,
@@ -167,6 +175,7 @@ import {
   type StarvationGuardMetricsInput,
   type WeightedMetricsInput,
   type DeadLetterEscalationMetricsInput,
+  type StalePauseMetricsInput,
 } from "./metrics.ts";
 import {
   summarizeDeadLetterFailure,
@@ -195,6 +204,7 @@ export { renderPrometheus };
 export { TENANT_ID_HEADER, assertValidTenantId, tenantScopeKey, splitTenantScopeKey };
 export type { DeliveryCountersInput, CircuitStateInput, LatencyHistogramInput, StarvationGuardMetricsInput, SloRiskMetricsInput, CertExpiryMetricsInput };
 export type { DeadLetterEscalationMetricsInput };
+export type { StalePauseMetricsInput };
 export { HttpDeliveryError, classifyFailure, parseRetryAfterMs };
 export type { FailureClass, ClassifiedFailure };
 export type { DownstreamResponseSummary };
@@ -283,6 +293,12 @@ export type {
   DeadLetterPurgeResult,
 };
 export { DeadLetterRetentionSweeper, resolveRetentionTtl };
+export { StalePauseSweeper, resolveStaleAfterMs };
+export type {
+  StalePauseOptions,
+  StaleEndpointPausedEvent,
+  StalePauseSweepResult,
+};
 export type { OtlpExporterOptions, OtlpStats } from "./otlp.ts";
 export { OutboundCoalescer, coalesceKey } from "./coalesce.ts";
 export type { CoalesceStats, CoalescingOptions } from "./coalesce.ts";
@@ -1484,11 +1500,41 @@ export interface RetryQueueOptions {
    */
   deadLetterRetention?: DeadLetterRetentionOptions;
   /**
+   * Stale-endpoint auto-pause (WR-100; see `src/stale-pause.ts`): opt-in
+   * configuration-rot hygiene. A background sweep (default every 60s,
+   * unref'd) auto-pauses a logical endpoint that has seen no successful
+   * delivery for `staleAfterDays` (default 30) *and* has nothing pending
+   * — queued, retrying, batch-buffered, or deliver_at-parked, across all
+   * tenants. The pause reuses the exact WR-50 operator-switch mechanics
+   * (parking, no retry-budget burn, no breaker verdict, no dead-letter,
+   * in-flight untouched) and is audited as `endpoint_auto_paused`
+   * (endpoint/idleDays/staleAfterDays/lastSuccessfulDeliveryAt — never
+   * the payload); resuming uses the ordinary `resumeEndpoint` path and
+   * restarts the idle clock. This is not the WR-10 circuit breaker: the
+   * breaker is transient fault handling, auto-pause is rot hygiene.
+   * Paused endpoints still accept inbound events (they park, they are
+   * not discarded). Disabled by default. Invalid values throw
+   * `RangeError` at construction. Reachable over HTTP via the
+   * `stalePause` server option; stats via `getStalePauseStats()` and
+   * the `relay_endpoint_auto_pauses_total` Prometheus counter.
+   */
+  stalePause?: StalePauseOptions;
+  /**
    * Called once per dead-letter entry auto-purged by the retention
    * sweep. The server audits these as `dead_letter_purged`; library
    * users get the hook directly.
    */
   onDeadLetterPurged?: (event: DeadLetterPurgedEvent) => void;
+  /**
+   * Called once per endpoint auto-paused by the stale-endpoint sweep
+   * (WR-100). The server audits these as `endpoint_auto_paused` —
+   * endpoint/idleDays/staleAfterDays/lastSuccessfulDeliveryAt — which is
+   * the operator alert channel for this feature (edge-triggered: one
+   * event per transition), alongside the
+   * `relay_endpoint_auto_pauses_total` Prometheus counter. Library
+   * users get the hook directly.
+   */
+  onStalePauseAudit?: (event: StaleEndpointPausedEvent) => void;
   /**
    * Dead-letter replay egress throttle (WR-68; see
    * `src/replay-egress.ts`). Opt-in per-endpoint RPS cap on the
@@ -1590,6 +1636,34 @@ export interface RetryQueueOptions {
 }
 
 /**
+ * Why an endpoint was paused. `"manual"` is an operator/API/library call
+ * to `pauseEndpoint`; `"auto"` is the WR-100 stale-endpoint sweep.
+ * Both ride the exact same WR-50 parking mechanics — the cause only
+ * distinguishes the audit event (`endpoint_paused` vs
+ * `endpoint_auto_paused`).
+ */
+export type EndpointPauseCause = "manual" | "auto";
+
+/**
+ * One row of the WR-100 stale-endpoint observability snapshot (see
+ * `RetryQueue.getStalePauseStats`). Operator metadata only — no payloads.
+ */
+export interface StalePauseStatsRow {
+  /** The known endpoint (logical `targetUrl`). */
+  endpoint: string;
+  /** Whole idle days since the last successful delivery / first sighting / last resume. */
+  idleDays: number;
+  /** ISO-8601 of the last successful delivery; absent when the endpoint never delivered. */
+  lastSuccessfulDeliveryAt?: string;
+  /** Current pending (not-yet-terminal) delivery count, across all tenants. */
+  pending: number;
+  /** Whether the endpoint is currently paused (manual or auto). */
+  paused: boolean;
+  /** Cumulative auto-pauses for this endpoint since construction. */
+  autoPauses: number;
+}
+
+/**
  * Fired on an endpoint pause/resume transition (WR-50). Pause is keyed by
  * the logical endpoint (`targetUrl` as enqueued) and applies across
  * tenants — pausing a downstream holds every tenant's deliveries to it.
@@ -1597,6 +1671,12 @@ export interface RetryQueueOptions {
 export interface EndpointPauseInfo {
   /** The paused/resumed endpoint (logical `targetUrl`). */
   endpoint: string;
+  /**
+   * Why the pause happened. Present on pause transitions; resumes carry
+   * no cause. Defaults to `"manual"` for direct `pauseEndpoint` calls —
+   * the WR-100 sweeper passes `"auto"`.
+   */
+  cause?: EndpointPauseCause;
 }
 
 /**
@@ -2397,6 +2477,24 @@ export class RetryQueue {
   private readonly autoReplayer?: DeadLetterAutoReplayer;
   /** WR-64: opt-in dead-letter retention sweeper; undefined when disabled. */
   private readonly retentionSweeper?: DeadLetterRetentionSweeper;
+  /** WR-100: opt-in stale-endpoint auto-pause sweeper; undefined when disabled. */
+  private readonly stalePauser?: StalePauseSweeper;
+  /**
+   * WR-100: per-endpoint idle activity, keyed by logical `targetUrl`.
+   * `firstSeenAt` is stamped on first sighting (enqueue) and reset on
+   * resume; `lastSuccessAt` is stamped only on a genuinely successful
+   * delivery — semantic (validator-rejected) and non-retryable (4xx
+   * poison) outcomes are not success, per WR-30. The sweep's idle
+   * baseline is `lastSuccessAt ?? firstSeenAt`.
+   */
+  private readonly endpointActivity = new Map<string, { firstSeenAt: number; lastSuccessAt?: number }>();
+  /** WR-100: clock shared by the activity stamps and the stale sweep. */
+  private readonly stalePauseNow: () => number;
+  /** WR-100: whether stale-endpoint auto-pause is configured (gates activity stamping). */
+  private readonly stalePauseEnabled: boolean;
+  /** WR-100: cumulative auto-pauses per logical endpoint (metric source). */
+  private readonly autoPauseCounts = new Map<string, number>();
+  private readonly onStalePauseAudit?: (event: StaleEndpointPausedEvent) => void;
   /**
    * Dead-letter ids currently claimed by a replay operation (WR-23
    * batch replay, including the WR-31 auto-replay, which runs through
@@ -2547,6 +2645,12 @@ export class RetryQueue {
     this.clearTimer = opts.clearTimer ?? ((h) => h.clear());
     this.onDeadLetter = opts.onDeadLetter;
     this.onDeadLetterPurged = opts.onDeadLetterPurged;
+    this.onStalePauseAudit = opts.onStalePauseAudit;
+    // WR-100: the activity stamps (first-seen, success, resume) and the
+    // sweep share one clock so a test-injected `now` stays consistent
+    // across both. Defaults to the wall clock when the feature is off.
+    this.stalePauseNow = opts.stalePause?.now ?? Date.now;
+    this.stalePauseEnabled = opts.stalePause !== undefined;
     this.onDelivered = opts.onDelivered;
     this.onConfigChange = opts.onConfigChange;
     this.onEndpointPaused = opts.onEndpointPaused;
@@ -2898,6 +3002,25 @@ export class RetryQueue {
         },
       });
     }
+    if (opts.stalePause !== undefined) {
+      // WR-100: opt-in stale-endpoint auto-pause. The sweeper validates
+      // eagerly (illegal values throw RangeError at construction) and
+      // arms only on `start()` — like the retention sweeper. Present =
+      // enabled; absent = the exact pre-WR-100 behavior.
+      this.stalePauser = new StalePauseSweeper({
+        ...opts.stalePause,
+        owner: {
+          knownEndpoints: () => [...this.endpointActivity.keys()],
+          idleBaselineMs: (endpoint) => {
+            const a = this.endpointActivity.get(endpoint);
+            return a === undefined ? undefined : (a.lastSuccessAt ?? a.firstSeenAt);
+          },
+          pendingCount: (endpoint) => this.pendingForEndpoint(endpoint),
+          isPaused: (endpoint) => this.pausedEndpoints.has(endpoint),
+          autoPauseStale: (endpoint, idleMs) => this.autoPauseStaleEndpoint(endpoint, idleMs),
+        },
+      });
+    }
     if (opts.replayEgress !== undefined) {
       // WR-68: constructed eagerly so invalid values throw RangeError at
       // construction, never mid-replay. Manual replays, the operator
@@ -2942,6 +3065,10 @@ export class RetryQueue {
       for (const item of rec.items) {
         this.queue.set(item.id, { ...item, attempt: item.attempt });
         this.bumpPending(item.tenantId, item.targetUrl, 1);
+        // WR-100: recovered items count as sightings, so a restarted
+        // relay does not immediately auto-pause endpoints it just
+        // recovered.
+        this.recordEndpointSeen(item.targetUrl);
         if (item.nextAt !== undefined) this.restoredNextAt.set(item.id, item.nextAt);
         // A recovery restarts the accepted→delivered clock: the sample
         // measures the post-restart delivery, not the pre-crash wait.
@@ -3495,6 +3622,55 @@ export class RetryQueue {
   }
 
   /**
+   * Run one stale-endpoint sweep immediately (WR-100): auto-pause every
+   * known endpoint idle for at least the configured `staleAfterDays`
+   * with nothing pending, skipping already-paused endpoints. The armed
+   * sweep timer calls this on its schedule; calling it directly is safe
+   * and does not disturb the schedule. Returns `{ paused: [] }` when
+   * stale-endpoint auto-pause is not configured.
+   */
+  sweepStaleEndpoints(): StalePauseSweepResult {
+    return this.stalePauser?.sweepNow() ?? { paused: [] };
+  }
+
+  /**
+   * The opt-in stale-endpoint auto-pause sweeper, or `undefined` when
+   * no `stalePause` option was configured.
+   */
+  getStalePauseSweeper(): StalePauseSweeper | undefined {
+    return this.stalePauser;
+  }
+
+  /**
+   * Stale-endpoint observability snapshot (WR-100): one row per known
+   * endpoint — current idle days (from the last successful delivery,
+   * first sighting, or last resume), pending count, pause state, and
+   * cumulative auto-pauses. Empty when the feature is off. The idle
+   * clock restarts on every successful delivery and every resume, so a
+   * row's `idleDays` is always "days since the endpoint last proved it
+   * is alive".
+   */
+  getStalePauseStats(): StalePauseStatsRow[] {
+    if (this.stalePauser === undefined) return [];
+    const nowMs = this.stalePauseNow();
+    const rows: StalePauseStatsRow[] = [];
+    for (const [endpoint, a] of this.endpointActivity) {
+      const baseline = a.lastSuccessAt ?? a.firstSeenAt;
+      rows.push({
+        endpoint,
+        idleDays: Math.floor(Math.max(0, nowMs - baseline) / MS_PER_DAY),
+        ...(a.lastSuccessAt !== undefined
+          ? { lastSuccessfulDeliveryAt: new Date(a.lastSuccessAt).toISOString() }
+          : {}),
+        pending: this.pendingForEndpoint(endpoint),
+        paused: this.pausedEndpoints.has(endpoint),
+        autoPauses: this.autoPauseCounts.get(endpoint) ?? 0,
+      });
+    }
+    return rows;
+  }
+
+  /**
    * Dead-letter observability snapshot: live entry count, entries
    * auto-purged by the retention sweep since construction, entries held
    * back by the WR-68 replay egress throttle (cumulative), and live
@@ -3832,6 +4008,8 @@ export class RetryQueue {
     this.latencyFor(item.tenantId)?.recordAccepted(item.id);
     // WR-71: the backlog changed — feed the SLO-risk predictor.
     this.bumpPending(item.tenantId, stored.targetUrl, 1);
+    // WR-100: first-sighting stamp for the stale-endpoint sweep.
+    this.recordEndpointSeen(stored.targetUrl);
     this.evaluateSloRisk(item.tenantId, stored.targetUrl);
     if (this.running) {
       this.schedule(item.id, 0);
@@ -3859,6 +4037,9 @@ export class RetryQueue {
     // Opt-in only: undefined when `deadLetterRetention` was never
     // configured, and a no-op when no TTL is set.
     this.retentionSweeper?.start();
+    // WR-100: opt-in only — undefined when `stalePause` was never
+    // configured.
+    this.stalePauser?.start();
     // Opt-in only: undefined when `probe` was never configured.
     this.prober?.start();
     // WR-83: opt-in only — re-arm a pending OTLP export retry timer
@@ -3872,6 +4053,9 @@ export class RetryQueue {
   stop(): void {
     this.autoReplayer?.stop();
     this.retentionSweeper?.stop();
+    // WR-100: no staleness sweeps while stopped — a stopped relay's
+    // endpoints must not be auto-paused for not delivering.
+    this.stalePauser?.stop();
     this.prober?.stop();
     this.callbacker?.stop();
     this.escalation?.stop();
@@ -3940,6 +4124,8 @@ export class RetryQueue {
     // whose TTL expired during the drain window stays visible for the
     // operator's post-mortem instead of vanishing.
     this.retentionSweeper?.stop();
+    // WR-100: same for the staleness sweep — no auto-pauses mid-shutdown.
+    this.stalePauser?.stop();
     // Same for the health prober: no new probe rounds mid-shutdown.
     this.prober?.stop();
     // WR-57: parked-but-not-due deliveries are dropped, exactly like
@@ -4631,6 +4817,11 @@ export class RetryQueue {
         }
         this.queue.delete(id);
         this.bumpPending(entry.tenantId, entry.targetUrl, -1);
+        // WR-100: a genuinely successful delivery restarts the endpoint's
+        // idle clock. Semantic/validator rejections and non-retryable
+        // outcomes land in the dead-letter path instead — never here — so
+        // they correctly leave the baseline untouched (WR-30).
+        this.recordEndpointSuccess(entry.targetUrl);
         this.armedNextAt.delete(id);
         this.recordDelivery(tenant, target, "delivered");
         if (fastLane) this.recordUrgentStat(target, "delivered");
@@ -5339,6 +5530,13 @@ export class RetryQueue {
         ...(s.tenant === undefined ? {} : { tenant: s.tenant }),
         escalations: s.escalations,
       }));
+    // WR-100: one series per endpoint that has actually been auto-paused
+    // — activity-gated, so a relay with the feature off (or never
+    // triggered) exposes no `relay_endpoint_auto_pauses_total` series
+    // at all. The queue's cumulative counts are the source.
+    const stalePause: StalePauseMetricsInput[] = [...this.autoPauseCounts]
+      .filter(([, pauses]) => pauses > 0)
+      .map(([endpoint, pauses]) => ({ endpoint, pauses }));
     return renderPrometheus({
       deliveries,
       circuits,
@@ -5376,6 +5574,8 @@ export class RetryQueue {
       ...(shadow.length > 0 ? { shadow } : {}),
       // WR-93: activity-gated (see above).
       ...(escalation.length > 0 ? { escalation } : {}),
+      // WR-100: activity-gated (see above).
+      ...(stalePause.length > 0 ? { stalePause } : {}),
       // WR-94: activity-gated — the gauge appears only once an adaptive
       // outcome has been recorded for an endpoint. Non-finite limits are
       // skipped: a Prometheus gauge cannot hold Infinity.
@@ -5537,8 +5737,14 @@ export class RetryQueue {
    * Idempotent: pausing an already-paused endpoint is a no-op returning
    * `false` (no duplicate audit event). Returns `true` on a real
    * transition. An empty/non-string endpoint throws `RangeError`.
+   *
+   * `detail.cause` marks who initiated the pause: `"manual"` (default)
+   * for operator/API/library calls, `"auto"` for the WR-100
+   * stale-endpoint sweep. The mechanics are identical either way; the
+   * cause only reaches `onEndpointPaused` so the audit event can
+   * distinguish them (`endpoint_paused` vs `endpoint_auto_paused`).
    */
-  pauseEndpoint(endpoint: string): boolean {
+  pauseEndpoint(endpoint: string, detail?: { cause?: EndpointPauseCause }): boolean {
     assertValidPauseEndpoint(endpoint, "pauseEndpoint");
     if (this.pausedEndpoints.has(endpoint)) return false;
     this.pausedEndpoints.add(endpoint);
@@ -5558,7 +5764,7 @@ export class RetryQueue {
       this.parked.set(id, this.armedNextAt.get(id) ?? Date.now());
       this.armedNextAt.delete(id);
     }
-    this.onEndpointPaused?.({ endpoint });
+    this.onEndpointPaused?.({ endpoint, cause: detail?.cause ?? "manual" });
     return true;
   }
 
@@ -5568,6 +5774,9 @@ export class RetryQueue {
    * their original attempt counts — the pause froze their lifecycle, it
    * did not reset it.
    *
+   * WR-100: a real resume transition also restarts the endpoint's idle
+   * clock — the operator's attention means the endpoint is not stale.
+   *
    * Idempotent: resuming a non-paused endpoint is a no-op returning
    * `false`. Returns `true` on a real transition. An empty/non-string
    * endpoint throws `RangeError`.
@@ -5575,6 +5784,10 @@ export class RetryQueue {
   resumeEndpoint(endpoint: string): boolean {
     assertValidPauseEndpoint(endpoint, "resumeEndpoint");
     if (!this.pausedEndpoints.delete(endpoint)) return false;
+    // WR-100: resume restarts the idle clock — firstSeen becomes now,
+    // wiping any pre-pause staleness, so a just-resumed endpoint gets a
+    // fresh full threshold window.
+    this.resetEndpointIdleClock(endpoint);
     const now = Date.now();
     for (const [id, nextAt] of this.parked) {
       const entry = this.queue.get(id);
@@ -5601,6 +5814,88 @@ export class RetryQueue {
   /** True when `endpoint` is currently paused (WR-50). */
   isEndpointPaused(endpoint: string): boolean {
     return this.pausedEndpoints.has(endpoint);
+  }
+
+  /**
+   * WR-100: stamp an endpoint's first sighting (set-if-absent). Called
+   * from `enqueueNow` — the single choke point where items enter the
+   * queue — and from the durable-journal recovery path. No-op when
+   * stale-endpoint auto-pause is disabled.
+   */
+  private recordEndpointSeen(endpoint: string): void {
+    if (!this.stalePauseEnabled) return;
+    if (!this.endpointActivity.has(endpoint)) {
+      this.endpointActivity.set(endpoint, { firstSeenAt: this.stalePauseNow() });
+    }
+  }
+
+  /**
+   * WR-100: stamp a genuinely successful delivery (`delivered` only —
+   * semantic/validator rejections and non-retryable 4xx outcomes are
+   * not success, per WR-30, so they leave the baseline untouched).
+   * No-op when the feature is disabled.
+   */
+  private recordEndpointSuccess(endpoint: string): void {
+    if (!this.stalePauseEnabled) return;
+    const at = this.stalePauseNow();
+    const a = this.endpointActivity.get(endpoint);
+    if (a === undefined) this.endpointActivity.set(endpoint, { firstSeenAt: at, lastSuccessAt: at });
+    else a.lastSuccessAt = at;
+  }
+
+  /**
+   * WR-100: restart an endpoint's idle clock (firstSeen becomes now).
+   * Called on a real `resumeEndpoint` transition — the operator's
+   * attention means the endpoint is not stale.
+   */
+  private resetEndpointIdleClock(endpoint: string): void {
+    if (!this.stalePauseEnabled) return;
+    this.endpointActivity.set(endpoint, { firstSeenAt: this.stalePauseNow() });
+  }
+
+  /**
+   * WR-100: pending (not-yet-terminal) delivery count for one logical
+   * endpoint, across all tenants: queued/retrying items
+   * (`pendingByEndpoint`), batch-window-buffered items (WR-09), and
+   * deliver_at-parked items (WR-57). A stale endpoint with any of these
+   * outstanding is never auto-paused.
+   */
+  private pendingForEndpoint(endpoint: string): number {
+    let n = 0;
+    for (const inner of this.pendingByEndpoint.values()) {
+      n += inner.get(endpoint) ?? 0;
+    }
+    n += this.batcher?.bufferedCount(endpoint) ?? 0;
+    for (const s of this.scheduler.list()) {
+      if (s.targetUrl === endpoint) n += 1;
+    }
+    return n;
+  }
+
+  /**
+   * WR-100: the sweeper's transition for a stale endpoint. Rides the
+   * exact WR-50 `pauseEndpoint` mechanics (cause `"auto"`), then counts
+   * it and fires `onStalePauseAudit` with the composed
+   * `endpoint_auto_paused` event. Returns the event on a real
+   * transition, `undefined` when the endpoint was already paused (a
+   * manual hold wins — never re-processed, never re-audited).
+   */
+  private autoPauseStaleEndpoint(endpoint: string, idleMs: number): StaleEndpointPausedEvent | undefined {
+    if (!this.pauseEndpoint(endpoint, { cause: "auto" })) return undefined;
+    this.autoPauseCounts.set(endpoint, (this.autoPauseCounts.get(endpoint) ?? 0) + 1);
+    const activity = this.endpointActivity.get(endpoint);
+    const event: StaleEndpointPausedEvent = {
+      event: "endpoint_auto_paused",
+      endpoint,
+      idleDays: Math.floor(idleMs / MS_PER_DAY),
+      staleAfterDays: this.stalePauser?.staleAfterDays() ?? 0,
+      ...(activity?.lastSuccessAt !== undefined
+        ? { lastSuccessfulDeliveryAt: new Date(activity.lastSuccessAt).toISOString() }
+        : {}),
+      at: new Date(this.stalePauseNow()).toISOString(),
+    };
+    this.onStalePauseAudit?.(event);
+    return event;
   }
 
   /**

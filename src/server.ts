@@ -16,6 +16,7 @@ import { RetryQueue, type DeliveryPriority, type DownstreamResponse, type RetryI
 import { parseDeliverAtHeader, DELIVER_AT_HEADER } from "./retry.ts";
 import type { ShadowDeliveredInfo, ShadowFailedInfo, ShadowTargetConfig, ShadowTargetsConfig } from "./retry.ts";
 import type { PhaseDurationsMs } from "./retry.ts";
+import type { StalePauseOptions } from "./retry.ts";
 import { parseCronExpression, CRON_HEADER } from "./cron.ts";
 import type { CompletionCallbackOptions } from "./callback.ts";
 import { createBoundAddressSelfCheck } from "./callback.ts";
@@ -851,6 +852,24 @@ export interface RelayServerOptions {
    * `GET /dead-letter/stats`.
    */
   deadLetterRetention?: DeadLetterRetentionOptions;
+  /**
+   * Stale-endpoint auto-pause (WR-100; see `src/stale-pause.ts` and the
+   * `stalePause` `RetryQueue` option): opt-in configuration-rot
+   * hygiene — a background sweep auto-pauses a logical endpoint with no
+   * successful delivery for `staleAfterDays` (default 30) and nothing
+   * pending, through the exact WR-50 parking mechanics (inbound events
+   * still accepted and parked — never discarded). Each auto-pause is
+   * audited as `endpoint_auto_paused` (endpoint/idleDays/
+   * staleAfterDays/lastSuccessfulDeliveryAt — never the payload), which
+   * is the operator alert channel for this feature (edge-triggered, one
+   * event per transition), alongside the
+   * `relay_endpoint_auto_pauses_total` Prometheus counter; resume with
+   * the ordinary `POST /endpoints/resume`. This is not the WR-10
+   * circuit breaker: the breaker is transient fault handling,
+   * auto-pause is rot hygiene. Off by default. Invalid values throw
+   * `RangeError` at startup.
+   */
+  stalePause?: StalePauseOptions;
   /**
    * Dead-letter replay egress throttle (WR-68; see
    * `src/replay-egress.ts` and the `replayEgress` `RetryQueue` option):
@@ -3214,6 +3233,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // An explicit server-level `deadLetterRetention` wins over the nested
     // `retry.deadLetterRetention`; either way the queue owns the sweeper.
     deadLetterRetention: opts.deadLetterRetention ?? opts.retry?.deadLetterRetention,
+    // WR-100: an explicit server-level `stalePause` wins over the nested
+    // `retry.stalePause`; either way the queue owns the sweeper.
+    stalePause: opts.stalePause ?? opts.retry?.stalePause,
     // An explicit server-level `replayEgress` wins over the nested
     // `retry.replayEgress`; either way the queue owns the gate.
     replayEgress: opts.replayEgress ?? opts.retry?.replayEgress,
@@ -3222,6 +3244,15 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     onDeadLetterPurged: (event) => {
       opts.auditLog.append(event);
       opts.retry?.onDeadLetterPurged?.(event);
+    },
+    // WR-100: wrap the caller's hook so every stale-endpoint auto-pause
+    // is audited as `endpoint_auto_paused` (the full event carries
+    // endpoint/idleDays/staleAfterDays/lastSuccessfulDeliveryAt), not
+    // just observed. This audit event is the operator alert channel for
+    // the feature — edge-triggered, one per transition.
+    onStalePauseAudit: (event) => {
+      opts.auditLog.append(event);
+      opts.retry?.onStalePauseAudit?.(event);
     },
     // Wrap the caller's hook so every deadline expiry is audited as
     // `delivery_deadline_exceeded`, not just observed.
@@ -3499,14 +3530,19 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // Wrap the caller's pause hooks so every pause/resume transition is
     // audited as `endpoint_paused` / `endpoint_resumed`, not just
     // observed. Edge-triggered in the queue — idempotent no-ops audit
-    // nothing.
-    onEndpointPaused: ({ endpoint }) => {
-      opts.auditLog.append({
-        event: "endpoint_paused",
-        endpoint,
-        ...(activeOperatorKeyId !== undefined ? { keyId: activeOperatorKeyId } : {}),
-      });
-      opts.retry?.onEndpointPaused?.({ endpoint });
+    // nothing. WR-100: auto-pauses (cause "auto") are NOT audited here
+    // as `endpoint_paused` — the richer `endpoint_auto_paused` event
+    // from `onStalePauseAudit` already covers the transition, so each
+    // pause audits exactly one event with the cause in its name.
+    onEndpointPaused: ({ endpoint, cause }) => {
+      if (cause !== "auto") {
+        opts.auditLog.append({
+          event: "endpoint_paused",
+          endpoint,
+          ...(activeOperatorKeyId !== undefined ? { keyId: activeOperatorKeyId } : {}),
+        });
+      }
+      opts.retry?.onEndpointPaused?.({ endpoint, cause });
     },
     onEndpointResumed: ({ endpoint }) => {
       opts.auditLog.append({

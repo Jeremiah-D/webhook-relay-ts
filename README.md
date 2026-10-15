@@ -1099,6 +1099,52 @@ curl -X POST http://127.0.0.1:PORT/endpoints/pause \
   (attempt counts survive through the durable queue; the remaining
   backoff does not).
 
+## Stale-endpoint auto-pause (opt-in)
+
+Configuration-rot hygiene for downstreams that quietly stopped working:
+when a logical endpoint has seen **no successful delivery** for
+`staleAfterDays` (default 30) **and** has nothing pending, a background
+sweep auto-pauses it through the exact operator-switch mechanics above —
+parking, no retry-budget burn, no breaker verdict, no dead-letter,
+in-flight untouched. Resume with the ordinary `resumeEndpoint` /
+`POST /endpoints/resume` path; resuming restarts the idle clock.
+
+```ts
+const queue = new RetryQueue({
+  sender,
+  stalePause: { staleAfterDays: 30 }, // off by default; present = enabled
+});
+queue.sweepStaleEndpoints(); // manual sweep; the timer also sweeps every sweepIntervalMs (60s)
+queue.getStalePauseStats();  // per-endpoint idleDays / pending / paused / autoPauses
+```
+
+- **Idle means idle** — the clock is stamped on every genuinely
+  successful delivery (`delivered`). A validator-rejected response
+  (semantic failure) or a non-retryable 4xx does **not** count as
+  success, so a downstream answering "no" forever still goes stale. An
+  endpoint that never delivered is measured from its first sighting.
+- **Nothing pending, ever stranded** — queued, retrying,
+  batch-window-buffered, and `deliver_at`-parked items (across all
+  tenants) all block the pause. The sweep also never re-processes an
+  already-paused endpoint: a manual operator hold wins silently, with no
+  duplicate audit.
+- **Pause ≠ discard** — while auto-paused, inbound events are still
+  accepted; they park in the (durable, when enabled) queue and resume
+  with their remaining delays on resume.
+- **Not the circuit breaker** — the WR-10 breaker is transient fault
+  handling (fast fail, half-open recovery) driven by consecutive
+  failures; auto-pause is rot hygiene driven by the *absence* of
+  success. They never interact: pausing doesn't trip the breaker and
+  breaker transitions don't unpause.
+- **Operator alerting** — each auto-pause is audited as
+  `endpoint_auto_paused` (endpoint/idleDays/staleAfterDays/
+  lastSuccessfulDeliveryAt — never the payload; queryable via
+  `GET /audit?event=endpoint_auto_paused`). The event is edge-triggered
+  (one per transition) and is the alert channel for this feature; pair
+  it with the `relay_endpoint_auto_pauses_total{endpoint}` Prometheus
+  counter. Manual pauses keep auditing as `endpoint_paused` — one
+  transition, one event, the cause in the name.
+
 ## Scheduled delivery (deliver_at)
 
 Timed delivery: an inbound event may declare a future delivery time via

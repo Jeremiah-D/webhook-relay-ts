@@ -76,6 +76,10 @@
  *   (tenant, endpoint) scope, with a `tenant` label when the scope is
  *   tenant-scoped. Activity-gated: present only for scopes that
  *   actually escalated — absent entirely when the feature is off.
+ * - `relay_endpoint_auto_pauses_total{endpoint}`: counter of
+ *   stale-endpoint auto-pauses (WR-100) per logical endpoint.
+ *   Activity-gated: present only for endpoints that have actually been
+ *   auto-paused — absent entirely when the feature is off.
  * - `relay_tenant_ratelimited_total{endpoint,tenant}`: counter of
  *   over-limit decisions (denials) by the per-(tenant, endpoint)
  *   outbound rate limiter (WR-97) — every denied `take()`, in both
@@ -148,6 +152,14 @@ export interface DeadLetterEscalationMetricsInput {
   tenant?: string;
   /** Cumulative escalation alerts dispatched for this scope. */
   escalations: number;
+}
+
+/** One endpoint's stale-endpoint auto-pause count (WR-100). */
+export interface StalePauseMetricsInput {
+  /** Auto-paused endpoint (logical `targetUrl`). */
+  endpoint: string;
+  /** Cumulative auto-pauses for this endpoint. */
+  pauses: number;
 }
 
 /**
@@ -230,6 +242,12 @@ export interface MetricsInput {
    * series.
    */
   escalation?: DeadLetterEscalationMetricsInput[];
+  /**
+   * Present only for endpoints that have actually been auto-paused by
+   * the stale-endpoint sweep (WR-100); absent entirely when the feature
+   * is off — the same activity-gated convention as the probe series.
+   */
+  stalePause?: StalePauseMetricsInput[];
   /**
    * Present only when OTLP delivery-event export (WR-83) is enabled
    * (`RetryQueueOptions.otlp`); absent entirely otherwise — the same
@@ -618,6 +636,19 @@ export function renderPrometheus(input: MetricsInput): string {
     for (const s of input.escalation) {
       const labels = `endpoint="${escapeLabelValue(s.endpoint)}"${tenantLabel(s.tenant)}`;
       lines.push(`relay_dead_letter_escalations_total{${labels}} ${s.escalations}`);
+    }
+  }
+  // WR-100: activity-gated like the escalation series — the series
+  // appears only for endpoints that have actually been auto-paused, so
+  // a relay with the feature off exposes no
+  // `relay_endpoint_auto_pauses_total` series at all.
+  if (input.stalePause !== undefined && input.stalePause.length > 0) {
+    lines.push(
+      "# HELP relay_endpoint_auto_pauses_total Stale-endpoint auto-pauses (WR-100) per logical endpoint."
+    );
+    lines.push("# TYPE relay_endpoint_auto_pauses_total counter");
+    for (const s of input.stalePause) {
+      lines.push(`relay_endpoint_auto_pauses_total{endpoint="${escapeLabelValue(s.endpoint)}"} ${s.pauses}`);
     }
   }
   // WR-83: emitted only when OTLP export is enabled — the same
