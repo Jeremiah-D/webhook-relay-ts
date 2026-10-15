@@ -58,6 +58,17 @@
  *   checked at config load). Present only for endpoints whose certificate
  *   was actually observed — absent entirely when the monitor is disabled
  *   or nothing was observed yet.
+ * - `relay_ocsp_total{endpoint,status}`: counter of outbound OCSP
+ *   revocation check outcomes (WR-101), by endpoint. `status` is one of:
+ *   - `good`: the peer's certificate is not revoked;
+ *   - `revoked`: the peer's certificate is revoked (the delivery was
+ *     rejected before a single payload byte was written);
+ *   - `unknown`: the responder had no verdict for the certificate
+ *     (handled per the endpoint's fail-open/fail-closed mode);
+ *   - `error`: the revocation status could not be determined (no
+ *     stapled response, no/failing responder, malformed response).
+ *   Present only for endpoints where a check actually ran — absent
+ *   entirely when the feature is off.
  * - `relay_otlp_exports_total{event_type,status}`: counter of delivery/SLO
  *   events exported to the OTLP collector (WR-83), by event type
  *   (`delivered` / `retrying` / `dead_letter` / `slo_missed` /
@@ -249,6 +260,12 @@ export interface MetricsInput {
    */
   stalePause?: StalePauseMetricsInput[];
   /**
+   * Present only for endpoints where an OCSP revocation check (WR-101)
+   * actually ran; absent entirely when the feature is off — the same
+   * activity-gated convention as the probe series.
+   */
+  ocsp?: OcspMetricsInput[];
+  /**
    * Present only when OTLP delivery-event export (WR-83) is enabled
    * (`RetryQueueOptions.otlp`); absent entirely otherwise — the same
    * "optional sections only emit series when enabled" convention as the
@@ -438,6 +455,35 @@ export function renderTenantRateLimitedBlock(series: TenantRateLimitMetricsInput
   for (const s of series) {
     lines.push(
       `relay_tenant_ratelimited_total{endpoint="${escapeLabelValue(s.endpoint)}"${tenantLabel(s.tenant)}} ${s.limited}`
+    );
+  }
+  return lines;
+}
+
+/** One endpoint's outbound OCSP revocation check outcomes (WR-101), in Prometheus label order. */
+export interface OcspMetricsInput {
+  /** The delivery `targetUrl` whose peer was checked. */
+  endpoint: string;
+  /** Check outcome: `good` / `revoked` / `unknown` / `error`. */
+  status: "good" | "revoked" | "unknown" | "error";
+  /** Cumulative checks with this outcome. */
+  count: number;
+}
+
+/**
+ * Render just the OCSP outcome block (WR-101) as exposition lines; `[]`
+ * when the series is empty, so callers can keep their output
+ * byte-identical until the first check actually runs.
+ */
+export function renderOcspBlock(series: OcspMetricsInput[]): string[] {
+  if (series.length === 0) return [];
+  const lines = [
+    "# HELP relay_ocsp_total Outbound OCSP revocation check outcomes by endpoint (WR-101).",
+    "# TYPE relay_ocsp_total counter",
+  ];
+  for (const s of series) {
+    lines.push(
+      `relay_ocsp_total{endpoint="${escapeLabelValue(s.endpoint)}",status="${s.status}"} ${s.count}`
     );
   }
   return lines;
@@ -651,6 +697,11 @@ export function renderPrometheus(input: MetricsInput): string {
       lines.push(`relay_endpoint_auto_pauses_total{endpoint="${escapeLabelValue(s.endpoint)}"} ${s.pauses}`);
     }
   }
+  // WR-101: activity-gated like the probe series — the OCSP series
+  // appears only once a revocation check has actually run for an
+  // endpoint, so a relay with the feature off exposes no
+  // `relay_ocsp_total` series at all.
+  lines.push(...renderOcspBlock(input.ocsp ?? []));
   // WR-83: emitted only when OTLP export is enabled — the same
   // "optional sections only emit series when enabled" convention as the
   // probe series. The buffered gauge is always present then (even at 0);

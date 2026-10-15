@@ -571,6 +571,43 @@ reliability primitives that matter for any signed-payload pipeline.
   targets; `wss:` targets are not covered in this round (the WebSocket pool
   owns its own handshake). Invalid floors throw `RangeError` at startup.
   Zero dependencies.
+- `src/ocsp.ts` — outbound per-endpoint TLS OCSP revocation checking (WR-101):
+  `createRelayServer({ tlsOcsp: { "<exact targetUrl>": { mode?, useStapled?,
+  responderUrl?, responderFetcher?, responderTimeoutMs? } } })` (also
+  exposed as the twenty-fourth/twenty-fifth `createDefaultSender(...)`
+  arguments). After the handshake the relay checks whether the peer's
+  certificate was revoked — the stapled OCSP response first
+  (`requestOCSP: true` on the handshake, zero extra round-trips),
+  responder fallback second (explicit `responderUrl`, else the leaf's
+  Authority Information Access extension, via the pluggable
+  `responderFetcher`; the default is a plain `node:https` POST). A
+  `revoked` verdict destroys the request with `OcspRevokedError`
+  *before* a single payload byte is written (the revoked peer never
+  observes the body); the attempt follows the normal retry /
+  dead-letter path, an `ocsp_revoked` audit event fires, the alert hook
+  fires, and the outcome counts in
+  `relay_ocsp_total{endpoint,status}` (`good` / `revoked` / `unknown` /
+  `error`). `mode` (default `"fail-open"`) governs only the
+  *undeterminable* case (no stapled response, no/failing responder,
+  malformed response): `"fail-open"` proceeds after the alert,
+  `"fail-closed"` fails the attempt with `OcspError` — a `revoked`
+  verdict rejects in both modes. **Pinned endpoints should use
+  `"fail-closed"`** (a pin already says which key to expect; failing
+  closed on revocation-telemetry loss is the consistent posture).
+  Orthogonal to `tlsPins`: pinning anchors *identity* (compromised CA /
+  MITM), OCSP checks *revocation freshness*; the pin check runs first.
+  An OCSP *query* failure explicitly does **not** count as a
+  circuit-breaker failure (local telemetry outage, not a sick endpoint);
+  a revocation does. The keep-alive pool binds OCSP endpoints to their
+  own agents (`|ocsp`: stapling requested, session resumption disabled —
+  a resumed handshake carries no certificate to check); the check runs
+  on session establishment and pooled reuse skips it. Applies to
+  `https:` on the HTTP/1.1 path — OCSP endpoints are kept off the
+  opt-in HTTP/2 path rather than silently skipping, and `wss:` is not
+  covered in this round. Off by default: zero behavior change and no
+  `relay_ocsp_*` series until an endpoint opts in. Invalid values throw
+  `RangeError` at startup. Zero dependencies (`node:crypto` +
+  `node:https`; the DER reader/writer is hand-rolled).
 - `src/keepalive.ts` — outbound keep-alive connection pool: deliveries reuse
   TCP/TLS connections per `(scheme, host, port)` instead of paying a handshake
   per attempt. One `http.Agent`/`https.Agent` per origin, with
@@ -2139,6 +2176,83 @@ const server = createRelayServer({
 - **Fail-fast** — invalid `ttlMs` / `refreshBackoffMs` / `maxHosts`
   throw `RangeError` at startup. Absent by default: with no `dnsCache`
   configured, every connection uses the OS resolver.
+
+## Outbound TLS OCSP revocation checking (opt-in)
+
+TLS certificate pinning (`tlsPins`) answers "is this the server I
+expect?" — it stops a compromised CA or a MITM holding a
+valid-but-unexpected certificate. It does not answer "has this
+certificate been *revoked* since it was issued?" A pinned certificate
+can still be revoked (key compromise discovered after issuance), and a
+CA-valid certificate the relay never pinned can be revoked hours before
+anyone renews it. OCSP (`src/ocsp.ts`) covers that orthogonal risk:
+after the handshake, the relay asks the certificate's OCSP responder
+(RFC 6960) for a freshness verdict and refuses to deliver to a revoked
+peer.
+
+```ts
+const server = createRelayServer({
+  tlsPins: { "https://payments.example.com/hook": ["sha256/<base64>"] },
+  tlsOcsp: {
+    "https://payments.example.com/hook": {
+      mode: "fail-closed",   // default "fail-open"; pinned endpoints should fail closed
+      // useStapled: true,   // default: prefer the server's stapled response
+      // responderUrl: "https://ocsp.example.com/",  // default: the leaf's AIA extension
+    },
+  },
+});
+```
+
+- **Stapled first, responder fallback** — the handshake requests a
+  stapled OCSP response (`requestOCSP: true`); when the server staples
+  one, it is evaluated with zero extra round-trips. Otherwise the relay
+  POSTs a DER OCSPRequest to `responderUrl` (or the leaf certificate's
+  Authority Information Access extension) via the pluggable
+  `responderFetcher` — the default is a plain `node:https` POST with a
+  3s timeout (`responderTimeoutMs`, 100ms–30s); tests inject a stub and
+  never touch a real responder. Set `useStapled: false` for
+  responder-only checking.
+- **Revoked means rejected, before any payload byte** — a `revoked`
+  verdict destroys the request with `OcspRevokedError` on the TLS layer,
+  *before* a single payload byte is written (the pinning precedent: the
+  revoked peer never observes the body). The attempt follows the normal
+  retry / dead-letter path, an `ocsp_revoked` audit event fires
+  (endpoint, serial, revocation time, mode, source), the alert hook
+  fires, and `relay_ocsp_total{endpoint,status="revoked"}` counts it.
+- **fail-open / fail-closed governs the *unknown*, not the revoked** —
+  when the revocation *status* cannot be determined (no stapled
+  response, no/failing responder, malformed response, responder answers
+  `unknown`), `"fail-open"` (default) lets the delivery proceed after
+  firing the `ocsp_alert` alert, while `"fail-closed"` fails the attempt
+  with `OcspError`. **Guidance:** pinned endpoints should use
+  `"fail-closed"` — a pin already says "I know exactly which key to
+  expect", so failing closed on revocation-telemetry loss is the
+  consistent posture; unpinned endpoints typically stay `"fail-open"`
+  so a dead OCSP responder cannot take down deliveries.
+- **Orthogonal to pinning, honest with the breaker** — the pin check
+  runs first (identity), OCSP runs on the pinned or PKI-verified peer
+  (freshness). An OCSP *query* failure explicitly does **not** count as
+  a circuit-breaker failure — an unreachable responder is a local
+  telemetry outage, not a sick endpoint — while a revoked certificate
+  counts normally (the endpoint is serving a dead credential).
+- **Keep-alive semantics** — the check runs on session establishment:
+  OCSP endpoints get their own pool agents (`|ocsp`) with stapling
+  requested and TLS session resumption disabled (a resumed TLS 1.3
+  handshake re-sends no certificate, so there would be nothing to
+  check), and a pooled socket already verified for an endpoint is not
+  re-checked while it stays pooled. Only the HTTP/1.1 path is gated in
+  this round: an OCSP-configured endpoint is kept off the opt-in HTTP/2
+  path rather than silently skipping the check, and `wss:` targets are
+  not covered (the WebSocket pool owns its own handshake).
+- **Observability** — `GET /metrics` renders
+  `relay_ocsp_total{endpoint,status}` (`good` / `revoked` / `unknown` /
+  `error`); revocations audit as `ocsp_revoked` and revocations plus
+  fail-open continuations audit as `ocsp_alert`.
+- **Fail-fast** — a bad `mode`, non-boolean `useStapled`, non-http(s)
+  `responderUrl`, non-function `responderFetcher`, or out-of-range
+  `responderTimeoutMs` throws `RangeError` at startup. Off by default:
+  endpoints without an entry behave exactly as before, and no
+  `relay_ocsp_*` series appears until the first check runs.
 
 ## Delivery lifecycle
 

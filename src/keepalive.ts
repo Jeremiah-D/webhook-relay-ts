@@ -192,9 +192,11 @@ export interface PoolEndpointStats {
   /**
    * Pool key: `<scheme>//<host>:<port>`, plus `|proxy:<hash>` when routed
    * through an outbound proxy, `|pins:<hash>` when pinned,
-   * `|cert:<hash>` when a client certificate is bound, and `|sni:<hash>`
+   * `|cert:<hash>` when a client certificate is bound, `|sni:<hash>`
    * when a per-endpoint TLS SNI/ALPN override applies (see
-   * `src/tls-sni.ts`).
+   * `src/tls-sni.ts`), `|tlsmin:<version>` when a TLS floor applies (see
+   * `src/tls-version.ts`), and `|ocsp` when the agent serves
+   * OCSP-checked endpoints (see `src/ocsp.ts`).
    */
   key: string;
   scheme: "http" | "https";
@@ -298,10 +300,17 @@ export class OutboundConnectionPool {
    * configured with a different one. `minTlsVersion` (see
    * `src/tls-version.ts`) binds the agent to one TLS floor, so a
    * connection handshaked under a lower floor can never serve an
-   * endpoint configured with a higher one. Endpoints without an override entry
-   * pass `undefined` and keep the exact historical pool keys.
+   * endpoint configured with a higher one. `ocsp` (see `src/ocsp.ts`)
+   * binds the agent to OCSP-checked endpoints: the agent requests a
+   * stapled OCSP response on every handshake (`requestOCSP` is an
+   * agent-level TLS option) and disables TLS session resumption
+   * (`maxCachedSessions: 0`) — on a resumed TLS 1.3 handshake the
+   * server re-sends no certificate, so there would be nothing to
+   * check, exactly the pinned-agent rationale. Endpoints without an
+   * override entry pass `undefined` and keep the exact historical pool
+   * keys.
    */
-  agentFor(url: URL, pins?: readonly string[], proxyUrl?: string, clientCertId?: string, tlsSni?: ResolvedTlsSniOverride, minTlsVersion?: MinTlsVersion): HttpAgent {
+  agentFor(url: URL, pins?: readonly string[], proxyUrl?: string, clientCertId?: string, tlsSni?: ResolvedTlsSniOverride, minTlsVersion?: MinTlsVersion, ocsp?: boolean): HttpAgent {
     if (url.protocol !== "http:" && url.protocol !== "https:") {
       throw new Error(`OutboundConnectionPool: unsupported protocol ${url.protocol}`);
     }
@@ -327,6 +336,11 @@ export class OutboundConnectionPool {
     // would reject every delivery over it instead of the handshake
     // failing once at connect time.
     if (minTlsVersion !== undefined) key += `|tlsmin:${minTlsVersion}`;
+    // WR-101: an OCSP-checked endpoint gets its own agent, so a
+    // connection handshaked without `requestOCSP` (and, worse, a resumed
+    // session carrying no certificate at all) can never silently serve
+    // an endpoint that must check revocation.
+    if (ocsp === true) key += "|ocsp";
     let entry = this.entries.get(key);
     if (entry === undefined) {
       const agentOpts = {
@@ -351,6 +365,18 @@ export class OutboundConnectionPool {
         // endpoints keep the agent's session cache (resumption is safe
         // there: nothing reads the peer certificate).
         ...(pinned && scheme === "https" ? { maxCachedSessions: 0 } : {}),
+        // WR-101: OCSP-checked endpoints must never resume a TLS session
+        // either: a resumed handshake carries no certificate, so the
+        // revocation check would have nothing to evaluate — a fail-closed
+        // endpoint would reject every resumed delivery, a fail-open one
+        // would alert on every resumed delivery. Full handshakes only.
+        ...(ocsp === true && scheme === "https" ? { maxCachedSessions: 0 } : {}),
+        // WR-101: ask the server to staple its OCSP response (RFC 6960
+        // §4) on every handshake this agent opens. The stapled bytes are
+        // read per delivery via `socket.getOCSPResponse()`; endpoints
+        // that disable stapling (`useStapled: false`) still get their own
+        // agent (resumption stays off) and check via the responder.
+        ...(ocsp === true && scheme === "https" ? { requestOCSP: true } : {}),
       };
       const agent: HttpAgent =
         proxyUrl !== undefined

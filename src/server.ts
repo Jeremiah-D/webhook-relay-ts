@@ -99,6 +99,12 @@ import {
   type MinTlsVersion,
 } from "./tls-version.ts";
 import {
+  OcspMonitor,
+  resolveOcspEndpointOptions,
+  type OcspEndpointOptions,
+  type ResolvedOcspEndpointOptions,
+} from "./ocsp.ts";
+import {
   assertValidSecretRotationRules,
   compileSecretRotationRules,
   selectSecretRotation,
@@ -533,6 +539,53 @@ export interface RelayServerOptions {
    * startup.
    */
   minTlsVersions?: Record<string, MinTlsVersion>;
+  /**
+   * Outbound per-endpoint TLS OCSP revocation checking (WR-101, see
+   * `src/ocsp.ts`): `{ "<exact targetUrl>": { mode?, useStapled?,
+   * responderUrl?, responderFetcher?, responderTimeoutMs? } }`, keyed by
+   * exact delivery `targetUrl`. After the handshake the relay checks
+   * whether the peer's certificate was revoked — stapled OCSP response
+   * first (`requestOCSP: true` on the handshake), responder fallback
+   * second (explicit `responderUrl`, else the leaf's AIA extension, via
+   * the pluggable `responderFetcher`). A `revoked` verdict destroys the
+   * request with `OcspRevokedError` *before* a single payload byte is
+   * written (the revoked peer never observes the body); the attempt
+   * follows the normal retry / dead-letter path, an `ocsp_revoked` audit
+   * event fires, the alert hook fires, and the outcome counts in
+   * `relay_ocsp_total{endpoint,status}`.
+   *
+   * `mode` (default `"fail-open"`): what happens when the revocation
+   * *status* cannot be determined (no stapled response, no/failing
+   * responder, malformed response). `"fail-open"` lets the delivery
+   * proceed after firing the alert; `"fail-closed"` fails the attempt
+   * with `OcspError`. A `revoked` verdict rejects the delivery in both
+   * modes. **Pinned endpoints should use `"fail-closed"`** — a pin
+   * already says "I know exactly which key to expect", so failing
+   * closed on revocation-telemetry loss is the consistent posture; an
+   * unpinned endpoint typically stays `"fail-open"` so a dead OCSP
+   * responder cannot take down deliveries.
+   *
+   * Orthogonal to `tlsPins` (WR-21): pinning anchors *identity* (stops a
+   * compromised CA / MITM with a valid-but-unexpected certificate),
+   * OCSP checks *revocation freshness* (stops a once-valid certificate
+   * killed after issuance). The pin check runs first; OCSP runs on the
+   * pinned (or PKI-verified) peer. An OCSP *query* failure explicitly
+   * does NOT count as a circuit-breaker failure (it is a local
+   * telemetry outage, not a sick endpoint); a revocation does.
+   *
+   * Off by default: endpoints without an entry behave exactly as
+   * before, and `GET /metrics` exposes no `relay_ocsp_*` series until
+   * the first check runs. The keep-alive pool binds OCSP endpoints to
+   * their own agents (`|ocsp`): stapling is requested on every
+   * handshake and TLS session resumption is disabled (a resumed
+   * handshake carries no certificate to check). Applies to `https:`
+   * targets on the HTTP/1.1 path; an OCSP-configured endpoint is kept
+   * off the opt-in HTTP/2 path rather than silently skipping the
+   * check, and `wss:` targets are not covered in this round (the
+   * WebSocket pool owns its own handshake). Invalid values throw
+   * `RangeError` at startup.
+   */
+  tlsOcsp?: Record<string, OcspEndpointOptions>;
   /**
    * Per-endpoint outbound TLS SNI/ALPN overrides (WR-60, see
    * `src/tls-sni.ts`): `{ "<exact targetUrl>": { servername?,
@@ -1390,7 +1443,22 @@ export function createDefaultSender(
    * forwards a caller-supplied `tracestate` verbatim. `undefined` keeps
    * the exact pre-WR-98 wire shape. Validated at startup.
    */
-  traceContext?: TraceContextOptions
+  traceContext?: TraceContextOptions,
+  /**
+   * WR-101: per-endpoint OCSP revocation checking (see `src/ocsp.ts`
+   * and the `tlsOcsp` server option): `{ "<exact targetUrl>":
+   * OcspEndpointOptions }`. Validated at startup; `undefined` keeps
+   * the exact pre-WR-101 behavior.
+   */
+  tlsOcsp?: Record<string, OcspEndpointOptions>,
+  /**
+   * WR-101: the revocation monitor owning the verified-socket cache,
+   * the `relay_ocsp_total` counters, and the revocation/alert hooks.
+   * When `tlsOcsp` is set but no monitor is passed, an inert one (no
+   * hooks) is created so the check still gates deliveries; the relay
+   * server passes its hooked monitor here.
+   */
+  ocspMonitor?: OcspMonitor
 ): PooledSender {
   if (tlsPins !== undefined) {
     for (const [endpoint, pins] of Object.entries(tlsPins)) {
@@ -1415,6 +1483,25 @@ export function createDefaultSender(
         );
       }
     }
+  }
+  // WR-101: fail fast on a misconfigured OCSP entry — a bad mode or
+  // responder URL must not silently leave an endpoint unprotected (or
+  // unknowingly fail-closed). When entries exist but no monitor was
+  // passed, create an inert one so the check still gates deliveries —
+  // the security property must not depend on the caller remembering
+  // the monitor argument.
+  const resolvedOcsp = new Map<string, ResolvedOcspEndpointOptions>();
+  if (tlsOcsp !== undefined) {
+    for (const [endpoint, cfg] of Object.entries(tlsOcsp)) {
+      try {
+        resolvedOcsp.set(endpoint, resolveOcspEndpointOptions(cfg));
+      } catch (err) {
+        throw new RangeError(
+          `createDefaultSender: invalid tlsOcsp for ${endpoint}: ${(err as Error).message}`
+        );
+      }
+    }
+    if (ocspMonitor === undefined) ocspMonitor = new OcspMonitor();
   }
   if (proxies !== undefined) {
     for (const [endpoint, proxyUrl] of Object.entries(proxies)) {
@@ -1864,7 +1951,16 @@ export function createDefaultSender(
      * construction — and the handshake runs the primary → fallback
      * candidate loop below.
      */
-    clientCertRotation?: RotatingClientCertSet
+    clientCertRotation?: RotatingClientCertSet,
+    /**
+     * WR-101: revocation checking for this endpoint (`undefined` when
+     * the endpoint has no `tlsOcsp` entry): the resolved per-endpoint
+     * config plus the monitor owning the verified-socket cache. The
+     * pool key already binds this (see the `agentFor` call below), so a
+     * connection handshaked without OCSP stapling can never silently
+     * serve an OCSP endpoint.
+     */
+    ocsp?: { cfg: ResolvedOcspEndpointOptions; monitor: OcspMonitor }
   ): Promise<DownstreamResponse | void> => {
     // WR-75: the guarded 415→plaintext fallback needs the compression
     // decision outside the attempt promise. The decision is deterministic
@@ -1944,7 +2040,12 @@ export function createDefaultSender(
             // identity can never serve a delivery using another.
             certToUse !== undefined ? clientCertIdentity(certToUse) : undefined,
             tlsSni,
-            minTlsVersion
+            minTlsVersion,
+            // WR-101: OCSP endpoints get their own agent (stapling
+            // requested, resumption off) — a connection handshaked
+            // without revocation telemetry can never silently serve
+            // them.
+            ocsp !== undefined
           ) ??
           (proxyUrl !== undefined
             ? (oneOffAgent = createProxiedAgent(
@@ -2089,6 +2190,15 @@ export function createDefaultSender(
                         ALPNProtocols: [...tlsSni.alpnProtocols],
                       }
                     : {}),
+                  // WR-101: ask the server to staple its OCSP response
+                  // (RFC 6960 §4) when the endpoint wants the stapled
+                  // fast path. Per-request TLS options apply to
+                  // connections the pooled agent opens (like the WR-60
+                  // SNI options above) and to one-off connections; the
+                  // pool key additionally binds OCSP endpoints to their
+                  // own agent, so the stapling request is present on
+                  // every handshake serving them.
+                  ...(ocsp !== undefined && ocsp.cfg.useStapled ? { requestOCSP: true } : {}),
                   // The client certificate rides the TLS handshake (per-request
                   // TLS options apply to connections the pooled agent opens;
                   // the pool key already binds this exact identity, so a
@@ -2180,6 +2290,40 @@ export function createDefaultSender(
         };
 
         /**
+         * WR-101: gate the payload on the endpoint's OCSP revocation
+         * check. The check may need an async responder round-trip, so —
+         * unlike the pin/floor checks — the payload waits for it instead
+         * of firing inline on `secureConnect`. The revoked / fail-closed
+         * paths destroy the request before a single payload byte is
+         * written (the pinning.ts precedent: the revoked peer never
+         * observes the body); the attempt then follows the normal retry
+         * / dead-letter path. A no-op `writePayload()` when the endpoint
+         * has no OCSP entry.
+         */
+        const gatePayloadOnOcsp = (tlsSocket: TLSSocket): void => {
+          if (ocsp === undefined) {
+            writePayload();
+            return;
+          }
+          // A pooled socket already verified for this endpoint skips the
+          // re-check: revocation is a property of the certificate
+          // presented at session establishment, and the peer cannot
+          // change underneath a live TLS session.
+          if (ocsp.monitor.socketVerified(tlsSocket, item.targetUrl)) {
+            writePayload();
+            return;
+          }
+          void (async () => {
+            try {
+              await ocsp.monitor.checkPeer(tlsSocket, item.targetUrl, ocsp.cfg);
+              writePayload();
+            } catch (err) {
+              req.destroy(err as Error);
+            }
+          })();
+        };
+
+        /**
          * WR-73: capture the peer certificate's expiry on the TLS handshake
          * for `https:` targets — the same `getPeerCertificate` read the
          * WR-21 pin check uses. Runs on the fresh-handshake path; a reused
@@ -2217,6 +2361,22 @@ export function createDefaultSender(
                 tlsSocket.once("secureConnect", () => enforceTlsFloor(tlsSocket));
               }
             });
+          }
+          // WR-101: OCSP gates the payload on the unpinned path too. The
+          // check may need an async responder round-trip, so writePayload
+          // waits for the check instead of firing immediately — the
+          // revoked / fail-closed paths destroy the request first.
+          if (ocsp !== undefined && url.protocol === "https:") {
+            req.on("socket", (socket) => {
+              const tlsSocket = socket as TLSSocket;
+              const already = tlsSocket.getPeerCertificate() as { raw?: unknown };
+              if (already && already.raw) {
+                gatePayloadOnOcsp(tlsSocket);
+              } else {
+                tlsSocket.once("secureConnect", () => gatePayloadOnOcsp(tlsSocket));
+              }
+            });
+            return;
           }
           writePayload();
           return;
@@ -2267,7 +2427,12 @@ export function createDefaultSender(
             // Cache the handshake result on the pooled socket: pinning is
             // about server identity, and this connection already proved it.
             pool?.cachePresentedPin(tlsSocket, presented);
-            writePayload();
+            // WR-101: OCSP after pinning — pinning anchors identity
+            // (stops a compromised CA / MITM), OCSP checks revocation
+            // freshness. The payload waits for the (possibly async)
+            // check; the revoked / fail-closed paths destroy the request
+            // before a single payload byte is written.
+            gatePayloadOnOcsp(tlsSocket);
           } else {
             // Fail the delivery attempt: it follows the normal retry /
             // dead-letter path and the mismatch lands in the audit trail.
@@ -2289,7 +2454,11 @@ export function createDefaultSender(
             // and loud, in case a socket ever drifts below the floor.
             if (enforceTlsFloor(tlsSocket)) return;
             if (allowed.includes(cached)) {
-              writePayload();
+              // WR-101: a reused pooled connection proved its identity at
+              // handshake time, but revocation is re-checked per endpoint
+              // policy — the monitor skips sockets it already verified
+              // for this endpoint (session-establishment semantics).
+              gatePayloadOnOcsp(tlsSocket);
             } else {
               socket.destroy();
               req.destroy(new TlsPinMismatchError(item.targetUrl, cached));
@@ -2588,6 +2757,18 @@ export function createDefaultSender(
     // targets — keeps the exact current behavior.
     const minTlsVersion =
       url.protocol === "https:" ? minTlsVersions?.[item.targetUrl] : undefined;
+    // WR-101: per-endpoint OCSP revocation checking (exact targetUrl
+    // match). `undefined` for endpoints without an entry — and for
+    // non-`https:` targets — keeps the exact current behavior. The
+    // monitor is always present when entries exist (createDefaultSender
+    // creates an inert one when the caller passes none), so the pair is
+    // complete here.
+    const ocspForEndpoint =
+      url.protocol === "https:" ? resolvedOcsp.get(item.targetUrl) : undefined;
+    const ocsp =
+      ocspForEndpoint !== undefined && ocspMonitor !== undefined
+        ? { cfg: ocspForEndpoint, monitor: ocspMonitor }
+        : undefined;
     // Outbound proxy for this endpoint: explicit per-endpoint config
     // first, then the environment (read per delivery, so proxy rotation
     // needs no restart; `NO_PROXY` bypasses the env fallback only — an
@@ -2613,16 +2794,19 @@ export function createDefaultSender(
       // traffic rides the HTTP/1.1 CONNECT tunnel (see `src/http2.ts`). Any
       // H2-level failure falls back to the HTTP/1.1 pool below: a delivery
       // is never lost because of H2.
-      if (h2pool !== undefined && proxyUrl === undefined && h2pool.eligibleFor(url)) {
+      // WR-101: an OCSP-configured endpoint never rides H2 — the H2
+      // session pool owns its own handshake and has no revocation gate,
+      // so H2 would silently skip the check. HTTP/1.1 instead, loudly.
+      if (h2pool !== undefined && proxyUrl === undefined && ocsp === undefined && h2pool.eligibleFor(url)) {
         return deliverViaHttp2(item, url, pins, clientCert, tlsSni, minTlsVersion, clientCertRotation).catch((err) => {
           if (err instanceof Http2UnavailableError) {
             h2pool!.noteFallback();
-            return deliverViaHttp1(item, url, pins, clientCert, proxyUrl, tlsSni, minTlsVersion, clientCertRotation);
+            return deliverViaHttp1(item, url, pins, clientCert, proxyUrl, tlsSni, minTlsVersion, clientCertRotation, ocsp);
           }
           throw err;
         });
       }
-      return deliverViaHttp1(item, url, pins, clientCert, proxyUrl, tlsSni, minTlsVersion, clientCertRotation);
+      return deliverViaHttp1(item, url, pins, clientCert, proxyUrl, tlsSni, minTlsVersion, clientCertRotation, ocsp);
     };
     // WR-99: enforce the propagated deadline budget on the physical
     // attempt. The race bounds every transport (H1/H2/WS) at the
@@ -3001,6 +3185,31 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       });
     },
   });
+  // WR-101: the OCSP revocation monitor is only constructed when at
+  // least one endpoint opts in via `tlsOcsp` — otherwise no
+  // `relay_ocsp_*` series ever appears. Every `ocsp_revoked` event lands
+  // in the audit log; revocations and fail-open continuations also fire
+  // the alert hook (audited as `ocsp_alert`). Invalid values throw
+  // RangeError at startup (see createDefaultSender).
+  const ocspMonitor =
+    opts.tlsOcsp !== undefined
+      ? new OcspMonitor({
+          onRevoked: (event) => {
+            opts.auditLog.append(event);
+          },
+          onAlert: (alert) => {
+            opts.auditLog.append({
+              event: "ocsp_alert",
+              kind: alert.kind,
+              endpoint: alert.endpoint,
+              mode: alert.mode,
+              detail: alert.detail,
+              outcome: alert.outcome,
+              at: alert.at,
+            });
+          },
+        })
+      : undefined;
   // WR-75: a guarded-compressed delivery was answered 415 and resent
   // as plaintext inside the same attempt — worth an audit line (the
   // downstream does not speak gzip; the operator may want to drop the
@@ -3070,7 +3279,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   }
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext)
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor)
       : undefined;
   // WR-50: endpoints the operator may pause/resume over HTTP. The server
   // only ever delivers to these — the intake target plus every
@@ -3100,7 +3309,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     if (validators !== undefined && typeof validators === "object") {
       for (const endpoint of Object.keys(validators)) knownEndpoints.add(endpoint);
     }
-    for (const record of [opts.tlsPins, opts.tlsClientCerts, opts.tlsClientCertRotation, opts.compressOutbound, opts.compressThreshold, opts.proxies, opts.outboundEncryption, opts.responseCompression, opts.forwardHeaders, opts.minTlsVersions]) {
+    for (const record of [opts.tlsPins, opts.tlsClientCerts, opts.tlsClientCertRotation, opts.compressOutbound, opts.compressThreshold, opts.proxies, opts.outboundEncryption, opts.responseCompression, opts.forwardHeaders, opts.minTlsVersions, opts.tlsOcsp]) {
       if (record) for (const endpoint of Object.keys(record)) knownEndpoints.add(endpoint);
     }
     for (const endpoint of opts.retry?.probe?.endpoints ?? []) knownEndpoints.add(endpoint);
@@ -3952,7 +4161,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       // configured, keeping the output byte-identical to the legacy shape.
       res
         .writeHead(200, { "content-type": "text/plain; version=0.0.4" })
-        .end(queue.renderMetrics() + versionMetrics.render() + schemaMetrics.render() + (schemaRegistry?.renderMetrics() ?? "") + ipAclMetrics.render() + certExpiryMonitor.render() + tlsVersionMonitor.render() + (usageMeter?.render() ?? "") + (defaultSender?.compressionStats.render() ?? "") + (defaultSender?.dnsCache?.render() ?? ""));
+        .end(queue.renderMetrics() + versionMetrics.render() + schemaMetrics.render() + (schemaRegistry?.renderMetrics() ?? "") + ipAclMetrics.render() + certExpiryMonitor.render() + tlsVersionMonitor.render() + (ocspMonitor?.render() ?? "") + (usageMeter?.render() ?? "") + (defaultSender?.compressionStats.render() ?? "") + (defaultSender?.dnsCache?.render() ?? ""));
       return;
     }
     if (isEvents) {

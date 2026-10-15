@@ -34,6 +34,7 @@ import {
   type ClassifiedFailure,
   type FailureClass,
 } from "./failure.ts";
+import { OcspError } from "./ocsp.ts";
 import {
   LatencyTracker,
   type EndpointLatencyStats,
@@ -176,6 +177,7 @@ import {
   type WeightedMetricsInput,
   type DeadLetterEscalationMetricsInput,
   type StalePauseMetricsInput,
+  type OcspMetricsInput,
 } from "./metrics.ts";
 import {
   summarizeDeadLetterFailure,
@@ -205,6 +207,7 @@ export { TENANT_ID_HEADER, assertValidTenantId, tenantScopeKey, splitTenantScope
 export type { DeliveryCountersInput, CircuitStateInput, LatencyHistogramInput, StarvationGuardMetricsInput, SloRiskMetricsInput, CertExpiryMetricsInput };
 export type { DeadLetterEscalationMetricsInput };
 export type { StalePauseMetricsInput };
+export type { OcspMetricsInput };
 export { HttpDeliveryError, classifyFailure, parseRetryAfterMs };
 export type { FailureClass, ClassifiedFailure };
 export type { DownstreamResponseSummary };
@@ -4970,7 +4973,12 @@ export class RetryQueue {
         // N followers recording the same failure would trip the circuit
         // N× faster than the downstream actually failed.
         if (attemptLeads) {
-          breaker?.recordFailure(target);
+          // WR-101: an OCSP *query* failure (OcspError) is a local
+          // telemetry outage, not a sick endpoint — it explicitly
+          // bypasses the breaker verdict. A revoked certificate
+          // (OcspRevokedError, a different class) is a real endpoint
+          // failure and counts normally.
+          if (!(err instanceof OcspError)) breaker?.recordFailure(target);
           // WR-59: a retryable failure heats the endpoint's adaptive base
           // toward the ceiling.
           this.adaptiveBackoffFor(tenant)?.recordOutcome(target, false);
