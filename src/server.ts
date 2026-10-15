@@ -3,11 +3,14 @@ import { request as httpsRequest } from "node:https";
 import type { Server } from "node:http";
 import { randomUUID } from "node:crypto";
 import {
+  assertValidEndpointBodyLimitRules,
   assertValidEndpointVerifierRules,
   HmacSha256Verifier,
   RotatingHmacVerifier,
+  selectEndpointBodyLimit,
   selectEndpointVerifier,
   signSha256,
+  type EndpointBodyLimitRule,
   type EndpointVerifierRule,
   type SigningKey,
   type Verifier,
@@ -795,6 +798,26 @@ export interface RelayServerOptions {
    * (`DEFAULT_MAX_BODY_BYTES`). Invalid values throw `RangeError`.
    */
   maxBodyBytes?: number;
+  /**
+   * Per-endpoint inbound body size overrides (WR-102). Rules are
+   * `{ pattern, maxBodyBytes }` — exact (`/hooks/payments`) or prefix
+   * (`/hooks/*`) path patterns, first match wins, unmatched paths keep
+   * the global `maxBodyBytes`. A rule may be tighter or looser than the
+   * global budget, and it governs all three enforcement points for the
+   * matched endpoint: the declared Content-Length pre-check, the
+   * `readRawBody` streaming cap, and the `gunzipCapped` decompression
+   * cap (a gzip bomb on the endpoint is answered 413 under the
+   * endpoint's own budget). Over-limit bodies are answered 413 and
+   * audited as `rejected` with reason `body_too_large` carrying the
+   * *effective* `maxBodyBytes`. This is the transport layer — it runs
+   * before signature verification and before WR-41 schema validation
+   * (semantic validation); the two are orthogonal. The batch envelope
+   * (`POST /ingest/batch`) is subject to the same gate, so per-item
+   * payloads are bounded by the outer envelope. Unset means exact
+   * current global behavior. Invalid rules throw `RangeError` at
+   * startup.
+   */
+  endpointBodyLimits?: EndpointBodyLimitRule[];
   /**
    * Outbound request signing (WR-26, see `OutboundSigningConfig`): when set,
    * every delivery made by the default sender carries
@@ -3866,6 +3889,10 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // Per-endpoint verifier rules are validated once at startup so a bad
   // pattern or verifier can never fail a request mid-flight.
   assertValidEndpointVerifierRules(opts.endpointVerifiers);
+  // WR-102: per-endpoint body limit rules are validated once at startup
+  // for the same reason — a bad pattern or budget can never fail a
+  // request mid-flight.
+  assertValidEndpointBodyLimitRules(opts.endpointBodyLimits);
   // WR-67: dual-secret rotation rules are validated and compiled once at
   // startup for the same reason — and compiling once pins the
   // previous-secret grace window of rules without previousRetiredAtMs to
@@ -4726,6 +4753,14 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   interface IntakeGateResult {
     body: Buffer;
     /**
+     * WR-102: the body budget that actually governed this request's
+     * intake — the matching `endpointBodyLimits` rule's budget, or the
+     * global `maxBodyBytes` when no rule matched. Travels with the body
+     * so `admitOneEvent` can apply the same budget to the WR-40 gzip
+     * decompression cap.
+     */
+    maxBodyBytes: number;
+    /**
      * The matched API key id and the guarding rule. The rule travels
      * with it so the admission pipeline knows whether the signature
      * check still applies (`requireSignature`) and which `keyId` to
@@ -4872,6 +4907,19 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       }
     }
 
+    // Inbound per-endpoint body size override (WR-102): resolved from
+    // headers alone — before a single body byte is read — so the
+    // endpoint's own budget governs all three enforcement points: the
+    // declared Content-Length pre-check below, the `readRawBody`
+    // streaming cap, and the WR-40 gzip decompression cap in
+    // `admitOneEvent` (the budget rides along on the gate result).
+    // `undefined` when no rule matched: exact global behavior. This is
+    // the transport layer — it runs before signature verification and
+    // before WR-41 schema validation (semantic validation); the two are
+    // orthogonal.
+    const effectiveMaxBodyBytes =
+      selectEndpointBodyLimit(pathname, opts.endpointBodyLimits) ?? maxBodyBytes;
+
     // Inbound body size limit (WR-25), first line of defense: the declared
     // Content-Length is checked before a single body byte is read, so a
     // giant payload is rejected without touching memory or the verifier. A
@@ -4879,13 +4927,13 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     const declaredLength = req.headers["content-length"];
     if (typeof declaredLength === "string") {
       const n = Number(declaredLength);
-      if (Number.isInteger(n) && n > maxBodyBytes) {
+      if (Number.isInteger(n) && n > effectiveMaxBodyBytes) {
         opts.auditLog.append({
           event: "rejected",
           id,
           traceId,
           reason: "body_too_large",
-          maxBodyBytes,
+          maxBodyBytes: effectiveMaxBodyBytes,
         });
         // `connection: close` drops the socket after the 413, so the
         // client cannot keep streaming a flood into a dead request.
@@ -4900,7 +4948,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     try {
       // Second line of defense: chunked bodies and lying Content-Lengths
       // are capped while streaming; the body never exceeds the budget.
-      body = await readRawBody(req, maxBodyBytes);
+      body = await readRawBody(req, effectiveMaxBodyBytes);
     } catch (err) {
       if (err instanceof BodyTooLargeError) {
         opts.auditLog.append({
@@ -4908,7 +4956,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
           id,
           traceId,
           reason: "body_too_large",
-          maxBodyBytes,
+          maxBodyBytes: effectiveMaxBodyBytes,
         });
         res
           .writeHead(413, { "content-type": "text/plain", connection: "close" })
@@ -4918,7 +4966,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       res.writeHead(400, { "content-type": "text/plain" }).end("Bad request");
       return undefined;
     }
-    return { body, apiKey };
+    return { body, maxBodyBytes: effectiveMaxBodyBytes, apiKey };
   };
 
   /**
@@ -4986,7 +5034,15 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
      * inbound `traceparent` / `tracestate`); rides the queued item so
      * outbound deliveries propagate it. `undefined` = no caller context.
      */
-    inboundTrace?: TraceContext
+    inboundTrace?: TraceContext,
+    /**
+     * WR-102: the body budget the intake gates resolved for this
+     * request (the matching `endpointBodyLimits` rule's budget, or the
+     * global `maxBodyBytes`). Caps the WR-40 gzip decompression here —
+     * the third enforcement point of the same per-endpoint budget.
+     * Defaults to the global so unset means zero behavior change.
+     */
+    bodyBudgetBytes: number = maxBodyBytes
   ): Promise<AdmitOutcome> => {
     const signatureHeader = headers["x-signature"];
     const keyIdHeader = headers["x-key-id"];
@@ -5094,13 +5150,14 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // is transparently decompressed. Signature verification above ran on
     // the raw wire bytes the sender signed; everything below — version
     // routing, replay guard, dedup, the queue — sees the canonical plain
-    // payload. Decompression is streaming and capped at `maxBodyBytes`
-    // (WR-25 applies to the decompressed size too), so a gzip bomb is
+    // payload. Decompression is streaming and capped at the request's
+    // effective body budget (WR-102: the endpoint's own budget when a
+    // rule matched, else the global `maxBodyBytes`) — a gzip bomb is
     // answered 413 exactly like an oversized plain body.
     let inboundGzip = false;
     if (isGzipContentEncoding(headers["content-encoding"])) {
       try {
-        body = await gunzipCapped(body, maxBodyBytes);
+        body = await gunzipCapped(body, bodyBudgetBytes);
         inboundGzip = true;
       } catch (err) {
         if (err instanceof DecompressionTooLargeError) {
@@ -5109,7 +5166,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
             id,
             traceId,
             reason: "body_too_large",
-            maxBodyBytes,
+            maxBodyBytes: bodyBudgetBytes,
           });
           return {
             status: 413,
@@ -5583,7 +5640,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     const traceId = inboundTrace?.traceId ?? resolveTraceId(req.headers[TRACE_ID_HEADER]);
     const gates = await runIntakeGates(req, res, pathname, id, traceId);
     if (gates === undefined) return;
-    const outcome = await admitOneEvent(id, traceId, gates.body, req.headers, pathname, {}, gates.apiKey, inboundTrace);
+    const outcome = await admitOneEvent(id, traceId, gates.body, req.headers, pathname, {}, gates.apiKey, inboundTrace, gates.maxBodyBytes);
     const tenantLabel = outcome.tenantId === undefined ? {} : { tenant: outcome.tenantId };
     if (outcome.status === 202) {
       res
@@ -5809,7 +5866,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         "/ingest/batch",
         correlation,
         undefined,
-        itemTrace
+        itemTrace,
+        gates.maxBodyBytes
       );
       const result: Record<string, unknown> = {
         index,

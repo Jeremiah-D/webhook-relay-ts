@@ -431,3 +431,70 @@ export function selectEndpointVerifier(
   }
   return undefined;
 }
+
+/**
+ * Per-endpoint inbound body size limit rule (WR-102). Mirrors
+ * `EndpointVerifierRule` (WR-29): exact path (`/hooks/payments`) or prefix
+ * (`/hooks/*`, which also matches `/hooks` itself); the first matching
+ * rule in config order wins via `selectEndpointBodyLimit`, and paths with
+ * no match fall back to the global `maxBodyBytes`. A rule may be tighter
+ * or looser than the global budget — e.g. a fat settlement webhook on
+ * `/hooks/ledger` gets a bigger budget than the default 1 MiB.
+ */
+export interface EndpointBodyLimitRule {
+  /** Request path pattern: exact (`/hooks/payments`) or prefix (`/hooks/*`). */
+  pattern: string;
+  /** Body size budget in bytes for this endpoint. Positive integer. */
+  maxBodyBytes: number;
+}
+
+/**
+ * Validate endpoint body limit rules at startup. Throws RangeError on a
+ * non-array, a pattern that is not a `/`-rooted path, or a
+ * non-positive-integer `maxBodyBytes` — fail fast, never mid-request.
+ */
+export function assertValidEndpointBodyLimitRules(rules: EndpointBodyLimitRule[] | undefined): void {
+  if (rules === undefined) return;
+  if (!Array.isArray(rules)) {
+    throw new RangeError("endpointBodyLimits: expected an array of { pattern, maxBodyBytes } rules");
+  }
+  rules.forEach((rule, i) => {
+    const where = `endpointBodyLimits[${i}]`;
+    if (
+      !rule ||
+      typeof rule.pattern !== "string" ||
+      rule.pattern === "" ||
+      !rule.pattern.startsWith("/")
+    ) {
+      throw new RangeError(
+        `${where}: pattern must be a path starting with "/" (exact) or ending with "/*" (prefix)`
+      );
+    }
+    if (!Number.isInteger(rule.maxBodyBytes) || rule.maxBodyBytes <= 0) {
+      throw new RangeError(`${where}: maxBodyBytes must be a positive integer`);
+    }
+  });
+}
+
+/**
+ * Select the inbound body budget for a request path: the first matching
+ * rule's `maxBodyBytes`, or `undefined` when nothing matches (the caller
+ * falls back to the global `maxBodyBytes`). Never throws.
+ */
+export function selectEndpointBodyLimit(
+  pathname: string,
+  rules: EndpointBodyLimitRule[] | undefined
+): number | undefined {
+  if (rules === undefined) return undefined;
+  for (const rule of rules) {
+    if (rule.pattern.endsWith("/*")) {
+      const prefix = rule.pattern.slice(0, -2);
+      if (pathname === prefix || pathname.startsWith(prefix + "/")) {
+        return rule.maxBodyBytes;
+      }
+    } else if (pathname === rule.pattern) {
+      return rule.maxBodyBytes;
+    }
+  }
+  return undefined;
+}

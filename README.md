@@ -383,7 +383,11 @@ reliability primitives that matter for any signed-payload pipeline.
   `content-length` is checked before a single body byte is read, and
   chunked or lying bodies are capped while streaming — the response closes
   the connection (`connection: close`) so a flood cannot keep streaming
-  into a dead request. Invalid values throw `RangeError` at startup.
+  into a dead request. The budget can be overridden per inbound path with
+  `endpointBodyLimits` (see *Per-endpoint body size limits* below) —
+  tighter or looser, first matching rule wins, and the gzip-bomb cap
+  follows the endpoint's own budget. Invalid values throw `RangeError`
+  at startup.
 - Outbound request signing (`outboundSigning`, off by default): every delivery
   made by the default sender stamps `x-relay-signature: sha256=<hex>` — the
   HMAC-SHA256 of the forwarded body — plus `x-relay-key-id` when a `keyId`
@@ -1637,6 +1641,43 @@ payment-webhook JSON, Node v24.20.0 / AMD EPYC 9D25):
 | ratio | 0.228 (**4.4x smaller**) |
 
 gzip p50: ~34µs per payload — negligible next to a network round trip.
+
+## Per-endpoint body size limits
+
+`endpointBodyLimits` overrides the global `maxBodyBytes` on selected
+inbound paths — tighter *or* looser — using the same rule convention as the
+WR-29 per-endpoint verifiers (exact or `path/*` prefix patterns, first
+matching rule wins, unmatched paths keep the exact global behavior):
+
+```ts
+const server = createRelayServer({
+  maxBodyBytes: 1_048_576, // global budget: 1 MiB
+  endpointBodyLimits: [
+    { pattern: "/hooks/ledger", maxBodyBytes: 5_242_880 }, // fat settlement webhooks
+    { pattern: "/hooks/*", maxBodyBytes: 262_144 },         // everything else under /hooks/*
+  ],
+});
+```
+
+- **One budget, three enforcement points** — the matched rule's budget is
+  resolved from headers alone (before a single body byte is read) and
+  governs the declared `Content-Length` pre-check, the `readRawBody`
+  streaming cap, and the `gunzipCapped` decompression cap. A gzip bomb on
+  a tightened endpoint is answered `413` under that endpoint's own budget,
+  exactly like an oversized plain body.
+- **Operators see which cap fired** — over-limit bodies are answered `413`
+  with `connection: close` and audited as `rejected` (reason
+  `body_too_large`) carrying the *effective* `maxBodyBytes`, so the audit
+  trail distinguishes a per-endpoint cap from the global one.
+- **Orthogonal to WR-41 schema validation** — this is the transport layer
+  (byte budget, enforced before signature verification and before schema
+  validation); schema is semantic validation (payload shape, runs after
+  decompression). The batch envelope (`POST /ingest/batch`) is gated by
+  its own rule, so per-item payloads are bounded by the outer envelope —
+  no per-item budget is needed or applied.
+- Invalid rules (non-array, pattern not starting with `/`,
+  non-positive-integer `maxBodyBytes`) throw `RangeError` at startup, so
+  a bad config can never fail a request mid-flight.
 
 ## Batch inbound ingestion
 
