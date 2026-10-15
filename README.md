@@ -437,10 +437,22 @@ reliability primitives that matter for any signed-payload pipeline.
   cooldown. A success on a closed circuit resets the failure count. Wired
   into `RetryQueue` via `retry: { circuitBreaker: {...} }` (off by default);
   `getCircuitStats()` reports per-endpoint `state` / `consecutiveFailures` /
-  `trips`, `circuitBlockedCount()` counts parked attempts, and every
+  `trips` / `tripMode` / `errorRate` / `errorRateSamples`,
+  `circuitBlockedCount()` counts parked attempts, and every
   transition is audited as `circuit_open` / `circuit_half_open` /
   `circuit_closed` with the endpoint. Injectable clock for deterministic
-  tests.
+  tests. WR-104 adds an opt-in `tripMode: "error-rate"`: a rolling window
+  of the last `errorRateWindowSize` outcomes (default 20) trips the
+  circuit once the window holds at least `errorRateMinSamples` outcomes
+  (default 10, always ≥ 2) and the failure rate reaches
+  `errorRateThreshold` (default 0.5) — a lone 1/1 failure can never trip
+  it, which stops jittery endpoints from flapping the breaker. Half-open
+  probe semantics are unchanged, and the mode is switchable per endpoint
+  at runtime via `setEndpointThresholds` (also through the hot-reload
+  `circuitBreaker` patch); the window and the consecutive counter are
+  maintained in both modes, so a switch trips on live history instead of
+  a cold start. `relay_endpoint_circuit_error_rate{endpoint}` exposes the
+  rolling-window rate per error-rate-mode endpoint.
 - `src/downstream-probe.ts` — opt-in *active* downstream health probing
   (`DownstreamProber`), wired into `RetryQueue` via `retry: { probe: {
   endpoints, intervalMs, method, timeoutMs } }` (off by default). Each
@@ -2802,6 +2814,9 @@ endpoints (404 when disabled):
   retry) / `dead_letter`,
 - `relay_endpoint_circuit_state{endpoint}` — 0 closed, 1 half_open,
   2 open (only endpoints that tripped),
+- `relay_endpoint_circuit_error_rate{endpoint}` — rolling-window failure
+  rate in [0, 1] (WR-104 error-rate trip mode; only error-rate-mode
+  endpoints with at least one recorded outcome),
 - `relay_delivery_latency_seconds_{bucket,sum,count}{endpoint}` —
   accepted→delivered latency histogram, only when `retry.latency` is
   enabled; bucket bounds via `retry.metrics.histogramBucketsMs`

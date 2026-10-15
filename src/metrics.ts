@@ -12,6 +12,9 @@
  *   - `dead_letter`: the item exhausted `maxAttempts`.
  * - `relay_endpoint_circuit_state{endpoint}`: gauge, 0 = closed,
  *   1 = half_open, 2 = open. Present only for endpoints that tripped.
+ * - `relay_endpoint_circuit_error_rate{endpoint}`: gauge, the rolling-window
+ *   failure rate in [0, 1] (WR-104 error-rate trip mode). Present only for
+ *   error-rate-mode endpoints with at least one recorded outcome.
  * - `relay_delivery_latency_seconds_{bucket,sum,count}{endpoint}`:
  *   histogram of accepted→delivered latency (seconds). Present only when
  *   latency tracking is enabled (`RetryQueueOptions.latency`); bucket
@@ -122,6 +125,18 @@ export interface CircuitStateInput {
   state: "closed" | "half_open" | "open";
 }
 
+/**
+ * One error-rate-mode endpoint's rolling-window failure rate (WR-104),
+ * in Prometheus label order.
+ */
+export interface CircuitErrorRateInput {
+  endpoint: string;
+  /** Tenant id (WR-48); when set it is rendered as a `tenant` label. */
+  tenant?: string;
+  /** Current rolling-window failure rate in [0, 1]. */
+  errorRate: number;
+}
+
 export interface LatencyHistogramInput {
   endpoint: string;
   /** Tenant id (WR-48); when set it is rendered as a `tenant` label. */
@@ -202,6 +217,13 @@ export interface TenantRateLimitMetricsInput {
 export interface MetricsInput {
   deliveries: DeliveryCountersInput[];
   circuits: CircuitStateInput[];
+  /**
+   * Present only for error-rate-mode (WR-104) endpoints with at least
+   * one recorded outcome — activity-gated, so a relay that never enables
+   * the mode exposes no `relay_endpoint_circuit_error_rate` series at
+   * all.
+   */
+  circuitErrorRates?: CircuitErrorRateInput[];
   latencyHistograms: LatencyHistogramInput[];
   /** Present only when active downstream probing is enabled. */
   probes?: ProbeMetricsInput[];
@@ -489,6 +511,24 @@ export function renderOcspBlock(series: OcspMetricsInput[]): string[] {
   return lines;
 }
 
+/**
+ * Render just the error-rate gauge block (WR-104) as exposition lines;
+ * `[]` when the series is empty, so callers can keep their output
+ * byte-identical until the first error-rate-mode outcome is recorded.
+ */
+export function renderCircuitErrorRateBlock(series: CircuitErrorRateInput[]): string[] {
+  if (series.length === 0) return [];
+  const lines = [
+    "# HELP relay_endpoint_circuit_error_rate Rolling-window failure rate by endpoint (WR-104 error-rate trip mode; present only for error-rate-mode endpoints with at least one recorded outcome).",
+    "# TYPE relay_endpoint_circuit_error_rate gauge",
+  ];
+  for (const s of series) {
+    lines.push(
+      `relay_endpoint_circuit_error_rate{endpoint="${escapeLabelValue(s.endpoint)}"${tenantLabel(s.tenant)}} ${s.errorRate}`
+    );
+  }
+  return lines;
+}
 /** Escape a label value per the Prometheus exposition format. */
 function escapeLabelValue(value: string): string {
   return value.replace(/\\/g, "\\\\").replace(/\n/g, "\\n").replace(/"/g, '\\"');
@@ -528,6 +568,11 @@ export function renderPrometheus(input: MetricsInput): string {
       );
     }
   }
+  // WR-104: activity-gated like the circuit-state gauge — the error-rate
+  // gauge appears only for error-rate-mode endpoints with a recorded
+  // outcome, so a relay on the default consecutive-failures mode exposes
+  // no `relay_endpoint_circuit_error_rate` series at all.
+  lines.push(...renderCircuitErrorRateBlock(input.circuitErrorRates ?? []));
   if (input.latencyHistograms.length > 0) {
     lines.push("# HELP relay_delivery_latency_seconds Accepted-to-delivered latency by endpoint.");
     lines.push("# TYPE relay_delivery_latency_seconds histogram");

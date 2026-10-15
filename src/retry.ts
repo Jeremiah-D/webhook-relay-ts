@@ -165,6 +165,7 @@ import {
 import {
   renderPrometheus,
   type CircuitStateInput,
+  type CircuitErrorRateInput,
   type CertExpiryMetricsInput,
   type DeliveryCountersInput,
   type DeliveryDeadlineExceededInput,
@@ -4384,6 +4385,18 @@ export class RetryQueue {
       if (patch.circuitBreaker.cooldownMs !== undefined) {
         rec("circuitBreaker.cooldownMs", before.cooldownMs, patch.circuitBreaker.cooldownMs);
       }
+      if (patch.circuitBreaker.tripMode !== undefined) {
+        rec("circuitBreaker.tripMode", before.tripMode, patch.circuitBreaker.tripMode);
+      }
+      if (patch.circuitBreaker.errorRateWindowSize !== undefined) {
+        rec("circuitBreaker.errorRateWindowSize", before.errorRateWindowSize, patch.circuitBreaker.errorRateWindowSize);
+      }
+      if (patch.circuitBreaker.errorRateThreshold !== undefined) {
+        rec("circuitBreaker.errorRateThreshold", before.errorRateThreshold, patch.circuitBreaker.errorRateThreshold);
+      }
+      if (patch.circuitBreaker.errorRateMinSamples !== undefined) {
+        rec("circuitBreaker.errorRateMinSamples", before.errorRateMinSamples, patch.circuitBreaker.errorRateMinSamples);
+      }
       breaker!.setEndpointThresholds(endpoint, patch.circuitBreaker);
     }
     if (patch.quota !== undefined && patch.quota.deliveriesPerMinute !== undefined) {
@@ -5437,6 +5450,24 @@ export class RetryQueue {
         circuits.push({ endpoint, ...(tenant === undefined ? {} : { tenant }), state });
       }
     }
+    // WR-104: one gauge row per error-rate-mode endpoint with at least
+    // one recorded outcome — activity-gated, so a relay that never
+    // enables the mode exposes no `relay_endpoint_circuit_error_rate`
+    // series at all. The breakers are the source; the queue keeps no
+    // parallel counter.
+    const circuitErrorRates: CircuitErrorRateInput[] = [];
+    for (const [tenantKey, breaker] of this.breakers) {
+      const tenant = tenantKey === "" ? undefined : tenantKey;
+      for (const row of breaker.stats()) {
+        if (row.tripMode === "error-rate" && row.errorRateSamples > 0) {
+          circuitErrorRates.push({
+            endpoint: row.endpoint,
+            ...(tenant === undefined ? {} : { tenant }),
+            errorRate: row.errorRate,
+          });
+        }
+      }
+    }
     const latencyHistograms: LatencyHistogramInput[] = [];
     if (this.latencyOpts !== undefined) {
       for (const [tenantKey, inner] of this.latencyHist) {
@@ -5548,6 +5579,9 @@ export class RetryQueue {
     return renderPrometheus({
       deliveries,
       circuits,
+      // WR-104: activity-gated (see above) — the error-rate gauge stays
+      // absent until an error-rate-mode endpoint records an outcome.
+      ...(circuitErrorRates.length > 0 ? { circuitErrorRates } : {}),
       latencyHistograms,
       probes,
       starvationGuard,

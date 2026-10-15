@@ -334,3 +334,178 @@ describe("server circuit breaker audit", () => {
     }
   });
 });
+
+describe("EndpointCircuitBreaker error-rate mode (WR-104)", () => {
+  it("trips when the rolling window's failure rate reaches the threshold with enough samples", () => {
+    let now = 0;
+    const b = new EndpointCircuitBreaker({
+      tripMode: "error-rate",
+      errorRateWindowSize: 4,
+      errorRateThreshold: 0.5,
+      errorRateMinSamples: 4,
+      cooldownMs: 5000,
+      nowMs: () => now,
+    });
+    b.recordFailure(URL);
+    b.recordFailure(URL);
+    b.recordFailure(URL);
+    assert.equal(b.state(URL), "closed", "3 samples < minSamples 4: no trip yet");
+    b.recordFailure(URL); // 4/4 = 1.0 >= 0.5
+    assert.equal(b.state(URL), "open");
+    assert.deepEqual(b.shouldAllow(URL), { allowed: false, probe: false });
+  });
+
+  it("a lone 1/1 failure never trips (anti-flap)", () => {
+    let now = 0;
+    const b = new EndpointCircuitBreaker({ tripMode: "error-rate", nowMs: () => now });
+    b.recordFailure(URL); // 1/1 = 100% rate but only 1 sample
+    assert.equal(b.state(URL), "closed");
+    const s = b.stats().find((x) => x.endpoint === URL)!;
+    assert.equal(s.errorRate, 1);
+    assert.equal(s.errorRateSamples, 1);
+    assert.equal(s.tripMode, "error-rate");
+    assert.equal(s.trips, 0);
+  });
+
+  it("stays closed below the threshold rate", () => {
+    let now = 0;
+    const b = new EndpointCircuitBreaker({
+      tripMode: "error-rate",
+      errorRateWindowSize: 6,
+      errorRateThreshold: 0.75,
+      errorRateMinSamples: 2,
+      nowMs: () => now,
+    });
+    b.recordFailure(URL);
+    b.recordSuccess(URL);
+    b.recordFailure(URL); // 2/3 ≈ 0.667 < 0.75
+    assert.equal(b.state(URL), "closed");
+    const s = b.stats().find((x) => x.endpoint === URL)!;
+    assert.ok(Math.abs(s.errorRate - 2 / 3) < 1e-9);
+    assert.equal(s.errorRateSamples, 3);
+  });
+
+  it("half-open probe failure re-opens immediately (probe semantics unchanged)", () => {
+    let now = 0;
+    const b = new EndpointCircuitBreaker({
+      tripMode: "error-rate",
+      errorRateWindowSize: 4,
+      errorRateThreshold: 0.5,
+      errorRateMinSamples: 2,
+      cooldownMs: 1000,
+      nowMs: () => now,
+    });
+    b.recordFailure(URL);
+    b.recordFailure(URL); // 2/2 >= 0.5 with 2 samples → open
+    assert.equal(b.state(URL), "open");
+    now += 1001;
+    assert.deepEqual(b.shouldAllow(URL), { allowed: true, probe: true });
+    b.recordFailure(URL); // probe failed: immediate re-open, no window math
+    assert.equal(b.state(URL), "open");
+    assert.equal(b.stats()[0].trips, 2);
+  });
+
+  it("half-open probe success closes and resets the window", () => {
+    let now = 0;
+    const b = new EndpointCircuitBreaker({
+      tripMode: "error-rate",
+      errorRateWindowSize: 4,
+      errorRateThreshold: 0.5,
+      errorRateMinSamples: 2,
+      cooldownMs: 1000,
+      nowMs: () => now,
+    });
+    b.recordFailure(URL);
+    b.recordFailure(URL);
+    assert.equal(b.state(URL), "open");
+    now += 1001;
+    assert.deepEqual(b.shouldAllow(URL), { allowed: true, probe: true });
+    b.recordSuccess(URL);
+    assert.equal(b.state(URL), "closed");
+    const s = b.stats().find((x) => x.endpoint === URL)!;
+    assert.equal(s.consecutiveFailures, 0);
+    assert.equal(s.errorRate, 0);
+    assert.equal(s.errorRateSamples, 0);
+  });
+
+  it("runtime mode switch trips on live history (no cold start)", () => {
+    let now = 0;
+    const b = new EndpointCircuitBreaker({ failureThreshold: 5, cooldownMs: 5000, nowMs: () => now });
+    for (let i = 0; i < 4; i++) b.recordFailure(URL);
+    assert.equal(b.state(URL), "closed", "4 consecutive < threshold 5");
+    // The window was maintained all along, so the new mode sees 4 samples.
+    b.setEndpointThresholds(URL, { tripMode: "error-rate", errorRateMinSamples: 6 });
+    assert.equal(b.thresholdsFor(URL).tripMode, "error-rate");
+    assert.equal(b.state(URL), "closed", "4 samples < minSamples 6");
+    b.recordFailure(URL);
+    b.recordFailure(URL); // 6/6 = 1.0 >= 0.5
+    assert.equal(b.state(URL), "open");
+  });
+
+  it("window trims when the runtime override shrinks it", () => {
+    let now = 0;
+    const b = new EndpointCircuitBreaker({
+      tripMode: "error-rate",
+      errorRateWindowSize: 10,
+      errorRateThreshold: 1,
+      errorRateMinSamples: 10,
+      nowMs: () => now,
+    });
+    for (let i = 0; i < 8; i++) b.recordFailure(URL);
+    assert.equal(b.stats().find((x) => x.endpoint === URL)!.errorRateSamples, 8);
+    b.setEndpointThresholds(URL, { errorRateWindowSize: 3, errorRateMinSamples: 3 });
+    assert.equal(b.stats().find((x) => x.endpoint === URL)!.errorRateSamples, 3);
+  });
+
+  it("resolves error-rate defaults (minSamples clamps to the window size)", () => {
+    const b = new EndpointCircuitBreaker({ tripMode: "error-rate" });
+    const t = b.thresholdsFor("anything");
+    assert.equal(t.tripMode, "error-rate");
+    assert.equal(t.errorRateWindowSize, 20);
+    assert.equal(t.errorRateThreshold, 0.5);
+    assert.equal(t.errorRateMinSamples, 10);
+    const small = new EndpointCircuitBreaker({ tripMode: "error-rate", errorRateWindowSize: 5 });
+    assert.equal(small.thresholdsFor("x").errorRateMinSamples, 5);
+  });
+
+  it("rejects invalid error-rate configuration", () => {
+    assert.throws(() => new EndpointCircuitBreaker({ tripMode: "bogus" as never }), RangeError);
+    assert.throws(
+      () => new EndpointCircuitBreaker({ tripMode: "error-rate", errorRateWindowSize: 1 }),
+      RangeError
+    );
+    assert.throws(
+      () => new EndpointCircuitBreaker({ tripMode: "error-rate", errorRateThreshold: 0 }),
+      RangeError
+    );
+    assert.throws(
+      () => new EndpointCircuitBreaker({ tripMode: "error-rate", errorRateThreshold: 1.5 }),
+      RangeError
+    );
+    assert.throws(
+      () => new EndpointCircuitBreaker({ tripMode: "error-rate", errorRateMinSamples: 1 }),
+      RangeError
+    );
+    assert.throws(
+      () =>
+        new EndpointCircuitBreaker({
+          tripMode: "error-rate",
+          errorRateWindowSize: 4,
+          errorRateMinSamples: 5,
+        }),
+      RangeError
+    );
+    // Shrinking the window clamps the inherited minSamples down instead
+    // of throwing; an explicitly oversized minSamples still throws.
+    const b = new EndpointCircuitBreaker({ tripMode: "error-rate", nowMs: () => 0 });
+    b.recordFailure(URL);
+    b.setEndpointThresholds(URL, { errorRateWindowSize: 4 });
+    assert.equal(b.thresholdsFor(URL).errorRateMinSamples, 4);
+    assert.throws(() => b.setEndpointThresholds(URL, { errorRateMinSamples: 5 }), RangeError);
+    b.setEndpointThresholds(URL, { errorRateWindowSize: 4, errorRateMinSamples: 4 });
+    assert.equal(b.thresholdsFor(URL).errorRateMinSamples, 4);
+    // An override for a never-seen endpoint creates no record.
+    b.setEndpointThresholds("http://never-seen/x", { tripMode: "error-rate" });
+    assert.equal(b.stats().length, 1);
+  });
+});

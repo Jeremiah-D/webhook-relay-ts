@@ -28,6 +28,7 @@
 
 import type { JitterStrategy } from "./retry.ts";
 import { assertValidWeightedTargets, type WeightedTargetConfig } from "./weighted.ts";
+import type { CircuitTripMode } from "./circuit.ts";
 
 /** Patch for one endpoint's circuit-breaker trip/cooldown thresholds. */
 export interface CircuitBreakerPatch {
@@ -35,6 +36,18 @@ export interface CircuitBreakerPatch {
   failureThreshold?: number;
   /** Cooldown in ms before a half-open probe. Finite > 0. */
   cooldownMs?: number;
+  /** Trip mode switch (WR-104): "consecutive-failures" or "error-rate". */
+  tripMode?: CircuitTripMode;
+  /** Rolling-window size for error-rate mode. Integer >= 2. */
+  errorRateWindowSize?: number;
+  /** Failure-rate threshold for error-rate mode. In (0, 1]. */
+  errorRateThreshold?: number;
+  /**
+   * Minimum outcomes before error-rate mode may trip. Integer >= 2 and
+   * <= the effective window size (validated against the merged
+   * thresholds at apply time).
+   */
+  errorRateMinSamples?: number;
 }
 
 /** Patch for one endpoint's per-minute delivery quota. */
@@ -165,6 +178,25 @@ export function assertValidEndpointConfigPatch(patch: EndpointConfigPatch): void
     }
     if (cb.cooldownMs !== undefined) {
       assertNumberIn(cb.cooldownMs, "circuitBreaker.cooldownMs", (n) => Number.isFinite(n) && n > 0, "a finite number > 0");
+    }
+    if (cb.tripMode !== undefined) {
+      if (cb.tripMode !== "consecutive-failures" && cb.tripMode !== "error-rate") {
+        throw new RangeError(
+          `updateEndpointConfig: \`circuitBreaker.tripMode\` must be "consecutive-failures" or "error-rate", got ${JSON.stringify(cb.tripMode)}`
+        );
+      }
+    }
+    if (cb.errorRateWindowSize !== undefined) {
+      assertNumberIn(cb.errorRateWindowSize, "circuitBreaker.errorRateWindowSize", (n) => Number.isInteger(n) && n >= 2, "an integer >= 2");
+    }
+    if (cb.errorRateThreshold !== undefined) {
+      assertNumberIn(cb.errorRateThreshold, "circuitBreaker.errorRateThreshold", (n) => Number.isFinite(n) && n > 0 && n <= 1, "a finite number in (0, 1]");
+    }
+    if (cb.errorRateMinSamples !== undefined) {
+      // The <= windowSize half is checked against the merged thresholds
+      // at apply time (setEndpointThresholds); here we only fail-fast
+      // the >= 2 floor that structurally prevents 1/1 flapping.
+      assertNumberIn(cb.errorRateMinSamples, "circuitBreaker.errorRateMinSamples", (n) => Number.isInteger(n) && n >= 2, "an integer >= 2");
     }
   }
   if (p.quota !== undefined) {

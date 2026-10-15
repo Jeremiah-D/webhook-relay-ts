@@ -336,3 +336,53 @@ describe("GET /metrics operator endpoint", () => {
     }
   });
 });
+
+describe("circuit error-rate gauge (WR-104)", () => {
+  it("exposes the rolling-window failure rate for error-rate-mode endpoints", async () => {
+    const timer = manualTimer();
+    const q = new RetryQueue({
+      sender: async () => {
+        throw new Error("down");
+      },
+      baseDelayMs: 10,
+      jitterMs: 0,
+      maxAttempts: 1,
+      circuitBreaker: {
+        tripMode: "error-rate",
+        errorRateWindowSize: 10,
+        errorRateThreshold: 0.9,
+        errorRateMinSamples: 2,
+        cooldownMs: 60_000,
+      },
+      setTimer: timer.setTimer,
+    });
+    q.start();
+    q.enqueue({ ...ITEM, id: "e-1" });
+    await timer.run();
+    const out = q.renderMetrics();
+    // One recorded outcome: the gauge appears (samples > 0) even though
+    // minSamples 2 has not tripped the circuit yet.
+    assert.equal(
+      metricLine(out, "relay_endpoint_circuit_error_rate", `endpoint="${URL}"`),
+      `relay_endpoint_circuit_error_rate{endpoint="${URL}"} 1`
+    );
+  });
+
+  it("omits the error-rate gauge in consecutive-failures mode", async () => {
+    const timer = manualTimer();
+    const q = new RetryQueue({
+      sender: async () => {
+        throw new Error("down");
+      },
+      baseDelayMs: 10,
+      jitterMs: 0,
+      maxAttempts: 1,
+      circuitBreaker: { failureThreshold: 5, cooldownMs: 60_000 },
+      setTimer: timer.setTimer,
+    });
+    q.start();
+    q.enqueue({ ...ITEM, id: "e-2" });
+    await timer.run();
+    assert.ok(!q.renderMetrics().includes("relay_endpoint_circuit_error_rate"));
+  });
+});
