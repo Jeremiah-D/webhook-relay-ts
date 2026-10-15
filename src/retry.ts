@@ -79,12 +79,14 @@ export type {
 export {
   QuorumFanoutSet,
   assertValidQuorumConfig,
+  assertValidQuorumRetentionOptions,
 };
 export type {
   QuorumAcknowledgedInfo,
   QuorumConfig,
   QuorumDeadTarget,
   QuorumDispatchedInfo,
+  QuorumEvictedInfo,
   QuorumFailedInfo,
   QuorumFanoutConfig,
   QuorumFanoutStats,
@@ -172,10 +174,12 @@ import {
 import {
   QuorumFanoutSet,
   assertValidQuorumConfig,
+  assertValidQuorumRetentionOptions,
   type QuorumAcknowledgedInfo,
   type QuorumConfig,
   type QuorumDeadTarget,
   type QuorumDispatchedInfo,
+  type QuorumEvictedInfo,
   type QuorumFailedInfo,
   type QuorumFanoutConfig,
   type QuorumFanoutStats,
@@ -1673,6 +1677,10 @@ export interface RetryQueueOptions {
    * becomes a single dead-letter entry. Disabled by default (absent =
    * zero behavior change). Invalid values throw `RangeError` at
    * construction. Reachable over HTTP via the `quorum` server option.
+   * Settled fan-outs are retained by a retention window (WR-109): see
+   * `quorumRetentionMs` / `quorumMaxFanouts`; evictions fire
+   * `onQuorumEvicted`, are counted by `getQuorumEvictedCount()`, and are
+   * rendered as `relay_quorum_evicted_total` in `renderMetrics()`.
    */
   quorum?: QuorumConfig;
   /**
@@ -1704,6 +1712,28 @@ export interface RetryQueueOptions {
    * directly.
    */
   onQuorumTargetDeadLettered?: (info: QuorumTargetDeadLetteredInfo) => void;
+  /**
+   * Called once per settled quorum fan-out evicted by the retention
+   * window (WR-109: `quorumRetentionMs` / `quorumMaxFanouts`). The
+   * server audits these as `quorum_evicted`; library users get the hook
+   * directly.
+   */
+  onQuorumEvicted?: (info: QuorumEvictedInfo) => void;
+  /**
+   * WR-109: retention window for settled quorum fan-outs — milliseconds
+   * after the verdict, after which the fan-out is archived and evicted
+   * from memory (in-progress fan-outs are never evicted). Passed to
+   * `QuorumFanoutSet`: must be a positive integer, `undefined` = 1h
+   * (3_600_000). Invalid values throw `RangeError` at construction.
+   */
+  quorumRetentionMs?: number;
+  /**
+   * WR-109: cap on retained settled quorum fan-outs (LRU by verdict
+   * time; oldest verdict evicted first). In-progress fan-outs are
+   * exempt. Must be a positive integer, `undefined` = 10_000. Invalid
+   * values throw `RangeError` at construction.
+   */
+  quorumMaxFanouts?: number;
   /**
    * OTLP/HTTP JSON delivery-event export (WR-83; see `src/otlp.ts`).
    * Opt-in: exports the `delivered` / `retrying` / `dead_letter`
@@ -2820,6 +2850,11 @@ export class RetryQueue {
             onSatisfied: opts.onQuorumSatisfied,
             onFailed: opts.onQuorumFailed,
             onTargetDeadLettered: opts.onQuorumTargetDeadLettered,
+            // WR-109: retention window + LRU cap; the set validates
+            // (RangeError) and defaults both when absent.
+            onEvicted: opts.onQuorumEvicted,
+            retentionMs: opts.quorumRetentionMs,
+            maxFanouts: opts.quorumMaxFanouts,
           })
         : undefined;
     this.onScheduledFired = opts.onScheduledFired;
@@ -5464,6 +5499,15 @@ export class RetryQueue {
   }
 
   /**
+   * WR-109: cumulative settled quorum fan-outs the retention sweep
+   * archived and evicted from memory since construction (`retention_ttl`
+   * + `lru_cap`). 0 when the feature is off. Monotonic.
+   */
+  getQuorumEvictedCount(): number {
+    return this.quorum?.evictedCount() ?? 0;
+  }
+
+  /**
    * Install the runtime loop check for completion callbacks (WR-47). The
    * server derives the predicate from the actually bound listen address,
    * so a callback URL that resolves to this relay — even one not declared
@@ -5726,6 +5770,10 @@ export class RetryQueue {
       acknowledged: s.acknowledged,
       targetDeadLetters: s.targetDeadLetters,
     }));
+    // WR-109: cumulative retention evictions — activity-gated, so the
+    // series stays absent until the first settled fan-out is actually
+    // evicted (a relay with the feature off exposes no series at all).
+    const quorumEvicted = this.quorum?.evictedCount() ?? 0;
     // WR-93: one series per (tenant, endpoint) scope that actually
     // dispatched a storm alert — activity-gated, so the series stays
     // absent until the first escalation fires. The escalator's
@@ -5786,6 +5834,9 @@ export class RetryQueue {
       // WR-106: activity-gated (see above) — the quorum series stays
       // absent until the first acknowledgement or loss.
       ...(quorum.length > 0 ? { quorum } : {}),
+      // WR-109: activity-gated (see above) — the eviction counter stays
+      // absent until the first settled fan-out is actually evicted.
+      ...(quorumEvicted > 0 ? { quorumEvicted } : {}),
       // WR-93: activity-gated (see above).
       ...(escalation.length > 0 ? { escalation } : {}),
       // WR-100: activity-gated (see above).

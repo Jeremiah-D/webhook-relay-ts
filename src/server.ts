@@ -22,6 +22,7 @@ import type {
   QuorumAcknowledgedInfo,
   QuorumConfig,
   QuorumDispatchedInfo,
+  QuorumEvictedInfo,
   QuorumFailedInfo,
   QuorumSatisfiedInfo,
   QuorumTargetDeadLetteredInfo,
@@ -504,11 +505,34 @@ export interface RelayServerOptions {
    * as delivered. Progress is observable via `GET /quorum`, audited as
    * `quorum_dispatched` / `quorum_acknowledged` / `quorum_satisfied` /
    * `quorum_failed` / `quorum_target_dead_lettered`, and counted in
-   * `relay_quorum_*`. An explicit server-level `quorum` wins over the
-   * nested `retry.quorum`. Off by default; invalid values throw
+   * `relay_quorum_*`. Settled fan-outs are retained by a retention
+   * window (WR-109): `quorumRetentionMs` after the verdict (default 1h)
+   * and at most `quorumMaxFanouts` settled fan-outs (default 10_000,
+   * oldest verdict evicted first); evictions are audited as
+   * `quorum_evicted`, counted in `relay_quorum_evicted_total`, and
+   * exposed via `GET /quorum/stats` (the object-shaped companion to the
+   * array-shaped `GET /quorum`). An explicit server-level `quorum` wins
+   * over the nested `retry.quorum`. Off by default; invalid values throw
    * `RangeError` at startup.
    */
   quorum?: QuorumConfig;
+  /**
+   * WR-109: retention window for settled quorum fan-outs — milliseconds
+   * after the verdict, after which the fan-out is archived (audited as
+   * `quorum_evicted`) and evicted from memory. In-progress fan-outs are
+   * never evicted. An explicit server-level `quorumRetentionMs` wins over
+   * the nested `retry.quorumRetentionMs`. Off by default (= 1h);
+   * invalid values throw `RangeError` at startup.
+   */
+  quorumRetentionMs?: number;
+  /**
+   * WR-109: cap on retained settled quorum fan-outs (LRU by verdict
+   * time; oldest verdict evicted first). In-progress fan-outs are
+   * exempt. An explicit server-level `quorumMaxFanouts` wins over the
+   * nested `retry.quorumMaxFanouts`. Off by default (= 10_000);
+   * invalid values throw `RangeError` at startup.
+   */
+  quorumMaxFanouts?: number;
   /**
    * Outbound TLS certificate pinning (see `src/pinning.ts`): per-endpoint
    * SPKI fingerprint whitelist, keyed by exact delivery `targetUrl`.
@@ -3178,6 +3202,7 @@ function isOperatorPath(pathname: string): boolean {
     pathname === "/latency" ||
     pathname === "/slo-risk" ||
     pathname === "/quorum" ||
+    pathname === "/quorum/stats" ||
     pathname === "/usage" ||
     pathname === "/health/summary" ||
     pathname === "/events" ||
@@ -3711,6 +3736,11 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // either way the queue owns the fan-out set. Wrap the caller's hooks
     // so every quorum outcome is audited, not just observed.
     quorum: opts.quorum ?? opts.retry?.quorum,
+    // WR-109: retention window + LRU cap ride through to the queue's
+    // fan-out set (which validates fail-fast); server-level wins over
+    // nested `retry.*`, mirroring the `quorum` option itself.
+    quorumRetentionMs: opts.quorumRetentionMs ?? opts.retry?.quorumRetentionMs,
+    quorumMaxFanouts: opts.quorumMaxFanouts ?? opts.retry?.quorumMaxFanouts,
     onQuorumDispatched: (info: QuorumDispatchedInfo) => {
       opts.auditLog.append({
         event: "quorum_dispatched",
@@ -3775,6 +3805,29 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         targets: info.targets,
       });
       opts.retry?.onQuorumTargetDeadLettered?.(info);
+    },
+    // WR-109: wrap the caller's hook so every retention eviction is
+    // archived in the audit trail as `quorum_evicted` (operator
+    // metadata only: fan-out id, endpoint, tenant, terminal status,
+    // acked/targets/lost-target counts, dispatch/verdict/eviction
+    // timestamps, eviction reason — no payloads), not just observed.
+    onQuorumEvicted: (info: QuorumEvictedInfo) => {
+      opts.auditLog.append({
+        event: "quorum_evicted",
+        id: info.fanoutId,
+        traceId: info.traceId,
+        ...(info.tenant !== undefined ? { tenant: info.tenant } : {}),
+        targetUrl: info.endpoint,
+        status: info.status,
+        acked: info.acked,
+        targets: info.targets,
+        deadLettered: info.deadLettered,
+        dispatchedAt: info.dispatchedAt,
+        settledAt: info.settledAt,
+        evictedAt: info.evictedAt,
+        reason: info.reason,
+      });
+      opts.retry?.onQuorumEvicted?.(info);
     },
     onProbeAudit: (event) => {
       opts.auditLog.append(event);
@@ -4259,6 +4312,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     const isLatency = pathname === "/latency";
     const isSloRisk = pathname === "/slo-risk";
     const isQuorum = pathname === "/quorum";
+    const isQuorumStats = pathname === "/quorum/stats";
     const isUsage = pathname === "/usage";
     const isHealthSummary = pathname === "/health/summary";
     const isEvents = pathname === "/events";
@@ -4286,6 +4340,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       !isLatency &&
       !isSloRisk &&
       !isQuorum &&
+      !isQuorumStats &&
       !isUsage &&
       !isHealthSummary &&
       !isEvents &&
@@ -4318,6 +4373,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         (isLatency && req.method === "GET") ||
         (isSloRisk && req.method === "GET") ||
         (isQuorum && req.method === "GET") ||
+        (isQuorumStats && req.method === "GET") ||
         (isUsage && req.method === "GET") ||
         (isHealthSummary && req.method === "GET") ||
         (isEvents && req.method === "GET") ||
@@ -4497,6 +4553,16 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       // dispatch order. Same operator-token guard as the other operator
       // endpoints (fail-closed without operatorToken).
       respondJson(res, 200, queue.getQuorumStats());
+      return;
+    }
+    if (isQuorumStats) {
+      // WR-109: object-shaped quorum companion to the array-shaped
+      // `GET /quorum` (whose array response is pinned by clients and
+      // tests, so it cannot grow a top-level `evicted` field): the same
+      // per-fanout progress plus the cumulative retention-eviction
+      // count. Same operator-token guard (fail-closed without
+      // operatorToken).
+      respondJson(res, 200, { fanouts: queue.getQuorumStats(), evicted: queue.getQuorumEvictedCount() });
       return;
     }
     if (isUsage) {

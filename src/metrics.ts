@@ -122,6 +122,10 @@
  *   acknowledging. All activity-gated: present only for endpoints with a
  *   recorded acknowledgement or loss — absent entirely when the feature
  *   is off.
+ * - `relay_quorum_evicted_total`: counter of settled quorum fan-outs
+ *   archived and evicted from memory by the retention window (WR-109).
+ *   Activity-gated: present only once the first eviction has actually
+ *   happened.
  *
  * Cardinality note: labels are per endpoint (`targetUrl`), so a relay
  * fanning out to many distinct downstream URLs grows the series count —
@@ -341,6 +345,13 @@ export interface MetricsInput {
    * is byte-identical.
    */
   quorum?: QuorumMetricsInput[];
+  /**
+   * Present only when a settled quorum fan-out has actually been evicted
+   * by the retention window (WR-109); cumulative since construction.
+   * Absent until the first eviction, so an untouched relay's exposition
+   * is byte-identical.
+   */
+  quorumEvicted?: number;
 }
 
 /** One endpoint's starvation-guard activation count, in Prometheus label order. */
@@ -594,6 +605,23 @@ export function renderQuorumBlock(series: QuorumMetricsInput[]): string[] {
     );
   }
   return lines;
+}
+
+/**
+ * Render the WR-109 quorum retention-eviction counter as exposition
+ * lines; `[]` when no settled fan-out has been evicted yet, so callers
+ * keep their output byte-identical until the first eviction is actually
+ * recorded. The counter is global (not per endpoint): an evicted
+ * fan-out is already gone from the per-fanout state, and what an
+ * operator needs is the cumulative count.
+ */
+export function renderQuorumEvictedBlock(evicted?: number): string[] {
+  if (evicted === undefined || evicted <= 0) return [];
+  return [
+    "# HELP relay_quorum_evicted_total Settled quorum fan-outs (WR-109) archived and evicted from memory by the retention window (retention_ttl: verdict older than quorumRetentionMs; lru_cap: oldest verdict while retained settled fan-outs exceeded quorumMaxFanouts), cumulative since construction.",
+    "# TYPE relay_quorum_evicted_total counter",
+    `relay_quorum_evicted_total ${evicted}`,
+  ];
 }
 
 /**
@@ -865,6 +893,9 @@ export function renderPrometheus(input: MetricsInput): string {
   // once a target has actually acknowledged or died, so a relay with the
   // feature off exposes no `relay_quorum_*` series at all.
   lines.push(...renderQuorumBlock(input.quorum ?? []));
+  // WR-109: activity-gated the same way — the eviction counter appears
+  // only once a settled fan-out has actually been evicted.
+  lines.push(...renderQuorumEvictedBlock(input.quorumEvicted));
   // WR-76: activity-gated the same way — the series appears only once a
   // delivery deadline has actually expired.
   if (input.deliveryDeadlineExceeded !== undefined && input.deliveryDeadlineExceeded.length > 0) {

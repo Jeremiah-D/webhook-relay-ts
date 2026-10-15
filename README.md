@@ -1671,6 +1671,20 @@ const server = createRelayServer({
   `relay_quorum_acknowledged_total{endpoint}`, and
   `relay_quorum_target_dead_letters_total{endpoint}` (all activity-gated:
   absent until the first ack or loss).
+- **Retention window (WR-109)** — settled fan-outs do not accumulate
+  unboundedly in memory. A settled fan-out is evicted once its verdict is
+  older than `quorumRetentionMs` (default 1h), or — when more settled
+  fan-outs are retained than `quorumMaxFanouts` (default 10_000) — oldest
+  verdict first. Each eviction is archived as a `quorum_evicted` audit
+  line (operator metadata only: fan-out id, endpoint, terminal status,
+  acked/targets/lost-target counts, dispatch/verdict/eviction timestamps,
+  eviction reason; no payloads) and counted in the activity-gated
+  `relay_quorum_evicted_total`. The eviction count is also exposed via
+  `GET /quorum/stats` as `{ fanouts, evicted }` — the object-shaped
+  companion to the array-shaped `GET /quorum` (whose array response is
+  kept for backward compatibility). In-progress fan-outs are never
+  evicted; a delivery outcome that arrives after its fan-out was evicted
+  is silently ignored (the verdict, once reached, is terminal).
 - **Invalid configs throw `RangeError` at startup** — empty/duplicate/
   non-`http(s)` targets, fanning out to the logical endpoint itself
   (double-delivery), or a quorum outside `[1, targets.length]`. Absent =
