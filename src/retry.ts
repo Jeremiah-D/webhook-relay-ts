@@ -389,6 +389,16 @@ export interface RetryItem {
    */
   tenantId?: string;
   /**
+   * WR-107: mesh hops already traversed, from the inbound `x-relay-hops`
+   * header (0 when the event arrived directly from a producer). The
+   * sender stamps `x-relay-hops: meshHops + 1` on the outbound wire
+   * request; inbound rejects when `meshHops >= maxHops` (the loop guard).
+   * Absent when mesh is disabled. Rides dead-letter replay like `traceId`
+   * — a replay re-enters the mesh at the same hop count — and survives
+   * the durable-queue journal across restarts.
+   */
+  meshHops?: number;
+  /**
    * WR-57: future delivery time (epoch ms), from the inbound `x-deliver-at`
    * header. When set and in the future, the item is parked in the
    * deliver_at delay queue instead of entering the normal path: nothing is
@@ -5331,6 +5341,9 @@ export class RetryQueue {
       // WR-48: kept so a replay re-enters the same tenant's isolation
       // scope (breaker/quota/limiter instances).
       ...(entry.tenantId !== undefined ? { tenantId: entry.tenantId } : {}),
+      // WR-107: kept so a replay re-enters the mesh at the same hop
+      // count instead of restarting the loop-guard accounting at zero.
+      ...(entry.meshHops !== undefined ? { meshHops: entry.meshHops } : {}),
       attempts: entry.attempt,
       lastError: error,
       failureClass: classified.failureClass,

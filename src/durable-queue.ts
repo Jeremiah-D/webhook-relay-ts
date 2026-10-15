@@ -79,6 +79,8 @@ export interface JournalEnqueueItem {
   enqueuedAt?: number;
   /** WR-98: caller-propagated W3C trace context; validated on restore. */
   traceContext?: unknown;
+  /** WR-107: mesh hops already traversed; the hop count survives restarts. */
+  meshHops?: number;
 }
 
 /**
@@ -106,6 +108,8 @@ export interface JournalDeadLetter {
   headers: Record<string, string | string[] | undefined>;
   priority?: "normal" | "urgent";
   tenantId?: string;
+  /** WR-107: mesh hops already traversed; restored into the entry on recover. */
+  meshHops?: number;
   attempts: number;
   lastError: string;
   failureClass: string;
@@ -232,6 +236,9 @@ export class QueueJournal {
         // WR-76: preserve the deadline clock across restarts — a crash
         // does not reset the end-to-end SLO.
         ...(item.enqueuedAt !== undefined ? { enqueuedAt: item.enqueuedAt } : {}),
+        // WR-107: preserve the mesh hop count across restarts — a crash
+        // does not reset the loop-guard accounting.
+        ...(item.meshHops !== undefined ? { meshHops: item.meshHops } : {}),
       },
     });
   }
@@ -264,6 +271,9 @@ export class QueueJournal {
         ...(entry.priority !== undefined ? { priority: entry.priority } : {}),
         ...(entry.traceId !== undefined ? { traceId: entry.traceId } : {}),
         ...(entry.tenantId !== undefined ? { tenantId: entry.tenantId } : {}),
+        // WR-107: the mesh hop count survives the journal so a replay
+        // after a restart re-enters the mesh at the same count.
+        ...(entry.meshHops !== undefined ? { meshHops: entry.meshHops } : {}),
         attempts: entry.attempts,
         lastError: entry.lastError,
         failureClass: entry.failureClass,
@@ -342,6 +352,12 @@ export class QueueJournal {
             // lazily on the next dispatch instead of expiring a
             // just-restored item.
             ...(Number.isFinite(line.item.enqueuedAt) ? { enqueuedAt: line.item.enqueuedAt } : {}),
+            // WR-107: keep the pre-crash mesh hop count when the journal
+            // has a well-formed one; otherwise the item re-enters the mesh
+            // as a fresh arrival.
+            ...(Number.isInteger(line.item.meshHops) && (line.item.meshHops as number) >= 0
+              ? { meshHops: line.item.meshHops }
+              : {}),
           });
           break;
         }
@@ -389,6 +405,11 @@ export class QueueJournal {
             headers: e.headers ?? {},
             priority: e.priority,
             tenantId: e.tenantId,
+            // WR-107: restore the pre-crash mesh hop count when the
+            // journal has a well-formed one.
+            ...(Number.isInteger(e.meshHops) && (e.meshHops as number) >= 0
+              ? { meshHops: e.meshHops }
+              : {}),
             attempts: e.attempts,
             lastError: e.lastError,
             failureClass: e.failureClass as DeadLetterEntry["failureClass"],

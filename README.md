@@ -1676,6 +1676,57 @@ const server = createRelayServer({
   (double-delivery), or a quorum outside `[1, targets.length]`. Absent =
   zero behavior change.
 
+## Relay mesh forwarding (opt-in)
+
+Chain relays so an event hops relay → relay before reaching the final
+downstream — e.g. an edge relay that fans in to a central relay that owns
+the downstream credentials. The forwarding itself is just a `forwardUrl`
+(or content route) pointing at the next relay's inbound; the mesh layer
+adds hop accounting, a loop guard, and peer authentication on top:
+
+```ts
+// Relay A (edge): signs every outbound delivery with the shared relay key.
+const relayA = createRelayServer({
+  secret, forwardUrl: "https://relay-b.example.com/hook", auditLog,
+  mesh: {},                                   // enabled, maxHops defaults to 8
+  outboundSigning: { secret: "mesh-shared-relay-secret" },  // WR-26
+});
+// Relay B (core): verifies the peer signature and enforces the hop budget.
+const relayB = createRelayServer({
+  secret: "mesh-shared-relay-secret",          // the verifier holds the shared key
+  forwardUrl: "https://downstream/hook", auditLog,
+  mesh: { maxHops: 5 },
+});
+```
+
+- **`x-relay-hops` header** — counts traversed relays (0 = arrived
+  directly from a producer). Inbound is parsed at admission (absent = 0,
+  malformed = fail-closed 400 `mesh_hops_invalid`); the count rides the
+  queue item through retries, dead-letter + replay, and the durable-queue
+  journal, and every outbound wire request stamps
+  `x-relay-hops: meshHops + 1`.
+- **Loop guard** — an inbound event already at `maxHops` is rejected 400
+  (`mesh_hop_limit_exceeded`) instead of cycling A → B → A forever.
+  Malformed and over-budget rejections are audited as `rejected`.
+- **Peer authentication** — a mesh hop proves itself with
+  `x-relay-signature` (the WR-26 outbound signature), verified against the
+  relay's configured verifier as a fallback when the producer
+  `x-signature` is absent. The mesh runs on a shared relay secret, so this
+  grants no new capability beyond what `x-signature` already allows — it
+  only names the trust domain (`meshPeer: true` on the `accepted` audit
+  event). Run mesh links over TLS; the hop count itself is cooperative
+  telemetry, not a security boundary.
+- **Observability** — `accepted` / `delivered` / `dead_letter` audit events
+  carry `meshHops`; `relay_mesh_forwarded_total{endpoint}` and
+  `relay_mesh_hop_limit_rejections_total{endpoint}` render into
+  `GET /metrics` (activity-gated: absent until the first forward or
+  rejection). `x-trace-id` threads the whole mesh untouched (WR-18), so
+  one trace correlates every hop.
+- **Disabled = zero behavior change** — without `mesh`, the header is
+  stripped at intake and never stamped. Invalid `maxHops` throws
+  `RangeError` at startup. Shadow-target mirrors (WR-85) never stamp hops:
+  a mirror is not a mesh traversal.
+
 ## Payload gzip compression
 
 Outbound deliveries can be gzipped per endpoint (opt-in), and inbound

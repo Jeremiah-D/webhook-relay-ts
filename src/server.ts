@@ -51,6 +51,14 @@ import type { PayloadEncryptor } from "./encrypt.ts";
 import type { FieldMask } from "./masking.ts";
 import type { ReplayGuard } from "./replay.ts";
 import { DeliveryDeduplicator, type DedupOptions } from "./dedup.ts";
+import {
+  RELAY_HOPS_HEADER,
+  assertValidMeshOptions,
+  parseRelayHops,
+  nextRelayHops,
+  MeshMetrics,
+  type MeshOptions,
+} from "./mesh.ts";
 import { UsageMeter, type UsageOptions } from "./usage.ts";
 import { buildHealthSummary } from "./health-summary.ts";
 import { InboundRateLimiter, type InboundRateLimitOptions } from "./ratelimit.ts";
@@ -1087,6 +1095,20 @@ export interface RelayServerOptions {
    */
   dedup?: DedupOptions;
   /**
+   * Relay mesh forwarding (WR-107, see `src/mesh.ts`): chain this relay
+   * to other relays so an event can hop relay → relay before reaching
+   * the final downstream. When set, inbound `x-relay-hops` is parsed
+   * (absent = 0), rejected 400 past `maxHops` (the loop guard), carried
+   * on the item through retries/dead-letter/replay, and stamped back
+   * out as `x-relay-hops: meshHops + 1` on every outbound wire request.
+   * Mutual trust between hops rides the existing mechanisms: sign with
+   * WR-26 outbound signing on the sending relay, verify with a
+   * registered verifier (WR-01/WR-20/WR-29) on the receiving one. Off by
+   * default — when unset the header is stripped at intake and never
+   * stamped, i.e. zero behavior change.
+   */
+  mesh?: MeshOptions;
+  /**
    * Tenant-level usage metering for usage-based billing (WR-78, see
    * `src/usage.ts`). When set, every accepted webhook records `bytes_in`
    * (and the urgent fast-lane admission) per tenant at intake, and every
@@ -1559,7 +1581,17 @@ export function createDefaultSender(
    * hooks) is created so the check still gates deliveries; the relay
    * server passes its hooked monitor here.
    */
-  ocspMonitor?: OcspMonitor
+  ocspMonitor?: OcspMonitor,
+  /**
+   * WR-107: relay mesh forwarding (see `src/mesh.ts`). When set, the
+   * sender stamps `x-relay-hops: meshHops + 1` on every wire request
+   * built for an item carrying a mesh hop count, and records each stamp
+   * on `metrics` (the server's `MeshMetrics`, rendered into
+   * `GET /metrics`). `undefined` keeps the exact pre-WR-107 wire shape.
+   * Shadow-target sender copies (WR-85) intentionally pass `undefined`:
+   * a shadow mirror is not a mesh traversal.
+   */
+  mesh?: { metrics: MeshMetrics }
 ): PooledSender {
   if (tlsPins !== undefined) {
     for (const [endpoint, pins] of Object.entries(tlsPins)) {
@@ -1933,6 +1965,16 @@ export function createDefaultSender(
     // delivery with this relay's audit trail (overrides a stale inbound
     // value, which is identical anyway after `resolveTraceId`).
     if (item.traceId) headers[TRACE_ID_HEADER] = item.traceId;
+    // WR-107: mesh forwarding — stamp the incremented hop count. The
+    // inbound value was consumed into `item.meshHops` at admission (and
+    // stripped from the passthrough set), so this is always the relay's
+    // own accounting, never a verbatim forward of a peer's header. Only
+    // when the mesh sender option is set; otherwise the wire shape is
+    // untouched.
+    if (mesh !== undefined && item.meshHops !== undefined) {
+      headers[RELAY_HOPS_HEADER] = String(nextRelayHops(item.meshHops));
+      mesh.metrics.recordForwarded(item.targetUrl);
+    }
     // WR-98: W3C trace-context propagation — a forced stamp like
     // `x-trace-id`: a stale inbound `traceparent` in the passthrough set
     // is overridden with a fresh child span id per attempt, and a
@@ -3237,6 +3279,15 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   if (!Number.isInteger(maxBodyBytes) || maxBodyBytes <= 0) {
     throw new RangeError("createRelayServer: `maxBodyBytes` must be a positive integer");
   }
+  // WR-107: relay mesh config + activity-gated metrics. `undefined` =
+  // mesh disabled: the header is stripped at intake and never stamped.
+  // Declared early: the default sender (built below) needs the sender
+  // options in scope.
+  const meshCfg = assertValidMeshOptions(opts.mesh);
+  const meshMetrics = new MeshMetrics();
+  // The default sender stamps mesh hops only when mesh is enabled;
+  // `undefined` keeps the exact pre-WR-107 wire shape.
+  const meshSenderOpts = meshCfg !== undefined ? { metrics: meshMetrics } : undefined;
   // WR-56: split-plane config is validated once at startup, so a bad port
   // or host can never surface as a half-bound relay mid-flight.
   const operatorPlane = opts.operatorPort;
@@ -3409,7 +3460,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   }
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor)
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts)
       : undefined;
   // WR-50: endpoints the operator may pause/resume over HTTP. The server
   // only ever delivers to these — the intake target plus every
@@ -3834,6 +3885,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         ...(item.tenantId !== undefined ? { tenant: item.tenantId } : {}),
         targetUrl: item.targetUrl,
         attempts,
+        // WR-107: the mesh hop count the event arrived with — the audit
+        // trail shows how deep into the mesh the delivery traveled.
+        ...(item.meshHops !== undefined ? { meshHops: item.meshHops } : {}),
         ...(clientCertId !== undefined ? { clientCertId } : {}),
         // WR-54: downstream response summary — statusCode, responseBytes,
         // timeToFirstByteMs, bodyFingerprintSha256. `capturedBody` (the
@@ -3901,6 +3955,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         ...(item.tenantId !== undefined ? { tenant: item.tenantId } : {}),
         targetUrl: item.targetUrl,
         attempts,
+        // WR-107: the mesh hop count the event arrived with.
+        ...(item.meshHops !== undefined ? { meshHops: item.meshHops } : {}),
         ...(clientCertId !== undefined ? { clientCertId } : {}),
         error: lastError instanceof Error ? lastError.message : String(lastError),
         // "non_retryable" = poison payload dead-lettered on the first
@@ -4371,7 +4427,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       // new series. Absent entirely with a custom sender (no pool).
       res
         .writeHead(200, { "content-type": "text/plain; version=0.0.4" })
-        .end(queue.renderMetrics() + versionMetrics.render() + schemaMetrics.render() + (schemaRegistry?.renderMetrics() ?? "") + ipAclMetrics.render() + certExpiryMonitor.render() + tlsVersionMonitor.render() + (ocspMonitor?.render() ?? "") + (usageMeter?.render() ?? "") + (defaultSender?.compressionStats.render() ?? "") + (defaultSender?.dnsCache?.render() ?? "") + (defaultSender?.wsPool.renderMetrics() ?? ""));
+        .end(queue.renderMetrics() + versionMetrics.render() + schemaMetrics.render() + (schemaRegistry?.renderMetrics() ?? "") + ipAclMetrics.render() + certExpiryMonitor.render() + tlsVersionMonitor.render() + (ocspMonitor?.render() ?? "") + (usageMeter?.render() ?? "") + (defaultSender?.compressionStats.render() ?? "") + (defaultSender?.dnsCache?.render() ?? "") + (defaultSender?.wsPool.renderMetrics() ?? "") + meshMetrics.render());
       return;
     }
     if (isEvents) {
@@ -5291,6 +5347,33 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       verified = activeVerifier.verify(body, signatureHeader ?? "");
     }
 
+    // WR-107: mesh peer authentication — a relay forwarding over the mesh
+    // proves itself with `x-relay-signature` (WR-26 outbound signing on the
+    // sending relay) instead of the producer `x-signature`. Verified with
+    // the same active verifier, so the mesh runs on a shared relay
+    // secret: anything accepted here would verify identically as
+    // `x-signature` — the fallback grants no new capability, it only
+    // names the trust domain in the audit trail. Gated on mesh being
+    // enabled; disabled = zero behavior change.
+    let meshPeerAuth = false;
+    if (!verified && meshCfg !== undefined) {
+      const relaySigRaw = headers["x-relay-signature"];
+      const relaySig = Array.isArray(relaySigRaw) ? relaySigRaw[0] : relaySigRaw;
+      if (typeof relaySig === "string" && relaySig !== "") {
+        if (rotatingVerifier) {
+          const relayKeyIdRaw = headers["x-relay-key-id"];
+          const detail = activeVerifier.verifyDetailed(body, relaySig, {
+            keyId: Array.isArray(relayKeyIdRaw) ? relayKeyIdRaw[0] : relayKeyIdRaw,
+          });
+          verified = detail.ok;
+          if (verified) verifiedKeyId = detail.keyId;
+        } else {
+          verified = activeVerifier.verify(body, relaySig);
+        }
+        meshPeerAuth = verified;
+      }
+    }
+
     if (!verified) {
       const rejectedEvent: Record<string, unknown> = { ...correlation,
         event: "rejected",
@@ -5496,6 +5579,47 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       routeRuleId = decision.ruleId ?? "default";
     }
 
+    // WR-107: relay mesh hop accounting. Placement is deliberate: after
+    // signature verification and tenant validation (an unauthenticated
+    // caller learns nothing about the mesh), and after content routing
+    // so `targetUrl` is known for the audit event and the metric label.
+    // A malformed header is fail-closed 400 (`mesh_hops_invalid`); an
+    // event that already traversed `maxHops` relays is rejected 400
+    // (`mesh_hop_limit_exceeded`) — the loop guard against a
+    // misconfigured A → B → A cycle. Otherwise the hop count rides the
+    // item and is stamped back out incremented on the wire.
+    let meshHops: number | undefined;
+    if (meshCfg !== undefined) {
+      const hopsRaw = headers[RELAY_HOPS_HEADER];
+      try {
+        meshHops = parseRelayHops(Array.isArray(hopsRaw) ? hopsRaw[0] : hopsRaw);
+      } catch {
+        opts.auditLog.append({ ...correlation,
+          event: "rejected",
+          id,
+          traceId,
+          ...tenantLabel,
+          targetUrl,
+          reason: "mesh_hops_invalid",
+        });
+        return { status: 400, id, traceId, reason: "mesh_hops_invalid", detail: "Invalid x-relay-hops" };
+      }
+      if (meshHops >= meshCfg.maxHops) {
+        meshMetrics.recordHopLimitRejected(targetUrl);
+        opts.auditLog.append({ ...correlation,
+          event: "rejected",
+          id,
+          traceId,
+          ...tenantLabel,
+          targetUrl,
+          reason: "mesh_hop_limit_exceeded",
+          meshHops,
+          maxHops: meshCfg.maxHops,
+        });
+        return { status: 400, id, traceId, reason: "mesh_hop_limit_exceeded", detail: "Mesh hop limit exceeded" };
+      }
+    }
+
     if (opts.replay) {
       const nonceHeader = headers["x-nonce"];
       const nonce = Array.isArray(nonceHeader) ? nonceHeader[0] : nonceHeader;
@@ -5550,6 +5674,12 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       // downstream never asked for the caller's tenancy claim.
       if (k === "x-relay-signature" || k === "x-relay-key-id" || k === IDEMPOTENCY_KEY_HEADER) continue;
       if (k === TENANT_ID_HEADER) continue;
+      // WR-107: `x-relay-hops` is relay-internal mesh accounting, like
+      // `x-tenant-id` above. The inbound value is consumed into
+      // `item.meshHops` at admission; the sender stamps a fresh
+      // incremented value below, so a stale/forged header never travels
+      // downstream verbatim. Stripped even when mesh is disabled.
+      if (k === RELAY_HOPS_HEADER) continue;
       // WR-65: `x-api-key` is the caller's inbound credential — it
       // authenticates the intake, it is not part of the event, and it
       // must never travel downstream to the forward target.
@@ -5666,6 +5796,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         targetUrl,
         headers: passthrough,
         ...(priority ? { priority } : {}),
+        // WR-107: the mesh hop count rides the cron template so every
+        // per-cycle minted delivery re-enters the mesh at the same count.
+        ...(meshHops !== undefined ? { meshHops } : {}),
       }, cronSource);
       nextAt = queue.nextScheduleFire(scheduleId);
     } else if (queue.hasQuorumConfig(targetUrl)) {
@@ -5681,6 +5814,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         // WR-98: the caller-propagated W3C trace context rides the item
         // so every delivery attempt propagates it downstream.
         ...(inboundTrace !== undefined ? { traceContext: inboundTrace } : {}),
+        // WR-107: the mesh hop count rides every fan-out member.
+        ...(meshHops !== undefined ? { meshHops } : {}),
         payload: body,
         targetUrl,
         headers: passthrough,
@@ -5697,6 +5832,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         // WR-98: the caller-propagated W3C trace context rides the item
         // so every delivery attempt propagates it downstream.
         ...(inboundTrace !== undefined ? { traceContext: inboundTrace } : {}),
+        // WR-107: the mesh hop count rides the queued item.
+        ...(meshHops !== undefined ? { meshHops } : {}),
         payload: body,
         targetUrl,
         headers: passthrough,
@@ -5736,6 +5873,13 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       traceId,
       ...tenantLabel,
       targetUrl,
+      // WR-107: the mesh hop count at admission (absent when mesh is
+      // disabled) — the audit trail shows how deep into the mesh the
+      // event arrived.
+      ...(meshHops !== undefined ? { meshHops } : {}),
+      // WR-107: the event arrived over an authenticated mesh peer leg
+      // (`x-relay-signature` verified) rather than a producer signature.
+      ...(meshPeerAuth ? { meshPeer: true } : {}),
     };
     // WR-67: every webhook that verified with the previous secret is
     // audited on its own event, so the operator sees how much rotation
