@@ -38,6 +38,14 @@
  * header is fail-closed (400 `mesh_hops_invalid`), and when mesh is
  * disabled (the default) the header is stripped at intake and never
  * stamped — zero behavior change for non-mesh relays.
+ *
+ * WR-112 upgrades the link to mutual TLS (opt-in, `mesh.mtls`): inbound,
+ * a request that claims to be a mesh peer (presents `x-relay-signature`)
+ * must additionally present a client certificate verified through the
+ * inbound-mtls chain (WR-103: CA + fingerprint whitelist, certificate
+ * required on the mesh path); outbound, a mesh hop is only sent over
+ * `https:` and only with a client identity configured (WR-36
+ * `tlsClientCerts`). Either side missing → the hop is refused.
  */
 
 export const RELAY_HOPS_HEADER = "x-relay-hops";
@@ -53,10 +61,43 @@ export interface MeshOptions {
    * integer >= 1. Default: 8.
    */
   maxHops?: number;
+  /**
+   * WR-112: mutual TLS on the mesh link (opt-in; absent = disabled).
+   * Presence enables it — there is nothing else to tune here, because
+   * both halves reuse existing trust material:
+   *
+   * - inbound: a request claiming to be a mesh peer (it presents
+   *   `x-relay-signature`) must present a client certificate verified
+   *   through the `inboundMtls` chain (WR-103) — the CA chain plus the
+   *   fingerprint whitelist, with the certificate required on the mesh
+   *   path. (When the global `inboundMtls.requireCert` is already true
+   *   the mesh gate is redundant and skipped.)
+   * - outbound: a mesh hop is only forwarded over `https:` and only
+   *   with a client identity configured for the peer endpoint (WR-36
+   *   `tlsClientCerts`, exact targetUrl match). A mesh hop to a peer
+   *   without one is refused locally instead of being sent
+   *   unauthenticated.
+   *
+   * Enabling it requires `inboundMtls` with TLS terminated on the intake
+   * listener — a client certificate cannot be verified without a TLS
+   * handshake — so the server throws `RangeError` at startup otherwise
+   * (fail-fast, never a silent no-op).
+   */
+  mtls?: MeshMtlsOptions;
 }
+
+/**
+ * WR-112: marker for mesh-link mutual TLS. Empty by design — trust
+ * material lives where it already lives (`inboundMtls` for the
+ * inbound chain, `tlsClientCerts` for outbound identities), so there is
+ * nothing new to configure and nothing that can disagree.
+ */
+export interface MeshMtlsOptions {}
 
 export interface ResolvedMeshConfig {
   maxHops: number;
+  /** Present only when `mesh.mtls` was configured. */
+  mtls?: boolean;
 }
 
 /**
@@ -71,7 +112,14 @@ export function assertValidMeshOptions(opts?: MeshOptions): ResolvedMeshConfig |
   if (!Number.isInteger(maxHops) || maxHops < 1) {
     throw new RangeError(`mesh.maxHops must be an integer >= 1, got ${opts.maxHops}`);
   }
-  return { maxHops };
+  if (opts.mtls !== undefined) {
+    // A marker object: presence enables. Anything else is a typo that
+    // must not silently disable mutual TLS.
+    if (typeof opts.mtls !== "object" || opts.mtls === null || Array.isArray(opts.mtls)) {
+      throw new RangeError(`mesh.mtls must be an object, got ${JSON.stringify(opts.mtls)}`);
+    }
+  }
+  return { maxHops, ...(opts.mtls !== undefined ? { mtls: true as const } : {}) };
 }
 
 /**
@@ -110,6 +158,7 @@ function escapeLabelValue(value: string): string {
 export class MeshMetrics {
   private readonly forwarded = new Map<string, number>();
   private readonly hopLimitRejections = new Map<string, number>();
+  private readonly mtlsRejections = new Map<string, number>();
 
   /** One outbound delivery stamped with an incremented `x-relay-hops`. */
   recordForwarded(endpoint: string): void {
@@ -119,6 +168,15 @@ export class MeshMetrics {
   /** One inbound event rejected for exceeding `maxHops`. */
   recordHopLimitRejected(endpoint: string): void {
     this.hopLimitRejections.set(endpoint, (this.hopLimitRejections.get(endpoint) ?? 0) + 1);
+  }
+
+  /**
+   * WR-112: one inbound mesh-peer claim rejected for a missing/invalid
+   * client certificate. Labeled by request path — the rejection happens
+   * at intake, before the target URL is resolved.
+   */
+  recordMtlsRejected(path: string): void {
+    this.mtlsRejections.set(path, (this.mtlsRejections.get(path) ?? 0) + 1);
   }
 
   render(): string {
@@ -141,6 +199,15 @@ export class MeshMetrics {
         lines.push(
           `relay_mesh_hop_limit_rejections_total{endpoint="${escapeLabelValue(endpoint)}"} ${n}`
         );
+      }
+    }
+    if (this.mtlsRejections.size > 0) {
+      lines.push(
+        "# HELP relay_mesh_mtls_rejects_total Inbound mesh-peer claims rejected for a missing or invalid TLS client certificate (mesh.mtls)."
+      );
+      lines.push("# TYPE relay_mesh_mtls_rejects_total counter");
+      for (const [path, n] of this.mtlsRejections) {
+        lines.push(`relay_mesh_mtls_rejects_total{path="${escapeLabelValue(path)}"} ${n}`);
       }
     }
     return lines.length === 0 ? "" : lines.join("\n") + "\n";

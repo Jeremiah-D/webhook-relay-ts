@@ -1134,9 +1134,13 @@ export interface RelayServerOptions {
    * out as `x-relay-hops: meshHops + 1` on every outbound wire request.
    * Mutual trust between hops rides the existing mechanisms: sign with
    * WR-26 outbound signing on the sending relay, verify with a
-   * registered verifier (WR-01/WR-20/WR-29) on the receiving one. Off by
-   * default — when unset the header is stripped at intake and never
-   * stamped, i.e. zero behavior change.
+   * registered verifier (WR-01/WR-20/WR-29) on the receiving one — or
+   * upgrade the link to mutual TLS with `mesh.mtls` (WR-112: inbound
+   * mesh-peer claims must present a client certificate verified through
+   * the `inboundMtls` chain; outbound mesh hops only go over `https:`
+   * with a WR-36 `tlsClientCerts` identity for the peer endpoint).
+   * Off by default — when unset the header is stripped at intake and
+   * never stamped, i.e. zero behavior change.
    */
   mesh?: MeshOptions;
   /**
@@ -1621,8 +1625,12 @@ export function createDefaultSender(
    * `GET /metrics`). `undefined` keeps the exact pre-WR-107 wire shape.
    * Shadow-target sender copies (WR-85) intentionally pass `undefined`:
    * a shadow mirror is not a mesh traversal.
+   * WR-112: `mtls: true` additionally refuses to forward a mesh hop
+   * without mutual TLS — the peer endpoint must be `https:` with a
+   * WR-36 client identity configured; anything else fails the delivery
+   * locally instead of sending an unauthenticated hop.
    */
-  mesh?: { metrics: MeshMetrics }
+  mesh?: { metrics: MeshMetrics; mtls?: boolean }
 ): PooledSender {
   if (tlsPins !== undefined) {
     for (const [endpoint, pins] of Object.entries(tlsPins)) {
@@ -2919,6 +2927,27 @@ export function createDefaultSender(
     // construction, so at most one of the two is ever set here.
     const clientCertRotation =
       url.protocol === "https:" ? tlsClientCertRotation?.get(item.targetUrl) : undefined;
+    // WR-112: mesh-link mTLS (opt-in) outbound pre-flight. A mesh hop is
+    // an authenticated relay-to-relay link: when enabled it is only
+    // forwarded over `https:` and only with a client identity configured
+    // for the peer endpoint (WR-36 `tlsClientCerts`, exact targetUrl
+    // match — a rotation set counts too). Refusing locally, instead of
+    // sending a hop the peer would 401, keeps the misconfiguration loud:
+    // the rejection flows through the normal delivery failure path
+    // (retry budget, then dead-letter with this message as `lastError`),
+    // never a silent unauthenticated send.
+    if (
+      mesh?.mtls === true &&
+      item.meshHops !== undefined &&
+      (url.protocol !== "https:" || (clientCert === undefined && clientCertRotation === undefined))
+    ) {
+      return Promise.reject(
+        new Error(
+          `mesh.mtls: refusing unauthenticated mesh forward to ${item.targetUrl} — ` +
+            `mesh peers need https: with a TLS client certificate (tlsClientCerts)`
+        )
+      );
+    }
     // WR-60: per-endpoint TLS SNI/ALPN override (exact targetUrl match).
     // `undefined` for endpoints without an entry — and for non-`https:`
     // targets — keeps the exact current behavior.
@@ -3319,8 +3348,11 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   const meshCfg = assertValidMeshOptions(opts.mesh);
   const meshMetrics = new MeshMetrics();
   // The default sender stamps mesh hops only when mesh is enabled;
-  // `undefined` keeps the exact pre-WR-107 wire shape.
-  const meshSenderOpts = meshCfg !== undefined ? { metrics: meshMetrics } : undefined;
+  // `undefined` keeps the exact pre-WR-107 wire shape. WR-112: the
+  // sender also learns whether mesh-link mTLS is on, so it can refuse
+  // to forward a hop without mutual TLS.
+  const meshSenderOpts =
+    meshCfg !== undefined ? { metrics: meshMetrics, mtls: meshCfg.mtls === true } : undefined;
   // WR-56: split-plane config is validated once at startup, so a bad port
   // or host can never surface as a half-bound relay mid-flight.
   const operatorPlane = opts.operatorPort;
@@ -3352,6 +3384,37 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       throw new RangeError(`createRelayServer: invalid inboundMtls config: ${(err as Error).message}`);
     }
   }
+  // WR-112: mesh-link mTLS (opt-in) startup contract. A client
+  // certificate can only be verified inside a TLS handshake, so
+  // `mesh.mtls` requires `inboundMtls` with the intake listener
+  // terminating TLS (`requireCert`, or `operatorMtls` on the legacy
+  // single plane) — otherwise enabling it would silently verify
+  // nothing, which is worse than refusing to start. Plain HTTP intake
+  // + `mesh.mtls` is therefore a `RangeError`, never a quiet no-op.
+  if (meshCfg?.mtls === true) {
+    if (inboundMtls === undefined) {
+      throw new RangeError(
+        "createRelayServer: mesh.mtls requires inboundMtls — mesh peer certificates can only be verified when the intake listener terminates TLS"
+      );
+    }
+    const intakeTerminatesTls =
+      inboundMtls.requireCert || (operatorPlane === undefined && inboundMtls.operatorMtls);
+    if (!intakeTerminatesTls) {
+      throw new RangeError(
+        "createRelayServer: mesh.mtls requires the intake listener to terminate TLS " +
+          "(inboundMtls.requireCert, or inboundMtls.operatorMtls on the single-plane listener)"
+      );
+    }
+  }
+  // WR-112: the inbound-mtls chain the mesh gate reuses, with the
+  // certificate forced required on the mesh path. `undefined` when mesh
+  // mTLS is off — or when the global gate already requires a
+  // certificate everywhere (`requireCert`), which makes the mesh gate
+  // redundant: every request already carries a verified identity.
+  const meshMtlsInbound: ResolvedInboundMtlsConfig | undefined =
+    meshCfg?.mtls === true && inboundMtls !== undefined && !inboundMtls.requireCert
+      ? { ...inboundMtls, requireCert: true }
+      : undefined;
   // WR-84: content-based routing rule engine — validated once at startup
   // (`RangeError` fail-fast on bad rules or a bad default), held by the
   // server closure, hot-swappable atomically via `POST /routing/rules`.
@@ -6041,10 +6104,16 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     if (gates === undefined) return;
     // WR-103: the verified client identity rides every `accepted` /
     // `rejected` audit event through the admission correlation spread.
+    // WR-112: a mesh-mTLS-verified peer identity rides along the same
+    // way when the global gate left the request anonymous (the listener
+    // passes gate.identity ?? meshGate.identity).
     const mtlsCorrelation =
       mtlsIdentity === undefined
         ? {}
-        : { clientCertFingerprint: mtlsIdentity.fingerprint, clientCertSubject: mtlsIdentity.subject };
+        : {
+            clientCertFingerprint: mtlsIdentity.fingerprint,
+            clientCertSubject: mtlsIdentity.subject,
+          };
     const outcome = await admitOneEvent(id, traceId, gates.body, req.headers, pathname, mtlsCorrelation, gates.apiKey, inboundTrace, gates.maxBodyBytes);
     const tenantLabel = outcome.tenantId === undefined ? {} : { tenant: outcome.tenantId };
     if (outcome.status === 202) {
@@ -6428,6 +6497,68 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     return { proceed: false };
   };
 
+  /**
+   * WR-112: mesh-link mTLS (opt-in) inbound gate.
+   *
+   * A request that presents `x-relay-signature` claims to be a mesh
+   * peer; when `mesh.mtls` is enabled that claim is only honored with a
+   * client certificate verified through the inbound-mtls chain
+   * (`decideInboundMtls` against the CA + fingerprint whitelist, with
+   * the certificate required on the mesh path — `meshMtlsInbound`).
+   * Plain producers (`x-signature`, no relay signature) never enter this
+   * gate: mesh mTLS authenticates the relay-to-relay link, not webhook
+   * ingest.
+   *
+   * Like the WR-103 gate this enforces at request time (the listener
+   * runs `rejectUnauthorized: false`), so a rejection is a proper 401
+   * with a machine-readable reason instead of a bare TLS alert. Denials
+   * are audited as `rejected` with reason `mesh_mtls_reject` and counted
+   * on `relay_mesh_mtls_rejects_total{path}`; the connection is closed,
+   * since the caller must re-handshake with a different certificate.
+   *
+   * Returns the verified peer identity for the audit trail when the
+   * request may proceed.
+   */
+  const enforceMeshMtls = (
+    req: Parameters<Parameters<typeof createServer>[0]>[0],
+    res: Parameters<Parameters<typeof createServer>[0]>[1],
+    pathname: string
+  ): { proceed: true; identity?: InboundMtlsIdentity } | { proceed: false } => {
+    if (meshMtlsInbound === undefined) return { proceed: true };
+    const rawSig = req.headers["x-relay-signature"];
+    const firstSig = Array.isArray(rawSig) ? rawSig[0] : rawSig;
+    if (typeof firstSig !== "string" || firstSig === "") return { proceed: true };
+    const peer = extractPeerCertInfo(req.socket as TLSSocket);
+    const decision = decideInboundMtls(meshMtlsInbound, peer, false);
+    if (decision.allowed) {
+      return decision.identity === undefined
+        ? { proceed: true }
+        : { proceed: true, identity: decision.identity };
+    }
+    const id = randomUUID();
+    const traceId = resolveTraceId(req.headers[TRACE_ID_HEADER]);
+    meshMetrics.recordMtlsRejected(pathname);
+    opts.auditLog.append({
+      event: "rejected",
+      id,
+      traceId,
+      reason: "mesh_mtls_reject",
+      path: pathname,
+      ...(decision.fingerprint !== undefined
+        ? { clientCertFingerprint: decision.fingerprint, clientCertSubject: decision.subject ?? "" }
+        : {}),
+    });
+    res
+      .writeHead(401, { "content-type": "application/json", connection: "close" })
+      .end(
+        JSON.stringify({
+          error: "mesh peer client certificate required",
+          reason: "mesh_mtls_reject",
+        })
+      );
+    return { proceed: false };
+  };
+
   // WR-103: which listeners terminate TLS. The mTLS gate above is
   // enforced at request time, so a listener only needs TLS when some
   // route it serves can require a client certificate:
@@ -6477,9 +6608,15 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         await guardOperator(req, res, pathname);
         return;
       }
+      // WR-112: mesh-link mTLS runs before the WR-103 gate — a request
+      // claiming to be a mesh peer (x-relay-signature) is judged by the
+      // mesh gate alone (missing/invalid cert → 401 mesh_mtls_reject);
+      // anything without the claim falls through untouched.
+      const meshGate = enforceMeshMtls(req, res, pathname);
+      if (!meshGate.proceed) return;
       const gate = enforceInboundMtls(req, res, pathname, false);
       if (!gate.proceed) return;
-      await handleInbound(req, res, pathname, gate.identity);
+      await handleInbound(req, res, pathname, gate.identity ?? meshGate.identity);
     }, intakeListenerTls);
   } else {
     // Split plane (WR-56): operator paths hit on the intake listener are
@@ -6492,9 +6629,13 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         crossPlaneNotFound(res);
         return;
       }
+      // WR-112: mesh-link mTLS before the WR-103 gate (same rationale as
+      // the single-plane listener above).
+      const meshGate = enforceMeshMtls(req, res, pathname);
+      if (!meshGate.proceed) return;
       const gate = enforceInboundMtls(req, res, pathname, false);
       if (!gate.proceed) return;
-      await handleInbound(req, res, pathname, gate.identity);
+      await handleInbound(req, res, pathname, gate.identity ?? meshGate.identity);
     }, intakeListenerTls);
     operatorServer = createListener(async (req, res) => {
       const pathname = new URL(req.url ?? "/", "http://internal").pathname;

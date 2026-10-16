@@ -1749,6 +1749,25 @@ const relayB = createRelayServer({
   `GET /metrics` (activity-gated: absent until the first forward or
   rejection). `x-trace-id` threads the whole mesh untouched (WR-18), so
   one trace correlates every hop.
+- **Mutual TLS on the mesh link (opt-in, WR-112)** — `mesh: { mtls: {} }`
+  upgrades the cooperative `x-relay-signature` trust to real mutual TLS.
+  Inbound: a request presenting `x-relay-signature` (i.e. claiming to be a
+  mesh peer) must also present a client certificate verified through the
+  `inboundMtls` chain (WR-103: CA chain + fingerprint whitelist, required
+  on the mesh path) — a missing/invalid certificate is answered 401,
+  audited as `rejected` with reason `mesh_mtls_reject`, and counted on
+  `relay_mesh_mtls_rejects_total{path}`; the verified peer identity rides
+  the `accepted` audit as `clientCertFingerprint`. Plain producers (no
+  `x-relay-signature`) are untouched. Outbound: a mesh hop is only
+  forwarded over `https:` and only with a client identity configured for
+  the peer endpoint (WR-36 `tlsClientCerts`) — anything else is refused
+  locally and fails the delivery through the normal retry/dead-letter
+  path instead of sending an unauthenticated hop. Enabling it requires
+  `inboundMtls` with TLS terminated on the intake listener
+  (`requireCert`, or `operatorMtls` on the single-plane listener);
+  otherwise the server throws `RangeError` at startup — a client
+  certificate cannot be verified without a TLS handshake, so this is a
+  fail-fast, never a silent no-op. Off by default: zero behavior change.
 - **Disabled = zero behavior change** — without `mesh`, the header is
   stripped at intake and never stamped. Invalid `maxHops` throws
   `RangeError` at startup. Shadow-target mirrors (WR-85) never stamp hops:
