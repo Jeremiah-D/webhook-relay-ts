@@ -186,8 +186,19 @@ import {
 import type { KeyObject } from "node:crypto";
 import type { AuditLog } from "./audit.ts";
 import { DeliveryEventArchiver } from "./event-archive.ts";
+import { resolveOrderedConfig } from "./ordered.ts";
 import { buildDeliverySnapshot } from "./delivery-status.ts";
 import type { EndpointConfigPatch } from "./hotreload.ts";
+import {
+  EndpointRegistry,
+  deliverPolicyPatch,
+  diffEndpointConfigs,
+  hasDeliverPolicy,
+  summarizeEndpointConfig,
+  waitForEndpointDrain,
+  type EndpointConfig,
+  type EndpointRecord,
+} from "./endpoints.ts";
 import {
   exportConfig,
   applyConfig,
@@ -951,6 +962,27 @@ export interface RelayServerOptions {
    */
   outboundSigning?: OutboundSigningConfig;
   /**
+   * Dynamic endpoint registry (WR-114, see `src/endpoints.ts`): static
+   * endpoint records applied at startup — `{ targetUrl, verifier?,
+   * circuitBreaker?, quota?, maxConcurrentPerEndpoint?, proxy?,
+   * tlsPins?, ordered? }`. Every record is fully validated before any
+   * is applied (an illegal value throws `RangeError` at startup with
+   * zero partial application). The registry stays live after startup:
+   * the operator API (`POST /endpoints`, `PUT /endpoints/{id}`,
+   * `GET /endpoints`, `DELETE /endpoints/{id}`) manages it at runtime
+   * with WR-32 hot-reload semantics. Unset (default) keeps the exact
+   * pre-WR-114 behavior — the registry resolves nothing and every
+   * endpoint falls back to the static per-endpoint options above.
+   */
+  endpoints?: EndpointConfig[];
+  /**
+   * WR-114: how long `DELETE /endpoints/{id}` waits for in-flight
+   * deliveries to drain before answering 409 (use `?force=true` to skip
+   * the drain). Default: 30_000 ms. Must be a finite number > 0.
+   * Invalid values throw `RangeError` at startup.
+   */
+  endpointDrainTimeoutMs?: number;
+  /**
    * Per-endpoint outbound end-to-end encryption (WR-58, see
    * `OutboundEncryptionConfig` and `src/e2ee.ts`): `{ "<exact targetUrl>":
    * { publicKey } }`, where `publicKey` is the downstream's base64 X25519
@@ -1638,7 +1670,18 @@ export function createDefaultSender(
    * WR-36 client identity configured; anything else fails the delivery
    * locally instead of sending an unauthenticated hop.
    */
-  mesh?: { metrics: MeshMetrics; mtls?: boolean }
+  mesh?: { metrics: MeshMetrics; mtls?: boolean },
+  /**
+   * WR-114: dynamic endpoint registry. When set, each delivery attempt
+   * resolves its sender-side config (`verifier` signing override,
+   * `proxy`, `tlsPins`) from the registry first, falling back to the
+   * static per-endpoint options above. Resolution happens once per
+   * attempt, before the wire request is built — a registry change
+   * mid-flight never touches an attempt already on the wire (the WR-32
+   * in-flight-preservation rule). `undefined` keeps the exact
+   * pre-WR-114 resolution.
+   */
+  endpointRegistry?: EndpointRegistry
 ): PooledSender {
   if (tlsPins !== undefined) {
     for (const [endpoint, pins] of Object.entries(tlsPins)) {
@@ -2087,11 +2130,15 @@ export function createDefaultSender(
       body = sealOutboundPayload(wireBody, e2eeKey, contentEncoding);
       headers[E2EE_HEADER] = E2EE_ALGORITHM;
     }
-    if (outboundSigning !== undefined) {
+    // WR-114: a registry `verifier` record replaces the global
+    // `outboundSigning` for this endpoint. Resolved per attempt, like
+    // pins and proxy above.
+    const signing = endpointRegistry?.getSigning(item.targetUrl) ?? outboundSigning;
+    if (signing !== undefined) {
       // Stamp AFTER the passthrough headers: this guarantees the relay's
       // own signature always wins.
-      headers["x-relay-signature"] = signSha256(body, outboundSigning.secret);
-      if (outboundSigning.keyId !== undefined) headers["x-relay-key-id"] = outboundSigning.keyId;
+      headers["x-relay-signature"] = signSha256(body, signing.secret);
+      if (signing.keyId !== undefined) headers["x-relay-key-id"] = signing.keyId;
     }
     if (idempotencyKeyCfg !== undefined) {
       // WR-44: derive from (event id, 1-based attempt). The queue stamps
@@ -2924,7 +2971,12 @@ export function createDefaultSender(
     // rule covers `wss:` targets — the WebSocket pool verifies the SPKI
     // fingerprint before the upgrade handshake is written.
     const pins =
-      url.protocol === "https:" || url.protocol === "wss:" ? tlsPins?.[item.targetUrl] : undefined;
+      url.protocol === "https:" || url.protocol === "wss:"
+        ? // WR-114: the registry's per-endpoint pins win over the static
+          // `tlsPins` record; an endpoint without a registry entry (or
+          // without pins in its record) falls back to the static config.
+          (endpointRegistry?.getTlsPins(item.targetUrl) ?? tlsPins?.[item.targetUrl])
+        : undefined;
     // mTLS client identity for this endpoint (exact targetUrl match):
     // the certificate is presented during the TLS handshake so the
     // downstream can verify the relay. Off by default — endpoints without
@@ -2980,14 +3032,21 @@ export function createDefaultSender(
       ocspForEndpoint !== undefined && ocspMonitor !== undefined
         ? { cfg: ocspForEndpoint, monitor: ocspMonitor }
         : undefined;
-    // Outbound proxy for this endpoint: explicit per-endpoint config
-    // first, then the environment (read per delivery, so proxy rotation
-    // needs no restart; `NO_PROXY` bypasses the env fallback only — an
-    // explicit entry always wins). An invalid *environment* value throws
-    // here and fails the delivery through the normal retry path; explicit
-    // values were validated at startup.
-    const proxyUrl = resolveProxyUrl(item.targetUrl, proxies);
-    if (proxyUrl === undefined && proxies?.[item.targetUrl] !== undefined) {
+    // Outbound proxy for this endpoint: the WR-114 registry override
+    // first, then explicit per-endpoint config, then the environment
+    // (read per delivery, so proxy rotation needs no restart;
+    // `NO_PROXY` bypasses the env fallback only — an explicit entry
+    // always wins). An invalid *environment* value throws here and
+    // fails the delivery through the normal retry path; explicit values
+    // were validated at startup (static) or at registry-write time.
+    const registryProxy = endpointRegistry?.getProxy(item.targetUrl);
+    const proxyUrl = registryProxy ?? resolveProxyUrl(item.targetUrl, proxies);
+    if (proxyUrl === undefined && registryProxy === undefined && proxies?.[item.targetUrl] !== undefined) {
+      return Promise.reject(
+        new Error(`outbound proxy: proxy configured for non-HTTP(S) target ${item.targetUrl}`)
+      );
+    }
+    if (registryProxy !== undefined && url.protocol !== "http:" && url.protocol !== "https:") {
       return Promise.reject(
         new Error(`outbound proxy: proxy configured for non-HTTP(S) target ${item.targetUrl}`)
       );
@@ -3256,8 +3315,8 @@ function isOperatorPath(pathname: string): boolean {
     pathname === "/config/endpoint" ||
     pathname === "/config/snapshot" ||
     pathname === "/routing/rules" ||
-    pathname === "/endpoints/pause" ||
-    pathname === "/endpoints/resume" ||
+    pathname === "/endpoints" ||
+    pathname.startsWith("/endpoints/") ||
     pathname === "/scheduled" ||
     pathname.startsWith("/scheduled/") ||
     pathname.startsWith("/deliveries/")
@@ -3562,9 +3621,64 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       throw new RangeError(`createRelayServer: invalid dnsCache: ${(err as Error).message}`);
     }
   }
+  // WR-114: the dynamic endpoint registry. Always constructed — empty
+  // when `opts.endpoints` is unset — so the sender's per-attempt
+  // resolution has a stable lookup target and an unused registry is
+  // exactly the pre-WR-114 behavior (every lookup misses). The
+  // constructor validates every record before inserting any of them:
+  // an illegal value throws `RangeError` here, at startup.
+  let endpointRegistry: EndpointRegistry;
+  try {
+    endpointRegistry = new EndpointRegistry(opts.endpoints ?? []);
+  } catch (err) {
+    throw new RangeError(
+      `createRelayServer: invalid \`endpoints\`: ${(err as Error).message}`
+    );
+  }
+  if (
+    opts.endpointDrainTimeoutMs !== undefined &&
+    !(typeof opts.endpointDrainTimeoutMs === "number" &&
+      Number.isFinite(opts.endpointDrainTimeoutMs) &&
+      opts.endpointDrainTimeoutMs > 0)
+  ) {
+    throw new RangeError(
+      "createRelayServer: `endpointDrainTimeoutMs` must be a finite number > 0"
+    );
+  }
+  // WR-114: registry `ordered` records fold into the queue's ordered
+  // config before the queue is built (the queue constructs its
+  // ordered-delivery tracker once, at construction — there is no safe
+  // runtime enable). A static `ordered` config (server-level or nested)
+  // that is already enabled conflicts with registry `ordered` records:
+  // fail fast, never let the two disagree about who owns the line.
+  let registryOrdered: Record<string, boolean | { enabled: boolean; maxHeadOfLineHoldMs?: number }> | undefined;
+  for (const record of endpointRegistry.list()) {
+    if (record.ordered !== undefined) {
+      registryOrdered = registryOrdered ?? {};
+      registryOrdered[record.targetUrl] = record.ordered.enabled
+        ? { enabled: true, ...(record.ordered.maxHeadOfLineHoldMs !== undefined ? { maxHeadOfLineHoldMs: record.ordered.maxHeadOfLineHoldMs } : {}) }
+        : false;
+    }
+  }
+  if (registryOrdered !== undefined) {
+    let staticOrderedEnabled = false;
+    try {
+      staticOrderedEnabled =
+        resolveOrderedConfig(opts.ordered ?? opts.retry?.ordered) !== undefined;
+    } catch {
+      // Invalid static config: leave it for the queue constructor's own
+      // validation to report — the conflict check must not mask it.
+      staticOrderedEnabled = false;
+    }
+    if (staticOrderedEnabled) {
+      throw new RangeError(
+        "createRelayServer: `ordered` is configured both statically and via `endpoints` registry records — use one"
+      );
+    }
+  }
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts)
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry)
       : undefined;
   // WR-50: endpoints the operator may pause/resume over HTTP. The server
   // only ever delivers to these — the intake target plus every
@@ -3776,11 +3890,14 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // `reject-429` mode).
     tenantRateLimit: opts.tenantRateLimit ?? opts.retry?.tenantRateLimit,
     // WR-113: an explicit server-level `ordered` wins over the nested
-    // `retry.ordered`; either way the queue owns the line state. Wrap
-    // the caller's hook so every urgent bypass and every poison-parked
-    // head is audited as `ordered_bypassed` / `head_of_line_parked`,
-    // not just observed.
-    ordered: opts.ordered ?? opts.retry?.ordered,
+    // `retry.ordered`; either way the queue owns the line state. WR-114:
+    // registry `ordered` records supply the whole ordered config when
+    // no static ordered config is enabled (a conflict is a startup
+    // error, checked above).
+    ordered: registryOrdered ?? opts.ordered ?? opts.retry?.ordered,
+    // Wrap the caller's hook so every urgent bypass and every
+    // poison-parked head is audited as `ordered_bypassed` /
+    // `head_of_line_parked`, not just observed.
     onOrderedAudit: (event: OrderedAuditEvent) => {
       opts.auditLog.append({
         event: event.kind,
@@ -4183,6 +4300,38 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     },
   });
   queue.start();
+  // WR-114: apply the registry's deliver-policy fields into the queue.
+  // Structural validation already ran in the registry constructor; the
+  // remaining failure mode is a disabled subsystem (e.g. breaker
+  // thresholds with no breaker configured). Apply endpoint by endpoint
+  // and roll back the ones already applied on the first failure — a
+  // startup error must leave zero partial application behind.
+  // (`applied` is hoisted: a `const` declared inside `try` is invisible
+  // in `catch` on this Node/V8 — see AGENTS.md.)
+  const appliedRegistryEndpoints: EndpointRecord[] = [];
+  try {
+    for (const record of endpointRegistry.list()) {
+      if (hasDeliverPolicy(record)) {
+        queue.updateEndpointConfig(record.targetUrl, deliverPolicyPatch(record));
+        appliedRegistryEndpoints.push(record);
+      }
+    }
+  } catch (err) {
+    for (const record of appliedRegistryEndpoints) {
+      if (record.maxConcurrentPerEndpoint !== undefined) {
+        queue.clearEndpointConfigOverride(undefined, record.targetUrl, "maxConcurrentPerEndpoint");
+      }
+      if (record.circuitBreaker !== undefined) {
+        queue.clearEndpointConfigOverride(undefined, record.targetUrl, "circuitBreaker");
+      }
+      if (record.quota !== undefined) {
+        queue.clearEndpointConfigOverride(undefined, record.targetUrl, "quota");
+      }
+    }
+    throw new RangeError(
+      `createRelayServer: invalid \`endpoints\` deliver policy: ${(err as Error).message}`
+    );
+  }
   // WR-88: declarative inventory for config snapshots — the wiring
   // `updateEndpointConfig` cannot hot-reload, as identifiers only. Signing
   // keys contribute key ids (never the HMAC secrets); mTLS contributes the
@@ -4427,6 +4576,11 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     const isRoutingRules = pathname === "/routing/rules";
     const isEndpointsPause = pathname === "/endpoints/pause";
     const isEndpointsResume = pathname === "/endpoints/resume";
+    // WR-114: dynamic endpoint registry. The negative lookahead keeps
+    // `/endpoints/pause` and `/endpoints/resume` on their exact routes
+    // (mirrors the registry pattern in `src/operator-routes.ts`).
+    const isEndpointsRegistry = pathname === "/endpoints";
+    const endpointIdMatch = /^\/endpoints\/(?!pause$|resume$)(.+)$/.exec(pathname);
     const isScheduledList = pathname === "/scheduled";
     const scheduleActionMatch = /^\/scheduled\/([^/]+)\/(pause|resume)$/.exec(pathname);
     const deliveryMatch = /^\/deliveries\/([^/]+)$/.exec(pathname);
@@ -5090,6 +5244,237 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         runAsOperator(operatorKeyId, () => queue.resumeEndpoint(endpoint));
         respondJson(res, 200, { endpoint, paused: false });
       }
+      return;
+    }
+    if (isEndpointsRegistry || endpointIdMatch !== null) {
+      // WR-114: dynamic endpoint registry CRUD. The registry itself
+      // validates every write before mutating (a 400 always means
+      // "nothing changed"); deliver-policy fields
+      // (`maxConcurrentPerEndpoint`, `circuitBreaker`, `quota`) then
+      // apply through `queue.updateEndpointConfig`, which carries the
+      // WR-32 hot-reload semantics — in-flight deliveries keep the
+      // config they started with, only future scheduling decisions see
+      // the new values — and audits its own `endpoint_config_updated`
+      // with the field-level diff. The registry-level audit below adds
+      // the operation (`created`/`updated`/`deleted`) and the full
+      // old/new config summary (secrets redacted). Sender-side fields
+      // (`verifier`, `proxy`, `tlsPins`) resolve per delivery attempt in
+      // the default sender, so the same in-flight rule holds for them.
+      // `ordered` is startup-only: the operator API rejects runtime
+      // changes to it (400) because the queue builds its
+      // ordered-delivery tracker once at construction.
+      const readRegistryBody = async (): Promise<
+        { body: Record<string, unknown> } | { responded: true }
+      > => {
+        let raw: string;
+        try {
+          raw = (await readRawBody(req, maxBodyBytes)).toString("utf8");
+        } catch (err) {
+          if (err instanceof BodyTooLargeError) {
+            respondJson(res, 413, { error: "request body too large" });
+          } else {
+            respondJson(res, 400, { error: "invalid JSON body" });
+          }
+          return { responded: true };
+        }
+        if (raw.trim() === "") return { body: {} };
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(raw);
+        } catch {
+          respondJson(res, 400, { error: "invalid JSON body" });
+          return { responded: true };
+        }
+        if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+          respondJson(res, 400, { error: "body must be a JSON object" });
+          return { responded: true };
+        }
+        return { body: parsed as Record<string, unknown> };
+      };
+      const auditRegistryChange = (
+        operation: "created" | "updated" | "deleted",
+        oldRecord: EndpointRecord | null,
+        newRecord: EndpointRecord | null
+      ): void => {
+        const record = (newRecord ?? oldRecord)!;
+        opts.auditLog.append({
+          event: "endpoint_config_updated",
+          endpoint: record.targetUrl,
+          endpointId: record.id,
+          operation,
+          keyId: operatorKeyId,
+          changes: diffEndpointConfigs(oldRecord, newRecord),
+        });
+      };
+      // WR-82: the queue's `onConfigChange` hook fires synchronously
+      // inside `updateEndpointConfig`, so running it as this operator
+      // stamps the queue-level `endpoint_config_updated` audit with the
+      // right `keyId`.
+      const applyDeliverPolicy = (targetUrl: string, config: EndpointConfig): void => {
+        if (hasDeliverPolicy(config)) {
+          runAsOperator(operatorKeyId, () =>
+            queue.updateEndpointConfig(targetUrl, deliverPolicyPatch(config))
+          );
+        }
+      };
+      const clearDeliverPolicy = (targetUrl: string, config: EndpointConfig): void => {
+        if (config.maxConcurrentPerEndpoint !== undefined) {
+          queue.clearEndpointConfigOverride(undefined, targetUrl, "maxConcurrentPerEndpoint");
+        }
+        if (config.circuitBreaker !== undefined) {
+          queue.clearEndpointConfigOverride(undefined, targetUrl, "circuitBreaker");
+        }
+        if (config.quota !== undefined) {
+          queue.clearEndpointConfigOverride(undefined, targetUrl, "quota");
+        }
+      };
+      if (req.method === "GET") {
+        // GET /endpoints — registry metadata only. Secrets never leave
+        // the registry (a verifier renders as `{ keyId }`).
+        respondJson(res, 200, { endpoints: endpointRegistry.list() });
+        return;
+      }
+      if (req.method === "POST") {
+        // POST /endpoints — register a new endpoint.
+        const parsed = await readRegistryBody();
+        if ("responded" in parsed) return;
+        let record: EndpointRecord;
+        try {
+          record = endpointRegistry.create(parsed.body as EndpointConfig);
+        } catch (err) {
+          if (err instanceof RangeError) {
+            respondJson(res, 400, { error: (err as Error).message });
+            return;
+          }
+          throw err;
+        }
+        try {
+          applyDeliverPolicy(record.targetUrl, record);
+        } catch (err) {
+          // The queue refused the policy (e.g. a disabled subsystem):
+          // roll the registry record back so the 400 means "nothing
+          // changed" end to end.
+          endpointRegistry.remove(record.id);
+          if (err instanceof RangeError) {
+            respondJson(res, 400, { error: (err as Error).message });
+            return;
+          }
+          throw err;
+        }
+        auditRegistryChange("created", null, record);
+        respondJson(res, 201, {
+          id: record.id,
+          targetUrl: record.targetUrl,
+          endpoint: summarizeEndpointConfig(record),
+        });
+        return;
+      }
+      // PUT / DELETE /endpoints/{id}. The 405 dispatch above guarantees
+      // only those two methods reach this branch with an id.
+      const registryId = decodeURIComponent(endpointIdMatch![1]);
+      if (req.method === "PUT") {
+        const existing = endpointRegistry.get(registryId);
+        if (existing === undefined) {
+          respondJson(res, 404, { error: "unknown endpoint" });
+          return;
+        }
+        const parsed = await readRegistryBody();
+        if ("responded" in parsed) return;
+        if (parsed.body.ordered !== undefined) {
+          respondJson(res, 400, {
+            error: "`ordered` cannot be changed at runtime; configure it via the static `endpoints` option",
+          });
+          return;
+        }
+        let updated: { old: EndpointRecord; new: EndpointRecord };
+        try {
+          updated = endpointRegistry.update(registryId, parsed.body as Partial<EndpointConfig>);
+        } catch (err) {
+          if (err instanceof RangeError) {
+            respondJson(res, 400, { error: (err as Error).message });
+            return;
+          }
+          throw err;
+        }
+        const targetMoved = updated.new.targetUrl !== updated.old.targetUrl;
+        try {
+          // A targetUrl change re-keys the deliver-policy overrides:
+          // drop the old endpoint's overrides before applying the new
+          // ones. `updateEndpointConfig` is atomic per call, so a
+          // failure here applied nothing to the queue.
+          if (targetMoved) clearDeliverPolicy(updated.old.targetUrl, updated.old);
+          applyDeliverPolicy(updated.new.targetUrl, updated.new);
+        } catch (err) {
+          // Roll back: restore the registry record, then the old
+          // endpoint's policy (its values applied cleanly before, so
+          // this cannot fail on validation).
+          endpointRegistry.update(registryId, { ...updated.old });
+          if (targetMoved) applyDeliverPolicy(updated.old.targetUrl, updated.old);
+          if (err instanceof RangeError) {
+            respondJson(res, 400, { error: (err as Error).message });
+            return;
+          }
+          throw err;
+        }
+        auditRegistryChange("updated", updated.old, updated.new);
+        respondJson(res, 200, {
+          id: updated.new.id,
+          targetUrl: updated.new.targetUrl,
+          endpoint: summarizeEndpointConfig(updated.new),
+          changes: diffEndpointConfigs(updated.old, updated.new),
+        });
+        return;
+      }
+      if (req.method === "DELETE") {
+        const record = endpointRegistry.get(registryId);
+        if (record === undefined) {
+          respondJson(res, 404, { error: "unknown endpoint" });
+          return;
+        }
+        const params = new URL(req.url ?? "/endpoints", "http://internal").searchParams;
+        const parsed = await readRegistryBody();
+        if ("responded" in parsed) return;
+        const force =
+          params.get("force") === "true" || parsed.body.force === true;
+        // `drained` reports whether a drain actually ran and completed:
+        // with `force` the drain is skipped, so it stays false.
+        let drained = false;
+        let waitedMs = 0;
+        if (!force) {
+          // Drain first: wait until the endpoint has no in-flight or
+          // slot-queued deliveries, so no delivery outlives the config
+          // it started with into retries resolved against a removed
+          // record. Bounded — a stuck downstream answers 409 with the
+          // remaining count instead of hanging the operator call.
+          const drain = await waitForEndpointDrain(
+            () => queue.getConcurrencyStats(),
+            record.targetUrl,
+            opts.endpointDrainTimeoutMs !== undefined
+              ? { timeoutMs: opts.endpointDrainTimeoutMs }
+              : {}
+          );
+          drained = drain.drained;
+          waitedMs = drain.waitedMs;
+          if (!drained) {
+            respondJson(res, 409, {
+              error: `endpoint has ${drain.remaining} in-flight deliveries; retry later or delete with ?force=true`,
+              inFlight: drain.remaining,
+            });
+            return;
+          }
+        }
+        endpointRegistry.remove(registryId);
+        clearDeliverPolicy(record.targetUrl, record);
+        auditRegistryChange("deleted", record, null);
+        respondJson(res, 200, {
+          id: registryId,
+          deleted: true,
+          drained,
+          ...(force ? {} : { waitedMs }),
+        });
+        return;
+      }
+      respondJson(res, 405, { error: "method not allowed" });
       return;
     }
     const id = decodeURIComponent(replayMatch![1]);

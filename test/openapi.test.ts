@@ -25,7 +25,7 @@ const OPERATOR_TOKEN = "openapi-operator-token";
  * updating the registry (and this snapshot) fails loudly instead of
  * silently drifting the published spec.
  */
-const INVENTORY: Array<[string, Array<"GET" | "POST">]> = [
+const INVENTORY: Array<[string, Array<"GET" | "POST" | "PUT" | "DELETE">]> = [
   ["/dead-letter", ["GET"]],
   ["/dead-letter/stats", ["GET"]],
   ["/dead-letter/replay", ["POST"]],
@@ -50,6 +50,8 @@ const INVENTORY: Array<[string, Array<"GET" | "POST">]> = [
   ["/routing/rules", ["GET", "POST"]],
   ["/endpoints/pause", ["POST"]],
   ["/endpoints/resume", ["POST"]],
+  ["/endpoints", ["GET", "POST"]],
+  ["/endpoints/{id}", ["PUT", "DELETE"]],
   ["/scheduled", ["GET"]],
   ["/scheduled/{id}/{action}", ["POST"]],
   ["/deliveries/{traceId}", ["GET"]],
@@ -83,6 +85,10 @@ describe("WR-111 operator route registry", () => {
       "/scheduled/abc/pause",
       "/scheduled/abc/resume",
       "/deliveries/trace-1",
+      "/endpoints",
+      "/endpoints/pause",
+      "/endpoints/resume",
+      "/endpoints/some-id",
       "/openapi.json",
     ];
     for (const probe of probes) {
@@ -104,9 +110,11 @@ describe("WR-111 operator route registry", () => {
     assert.equal(matchOperatorRoute("/config/snapshot", "DELETE"), undefined);
   });
 
-  it("requiredScopeForMethod follows WR-82 (GET=read, POST=admin)", () => {
+  it("requiredScopeForMethod follows WR-82 (GET=read, mutating=admin)", () => {
     assert.equal(requiredScopeForMethod("GET"), "read");
     assert.equal(requiredScopeForMethod("POST"), "admin");
+    assert.equal(requiredScopeForMethod("PUT"), "admin");
+    assert.equal(requiredScopeForMethod("DELETE"), "admin");
   });
 });
 

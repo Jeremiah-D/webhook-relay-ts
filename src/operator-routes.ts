@@ -18,14 +18,18 @@
  * - Every route is behind the operator bearer token (`operatorToken` or
  *   an `operatorKeys` ring entry): 404 when no operator credential is
  *   configured (fail-closed), 403 on a bad bearer.
- * - WR-82 scopes: GET routes need the `read` scope, POST routes need
- *   `admin`. The spec records this as the `x-required-scope` vendor
- *   extension on each operation.
+ * - WR-82 scopes: GET routes need the `read` scope, mutating routes
+ *   (POST/PUT/DELETE) need `admin`. The spec records this as the
+ *   `x-required-scope` vendor extension on each operation.
+ * - Declaration order matters where patterns overlap: `/endpoints/pause`
+ *   and `/endpoints/resume` are declared before `/endpoints/{id}`, whose
+ *   pattern excludes them with a negative lookahead anyway, so no
+ *   pathname matches two routes.
  *
  * Zero dependencies (pure data + string building).
  */
 
-export type OperatorHttpMethod = "GET" | "POST";
+export type OperatorHttpMethod = "GET" | "POST" | "PUT" | "DELETE";
 
 /** One query parameter accepted by a route. All operator query params are optional. */
 export interface OperatorRouteQueryParam {
@@ -403,6 +407,63 @@ export const OPERATOR_ROUTES: readonly OperatorRoute[] = [
     },
   },
   {
+    path: "/endpoints",
+    pattern: exact("/endpoints"),
+    methods: ["GET", "POST"],
+    summary: "Endpoint registry: list / register endpoints",
+    description:
+      "WR-114: `GET` lists the dynamic endpoint registry (`{ endpoints }`, metadata only — no secrets, read scope); `POST` registers a new endpoint (`{ targetUrl, verifier?, circuitBreaker?, quota?, maxConcurrentPerEndpoint?, proxy?, tlsPins?, ordered?, id? }`, admin scope). The body is fully validated before anything is stored — a 400 always means “nothing changed”. Deliver-policy fields apply through the WR-32 hot-reload path and are audited as `endpoint_config_updated`; `ordered` is startup-only and rejected at runtime.",
+    okDescription:
+      "GET: `{ endpoints: [...] }`. POST: 201 `{ id, targetUrl, endpoint }` (metadata, no secrets).",
+    requestBody: {
+      description: "The endpoint config to register. `targetUrl` is required; `id` defaults to it.",
+      required: ["targetUrl"],
+      properties: {
+        id: { type: "string", description: "Registry id; defaults to targetUrl. `pause`/`resume` are reserved." },
+        targetUrl: { type: "string", description: "Downstream URL (http:/https:/ws:/wss:)." },
+        verifier: { type: "object", description: "Per-endpoint outbound signing override ({ secret, keyId? })." },
+        circuitBreaker: { type: "object", description: "Per-endpoint circuit-breaker thresholds (requires the breaker enabled)." },
+        quota: { type: "object", description: "Per-endpoint quota limit (requires quota enabled)." },
+        maxConcurrentPerEndpoint: { type: "number", description: "Per-endpoint concurrency limit: positive integer or Infinity." },
+        proxy: { type: "string", description: "Per-endpoint outbound proxy URL (plain HTTP only)." },
+        tlsPins: { type: "array", items: { type: "string" }, description: "Per-endpoint SPKI pin whitelist." },
+        ordered: { type: "object", description: "Per-endpoint ordered delivery. Startup-only: rejected at runtime." },
+      },
+    },
+  },
+  {
+    path: "/endpoints/{id}",
+    pattern: /^\/endpoints\/(?!pause$|resume$)(.+)$/,
+    methods: ["PUT", "DELETE"],
+    summary: "Endpoint registry: update / delete one endpoint",
+    description:
+      "WR-114: `PUT` replaces one endpoint's config fields (admin scope) — the merged config is validated before anything is swapped, deliver-policy fields re-apply through the WR-32 hot-reload path (in-flight deliveries keep the config they started with), and the change is audited as `endpoint_config_updated`. `ordered` cannot change at runtime (400). `DELETE` removes the endpoint (admin scope): without `force` it first drains in-flight deliveries (409 with the remaining count when the drain times out); `?force=true` (or body `{ force: true }`) skips the drain. Unknown ids are a fail-closed 404.",
+    okDescription:
+      "PUT: 200 `{ id, targetUrl, endpoint, changes }`. DELETE: 200 `{ id, deleted: true, drained, waitedMs }`.",
+    pathParams: [{ name: "id", description: "Registry id (defaults to the endpoint's targetUrl)." }],
+    queryParams: [
+      {
+        name: "force",
+        type: "boolean",
+        description: "DELETE: skip the in-flight drain and remove immediately.",
+      },
+    ],
+    requestBody: {
+      description: "PUT body: the config fields to change. DELETE body: optional `{ force }`.",
+      required: [],
+      properties: {
+        targetUrl: { type: "string", description: "New downstream URL (re-keys deliver-policy overrides)." },
+        verifier: { type: "object", description: "Per-endpoint outbound signing override ({ secret, keyId? })." },
+        circuitBreaker: { type: "object", description: "Per-endpoint circuit-breaker thresholds." },
+        quota: { type: "object", description: "Per-endpoint quota limit." },
+        maxConcurrentPerEndpoint: { type: "number", description: "Per-endpoint concurrency limit." },
+        proxy: { type: "string", description: "Per-endpoint outbound proxy URL." },
+        tlsPins: { type: "array", items: { type: "string" }, description: "Per-endpoint SPKI pin whitelist." },
+        force: { type: "boolean", description: "DELETE: skip the in-flight drain." },
+      },
+    },
+  },
+  {
     path: "/scheduled",
     pattern: exact("/scheduled"),
     methods: ["GET"],
@@ -460,7 +521,7 @@ export function matchOperatorRoute(
   return (route.methods as string[]).includes(method) ? route : undefined;
 }
 
-/** The operator scope a method needs: GET is read-only, POST is mutating (WR-82). */
+/** The operator scope a method needs: GET is read-only, mutating methods need `admin` (WR-82). */
 export function requiredScopeForMethod(method: OperatorHttpMethod): "read" | "admin" {
   return method === "GET" ? "read" : "admin";
 }

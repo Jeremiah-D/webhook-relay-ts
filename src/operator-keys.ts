@@ -194,12 +194,12 @@ export function matchOperatorKey(
 /**
  * Whether `identity` may call a recognized operator path with `method`.
  * Every recognized `GET` operator path is read-only (`read` suffices);
- * every recognized `POST` operator path is mutating (needs `admin`).
+ * every mutating method (`POST`, `PUT`, `DELETE`) needs `admin`.
  * Call only after the path is known to be an operator path and the
  * method is one the path allows — unknown paths and method mismatches
  * keep their 404/405 answers ahead of this check.
  */
 export function operatorMay(identity: OperatorIdentity, method: string): boolean {
-  if (method !== "POST") return identity.scopes.includes("read") || identity.scopes.includes("admin");
+  if (method === "GET") return identity.scopes.includes("read") || identity.scopes.includes("admin");
   return identity.scopes.includes("admin");
 }

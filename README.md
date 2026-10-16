@@ -1201,6 +1201,60 @@ curl -X POST http://127.0.0.1:PORT/endpoints/pause \
   (attempt counts survive through the durable queue; the remaining
   backoff does not).
 
+## Dynamic endpoint registry (opt-in)
+
+Manage the *set* of downstream endpoints without restarting the relay:
+register a new downstream with its full delivery policy, rotate a
+proxy or TLS pins, or retire an endpoint once its in-flight deliveries
+have drained. The registry is an opt-in config overlay — with no
+endpoints registered, behavior is exactly the static-config default.
+
+```ts
+createRelayServer({
+  endpoints: [
+    {
+      targetUrl: "https://downstream/hook",
+      circuitBreaker: { failureThreshold: 3, cooldownMs: 30_000 },
+      quota: { maxPerMinute: 500 },
+      maxConcurrentPerEndpoint: 8,
+      tlsPins: ["sha256/…"],
+    },
+  ],
+});
+```
+
+```sh
+# register (admin scope)
+curl -X POST http://127.0.0.1:PORT/endpoints \
+  -H "Authorization: Bearer $OPERATOR_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"targetUrl":"https://downstream/hook","quota":{"maxPerMinute":500}}'
+# → 201 { id, targetUrl, endpoint } (metadata only — no secrets)
+
+# update · delete (drains first unless ?force=true)
+curl -X PUT http://127.0.0.1:PORT/endpoints/https%3A%2F%2Fdownstream%2Fhook …
+curl -X DELETE 'http://127.0.0.1:PORT/endpoints/<id>?force=true' …
+# GET /endpoints lists records (read scope, metadata only)
+```
+
+- **Validated before anything is stored** — startup and each CRUD call
+  validate the full config first; a 400 always means "nothing changed".
+- **Hot-reload semantics** — deliver-policy fields (`circuitBreaker`,
+  `quota`, `maxConcurrentPerEndpoint`) apply through the WR-32 path:
+  in-flight deliveries keep the config they started with; only future
+  scheduling sees the new values. Sender-side fields (`verifier` outbound
+  signing, `proxy`, `tlsPins`) resolve per delivery *attempt*, so an
+  attempt already on the wire is likewise unaffected. Every change is
+  audited as `endpoint_config_updated` (secrets rendered `[redacted]`).
+- **`ordered` is startup-only** — the queue builds its ordered-delivery
+  tracker once at construction, so runtime `ordered` changes are
+  rejected with a clear 400.
+- **Retire safely** — `DELETE` first drains in-flight deliveries
+  (configurable `endpointDrainTimeoutMs`, default 30s); a timeout answers
+  409 with the remaining count, and `?force=true` skips the drain.
+- **Fail-closed** — without an operator credential all four routes are
+  404; `read` keys may `GET`, mutations need `admin`.
+
 ## Stale-endpoint auto-pause (opt-in)
 
 Configuration-rot hygiene for downstreams that quietly stopped working:
