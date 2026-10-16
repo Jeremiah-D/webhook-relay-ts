@@ -30,8 +30,12 @@
  *   `Retry-After` when one was supplied).
  * - `"non_retryable"`: the payload is poison — dead-letter immediately,
  *   without burning more of the retry budget.
+ * - `"head_of_line_timeout"`: not a downstream verdict at all — the item
+ *   held the head of an ordered-delivery line (WR-113) longer than
+ *   `maxHeadOfLineHoldMs` and was parked into the dead-letter list so the
+ *   line could advance. Never silently dropped.
  */
-export type FailureClass = "retryable" | "non_retryable";
+export type FailureClass = "retryable" | "non_retryable" | "head_of_line_timeout";
 
 /**
  * Structured delivery failure for a non-2xx downstream HTTP response.

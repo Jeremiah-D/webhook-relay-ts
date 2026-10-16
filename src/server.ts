@@ -30,6 +30,7 @@ import type {
 } from "./retry.ts";
 import type { PhaseDurationsMs } from "./retry.ts";
 import type { StalePauseOptions } from "./retry.ts";
+import type { OrderedAuditEvent, OrderedModeOptions } from "./retry.ts";
 import { parseCronExpression, CRON_HEADER } from "./cron.ts";
 import type { CompletionCallbackOptions } from "./callback.ts";
 import { createBoundAddressSelfCheck } from "./callback.ts";
@@ -1268,6 +1269,13 @@ export interface RelayServerOptions {
    * queue. Disabled by default.
    */
   tenantRateLimit?: TenantRateLimitOptions;
+  /**
+   * Per-endpoint ordered delivery (head-of-line blocking; see
+   * `RetryQueueOptions.ordered` and `src/ordered.ts`). An explicit
+   * server-level value wins over the nested `retry.ordered`; either way
+   * the queue owns the line state. Disabled by default.
+   */
+  ordered?: boolean | OrderedModeOptions | Record<string, boolean | OrderedModeOptions>;
   /** Inject queue hooks (e.g. to fail the server fast on dead letters). */
   /**
    * Seals dead-letter payloads at rest (see `RetryQueue` `payloadEncryptor`;
@@ -3767,6 +3775,26 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // limiter (the intake consults it via `admitTenantDelivery()` in
     // `reject-429` mode).
     tenantRateLimit: opts.tenantRateLimit ?? opts.retry?.tenantRateLimit,
+    // WR-113: an explicit server-level `ordered` wins over the nested
+    // `retry.ordered`; either way the queue owns the line state. Wrap
+    // the caller's hook so every urgent bypass and every poison-parked
+    // head is audited as `ordered_bypassed` / `head_of_line_parked`,
+    // not just observed.
+    ordered: opts.ordered ?? opts.retry?.ordered,
+    onOrderedAudit: (event: OrderedAuditEvent) => {
+      opts.auditLog.append({
+        event: event.kind,
+        id: event.id,
+        traceId: event.traceId,
+        ...(event.tenant !== undefined ? { tenant: event.tenant } : {}),
+        targetUrl: event.endpoint,
+        ...(event.blockedMs !== undefined ? { blockedMs: event.blockedMs } : {}),
+        ...(event.maxHeadOfLineHoldMs !== undefined
+          ? { maxHeadOfLineHoldMs: event.maxHeadOfLineHoldMs }
+          : {}),
+      });
+      opts.retry?.onOrderedAudit?.(event);
+    },
     // WR-98: an explicit server-level `traceContext` wins over the nested
     // `retry.traceContext`; either way the queue owns span-reference
     // resolution for delivery events and the OTLP export.

@@ -2414,6 +2414,100 @@ const queue = new RetryQueue({
   construction. Disabled by default: `coalesce: false` (or absent) keeps
   one physical attempt per delivery, exactly the pre-WR-91 behavior.
 
+## Per-endpoint ordered delivery (opt-in)
+
+Some downstreams cannot tolerate reordering — a ledger that applies
+credits before debits, a cache invalidator racing its own refill. When
+`retry: { ordered }` is enabled for an endpoint, its deliveries leave
+the relay **in receive order**: the head of the line must reach a
+terminal state (`delivered` / `dead_letter`) before the next item
+dispatches. A head that is retrying, backing off, or parked behind the
+circuit breaker / quota / rate limiter holds every follower behind it —
+followers held this way consume **no** attempt, no retry-budget token,
+no quota token, and no circuit verdict.
+
+```ts
+const queue = new RetryQueue({
+  sender,
+  ordered: true, // every endpoint, strict head-of-line
+  // or per endpoint (exact targetUrl, like tlsPins/responseValidators):
+  // ordered: { "https://ledger.example/hook": { maxHeadOfLineHoldMs: 30_000 } },
+});
+```
+
+- **Forms** — `true` orders every endpoint; an `OrderedModeOptions`
+  object (`{ enabled?, maxHeadOfLineHoldMs?, now? }`) tunes every
+  endpoint; a record maps exact `targetUrl` → `boolean |
+  OrderedModeOptions` so only the endpoints that need ordering pay for
+  it. Absent = unordered, exactly the pre-WR-113 behavior.
+- **Poison-message policy** — a head that never settles would wedge the
+  line forever, so `maxHeadOfLineHoldMs` bounds the hold: past the
+  bound the head is parked into the dead-letter list (failure class
+  `"head_of_line_timeout"`, audited as `head_of_line_parked`) and the
+  line advances. It is **never silently dropped** — the entry keeps its
+  honest attempt count, rides the normal dead-letter machinery
+  (retention sweep, replay), and no circuit verdict is recorded (the
+  endpoint was never attempted on that dispatch). Default:
+  **`Infinity`** — the head is held until it settles and ordering is
+  never broken by a timer. The default is deliberate: a feature whose
+  contract is "in order" must not dead-letter a never-attempted head on
+  a clock unless the operator explicitly opts into the bound.
+- **Urgent bypass** — the urgent lane (WR-12) skips the ordered gate by
+  default: low-latency semantics win over ordering. Every bypass is
+  audited as `ordered_bypassed` (with the delivery's trace id), so the
+  ordering gap is visible, never silent. A later urgent→normal
+  degradation (empty token bucket) does not re-enter the line — the
+  bypass verdict is made at the gate.
+- **Batching** — a flushed batch (WR-17) is one `RetryItem`, so the
+  ordered gate applies at item level; the batch takes its line position
+  at flush time (the batching delay precedes ordering, by design).
+  Urgent items skip batching as before.
+- **Replays** — a dead-letter replay starts a fresh delivery cycle, so
+  it takes the **tail** of the ordered line, not its original position.
+
+**Combination matrix** — the ordered gate is the **first** gate in
+`deliver()`, ahead of the deadline, pause, delivery-window, quota, rate
+limit, circuit, lane-scheduler, and concurrency gates. Rationale: the
+hold is about line position, not about *why* the head is waiting — a
+head parked by an open circuit or an empty quota bucket holds its
+followers with identical semantics, and a held follower must not touch
+anything a later gate would consume. Consequences:
+
+| Feature | Ordered interaction |
+|---|---|
+| Retry budget (WR-38) | Only the head's retries consume budget; held followers never burn it. |
+| Circuit breaker | Head parked by an open circuit still holds followers; no verdict is recorded for held items. |
+| Quota / tenant rate limit (WR-97) | Same: a quota-throttled head holds the line; held items consume no tokens. |
+| Concurrency (WR-06/51/94) | Held followers take no limiter slots; the head's in-flight attempt holds the line. |
+| Urgent lane (WR-12) | Bypasses by default, audited per bypass (`ordered_bypassed`). |
+| Batch (WR-17) | Item-level ordering; line position taken at flush. |
+| Delivery deadline (WR-76) | A follower's deadline is evaluated when it becomes head — never while held. |
+| Pause (WR-50) / delivery window (WR-52) | The gate runs first; a paused head still holds the line, and resume wakes the head, whose settlement wakes the next. |
+| Failover (WR-39) / weighted (WR-66) | The gate keys on the logical endpoint, before target resolution. |
+| Coalescing (WR-91) | Only head attempts (and urgent bypasses) reach the coalescer. |
+
+**Latency / SLO accounting** — head-of-line waiting is inside the
+accepted→delivered clock (WR-13): the latency tracker starts at
+`enqueue()`, so a follower's sample includes the full time it waited
+behind the head, and it counts toward `sloMs` attainment like any other
+queue wait. Poison-parked heads are dead letters and are discarded
+without sampling, exactly like every other dead letter. The SLO-risk
+predictor (WR-71) sees held followers as ordinary pending backlog.
+
+**Observability** — `queue.getOrderedStats()` returns per-endpoint
+`{ queued, headId, headBlockedCount, headOfLineParked, urgentBypassed }`
+(empty when disabled); Prometheus exposes
+`relay_ordered_head_blocked_total{endpoint}`,
+`relay_ordered_head_of_line_parked_total{endpoint}`, and
+`relay_ordered_urgent_bypassed_total{endpoint}` — activity-gated, so a
+relay with the feature off exposes no `relay_ordered_*` series at all.
+`onOrderedAudit` (audited by the server as `ordered_bypassed` /
+`head_of_line_parked`) is the per-event channel; `getOrderedStats` is
+the per-endpoint channel.
+
+**Fail-fast** — an illegal `ordered` value (bad shape, non-positive
+`maxHeadOfLineHoldMs`, …) throws `RangeError` at construction.
+
 ## Outbound DNS resolution cache (opt-in)
 
 Every new connection pays a DNS lookup, and under high fan-out to a
@@ -3519,6 +3613,18 @@ Requires Node 24+ (runs `.ts` directly via type stripping; zero dependencies).
   configs. Queue integration: accepted→delivered sampling with `onSloMiss`
   firing past the budget, dead-lettered items discarded without sampling,
   and tracking disabled by default.
+- `test/ordered.test.ts` — per-endpoint ordered delivery (WR-113):
+  `OrderedTracker` head advance + hold-clock restart on settle,
+  per-endpoint isolation, `assertValidOrderedConfig` / `resolveOrderedConfig`
+  (boolean / options / exact-targetUrl record forms, `RangeError` on
+  illegal values at construction); queue integration: receive-order
+  dispatch with a slow head, followers held behind a retrying head with
+  no attempt consumed, per-endpoint scoping (unordered endpoints
+  unaffected), poison-head park into the dead letter with
+  `failureClass: "head_of_line_timeout"` + `head_of_line_parked` audit
+  and line advance, urgent bypass audited as `ordered_bypassed`,
+  `relay_ordered_*` series activity-gated (zero series when disabled),
+  and the `Infinity` default holding the head without a timer.
 - `test/dedup.test.ts` — `DeliveryDeduplicator`: deterministic hashing,
   repeat-inside-window suppression, payload/endpoint independence, window
   expiry re-delivering, oldest-first eviction past `maxEntries`, and

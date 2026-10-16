@@ -96,6 +96,16 @@ export type {
   QuorumTargetDeadLetteredInfo,
 };
 import { EndpointQuota, type QuotaOptions, type QuotaStats } from "./quota.ts";
+import {
+  OrderedTracker,
+  assertValidOrderedConfig,
+  resolveOrderedClock,
+  resolveOrderedConfig,
+  type OrderedAuditEvent,
+  type OrderedEndpointStats,
+  type OrderedModeOptions,
+  type ResolvedOrderedConfig,
+} from "./ordered.ts";
 import { ReplayEgressGate, type ReplayEgressOptions, DEFAULT_REPLAY_EGRESS_RPS } from "./replay-egress.ts";
 import { RetryBudget, type RetryBudgetOptions } from "./retry-budget.ts";
 import {
@@ -216,6 +226,7 @@ import {
   type DeadLetterEscalationMetricsInput,
   type StalePauseMetricsInput,
   type OcspMetricsInput,
+  type OrderedMetricsInput,
 } from "./metrics.ts";
 import {
   summarizeDeadLetterFailure,
@@ -245,6 +256,20 @@ export { TENANT_ID_HEADER, assertValidTenantId, tenantScopeKey, splitTenantScope
 export type { DeliveryCountersInput, CircuitStateInput, LatencyHistogramInput, StarvationGuardMetricsInput, SloRiskMetricsInput, CertExpiryMetricsInput };
 export type { DeadLetterEscalationMetricsInput };
 export type { StalePauseMetricsInput };
+export type { OrderedMetricsInput };
+export {
+  OrderedTracker,
+  assertValidOrderedConfig,
+  resolveOrderedClock,
+  resolveOrderedConfig,
+};
+export type {
+  OrderedAuditEvent,
+  OrderedEndpointStats,
+  OrderedModeOptions,
+  ResolvedOrderedConfig,
+  ResolvedOrderedEndpointConfig,
+} from "./ordered.ts";
 export type { OcspMetricsInput };
 export { HttpDeliveryError, classifyFailure, parseRetryAfterMs };
 export type { FailureClass, ClassifiedFailure };
@@ -1294,6 +1319,44 @@ export interface RetryQueueOptions {
    * Disabled by default.
    */
   batch?: BatchOptions;
+  /**
+   * Per-endpoint ordered delivery (see `src/ordered.ts`). When enabled,
+   * an endpoint's deliveries leave the relay in receive order: the head
+   * of the line must reach a terminal state (`delivered` / `dead_letter`)
+   * before the next item dispatches — followers held behind a retrying,
+   * backing-off, or circuit/quota-parked head consume no attempt, no
+   * retry budget, no quota token, and no circuit verdict.
+   *
+   * Forms (the same exact-`targetUrl` keying convention as
+   * `tlsPins` / `responseValidators`):
+   *
+   * - `true`: every endpoint ordered, with default options.
+   * - `OrderedModeOptions`: `{ enabled?, maxHeadOfLineHoldMs?, now? }`
+   *   for every endpoint.
+   * - `Record<string, boolean | OrderedModeOptions>`: exact `targetUrl`
+   *   → per-endpoint config; only endpoints with a truthy config are
+   *   ordered.
+   *
+   * Poison-message policy: `maxHeadOfLineHoldMs` bounds how long a head
+   * may stay unsettled before it is parked into the dead-letter list
+   * (failure class `"head_of_line_timeout"`, never silently dropped) and
+   * the line advances. Default: `Infinity` — the head is held until it
+   * settles, so ordering is never broken by a timer; opt into a finite
+   * bound explicitly. Invalid values throw `RangeError` at construction.
+   *
+   * Disabled by default (absent = unordered, exactly the pre-WR-113
+   * behavior).
+   */
+  ordered?: boolean | OrderedModeOptions | Record<string, boolean | OrderedModeOptions>;
+  /**
+   * Called for ordered-delivery transitions worth auditing:
+   * `ordered_bypassed` every time an urgent item skips the ordered gate
+   * (the urgent lane bypasses ordering by default — low-latency
+   * semantics win), and `head_of_line_parked` when a stuck head is
+   * parked into the dead-letter list. The server writes both into the
+   * audit log; library users get the hook directly.
+   */
+  onOrderedAudit?: (event: OrderedAuditEvent) => void;
   /**
    * Per-endpoint downstream response semantic validators (WR-37; see
    * {@link ResponseValidator}). Either a single validator applied to every
@@ -2583,6 +2646,19 @@ export class RetryQueue {
   private readonly onBatch?: (info: BatchInfo) => void;
   /** Per-endpoint flushed-batch counters. */
   private readonly batchStats = new Map<string, { batches: number; events: number }>();
+  /**
+   * WR-113: per-endpoint ordered-delivery state. `undefined` when the
+   * `ordered` option is absent/disabled — the gate, the tracker, and
+   * the series are all compiled out of the dispatch path then.
+   */
+  private readonly orderedTracker?: OrderedTracker;
+  /** WR-113: normalized ordered config (global scope + exact-targetUrl records). */
+  private readonly orderedConfig?: ResolvedOrderedConfig;
+  private readonly onOrderedAudit?: (event: OrderedAuditEvent) => void;
+  /** WR-113: cumulative per-endpoint ordered counters (stats + metrics source). */
+  private readonly orderedHeadBlockedTotal = new Map<string, number>();
+  private readonly orderedHeadOfLineParkedTotal = new Map<string, number>();
+  private readonly orderedUrgentBypassedTotal = new Map<string, number>();
   /** Prometheus delivery counters per (tenant, endpoint) — see `src/metrics.ts`. Outer key is the tenant (`""` = default), inner key the plain endpoint. */
   private readonly deliveryCounters = new Map<
     string,
@@ -3125,6 +3201,17 @@ export class RetryQueue {
         this.flushBatch(endpoint, items)
       );
     }
+    // WR-113: opt-in per-endpoint ordered delivery. Invalid values throw
+    // `RangeError` here, at construction — never mid-delivery. When the
+    // option resolves to disabled, no tracker exists and the dispatch
+    // path keeps the exact pre-WR-113 behavior.
+    assertValidOrderedConfig(opts.ordered);
+    const orderedResolved = resolveOrderedConfig(opts.ordered);
+    if (orderedResolved !== undefined) {
+      this.orderedConfig = orderedResolved;
+      this.orderedTracker = new OrderedTracker(resolveOrderedClock(opts.ordered));
+    }
+    this.onOrderedAudit = opts.onOrderedAudit;
     if (opts.autoReplay !== undefined) {
       // Constructed even with `enabled: false` so the operator surface can
       // always report a status; it only ticks when enabled and started.
@@ -3209,6 +3296,9 @@ export class RetryQueue {
       this.durableSkippedLines = rec.skippedLines;
       for (const item of rec.items) {
         this.queue.set(item.id, { ...item, attempt: item.attempt });
+        // WR-113: recovered items rejoin the ordered line in journal
+        // order, which is the original enqueue order.
+        this.orderedTrackEnqueue(item.targetUrl, item.id);
         this.bumpPending(item.tenantId, item.targetUrl, 1);
         // WR-100: recovered items count as sightings, so a restarted
         // relay does not immediately auto-pause endpoints it just
@@ -3582,6 +3672,184 @@ export class RetryQueue {
     }));
   }
 
+  /**
+   * WR-113: resolve the ordered-delivery config for a logical endpoint.
+   * Per-endpoint records win over the global scope; `undefined` = the
+   * endpoint is unordered.
+   */
+  private orderedConfigFor(targetUrl: string): ResolvedOrderedEndpointConfig | undefined {
+    const cfg = this.orderedConfig;
+    if (cfg === undefined) return undefined;
+    return cfg.endpoints.get(targetUrl) ?? cfg.global;
+  }
+
+  /**
+   * WR-113: the head-of-line gate — the first gate in `deliver()`,
+   * ahead of the deadline, pause, delivery-window, quota, rate-limit,
+   * circuit, lane-scheduler, and concurrency gates. Rationale for
+   * "first": a head parked behind any of those gates still holds its
+   * followers with identical semantics — the hold is about line
+   * position, not about why the head is waiting — and a held follower
+   * must not consume anything (no attempt, no retry budget, no quota
+   * token, no circuit verdict, no latency bookkeeping) that a gate
+   * further down would touch.
+   *
+   * Returns `"dispatch"` (proceed), `"held"` (not the head — stay
+   * queued; the head's settlement wakes the next head), or `"settled"`
+   * (the head was poison-parked into the dead-letter list and the line
+   * already advanced — this dispatch is done).
+   */
+  private orderedGate(
+    entry: RetryItem & { attempt: number },
+    traceId: string,
+    tenant: string | undefined,
+    logicalEndpoint: string
+  ): "dispatch" | "held" | "settled" {
+    const tracker = this.orderedTracker;
+    if (tracker === undefined) return "dispatch";
+    const cfg = this.orderedConfigFor(logicalEndpoint);
+    if (cfg === undefined) return "dispatch";
+    // WR-12: the urgent lane bypasses the ordered gate by default —
+    // low-latency semantics win over ordering. Every bypass is audited
+    // as `ordered_bypassed` so the ordering gap is visible, not silent.
+    // (A later urgent→normal degradation for an empty token bucket does
+    // not re-enter the line: the bypass verdict is about the gate, made
+    // here.)
+    if (entry.priority === "urgent") {
+      this.bumpOrderedCounter(this.orderedUrgentBypassedTotal, logicalEndpoint);
+      this.onOrderedAudit?.({
+        kind: "ordered_bypassed",
+        id: entry.id,
+        traceId,
+        ...(tenant === undefined ? {} : { tenant }),
+        endpoint: logicalEndpoint,
+      });
+      return "dispatch";
+    }
+    // Self-healing: every live queue entry point registers with the
+    // tracker, but an item that somehow missed registration (e.g. a
+    // journal format from before WR-113) joins the tail instead of
+    // wedging the line.
+    if (!tracker.isTracked(logicalEndpoint, entry.id)) {
+      tracker.track(logicalEndpoint, entry.id);
+    }
+    if (tracker.head(logicalEndpoint) === entry.id) {
+      // Head-of-line poison guard: a head that has held the line longer
+      // than maxHeadOfLineHoldMs is parked into the dead-letter list —
+      // never silently dropped — and the line advances.
+      const blockedMs = tracker.headBlockedMs(logicalEndpoint) ?? 0;
+      if (blockedMs > cfg.maxHeadOfLineHoldMs) {
+        this.parkOrderedHead(entry, traceId, tenant, logicalEndpoint, blockedMs, cfg.maxHeadOfLineHoldMs);
+        return "settled";
+      }
+      return "dispatch";
+    }
+    // Not the head: hold behind it. The item stays queued with its
+    // attempt count intact; no timer is re-armed here (no polling loop)
+    // — the head's settlement wakes the next head via `orderedSettle`.
+    this.bumpOrderedCounter(this.orderedHeadBlockedTotal, logicalEndpoint);
+    return "held";
+  }
+
+  /**
+   * WR-113: park a poison head into the dead-letter list. The entry
+   * keeps its honest attempt count and rides the normal dead-letter
+   * machinery (audit, SSE event, retention sweep, replayable); the
+   * `"head_of_line_timeout"` failure class tells it apart from
+   * downstream rejections.
+   */
+  private parkOrderedHead(
+    entry: RetryItem & { attempt: number },
+    traceId: string,
+    tenant: string | undefined,
+    logicalEndpoint: string,
+    blockedMs: number,
+    maxHeadOfLineHoldMs: number
+  ): void {
+    // Settle in the tracker first so the wake-up below sees the next head.
+    this.orderedTracker?.settle(logicalEndpoint, entry.id);
+    this.bumpOrderedCounter(this.orderedHeadOfLineParkedTotal, logicalEndpoint);
+    this.onOrderedAudit?.({
+      kind: "head_of_line_parked",
+      id: entry.id,
+      traceId,
+      ...(tenant === undefined ? {} : { tenant }),
+      endpoint: logicalEndpoint,
+      blockedMs: Math.max(0, Math.round(blockedMs)),
+      maxHeadOfLineHoldMs,
+    });
+    const err = new Error(
+      `head-of-line hold exceeded maxHeadOfLineHoldMs (${maxHeadOfLineHoldMs}ms); ` +
+        `head blocked for ${Math.max(0, Math.round(blockedMs))}ms`
+    );
+    // Never attempted on this dispatch — the physical target is the
+    // logical endpoint; there is no failure signal to feed the breaker.
+    this.moveToDeadLetter(
+      entry,
+      entry.id,
+      err,
+      { failureClass: "head_of_line_timeout" },
+      new Date().toISOString(),
+      traceId,
+      logicalEndpoint
+    );
+    this.orderedWakeNext(logicalEndpoint);
+  }
+
+  /** WR-113: register a live item on its endpoint's ordered line (enqueue points). */
+  private orderedTrackEnqueue(targetUrl: string, id: string): void {
+    this.orderedTracker?.track(targetUrl, id);
+  }
+
+  /**
+   * WR-113: settle a live item on its endpoint's ordered line. When the
+   * head settles, the next head is woken immediately — held followers
+   * never wait on a timer.
+   */
+  private orderedSettle(targetUrl: string, id: string): void {
+    const tracker = this.orderedTracker;
+    if (tracker === undefined) return;
+    const wasHead = tracker.head(targetUrl) === id;
+    tracker.settle(targetUrl, id);
+    if (wasHead) this.orderedWakeNext(targetUrl);
+  }
+
+  /** WR-113: dispatch the next head of an endpoint's ordered line, if any. */
+  private orderedWakeNext(targetUrl: string): void {
+    const tracker = this.orderedTracker;
+    if (tracker === undefined || !this.running) return;
+    const next = tracker.head(targetUrl);
+    if (next !== undefined && this.queue.has(next)) {
+      this.schedule(next, 0);
+    }
+  }
+
+  private bumpOrderedCounter(counter: Map<string, number>, endpoint: string): void {
+    counter.set(endpoint, (counter.get(endpoint) ?? 0) + 1);
+  }
+
+  /**
+   * Per-endpoint ordered-delivery stats (WR-113). Empty when ordered
+   * delivery is disabled. Rows carry the live line depth, the current
+   * head id, and the cumulative hold / poison-park / urgent-bypass
+   * counters that feed `relay_ordered_*`.
+   */
+  getOrderedStats(): OrderedEndpointStats[] {
+    const tracker = this.orderedTracker;
+    if (tracker === undefined) return [];
+    return tracker.endpoints().map((endpoint) => {
+      const headId = tracker.head(endpoint);
+      return {
+        endpoint,
+        queued: tracker.depth(endpoint),
+        ...(headId === undefined ? {} : { headId }),
+        headBlockedCount: this.orderedHeadBlockedTotal.get(endpoint) ?? 0,
+        headOfLineParked: this.orderedHeadOfLineParkedTotal.get(endpoint) ?? 0,
+        urgentBypassed: this.orderedUrgentBypassedTotal.get(endpoint) ?? 0,
+      };
+    });
+  }
+
   /** Merge a flushed batch window into one delivery item and queue it. */
   private flushBatch(endpoint: string, items: RetryItem[]): void {
     const batchId = newBatchId();
@@ -3723,6 +3991,9 @@ export class RetryQueue {
     // WR-49: journal before the in-memory mutation, like enqueueNow.
     this.durable?.appendEnqueue(requeued);
     this.queue.set(item.id, requeued);
+    // WR-113: a replay starts a fresh delivery cycle, so it takes the
+    // tail of the ordered line — not its original position.
+    this.orderedTrackEnqueue(requeued.targetUrl, item.id);
     this.bumpPending(item.tenantId, requeued.targetUrl, 1);
     // A replay starts a fresh delivery cycle: restart the latency clock so
     // the sample measures the replayed attempt, not the original one.
@@ -4172,6 +4443,8 @@ export class RetryQueue {
     // two redelivers (at-least-once), never loses.
     this.durable?.appendEnqueue(stored);
     this.queue.set(item.id, stored);
+    // WR-113: take the tail position on the endpoint's ordered line.
+    this.orderedTrackEnqueue(stored.targetUrl, item.id);
     // Start the latency clock only after the item is really queued — a
     // duplicate-id throw must not leave a stale pending record behind.
     // (Batched items start their clock at flush time, when the merged item
@@ -4694,6 +4967,15 @@ export class RetryQueue {
     // endpoint has no weighted config, falling through to failover / the
     // endpoint itself.
     const logicalEndpoint = entry.targetUrl;
+    // WR-113: the head-of-line gate runs before every other dispatch
+    // gate (deadline, pause, window, quota, rate limit, circuit, lanes,
+    // concurrency) — see `orderedGate` for the placement rationale. A
+    // held follower returns here having consumed nothing; a
+    // poison-parked head already advanced the line.
+    if (this.orderedTracker !== undefined) {
+      const gate = this.orderedGate(entry, traceId, tenant, logicalEndpoint);
+      if (gate !== "dispatch") return;
+    }
     const weightedTarget = this.weighted?.resolveTarget(logicalEndpoint);
     const target = weightedTarget ?? this.failover?.resolveTarget(logicalEndpoint) ?? logicalEndpoint;
     // WR-76: the end-to-end delivery deadline is checked before every
@@ -5000,6 +5282,8 @@ export class RetryQueue {
           this.compactDurable();
         }
         this.queue.delete(id);
+        // WR-113: settle the ordered line — a settled head wakes the next head.
+        this.orderedSettle(entry.targetUrl, id);
         this.bumpPending(entry.tenantId, entry.targetUrl, -1);
         // WR-100: a genuinely successful delivery restarts the endpoint's
         // idle clock. Semantic/validator rejections and non-retryable
@@ -5395,6 +5679,8 @@ export class RetryQueue {
       this.compactDurable();
     }
     this.queue.delete(id);
+    // WR-113: settle the ordered line — a settled head wakes the next head.
+    this.orderedSettle(entry.targetUrl, id);
     this.bumpPending(entry.tenantId, entry.targetUrl, -1);
     this.armedNextAt.delete(id);
     this.recordDelivery(entry.tenantId, target, "deadLetter");
@@ -5793,6 +6079,17 @@ export class RetryQueue {
     const stalePause: StalePauseMetricsInput[] = [...this.autoPauseCounts]
       .filter(([, pauses]) => pauses > 0)
       .map(([endpoint, pauses]) => ({ endpoint, pauses }));
+    // WR-113: one counter row per ordered endpoint with recorded
+    // activity — activity-gated, so a relay with the feature off (or
+    // never exercised) exposes no `relay_ordered_*` series at all.
+    const orderedMetricsRows: OrderedMetricsInput[] = this.getOrderedStats()
+      .filter((s) => s.headBlockedCount > 0 || s.headOfLineParked > 0 || s.urgentBypassed > 0)
+      .map((s) => ({
+        endpoint: s.endpoint,
+        headBlocked: s.headBlockedCount,
+        headOfLineParked: s.headOfLineParked,
+        urgentBypassed: s.urgentBypassed,
+      }));
     return renderPrometheus({
       deliveries,
       circuits,
@@ -5869,6 +6166,12 @@ export class RetryQueue {
               })),
           }
         : {}),
+      // WR-113: activity-gated — the ordered series appear only for
+      // ordered endpoints with recorded activity (a held follower, a
+      // poison-parked head, or an urgent bypass), so a relay with the
+      // feature off (or never exercised) exposes no `relay_ordered_*`
+      // series at all.
+      ...(orderedMetricsRows.length > 0 ? { ordered: orderedMetricsRows } : {}),
       // WR-83: enabled-gated — the OTLP series appear only when OTLP
       // export is configured, exactly like the probe series.
       ...(this.otlpExporter !== undefined

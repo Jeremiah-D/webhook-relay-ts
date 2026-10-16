@@ -126,6 +126,15 @@
  *   archived and evicted from memory by the retention window (WR-109).
  *   Activity-gated: present only once the first eviction has actually
  *   happened.
+ * - `relay_ordered_head_blocked_total{endpoint}`: counter of follower
+ *   dispatches held behind the head of an ordered-delivery line (WR-113).
+ *   `relay_ordered_head_of_line_parked_total{endpoint}`: counter of
+ *   heads poison-parked into the dead-letter list after exceeding
+ *   `maxHeadOfLineHoldMs`.
+ *   `relay_ordered_urgent_bypassed_total{endpoint}`: counter of urgent
+ *   items that bypassed the ordered gate. All activity-gated: present
+ *   only for ordered endpoints with recorded activity — absent entirely
+ *   when the feature is off.
  *
  * Cardinality note: labels are per endpoint (`targetUrl`), so a relay
  * fanning out to many distinct downstream URLs grows the series count —
@@ -203,6 +212,18 @@ export interface DeadLetterEscalationMetricsInput {
   tenant?: string;
   /** Cumulative escalation alerts dispatched for this scope. */
   escalations: number;
+}
+
+/** One endpoint's ordered-delivery counters (WR-113), in Prometheus label order. */
+export interface OrderedMetricsInput {
+  /** Ordered endpoint (logical `targetUrl`). */
+  endpoint: string;
+  /** Cumulative follower dispatches held behind the head of the line. */
+  headBlocked: number;
+  /** Cumulative heads poison-parked into the dead-letter list. */
+  headOfLineParked: number;
+  /** Cumulative urgent items that bypassed the ordered gate. */
+  urgentBypassed: number;
 }
 
 /** One endpoint's stale-endpoint auto-pause count (WR-100). */
@@ -352,6 +373,14 @@ export interface MetricsInput {
    * is byte-identical.
    */
   quorumEvicted?: number;
+  /**
+   * Present only when per-endpoint ordered delivery (WR-113) is
+   * enabled; one counter series per endpoint with recorded ordered
+   * activity (a held follower, a poison-parked head, or an urgent
+   * bypass) — absent entirely when the feature is off, so an untouched
+   * relay's exposition is byte-identical.
+   */
+  ordered?: OrderedMetricsInput[];
 }
 
 /** One endpoint's starvation-guard activation count, in Prometheus label order. */
@@ -975,6 +1004,30 @@ export function renderPrometheus(input: MetricsInput): string {
     );
     lines.push("# TYPE relay_otlp_buffered gauge");
     lines.push(`relay_otlp_buffered ${input.otlp.buffered}`);
+  }
+  // WR-113: activity-gated like the stale-pause series — the ordered
+  // series appear only for ordered endpoints with recorded activity, so
+  // a relay with the feature off exposes no `relay_ordered_*` series at
+  // all.
+  if (input.ordered !== undefined && input.ordered.length > 0) {
+    lines.push(
+      "# HELP relay_ordered_head_blocked_total Follower dispatches held behind the head of an ordered-delivery line (WR-113)."
+    );
+    lines.push("# TYPE relay_ordered_head_blocked_total counter");
+    lines.push(
+      "# HELP relay_ordered_head_of_line_parked_total Heads poison-parked into the dead-letter list after exceeding maxHeadOfLineHoldMs (WR-113)."
+    );
+    lines.push("# TYPE relay_ordered_head_of_line_parked_total counter");
+    lines.push(
+      "# HELP relay_ordered_urgent_bypassed_total Urgent items that bypassed the ordered gate (WR-113)."
+    );
+    lines.push("# TYPE relay_ordered_urgent_bypassed_total counter");
+    for (const s of input.ordered) {
+      const ep = escapeLabelValue(s.endpoint);
+      lines.push(`relay_ordered_head_blocked_total{endpoint="${ep}"} ${s.headBlocked}`);
+      lines.push(`relay_ordered_head_of_line_parked_total{endpoint="${ep}"} ${s.headOfLineParked}`);
+      lines.push(`relay_ordered_urgent_bypassed_total{endpoint="${ep}"} ${s.urgentBypassed}`);
+    }
   }
   return lines.join("\n") + "\n";
 }
