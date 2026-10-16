@@ -7,6 +7,7 @@ import {
   assertValidEndpointVerifierRules,
   HmacSha256Verifier,
   RotatingHmacVerifier,
+  RotatingRsaPssVerifier,
   selectEndpointBodyLimit,
   selectEndpointVerifier,
   signSha256,
@@ -299,8 +300,8 @@ export interface RelayServerOptions {
   sender?: Sender;
   /**
    * Signature verifier; defaults to HMAC-SHA256 with `secret`.
-   * Inject e.g. `new Ed25519Verifier(pem)` to change schemes.
-   * Cannot be combined with `signingKeys`.
+   * Inject e.g. `new Ed25519Verifier(pem)` or `new RsaPssVerifier(pem)` to
+   * change schemes. Cannot be combined with `signingKeys`.
    */
   verifier?: Verifier;
   /**
@@ -329,7 +330,8 @@ export interface RelayServerOptions {
   /**
    * Per-endpoint signature verifier selection (WR-29): inbound request
    * paths can each trust a different verifier — e.g. Ed25519 for
-   * `/hooks/solana-program` and HMAC-SHA256 everywhere else. Rules are
+   * `/hooks/solana-program`, RSA-PSS for `/hooks/bank` (WR-110), and
+   * HMAC-SHA256 everywhere else. Rules are
    * tried in config order and the first match wins; paths with no match
    * fall back to the global `verifier` (or `signingKeys` / `secret`
    * default). Patterns are exact (`/hooks/stripe`) or prefix
@@ -5380,7 +5382,13 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     let verified = false;
     let verifiedKeyId: string | undefined;
     const apiKeyAuthenticates = apiKey !== undefined && apiKey.rule.requireSignature !== true;
-    const rotatingVerifier = activeVerifier instanceof RotatingHmacVerifier;
+    // WR-110: RSA-PSS rotation joins the HMAC rotation here — both expose
+    // verifyDetailed() -> { ok, keyId }, so the accepted-audit keyId
+    // attribution below works unchanged (for RSA the keyId is the
+    // SHA-256 fingerprint of the verifying public key).
+    const rotatingVerifier =
+      activeVerifier instanceof RotatingHmacVerifier ||
+      activeVerifier instanceof RotatingRsaPssVerifier;
     // Rotation attribution only applies when the signature check ran;
     // in api-key-only mode the key gate already authenticated the
     // request, so no signing key id is reported.

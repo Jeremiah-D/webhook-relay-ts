@@ -5,7 +5,8 @@
 > not employer production code and re-implements no proprietary system.
 
 A dependency-free TypeScript webhook relay: verify an incoming webhook through
-a pluggable verifier interface (HMAC-SHA256 default, Ed25519 included),
+a pluggable verifier interface (HMAC-SHA256 default, Ed25519 and RSA-PSS
+included),
 enqueue it into a retry queue with exponential backoff, forward it to a
 downstream URL, and record everything in an append-only audit log.
 
@@ -29,13 +30,20 @@ reliability primitives that matter for any signed-payload pipeline.
   (`registerVerifier` / `getVerifier` / `verifyWith`) lets you add schemes
   without touching the server. Built in: `HmacSha256Verifier` (default —
   `sha256=<hex>` and `t=<unix_ts>,v1=<hex>` formats, the timestamped one
-  covers `<ts>.<rawBody>`), and `Ed25519Verifier` (`ed25519=<hex>` over the
-  raw body, PEM public key). Uses `crypto.timingSafeEqual` on the HMAC path
+  covers `<ts>.<rawBody>`), `Ed25519Verifier` (`ed25519=<hex>` over the
+  raw body, PEM public key), and `RsaPssVerifier` (WR-110 — `rsa-sha256=<base64>`
+  over the raw body, SHA-256 with a 32-byte PSS salt, PEM RSA public key;
+  `signRsaPss` builds the header). Uses `crypto.timingSafeEqual` on the HMAC path
   and enforces a timestamp tolerance window (default 300s).
   `RotatingHmacVerifier` (also in `src/verify.ts`) layers key rotation on
   top: several HMAC keys coexist with one primary for new signatures,
   retired keys stay verifiable inside a grace window (default 24h), and
   `verifyDetailed` reports which key id verified for the audit trail.
+  `RotatingRsaPssVerifier` (WR-110) is the asymmetric counterpart: several
+  RSA public keys are tried in order so the old and new key both verify in
+  parallel during a rotation window, and `verifyDetailed` reports the
+  SHA-256 fingerprint of the matching key (surfaced as `keyId` in the
+  accepted-audit event, like the HMAC rotation).
   `selectEndpointVerifier` / `assertValidEndpointVerifierRules` implement
   per-endpoint verifier selection: inbound paths match `{ pattern,
   verifier }` rules (exact `/hooks/stripe` or prefix `/hooks/*`, first
@@ -886,8 +894,8 @@ reliability primitives that matter for any signed-payload pipeline.
   HTTPS+pins p50 4.18 → 0.87 ms; localhost numbers, not a WAN claim.)
 - `src/server.ts` — a minimal `node:http` receiver: read the raw body, verify
   the `x-signature` header with the injected `verifier` (defaults to
-  HMAC-SHA256 with `secret`; pass e.g. `new Ed25519Verifier(pem)` to change
-  schemes), or opt into key rotation with `signingKeys` (primary + retired
+  HMAC-SHA256 with `secret`; pass e.g. `new Ed25519Verifier(pem)` or
+  `new RsaPssVerifier(pem)` to change schemes), or opt into key rotation with `signingKeys` (primary + retired
   keys, grace via `keyGraceMs`, senders name their key with the `x-key-id`
   header; accepted/rejected audit events carry the verifying `keyId`),
   or select the verifier per inbound path with `endpointVerifiers:

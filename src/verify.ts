@@ -1,4 +1,6 @@
 import {
+  constants as cryptoConstants,
+  createHash,
   createHmac,
   createPrivateKey,
   createPublicKey,
@@ -149,6 +151,153 @@ export class Ed25519Verifier implements Verifier {
 export function signEd25519(rawBody: Buffer, privateKeyPem: string): string {
   const sig = cryptoSign(null, rawBody, createPrivateKey(privateKeyPem));
   return `ed25519=${sig.toString("hex")}`;
+}
+
+/** RSA-PSS salt length in bytes (WR-110): fixed at 32 with SHA-256. */
+export const RSA_PSS_SALT_LENGTH = 32;
+
+const BASE64_RE = /^[A-Za-z0-9+/]*={0,2}$/;
+
+/**
+ * SHA-256 fingerprint (lowercase hex) of a public key's SPKI DER encoding —
+ * the stable key identity used for audit trails. Never throws on a real
+ * KeyObject.
+ */
+export function publicKeyFingerprint(publicKey: ReturnType<typeof createPublicKey>): string {
+  const der = publicKey.export({ type: "spki", format: "der" });
+  return createHash("sha256")
+    .update(der as Buffer)
+    .digest("hex");
+}
+
+/**
+ * Asymmetric verifier slot: RSA-PSS over the raw body (WR-110).
+ * Header format: `rsa-sha256=<base64>`, where the signature covers
+ * `rawBody` exactly with SHA-256 and a 32-byte PSS salt. Construct with
+ * a PEM-encoded RSA public key; the holder of the matching private key
+ * signs with {@link signRsaPss}. The PSS salt is random per signature,
+ * so two signatures over the same body differ — both verify.
+ * Never throws from `verify`.
+ */
+export class RsaPssVerifier implements Verifier {
+  readonly name = "rsa-pss";
+
+  private readonly publicKey: ReturnType<typeof createPublicKey>;
+
+  constructor(publicKeyPem: string) {
+    if (typeof publicKeyPem !== "string" || publicKeyPem.trim() === "") {
+      throw new Error("RsaPssVerifier: publicKeyPem must be a non-empty PEM string");
+    }
+    this.publicKey = createPublicKey(publicKeyPem);
+  }
+
+  /** SHA-256 hex fingerprint of the SPKI DER — the stable key identity for audit. */
+  get fingerprint(): string {
+    return publicKeyFingerprint(this.publicKey);
+  }
+
+  verify(rawBody: Buffer, header: string): boolean {
+    try {
+      if (typeof header !== "string" || !header.startsWith("rsa-sha256=")) {
+        return false;
+      }
+      const b64 = header.slice("rsa-sha256=".length).trim();
+      if (b64 === "" || b64.length % 4 !== 0 || !BASE64_RE.test(b64)) {
+        return false;
+      }
+      const sig = Buffer.from(b64, "base64");
+      if (sig.length === 0) {
+        return false;
+      }
+      return cryptoVerify(
+        "sha256",
+        rawBody,
+        {
+          key: this.publicKey,
+          padding: cryptoConstants.RSA_PKCS1_PSS_PADDING,
+          saltLength: RSA_PSS_SALT_LENGTH,
+        },
+        sig
+      );
+    } catch {
+      return false;
+    }
+  }
+}
+
+/** Build an `rsa-sha256=<base64>` header with a PEM-encoded RSA private key. */
+export function signRsaPss(rawBody: Buffer, privateKeyPem: string): string {
+  const sig = cryptoSign("sha256", rawBody, {
+    key: createPrivateKey(privateKeyPem),
+    padding: cryptoConstants.RSA_PKCS1_PSS_PADDING,
+    saltLength: RSA_PSS_SALT_LENGTH,
+  });
+  return `rsa-sha256=${sig.toString("base64")}`;
+}
+
+/**
+ * RSA-PSS verifier with key rotation (WR-110): several RSA public keys
+ * coexist and every inbound signature is tried against each in config
+ * order — during a rotation window the old and the new key both verify
+ * in parallel, so upstreams can cut over without downtime. The first
+ * matching key wins. `verify` keeps the plain {@link Verifier} contract
+ * (boolean); {@link verifyDetailed} reports the SHA-256 fingerprint of
+ * the key that matched, for audit trails — the server surfaces it as
+ * `keyId`, exactly like the HMAC rotation's key id (there is no
+ * `x-key-id` hint for RSA: public keys are tried, not selected).
+ * Never throws from verification paths.
+ */
+export class RotatingRsaPssVerifier implements Verifier {
+  readonly name = "rsa-pss-rotating";
+
+  private readonly keys: { fingerprint: string; verifier: RsaPssVerifier }[];
+
+  constructor(publicKeyPems: string[]) {
+    if (!Array.isArray(publicKeyPems) || publicKeyPems.length === 0) {
+      throw new Error("RotatingRsaPssVerifier: `publicKeyPems` must be a non-empty array");
+    }
+    const seen = new Set<string>();
+    this.keys = publicKeyPems.map((pem, i) => {
+      const where = `RotatingRsaPssVerifier: publicKeyPems[${i}]`;
+      if (typeof pem !== "string" || pem.trim() === "") {
+        throw new Error(`${where} must be a non-empty PEM string`);
+      }
+      let verifier: RsaPssVerifier;
+      try {
+        verifier = new RsaPssVerifier(pem);
+      } catch {
+        throw new Error(`${where} is not a valid PEM public key`);
+      }
+      const fingerprint = verifier.fingerprint;
+      if (seen.has(fingerprint)) {
+        throw new Error(`${where} duplicates an earlier key`);
+      }
+      seen.add(fingerprint);
+      return { fingerprint, verifier };
+    });
+  }
+
+  /** Fingerprints of the configured keys, in try order. */
+  get keyFingerprints(): string[] {
+    return this.keys.map((k) => k.fingerprint);
+  }
+
+  verifyDetailed(rawBody: Buffer, header: string, _opts: VerifyDetailOptions = {}): VerifyDetail {
+    try {
+      for (const k of this.keys) {
+        if (k.verifier.verify(rawBody, header)) {
+          return { ok: true, keyId: k.fingerprint };
+        }
+      }
+      return { ok: false };
+    } catch {
+      return { ok: false };
+    }
+  }
+
+  verify(rawBody: Buffer, header: string, opts: VerifyOptions = {}): boolean {
+    return this.verifyDetailed(rawBody, header, opts).ok;
+  }
 }
 
 /** One HMAC key in a rotation set. */
