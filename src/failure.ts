@@ -24,11 +24,17 @@
  *   transform), so no downstream verdict exists and retrying is futile.
  *   The item is dead-lettered immediately and audited as
  *   `transform_failed`.
+ * - a WR-117 `OutboundSchemaViolationError` → `"non_retryable"`: the
+ *   post-transform payload failed the endpoint's outbound JSON schema
+ *   before the wire request was built, so no downstream verdict exists
+ *   and retrying is futile. The item is dead-lettered immediately and
+ *   audited as `schema_violation`.
  *
  * Zero dependencies (`node:` only where the caller's clock is needed).
  */
 
 import { PayloadTransformError } from "./transform.ts";
+import { OutboundSchemaViolationError } from "./outbound-schema.ts";
 import { SigV4SigningError } from "./sigv4.ts";
 
 /**
@@ -142,6 +148,15 @@ export function classifyFailure(err: unknown): ClassifiedFailure {
   // item, so dead-letter immediately instead of burning the retry
   // budget and the backoff clock.
   if (err instanceof SigV4SigningError) {
+    return { failureClass: "non_retryable" };
+  }
+  // WR-117: an outbound schema violation is a local config/payload
+  // problem, not a downstream verdict — the post-transform payload
+  // failed the endpoint's JSON schema before the wire request was
+  // built, let alone sent. Retrying can never succeed (same config,
+  // same payload), so dead-letter immediately instead of burning the
+  // retry budget and the backoff clock. Audited as `schema_violation`.
+  if (err instanceof OutboundSchemaViolationError) {
     return { failureClass: "non_retryable" };
   }
   let statusCode: number | undefined;

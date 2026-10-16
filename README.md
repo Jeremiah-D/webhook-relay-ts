@@ -2223,6 +2223,55 @@ const server = createRelayServer({
   pass bytes through untouched. Invalid rules throw `RangeError` /
   `TemplateError` at startup — never mid-delivery.
 
+## Outbound payload schema validation (opt-in)
+
+The mirror image of the WR-41 inbound schema registry: a per-endpoint,
+pluggable admission gate on the payload shape *after* the WR-115
+transform and *before* delivery (`src/outbound-schema.ts`). A
+misconfigured transform can silently drop a field the downstream
+requires — without this gate, that poisoned payload burns retry budget
+and backoff slots on a delivery that could never succeed:
+
+```ts
+const server = createRelayServer({
+  secret, forwardUrl, auditLog,
+  outboundSchemas: {
+    "https://payments.example/hook": paymentSchema, // a PayloadSchema: { name, version, validate }
+  },
+});
+```
+
+The `PayloadSchema` shape is shared with the inbound registry
+(`{ name, version, validate }`), so one schema implementation can guard
+both directions; the built-in `createRequiredFieldsSchema` from
+`src/schema.ts` works unchanged.
+
+- **Pipeline order** — validation runs on the post-transform JSON
+  payload: transform (WR-115) → schema → gzip (WR-40/WR-75) → E2EE
+  sealing (WR-58) → signing (WR-26). Compression and sealing produce
+  non-JSON wire bytes, so the schema must precede them; `x-relay-signature`
+  always covers the validated bytes — exactly what the downstream
+  receives and verifies.
+- **Exact-targetUrl keys** — rules are keyed by exact `targetUrl`, no
+  prefix matching (the outbound config convention: WR-60
+  `tlsSniOverrides`, WR-42 H2 pool keys). Endpoints without a rule keep
+  byte-exact current behavior.
+- **Failure is never silent** — a violation throws
+  `OutboundSchemaViolationError`, classified `"non_retryable"`: the item
+  dead-letters on the first attempt without burning the retry budget,
+  the endpoint's circuit breaker is untouched, and the audit log gets a
+  dedicated `schema_violation` event (delivery id, error, endpoint,
+  schema name/version) alongside the usual `dead_letter`. A non-JSON
+  payload under a configured rule fails validation (a JSON schema has
+  nothing to say about opaque bytes — the WR-41 convention); a throwing
+  validator is fail-closed. Invalid rules throw `RangeError` at
+  startup — never mid-delivery.
+- **Observability** — per-schema/per-endpoint counters render into
+  `GET /metrics` as `relay_outbound_schema_total{schema,version,endpoint,status="valid"|"invalid"}`;
+  the exposition renders empty until the first validated delivery, so
+  `/metrics` stays byte-identical for relays that never enable the
+  feature.
+
 ## AWS SigV4 outbound signing (opt-in)
 
 Some downstreams (API Gateway with IAM auth, AWS-service webhook sinks)

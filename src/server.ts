@@ -248,6 +248,11 @@ import {
   type PayloadSchema,
   type SchemaRegistration,
 } from "./schema.ts";
+import {
+  OutboundSchemaRegistry,
+  OutboundSchemaViolationError,
+  type OutboundSchemaMetrics,
+} from "./outbound-schema.ts";
 import type { ProbeOptions } from "./downstream-probe.ts";
 import type { OtlpExporterOptions } from "./otlp.ts";
 import {
@@ -1044,6 +1049,29 @@ export interface RelayServerOptions {
    */
   payloadTransforms?: Record<string, PayloadTransformRules>;
   /**
+   * Per-endpoint outbound payload JSON schema validation (WR-117, see
+   * `src/outbound-schema.ts`): `{ "<exact targetUrl>": PayloadSchema }`
+   * — a pluggable shape gate on the *post-transform* payload, keyed by
+   * exact `targetUrl` (no prefix matching — the outbound config
+   * convention in this relay: WR-60 `tlsSniOverrides`, WR-42 H2 pool
+   * keys). Pipeline order: transform (WR-115) → schema → gzip
+   * (WR-40/WR-75) → E2EE (WR-58) → sign (WR-26), so `x-relay-signature`
+   * always covers the validated bytes — exactly what the downstream
+   * receives and verifies. A violation throws
+   * `OutboundSchemaViolationError`, classified `"non_retryable"`: the
+   * item dead-letters on the first attempt without burning the retry
+   * budget, the endpoint's breaker is untouched, and the audit log gets
+   * a dedicated `schema_violation` event (delivery id, error, endpoint,
+   * schema name/version) alongside the usual `dead_letter` — never
+   * silently dropped. A non-JSON payload under a configured rule fails
+   * validation (a JSON schema has nothing to say about opaque bytes —
+   * the WR-41 convention); a throwing validator is fail-closed.
+   * Opt-in; endpoints without rules keep byte-exact current behavior.
+   * Applies to the default sender only. Invalid rules throw
+   * `RangeError` at startup — never mid-delivery.
+   */
+  outboundSchemas?: Record<string, PayloadSchema>;
+  /**
    * Per-endpoint AWS SigV4 request signing (WR-116, see `src/sigv4.ts`):
    * `{ "<exact targetUrl>": AwsSigV4EndpointConfig }` — access key id +
    * secret *reference* + region + service. Each delivery attempt to a
@@ -1593,6 +1621,15 @@ export interface PooledSender extends Sender {
    */
   compressionStats: OutboundCompressionTracker;
   /**
+   * WR-117: per-schema/per-endpoint outbound payload schema validation
+   * counters, when the feature is enabled — rendered into `GET /metrics`
+   * as `relay_outbound_schema_total` via `render()`. `undefined` when
+   * no `outboundSchemas` were configured; the metrics object itself
+   * renders `""` until the first validated delivery, keeping
+   * `GET /metrics` byte-identical for relays that never enable it.
+   */
+  outboundSchemaMetrics: OutboundSchemaMetrics | undefined;
+  /**
    * WR-89: take-and-clear the id of the rotation client certificate most
    * recently used in a handshake attempt for the delivery `deliveryId`
    * (the queue's item id) — the primary's id, or a fallback's id when an
@@ -1796,7 +1833,14 @@ export function createDefaultSender(
    * injected. An unresolvable ref fails the attempt with
    * `SigV4SecretUnavailableError` (classified `non_retryable`).
    */
-  awsSecretResolver?: SecretResolver
+  awsSecretResolver?: SecretResolver,
+  /**
+   * WR-117: per-endpoint outbound payload JSON schema validation
+   * (opt-in, see `src/outbound-schema.ts`): `{ "<exact targetUrl>":
+   * PayloadSchema }`. Validated at startup (`RangeError`); `undefined`
+   * keeps the exact pre-WR-117 wire shape.
+   */
+  outboundSchemas?: Record<string, PayloadSchema>
 ): PooledSender {
   if (tlsPins !== undefined) {
     for (const [endpoint, pins] of Object.entries(tlsPins)) {
@@ -2034,6 +2078,20 @@ export function createDefaultSender(
       sigv4Configs.set(endpoint, cfg);
     }
   }
+  // WR-117: RangeError on invalid values, at startup — never
+  // mid-delivery. The registry validates the whole record before any
+  // state is touched: zero partial application — a bad record refuses
+  // to boot rather than running with a half-wired gate.
+  let outboundSchemaRegistry: OutboundSchemaRegistry | undefined;
+  if (outboundSchemas !== undefined) {
+    try {
+      outboundSchemaRegistry = new OutboundSchemaRegistry(outboundSchemas);
+    } catch (err) {
+      throw new RangeError(
+        `createDefaultSender: invalid outboundSchemas config: ${(err as Error).message}`
+      );
+    }
+  }
   // RangeError on invalid values, at startup — never mid-delivery.
   if (outboundSigning !== undefined) {
     if (typeof outboundSigning.secret !== "string" || outboundSigning.secret === "") {
@@ -2233,6 +2291,20 @@ export function createDefaultSender(
         }
       }
       Object.assign(headers, injectedHeaders);
+    }
+    // WR-117: per-endpoint outbound payload schema validation — runs on
+    // the post-transform JSON payload BEFORE compression (WR-40/WR-75)
+    // and E2EE sealing (WR-58) — which produce non-JSON wire bytes — and
+    // before signing (WR-26), so `x-relay-signature` covers exactly the
+    // validated bytes the downstream receives. Opt-in: endpoints without
+    // rules keep the exact current behavior. A violation throws
+    // OutboundSchemaViolationError, classified "non_retryable": the item
+    // dead-letters on the first attempt and is audited as
+    // `schema_violation` — never silently dropped. A non-JSON payload
+    // under a configured rule fails validation (the WR-41 convention); a
+    // throwing validator is fail-closed.
+    if (outboundSchemaRegistry !== undefined) {
+      outboundSchemaRegistry.validatePayload(item.targetUrl, sourcePayload);
     }
     // Propagate the trace ID downstream so the next hop can correlate the
     // delivery with this relay's audit trail (overrides a stale inbound
@@ -3343,6 +3415,10 @@ export function createDefaultSender(
   sender.http2Pool = h2pool;
   sender.wsPool = wsPool;
   sender.compressionStats = compressionTracker;
+  // WR-117: outbound schema counters (undefined when the feature is off)
+  // — operators read them via `sender.outboundSchemaMetrics.getStats()`;
+  // they render into GET /metrics as `relay_outbound_schema_total`.
+  sender.outboundSchemaMetrics = outboundSchemaRegistry?.metrics;
   // WR-92: the shared DNS cache instance (undefined when the feature is
   // off) — operators read counters via `sender.dnsCache.getStats()`.
   sender.dnsCache = resolvedDnsCache;
@@ -3904,7 +3980,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   }
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, opts.awsSigV4, opts.awsSecretResolver)
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, opts.awsSigV4, opts.awsSecretResolver, opts.outboundSchemas)
       : undefined;
   // WR-50: endpoints the operator may pause/resume over HTTP. The server
   // only ever delivers to these — the intake target plus every
@@ -3934,7 +4010,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     if (validators !== undefined && typeof validators === "object") {
       for (const endpoint of Object.keys(validators)) knownEndpoints.add(endpoint);
     }
-    for (const record of [opts.tlsPins, opts.tlsClientCerts, opts.tlsClientCertRotation, opts.compressOutbound, opts.compressThreshold, opts.proxies, opts.outboundEncryption, opts.responseCompression, opts.forwardHeaders, opts.minTlsVersions, opts.tlsOcsp, opts.payloadTransforms]) {
+    for (const record of [opts.tlsPins, opts.tlsClientCerts, opts.tlsClientCertRotation, opts.compressOutbound, opts.compressThreshold, opts.proxies, opts.outboundEncryption, opts.responseCompression, opts.forwardHeaders, opts.minTlsVersions, opts.tlsOcsp, opts.payloadTransforms, opts.outboundSchemas]) {
       if (record) for (const endpoint of Object.keys(record)) knownEndpoints.add(endpoint);
     }
     for (const endpoint of opts.retry?.probe?.endpoints ?? []) knownEndpoints.add(endpoint);
@@ -4487,6 +4563,24 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
           error: lastError.message,
         });
       }
+      // WR-117: an outbound schema violation gets its own audit line on
+      // top of the `dead_letter` above — the operator sees *why* the
+      // item died (event id, error, endpoint, schema name/version), not
+      // just that it died. The `failure_class` on the `dead_letter`
+      // event is "non_retryable": the wire request was never built, so
+      // retrying was futile.
+      if (lastError instanceof OutboundSchemaViolationError) {
+        opts.auditLog.append({
+          event: "schema_violation",
+          id: item.id,
+          traceId: item.traceId,
+          ...(item.tenantId !== undefined ? { tenant: item.tenantId } : {}),
+          targetUrl: item.targetUrl,
+          schema: lastError.schemaName,
+          schemaVersion: lastError.schemaVersion,
+          error: lastError.message,
+        });
+      }
     },
     onCircuitStateChange: (endpoint, from, to, tenant) => {
       const event =
@@ -4943,7 +5037,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       // new series. Absent entirely with a custom sender (no pool).
       res
         .writeHead(200, { "content-type": "text/plain; version=0.0.4" })
-        .end(queue.renderMetrics() + versionMetrics.render() + schemaMetrics.render() + (schemaRegistry?.renderMetrics() ?? "") + ipAclMetrics.render() + certExpiryMonitor.render() + tlsVersionMonitor.render() + (ocspMonitor?.render() ?? "") + (usageMeter?.render() ?? "") + (defaultSender?.compressionStats.render() ?? "") + (defaultSender?.dnsCache?.render() ?? "") + (defaultSender?.wsPool.renderMetrics() ?? "") + meshMetrics.render());
+        .end(queue.renderMetrics() + versionMetrics.render() + schemaMetrics.render() + (schemaRegistry?.renderMetrics() ?? "") + ipAclMetrics.render() + certExpiryMonitor.render() + tlsVersionMonitor.render() + (ocspMonitor?.render() ?? "") + (usageMeter?.render() ?? "") + (defaultSender?.compressionStats.render() ?? "") + (defaultSender?.dnsCache?.render() ?? "") + (defaultSender?.wsPool.renderMetrics() ?? "") + meshMetrics.render() + (defaultSender?.outboundSchemaMetrics?.render() ?? ""));
       return;
     }
     if (isEvents) {
