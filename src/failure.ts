@@ -19,9 +19,16 @@
  *   TLS errors, proxy failures) → `"retryable"`: the normal backoff lane.
  *   A `429` additionally honors the downstream's `Retry-After` header when
  *   present.
+ * - a WR-115 `PayloadTransformError` → `"non_retryable"`: the wire
+ *   request was never built (non-JSON payload under a configured
+ *   transform), so no downstream verdict exists and retrying is futile.
+ *   The item is dead-lettered immediately and audited as
+ *   `transform_failed`.
  *
  * Zero dependencies (`node:` only where the caller's clock is needed).
  */
+
+import { PayloadTransformError } from "./transform.ts";
 
 /**
  * How a delivery failure should be treated by the retry queue.
@@ -120,6 +127,14 @@ export interface ClassifiedFailure {
  * with a numeric `statusCode` field is enough.
  */
 export function classifyFailure(err: unknown): ClassifiedFailure {
+  // WR-115: a payload-transform failure is a local config/payload
+  // problem, not a downstream verdict — the wire request was never
+  // built, let alone sent. Retrying can never succeed (same config,
+  // same payload), so dead-letter immediately instead of burning the
+  // retry budget and the backoff clock.
+  if (err instanceof PayloadTransformError) {
+    return { failureClass: "non_retryable" };
+  }
   let statusCode: number | undefined;
   let retryAfterMs: number | undefined;
   if (err !== null && typeof err === "object") {

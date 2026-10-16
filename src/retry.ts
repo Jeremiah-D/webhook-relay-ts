@@ -233,6 +233,7 @@ import {
   summarizeDownstreamResponse,
   type DownstreamResponseSummary,
 } from "./response-summary.ts";
+import { PayloadTransformer, PayloadTransformError, TemplateError } from "./transform.ts";
 import {
   DEFAULT_MIN_ATTEMPT_BUDGET_MS,
   DeadlineBudgetTimeoutError,
@@ -305,6 +306,8 @@ export type { EncryptedPayload, PayloadEncryptor };
 export type { EndpointLatencyStats, LatencyTrackerOptions };
 export type { SloRiskInfo, SloRiskObservation, SloRiskOptions };
 export type { FieldMask, FieldMaskRule, MaskStrategy };
+export { PayloadTransformer, PayloadTransformError, TemplateError };
+export type { PayloadTransformRules, TransformContext };
 export type { QuotaOptions, QuotaStats };
 export type { ReplayEgressOptions };
 export { ReplayEgressGate, DEFAULT_REPLAY_EGRESS_RPS };
@@ -5421,10 +5424,17 @@ export class RetryQueue {
           // settles a half-open probe exactly once, as the breaker
           // requires). Failover agrees: an answering target is a healthy
           // target.
+          // WR-115: a PayloadTransformError is not a downstream verdict at
+          // all — the wire request was never built, so the endpoint was
+          // never contacted. The control plane (breaker, adaptive
+          // backoff/concurrency, failover, weighted) must not learn
+          // anything from it: recording a "success" would reset failure
+          // streaks the endpoint actually earned.
+          const reachedDownstream = !(err instanceof PayloadTransformError);
           // WR-91: leader-only, like the success path above — a follower's
           // poison-payload verdict is logical (its own dead letter), not
           // a second physical observation of the endpoint.
-          if (attemptLeads) {
+          if (attemptLeads && reachedDownstream) {
             breaker?.recordSuccess(target);
             // WR-59: the downstream answered (poison payload, not a sick
             // endpoint) — cools the adaptive base like any success.

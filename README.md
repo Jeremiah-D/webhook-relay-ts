@@ -2151,6 +2151,67 @@ const server = createRelayServer({
   the stateful `g`/`y` flags so forwarding is deterministic. Invalid
   rules throw `RangeError` at startup — never mid-delivery.
 
+## Per-endpoint payload transform (opt-in)
+
+Rewrite the JSON payload just before delivery, per endpoint
+(`src/transform.ts`). Some downstreams speak a different dialect than the
+producer — a payment gateway that wants `amount_cents` instead of
+`amount`, a ledger hook that requires a static `x-tenant` header, an
+event bus that needs the delivery id echoed back as a header:
+
+```ts
+const server = createRelayServer({
+  secret, forwardUrl, auditLog,
+  outboundSigning: { secret: signSecret }, // WR-26
+  payloadTransforms: {
+    "https://payments.example/hook": {
+      fieldRenames: { amount: "amount_cents" },   // move: source deleted
+      fieldMaps: { "meta.order_id": "order" },    // copy: source kept
+      fieldDeletes: ["internal.debug"],
+      constants: { source: "relay", "meta.v": 1 },
+      headerInjections: {
+        "x-event-id": "evt-{{event_id}}",
+        "x-attempt": "{{attempt}}",
+        "x-tenant": "acme",
+      },
+    },
+  },
+});
+```
+
+- **Pipeline order** — the transform runs first, on the raw payload
+  bytes: transform → gzip (WR-40/WR-75) → E2EE sealing (WR-58) → signing
+  (WR-26). Compression and sealing produce non-JSON wire bytes, so the
+  transform must precede them; the signature always covers the
+  transformed bytes — exactly what the downstream receives and verifies.
+  For WR-09 batched deliveries the merged envelope is transformed as
+  one JSON document.
+- **Templates** — header values (and only header values) may use
+  `{{event_id}}` (the delivery id), `{{endpoint}}`, `{{attempt}}`
+  (1-based, per attempt), and `{{timestamp}}` (ISO-8601, rendered per
+  attempt). Unclosed `{{`, stray `}}`, or unknown variables throw
+  `TemplateError` at startup — never mid-delivery.
+- **Failure is never silent** — a non-JSON payload under a configured
+  transform (or any runtime transform failure) throws
+  `PayloadTransformError`, classified `"non_retryable"`: the item
+  dead-letters on the first attempt without burning the retry budget,
+  and the audit log gets a dedicated `transform_failed` event (delivery
+  id, error, endpoint) alongside the usual `dead_letter`. The endpoint
+  was never contacted, so the circuit breaker and the adaptive
+  controllers learn nothing from it.
+- **Anti-forgery** — injected headers are relay-computed: any inbound
+  header with the same name is stripped before stamping (the WR-26
+  pattern). Relay-owned and transport names (`x-relay-signature`,
+  `x-trace-id`, `traceparent`, `content-length`, …) are rejected at
+  construction; `x-`-prefixed names are recommended by convention.
+- **Paths** — dot-separated with numeric segments for array elements
+  (`items.0.sku`); `__proto__` / `constructor` / `prototype` are
+  rejected. Missing sources are no-ops; sets create intermediate
+  objects (arrays for numeric segments). Transformed payloads are
+  emitted as canonical JSON (`JSON.stringify`); endpoints without rules
+  pass bytes through untouched. Invalid rules throw `RangeError` /
+  `TemplateError` at startup — never mid-delivery.
+
 ## W3C trace-context propagation (opt-in)
 
 Distributed-tracing glue between the relay's own end-to-end trace IDs

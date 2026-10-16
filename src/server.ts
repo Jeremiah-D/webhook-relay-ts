@@ -52,6 +52,14 @@ import { installGracefulShutdown } from "./shutdown.ts";
 import { SourceBaselineDetector, type SourceBaselineOptions } from "./source-baseline.ts";
 import type { PayloadEncryptor } from "./encrypt.ts";
 import type { FieldMask } from "./masking.ts";
+import {
+  PayloadTransformer,
+  PayloadTransformError,
+  TemplateError,
+  type PayloadTransformRules,
+} from "./transform.ts";
+export { PayloadTransformer, PayloadTransformError, TemplateError };
+export type { PayloadTransformRules, TransformContext } from "./transform.ts";
 import type { ReplayGuard } from "./replay.ts";
 import { DeliveryDeduplicator, type DedupOptions } from "./dedup.ts";
 import {
@@ -994,6 +1002,27 @@ export interface RelayServerOptions {
    */
   outboundEncryption?: Record<string, OutboundEncryptionConfig>;
   /**
+   * Per-endpoint payload transform (WR-115, see `src/transform.ts`):
+   * `{ "<exact targetUrl>": PayloadTransformRules }` — field
+   * renames/maps/deletes, constant injection, and outbound header
+   * injection (static or `{{event_id}}` / `{{endpoint}}` / `{{attempt}}`
+   * / `{{timestamp}}` templates), applied to the JSON payload just
+   * before the wire request is built (after the payload is final,
+   * before compression / E2EE sealing / signing, so `x-relay-signature`
+   * always covers the transformed bytes). Useful when a downstream
+   * speaks a different dialect than the producer — e.g. a payment
+   * gateway that wants `amount_cents` instead of `amount`, or a ledger
+   * hook that requires a static `x-tenant` header. Interaction order:
+   * transform → gzip (WR-40/WR-75) → E2EE (WR-58) → sign (WR-26); for
+   * WR-09 batched deliveries the merged envelope is transformed as one
+   * JSON document. A non-JSON payload (or any runtime transform
+   * failure) dead-letters the item on the first attempt and audits
+   * `transform_failed` — never silently dropped. Opt-in; endpoints
+   * without rules are untouched. Applies to the default sender only.
+   * Invalid values throw `RangeError`/`TemplateError` at startup.
+   */
+  payloadTransforms?: Record<string, PayloadTransformRules>;
+  /**
    * Outbound idempotency-key stamping (WR-44, see `IdempotencyKeyOptions`
    * in `src/idempotency-key.ts`): when `enabled`, every delivery made by
    * the default sender carries `x-relay-idempotency-key` — the
@@ -1681,7 +1710,26 @@ export function createDefaultSender(
    * in-flight-preservation rule). `undefined` keeps the exact
    * pre-WR-114 resolution.
    */
-  endpointRegistry?: EndpointRegistry
+  endpointRegistry?: EndpointRegistry,
+  /**
+   * WR-115: per-endpoint payload transform (see `src/transform.ts`):
+   * `{ "<exact targetUrl>": PayloadTransformRules }` — field
+   * renames/maps/deletes, constant injection, and outbound header
+   * injection (static or `{{event_id}}` / `{{endpoint}}` / `{{attempt}}`
+   * / `{{timestamp}}` templates), applied to the JSON payload just
+   * before the wire request is built. The transform runs before
+   * compression (WR-40/WR-75) and E2EE sealing (WR-58) — which produce
+   * non-JSON wire bytes — and before signing (WR-26), so
+   * `x-relay-signature` always covers the transformed bytes. Opt-in:
+   * endpoints without rules keep the exact current behavior. A
+   * non-JSON payload (or any runtime transform failure) throws
+   * `PayloadTransformError`, classified `"non_retryable"` — the item
+   * dead-letters on the first attempt and is audited as
+   * `transform_failed`, never silently dropped. Invalid rules throw
+   * `RangeError`/`TemplateError` at startup. `undefined` keeps the
+   * exact pre-WR-115 wire shape.
+   */
+  payloadTransformRules?: Record<string, PayloadTransformRules>
 ): PooledSender {
   if (tlsPins !== undefined) {
     for (const [endpoint, pins] of Object.entries(tlsPins)) {
@@ -1883,6 +1931,25 @@ export function createDefaultSender(
       `createDefaultSender: invalid traceContext config: ${(err as Error).message}`
     );
   }
+  // WR-115: RangeError/TemplateError on invalid values, at startup —
+  // never mid-delivery.
+  let payloadTransforms: PayloadTransformer | undefined;
+  if (payloadTransformRules !== undefined) {
+    try {
+      payloadTransforms = new PayloadTransformer(payloadTransformRules);
+    } catch (err) {
+      // Preserve TemplateError (illegal template) vs RangeError
+      // (illegal shape/value) — callers distinguish the two.
+      if (err instanceof TemplateError) {
+        throw new TemplateError(
+          `createDefaultSender: invalid payloadTransforms config: ${err.message}`
+        );
+      }
+      throw new RangeError(
+        `createDefaultSender: invalid payloadTransforms config: ${(err as Error).message}`
+      );
+    }
+  }
   // RangeError on invalid values, at startup — never mid-delivery.
   if (outboundSigning !== undefined) {
     if (typeof outboundSigning.secret !== "string" || outboundSigning.secret === "") {
@@ -2051,6 +2118,38 @@ export function createDefaultSender(
       if (forwardRule !== undefined && !shouldForwardHeader(forwardRule, k)) continue;
       headers[k] = v;
     }
+    // WR-115: per-endpoint payload transform — runs on the raw inbound
+    // payload *before* compression (WR-40/WR-75) and E2EE sealing
+    // (WR-58), which both produce non-JSON wire bytes, and before
+    // signing (WR-26), so `x-relay-signature` covers the transformed
+    // bytes — exactly what the downstream receives. Opt-in: endpoints
+    // without rules keep the exact current behavior. A transform
+    // failure (non-JSON payload, template render failure) throws
+    // PayloadTransformError, which the queue classifies
+    // "non_retryable": the item dead-letters on the first attempt and
+    // is audited as `transform_failed` — never silently dropped.
+    // Injected headers are relay-computed, so any inbound header with
+    // the same name is stripped first (the WR-26 anti-forgery pattern).
+    // The payload the wire body is derived from: the raw inbound bytes,
+    // or the WR-115 transformed bytes when the endpoint has rules.
+    let sourcePayload = item.payload;
+    if (payloadTransforms !== undefined && payloadTransforms.hasRules(item.targetUrl)) {
+      const transformed = payloadTransforms.apply(item.targetUrl, sourcePayload, {
+        eventId: item.id,
+        endpoint: item.targetUrl,
+        attempt: (item.attempt ?? 0) + 1,
+        timestamp: new Date().toISOString(),
+      });
+      sourcePayload = transformed.body;
+      const injectedHeaders = transformed.headers;
+      for (const name of Object.keys(injectedHeaders)) {
+        const lower = name.toLowerCase();
+        for (const k of Object.keys(headers)) {
+          if (k.toLowerCase() === lower) delete headers[k];
+        }
+      }
+      Object.assign(headers, injectedHeaders);
+    }
     // Propagate the trace ID downstream so the next hop can correlate the
     // delivery with this relay's audit trail (overrides a stale inbound
     // value, which is identical anyway after `resolveTraceId`).
@@ -2082,7 +2181,7 @@ export function createDefaultSender(
     // engages only on HTTP transports: WebSocket deliveries keep their
     // RFC 7692 permessage-deflate story (`src/deflate.ts`) and never pass
     // through here. The 415 fallback resend forces both compressions off.
-    let wireBody = item.payload;
+    let wireBody = sourcePayload;
     let contentEncoding: "gzip" | undefined;
     let guardedCompressed = false;
     let guardedBytesSaved = 0;
@@ -2092,7 +2191,7 @@ export function createDefaultSender(
         wireOpts?.httpTransport === false ? undefined : compressThreshold?.[item.targetUrl];
       if (guardedOpts !== undefined) {
         const decision = guardedCompressOutbound(
-          item.payload,
+          sourcePayload,
           outboundContentType(item.headers),
           guardedOpts
         );
@@ -2105,7 +2204,7 @@ export function createDefaultSender(
         // no fallback). Compression happens before signing so
         // `x-relay-signature` covers the exact wire bytes the downstream
         // receives.
-        const legacy = maybeCompressOutbound(item.payload, compressOutbound?.[item.targetUrl]);
+        const legacy = maybeCompressOutbound(sourcePayload, compressOutbound?.[item.targetUrl]);
         wireBody = legacy.body;
         contentEncoding = legacy.contentEncoding;
       }
@@ -3678,7 +3777,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   }
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry)
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms)
       : undefined;
   // WR-50: endpoints the operator may pause/resume over HTTP. The server
   // only ever delivers to these — the intake target plus every
@@ -3708,7 +3807,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     if (validators !== undefined && typeof validators === "object") {
       for (const endpoint of Object.keys(validators)) knownEndpoints.add(endpoint);
     }
-    for (const record of [opts.tlsPins, opts.tlsClientCerts, opts.tlsClientCertRotation, opts.compressOutbound, opts.compressThreshold, opts.proxies, opts.outboundEncryption, opts.responseCompression, opts.forwardHeaders, opts.minTlsVersions, opts.tlsOcsp]) {
+    for (const record of [opts.tlsPins, opts.tlsClientCerts, opts.tlsClientCertRotation, opts.compressOutbound, opts.compressThreshold, opts.proxies, opts.outboundEncryption, opts.responseCompression, opts.forwardHeaders, opts.minTlsVersions, opts.tlsOcsp, opts.payloadTransforms]) {
       if (record) for (const endpoint of Object.keys(record)) knownEndpoints.add(endpoint);
     }
     for (const endpoint of opts.retry?.probe?.endpoints ?? []) knownEndpoints.add(endpoint);
@@ -3788,7 +3887,16 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
                   // WR-98: shadow deliveries mirror the identical wire
                   // request, so they propagate trace context like the main
                   // sender.
-                  opts.traceContext ?? opts.retry?.traceContext
+                  opts.traceContext ?? opts.retry?.traceContext,
+                  // tlsOcsp / ocspMonitor / mesh / endpointRegistry stay
+                  // off for shadow copies (pre-existing).
+                  undefined,
+                  undefined,
+                  undefined,
+                  undefined,
+                  // WR-115: shadow deliveries mirror the identical wire
+                  // request, so they apply the same payload transform.
+                  opts.payloadTransforms
                 ),
               })
             ),
@@ -4237,6 +4345,21 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         // "unavailable". Never carries a body.
         response_summary: summary,
       });
+      // WR-115: a transform failure gets its own audit line on top of the
+      // `dead_letter` above — the operator sees *why* the item died
+      // (event id, error, endpoint), not just that it died. The
+      // `failure_class` on the `dead_letter` event is "non_retryable":
+      // the wire request was never built, so retrying was futile.
+      if (lastError instanceof PayloadTransformError) {
+        opts.auditLog.append({
+          event: "transform_failed",
+          id: item.id,
+          traceId: item.traceId,
+          ...(item.tenantId !== undefined ? { tenant: item.tenantId } : {}),
+          targetUrl: item.targetUrl,
+          error: lastError.message,
+        });
+      }
     },
     onCircuitStateChange: (endpoint, from, to, tenant) => {
       const event =
