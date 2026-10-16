@@ -103,6 +103,13 @@ import type { TenantRateLimitOptions } from "./tenant-ratelimit.ts";
 import { InboundIpAcl, IpAclMetrics, type IpAclOptions } from "./ip-acl.ts";
 import { InboundApiKeyAuth, type ApiKeyOptions, type EndpointApiKeyRule } from "./api-key.ts";
 import {
+  SenderReputationTracker,
+  assertValidReputationOptions,
+  type ReputationOptions,
+  type ReputationPenaltyKind,
+  type ReputationTransition,
+} from "./reputation.ts";
+import {
   assertValidOperatorKeys,
   bearerToken,
   matchOperatorKey,
@@ -1358,6 +1365,27 @@ export interface RelayServerOptions {
    * `RangeError` at startup.
    */
   apiKeys?: ApiKeyOptions;
+  /**
+   * Inbound sender reputation scoring (WR-119; see `src/reputation.ts`):
+   * opt-in per-sender behavior scoring keyed by the inbound API key id
+   * (or `"anonymous"` when no key guards the endpoint). Signature
+   * verification failures, inbound rate-limit hits, and schema
+   * violations accumulate weighted penalties; the demerit decays
+   * exponentially (`halfLifeMs`, default 10 minutes), so quiet senders
+   * recover on their own. Below `lowThreshold` (default 40) the sender
+   * is downgraded and intake tightens automatically: (a) a halved
+   * per-sender rate-limit budget on top of the configured inbound
+   * limiter, (b) forced signature verification even where the API key
+   * alone would authenticate (only meaningful where a verifier is
+   * configured — the relay always configures one, default HMAC over
+   * `secret`), (c) a doubled dedup window. Above `highThreshold`
+   * (default 70) the sender upgrades back and relaxes. Crossings are
+   * audited as `reputation_downgraded` / `reputation_upgraded` (key id +
+   * score, no secrets) and exposed as `relay_sender_reputation_score`
+   * / `relay_sender_reputation_degraded_total`. Off by default: unset =
+   * zero behavior change. Invalid config throws `RangeError` at startup.
+   */
+  senderReputation?: ReputationOptions;
   /**
    * Inbound source baseline anomaly detection (WR-63; see
    * `src/source-baseline.ts`): opt-in per-endpoint learning of the sender
@@ -4818,6 +4846,36 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // is pure validation) once at startup, so a bad pattern or key entry
   // can never fail a request mid-flight.
   const apiKeyAuth = opts.apiKeys !== undefined ? new InboundApiKeyAuth(opts.apiKeys) : undefined;
+  // Inbound sender reputation scoring (WR-119): validated once at
+  // startup so bad config can never fail a request mid-flight. Opt-in:
+  // unset means the tracker is never constructed and intake is
+  // byte-identical.
+  assertValidReputationOptions(opts.senderReputation);
+  const reputation =
+    opts.senderReputation !== undefined ? new SenderReputationTracker(opts.senderReputation) : undefined;
+  // WR-119 tightening (c): degraded senders admit through a second,
+  // doubled dedup window. Built only when dedup itself is configured —
+  // otherwise there is no window to lengthen — and in-memory only (no
+  // journal, no custom store): the tightening path must never share the
+  // base window's durability state.
+  const tightenedDeduplicator =
+    reputation !== undefined && opts.dedup !== undefined
+      ? new DeliveryDeduplicator({
+          windowMs: (opts.dedup.windowMs ?? 300_000) * 2,
+          maxEntries: opts.dedup.maxEntries,
+          now: opts.dedup.now,
+        })
+      : undefined;
+  // WR-119 tightening (a): the degraded-sender budget is half the
+  // configured inbound budget (per-IP first, else per-endpoint). Unset
+  // when no inbound rate limiter is configured — halving "no budget" is
+  // meaningless, so the tightening is a documented no-op there.
+  const tightenedBudgetPerSecond =
+    reputation !== undefined && opts.rateLimit !== undefined
+      ? (opts.rateLimit.perIpPerSecond ?? opts.rateLimit.perEndpointPerSecond) !== undefined
+        ? ((opts.rateLimit.perIpPerSecond ?? opts.rateLimit.perEndpointPerSecond) as number) / 2
+        : undefined
+      : undefined;
   // Scoped operator API keys (WR-82): validated once at startup so a bad
   // scope, empty id/key, or duplicate id/key can never fail a request
   // mid-flight.
@@ -5053,7 +5111,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       // new series. Absent entirely with a custom sender (no pool).
       res
         .writeHead(200, { "content-type": "text/plain; version=0.0.4" })
-        .end(queue.renderMetrics() + versionMetrics.render() + schemaMetrics.render() + (schemaRegistry?.renderMetrics() ?? "") + ipAclMetrics.render() + certExpiryMonitor.render() + tlsVersionMonitor.render() + (ocspMonitor?.render() ?? "") + (usageMeter?.render() ?? "") + (defaultSender?.compressionStats.render() ?? "") + (defaultSender?.dnsCache?.render() ?? "") + (defaultSender?.wsPool.renderMetrics() ?? "") + meshMetrics.render() + (defaultSender?.outboundSchemaMetrics?.render() ?? ""));
+        .end(queue.renderMetrics() + versionMetrics.render() + schemaMetrics.render() + (schemaRegistry?.renderMetrics() ?? "") + ipAclMetrics.render() + certExpiryMonitor.render() + tlsVersionMonitor.render() + (ocspMonitor?.render() ?? "") + (usageMeter?.render() ?? "") + (defaultSender?.compressionStats.render() ?? "") + (defaultSender?.dnsCache?.render() ?? "") + (defaultSender?.wsPool.renderMetrics() ?? "") + meshMetrics.render() + (defaultSender?.outboundSchemaMetrics?.render() ?? "") + (reputation?.renderMetrics() ?? ""));
       return;
     }
     if (isEvents) {
@@ -5883,6 +5941,41 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     apiKey?: { keyId: string; rule: EndpointApiKeyRule };
   }
 
+  /**
+   * WR-119: audit one reputation threshold crossing. `extra` carries the
+   * request correlation (id, traceId, ...); the event itself carries only
+   * the sender key id and the score — never a secret. A no-op when
+   * `transition` is undefined (no crossing) or the feature is off.
+   */
+  const auditReputationTransition = (
+    transition: ReputationTransition | undefined,
+    extra: Record<string, unknown>
+  ): void => {
+    if (reputation === undefined || transition === undefined) return;
+    opts.auditLog.append({
+      ...extra,
+      event: transition.kind === "downgraded" ? "reputation_downgraded" : "reputation_upgraded",
+      keyId: transition.key,
+      // Two decimals: the float tail carries no more signal than that.
+      score: Math.round(transition.score * 100) / 100,
+      at: transition.at,
+    });
+  };
+
+  /**
+   * WR-119: record one reputation penalty event for the intake sender
+   * and audit the threshold crossing when one happened. A no-op when
+   * the feature is off.
+   */
+  const recordReputationPenalty = (
+    key: string,
+    kind: ReputationPenaltyKind,
+    extra: Record<string, unknown>
+  ): void => {
+    if (reputation === undefined) return;
+    auditReputationTransition(reputation.recordPenalty(key, kind), extra);
+  };
+
   const runIntakeGates = async (
     req: Parameters<Parameters<typeof createServer>[0]>[0],
     res: Parameters<Parameters<typeof createServer>[0]>[1],
@@ -6000,8 +6093,13 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // audited like every other rejection, with the exhausted dimension.
     if (rateLimiter) {
       const ip = req.socket.remoteAddress ?? "unknown";
+      // WR-119: the sender dimension is the matched API key id, or
+      // "anonymous" when no key guards the endpoint.
+      const senderKey = apiKey?.keyId ?? "anonymous";
       const verdict = rateLimiter.take(ip, opts.forwardUrl);
       if (!verdict.ok) {
+        // WR-119: a rate-limit hit is a reputation penalty event.
+        recordReputationPenalty(senderKey, "rate_limit", { id, traceId });
         opts.auditLog.append({
           event: "rejected",
           id,
@@ -6018,6 +6116,35 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
           })
           .end("Too many requests");
         return undefined;
+      }
+      // WR-119 tightening (a): a degraded sender faces a halved
+      // per-sender budget on top of the normal limiter. The main limiter
+      // already passed, so this only ever *adds* rejections for senders
+      // already in the degraded state. `observe` decays first, so a
+      // sender quiet long enough upgrades back here and skips the extra
+      // budget entirely; the transition audits exactly once.
+      if (tightenedBudgetPerSecond !== undefined && reputation !== undefined) {
+        const view = reputation.observe(senderKey);
+        auditReputationTransition(view.transition, { id, traceId });
+        if (view.degraded && !reputation.takeTightenedBudget(senderKey, tightenedBudgetPerSecond)) {
+          recordReputationPenalty(senderKey, "rate_limit", { id, traceId });
+          const retryAfterMs = Math.ceil(1000 / tightenedBudgetPerSecond);
+          opts.auditLog.append({
+            event: "rejected",
+            id,
+            traceId,
+            reason: "rate_limited",
+            dimension: "reputation",
+            retryAfterMs,
+          });
+          res
+            .writeHead(429, {
+              "content-type": "text/plain",
+              "retry-after": String(Math.max(1, Math.ceil(retryAfterMs / 1000))),
+            })
+            .end("Too many requests");
+          return undefined;
+        }
       }
     }
 
@@ -6162,6 +6289,16 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     const keyIdHeader = headers["x-key-id"];
     const keyIdHint = Array.isArray(keyIdHeader) ? keyIdHeader[0] : keyIdHeader;
 
+    // Inbound sender reputation (WR-119): the sender dimension is the
+    // matched API key id, or "anonymous" when no key guards the endpoint
+    // (batch items always land here — per-item admission carries no key).
+    // `observe` decays past demerit to now and reports a threshold
+    // crossing (a quiet degraded sender can recover here); the crossing
+    // audits exactly once, on this request.
+    const senderKey = apiKey?.keyId ?? "anonymous";
+    const reputationView = reputation?.observe(senderKey);
+    auditReputationTransition(reputationView?.transition, { ...correlation, id, traceId });
+
     // Per-endpoint verifier selection (WR-29): the request path picks the
     // trusted verifier; anything unmatched falls back to the global one.
     // A mismatch here is answered 401 below and never enqueues, so it can
@@ -6180,7 +6317,15 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // behavior.
     let verified = false;
     let verifiedKeyId: string | undefined;
-    const apiKeyAuthenticates = apiKey !== undefined && apiKey.rule.requireSignature !== true;
+    // WR-119 tightening (b): a degraded sender is forced through
+    // signature verification even where the API key alone would
+    // authenticate — the same as `requireSignature: true` on the rule.
+    // Only meaningful where a verifier is configured; the relay always
+    // configures one (the default HMAC verifier over `secret`), so the
+    // forced check always takes effect.
+    const forceSignature = reputationView?.degraded ?? false;
+    const apiKeyAuthenticates =
+      apiKey !== undefined && apiKey.rule.requireSignature !== true && !forceSignature;
     // WR-110: RSA-PSS rotation joins the HMAC rotation here — both expose
     // verifyDetailed() -> { ok, keyId }, so the accepted-audit keyId
     // attribution below works unchanged (for RSA the keyId is the
@@ -6264,6 +6409,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       // trail shows which trust rule fired.
       if (perEndpointVerifier) rejectedEvent.verifier = activeVerifier.name;
       opts.auditLog.append(rejectedEvent);
+      // WR-119: a signature verification failure is a reputation penalty
+      // event for the sender dimension.
+      recordReputationPenalty(senderKey, "verify_failure", { ...correlation, id, traceId });
       return {
         status: 401,
         id,
@@ -6433,6 +6581,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
             schemaVersion: schema.version,
             errors: errors.slice(0, 10),
           });
+          // WR-119: a schema validation failure is a reputation penalty
+          // event for the sender dimension.
+          recordReputationPenalty(senderKey, "schema_violation", { ...correlation, id, traceId });
           return { status: 400, id, traceId, reason: "schema_failed", detail: "Schema validation failed" };
         }
       }
@@ -6517,11 +6668,19 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // event as handled instead of retrying again. WR-48: the dedup key is
     // tenant-scoped — one tenant's push must never suppress another
     // tenant's identical business event.
-    if (deduplicator) {
+    // WR-119 tightening (c): a degraded sender's duplicates are
+    // suppressed over the doubled window — a misbehaving sender's
+    // retries stay collapsed longer. The base window is untouched for
+    // healthy senders.
+    const activeDeduplicator =
+      tightenedDeduplicator !== undefined && (reputationView?.degraded ?? false)
+        ? tightenedDeduplicator
+        : deduplicator;
+    if (activeDeduplicator) {
       const payloadHash = DeliveryDeduplicator.hashPayload(body);
       // WR-108: `check()` is async — a custom DedupStore may answer from
       // across the network (e.g. Redis). `admitOneEvent` is already async.
-      if (await deduplicator.check(tenantScopeKey(tenantId, targetUrl), payloadHash)) {
+      if (await activeDeduplicator.check(tenantScopeKey(tenantId, targetUrl), payloadHash)) {
         opts.auditLog.append({ ...correlation,
           event: "duplicate_suppressed",
           id,

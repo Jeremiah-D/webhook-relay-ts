@@ -2964,6 +2964,57 @@ createRelayServer({
   startup. Off by default: unset means plain-HTTP listeners and zero
   behavior change. Zero dependencies (`node:crypto` + `node:tls`).
 
+## Sender reputation (opt-in)
+
+Not every sender deserves the same trust. `createRelayServer({
+senderReputation })` (`src/reputation.ts`) scores each inbound sender —
+keyed by the WR-65 API key id, or `"anonymous"` when no key guards the
+endpoint — on their historical behavior:
+
+```ts
+createRelayServer({
+  // ... secret, forwardUrl, auditLog ...
+  senderReputation: {
+    halfLifeMs: 600_000,        // demerit half-life: 10 min of quiet halves it
+    lowThreshold: 40,           // score < 40 -> downgraded (tightened)
+    highThreshold: 70,          // score > 70 -> upgraded back (relaxed)
+    verifyFailurePenalty: 25,   // per signature verification failure
+    rateLimitPenalty: 5,        // per inbound rate-limit hit
+    schemaViolationPenalty: 10, // per inbound schema validation failure
+  },
+});
+```
+
+- **Weighted penalties, exponential recovery** — the three intake
+  failure kinds above accumulate weighted demerit against the sender;
+  the score is `100 - demerit`, clamped to `[0, 100]` (100 = pristine).
+  The demerit decays exponentially with `halfLifeMs`, so a sender that
+  stops misbehaving recovers on its own — no manual intervention, and
+  no "good behavior" events to game: silence is what heals.
+- **Hysteresis, not flapping** — the score must fall *strictly below*
+  `lowThreshold` to downgrade and climb *strictly above*
+  `highThreshold` to upgrade, so a sender oscillating around one line
+  cannot flap between states.
+- **Automatic tightening while degraded** — a downgraded sender gets
+  (a) a halved per-sender rate-limit budget on top of the configured
+  inbound limiter (no limiter configured = this tightening is a
+  documented no-op), (b) forced signature verification even where the
+  API key alone would authenticate (the same as `requireSignature: true`
+  on the rule; only meaningful where a verifier is configured — the
+  relay always configures one, the default HMAC verifier over `secret`,
+  so the forced check always takes effect), and (c) a doubled dedup
+  window (only when dedup itself is configured; the widened window is
+  in-memory and never shares the base window's journal).
+- **Observable** — crossings audit as `reputation_downgraded` /
+  `reputation_upgraded` (key id + score only, never a secret), and the
+  operator `/metrics` exposes `relay_sender_reputation_score{key}` (gauge)
+  plus `relay_sender_reputation_degraded_total{key}` (counter of
+  downgrade transitions, only for senders that actually downgraded).
+- **Fail-fast** — a non-positive `halfLifeMs`, thresholds outside
+  `[0, 100]`, a missing `low < high` gap, or negative penalties throw
+  `RangeError` at startup. Off by default: unset means zero behavior
+  change. Zero dependencies.
+
 ## Delivery lifecycle
 
 Every accepted webhook walks the same state machine; each transition is
