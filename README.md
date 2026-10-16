@@ -406,6 +406,17 @@ reliability primitives that matter for any signed-payload pipeline.
   smuggle a forged relay signature downstream. The config applies to the
   default sender only — an injected sender signs (or doesn't) on its own.
   Invalid values throw `RangeError` at startup.
+- AWS SigV4 outbound signing (`awsSigV4`, off by default, WR-116): per
+  endpoint, `{ "<exact targetUrl>": { accessKeyId, secretRef, region,
+  service } }` stamps `Authorization` + `x-amz-date` per the AWS
+  Signature Version 4 spec over the final wire bytes (after
+  transform/compression/E2EE). The secret is never in the config —
+  `secretRef` resolves per attempt through `awsSecretResolver`
+  (default: an environment variable name), so snapshots and the
+  operator API can't leak key material and rotation needs no restart.
+  Orthogonal to `outboundSigning` above (both may be enabled); see
+  *AWS SigV4 outbound signing (opt-in)*. Invalid values throw
+  `RangeError` at startup.
 - Outbound end-to-end encryption (`outboundEncryption`, off by default,
   WR-58; key rotation WR-81): per endpoint, `{ "<exact targetUrl>": { publicKey } }` with the
   downstream's base64 X25519 public key (mint with `generateX25519KeyPair()`
@@ -2211,6 +2222,56 @@ const server = createRelayServer({
   emitted as canonical JSON (`JSON.stringify`); endpoints without rules
   pass bytes through untouched. Invalid rules throw `RangeError` /
   `TemplateError` at startup — never mid-delivery.
+
+## AWS SigV4 outbound signing (opt-in)
+
+Some downstreams (API Gateway with IAM auth, AWS-service webhook sinks)
+require AWS Signature Version 4 instead of — or in addition to — the
+relay's own `x-relay-signature` HMAC. `awsSigV4` (off by default, WR-116;
+`src/sigv4.ts`, zero new dependencies) signs per endpoint:
+
+```ts
+createRelayServer({
+  // ...
+  awsSigV4: {
+    "https://abc123.execute-api.us-east-1.amazonaws.com/prod/hook": {
+      accessKeyId: "AKIA…",        // public id — safe in snapshots/audit
+      secretRef: "AWS_HOOK_KEY",   // reference, never the raw secret
+      region: "us-east-1",
+      service: "execute-api",
+      additionalSignedHeaders: ["content-type"], // optional
+    },
+  },
+  // optional: defaults to process.env[ref]
+  awsSecretResolver: (ref) => vault.read(ref),
+});
+```
+
+Each delivery attempt to a configured endpoint stamps `Authorization`
+(`AWS4-HMAC-SHA256 Credential=…/aws4_request, SignedHeaders=…,
+Signature=…`) and `x-amz-date`, computed over the **final** wire bytes —
+after transform (WR-115), compression (WR-40/WR-75) and E2EE sealing
+(WR-58) — so the payload hash authenticates exactly what the downstream
+receives. Signed headers are always `host` + `x-amz-date`; anything in
+`additionalSignedHeaders` is read from the wire headers (an absent one
+fails the attempt loudly instead of signing a lie).
+
+- **Secret handling** — the config carries only `secretRef`; the secret
+  itself is resolved per attempt through `awsSecretResolver` (default:
+  the ref names an environment variable), so config snapshots, the
+  operator API and audit logs can never leak plaintext key material,
+  and rotation works without a restart. A missing secret fails the
+  attempt as `SigV4SecretUnavailableError` (classified `non_retryable`:
+  retrying a config problem burns the budget for nothing).
+- **Orthogonal to WR-26** — both stamps may be enabled for one
+  endpoint; SigV4 never signs `x-relay-signature`, so the two never
+  order-depend. Inbound `authorization` / `x-amz-date` headers are
+  stripped before stamping (relay-owned stamps always win).
+- HTTP only — the WebSocket delivery path is never signed.
+- Invalid configs throw `RangeError` at startup. The signer is a pure
+  function (`signAwsSigV4`) cross-validated against an independent
+  SigV4 implementation on GET/POST/PUT/DELETE vectors (query sorting,
+  RFC 3986 path encoding, duplicate params, non-default ports).
 
 ## W3C trace-context propagation (opt-in)
 

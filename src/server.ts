@@ -60,6 +60,27 @@ import {
 } from "./transform.ts";
 export { PayloadTransformer, PayloadTransformError, TemplateError };
 export type { PayloadTransformRules, TransformContext } from "./transform.ts";
+import {
+  AMZ_DATE_HEADER,
+  AUTHORIZATION_HEADER,
+  SigV4SecretUnavailableError,
+  SigV4SigningError,
+  assertValidAwsSigV4Config,
+  defaultSecretResolver,
+  headerValueIgnoreCase,
+  signAwsSigV4,
+  type AwsSigV4EndpointConfig,
+  type SecretResolver,
+} from "./sigv4.ts";
+export {
+  SigV4SecretUnavailableError,
+  SigV4SigningError,
+  assertValidAwsSigV4Config,
+  defaultSecretResolver,
+  headerValueIgnoreCase,
+  signAwsSigV4,
+};
+export type { AwsSigV4EndpointConfig, SecretResolver };
 import type { ReplayGuard } from "./replay.ts";
 import { DeliveryDeduplicator, type DedupOptions } from "./dedup.ts";
 import {
@@ -1023,6 +1044,30 @@ export interface RelayServerOptions {
    */
   payloadTransforms?: Record<string, PayloadTransformRules>;
   /**
+   * Per-endpoint AWS SigV4 request signing (WR-116, see `src/sigv4.ts`):
+   * `{ "<exact targetUrl>": AwsSigV4EndpointConfig }` — access key id +
+   * secret *reference* + region + service. Each delivery attempt to a
+   * configured endpoint stamps `Authorization` + `x-amz-date` per the
+   * AWS Signature Version 4 spec, over the final wire bytes (after
+   * transform/compression/E2EE). The secret itself is never in this
+   * config: `secretRef` is resolved per attempt through
+   * `awsSecretResolver` (default: the ref names an environment
+   * variable), so config snapshots and the operator API can never leak
+   * plaintext key material, and rotation works without a restart.
+   * Orthogonal to `outboundSigning` (WR-26 HMAC): both may be enabled
+   * for one endpoint. A missing secret fails the attempt as
+   * `SigV4SecretUnavailableError` (classified `non_retryable`).
+   * Applies to the default sender only. Invalid values throw
+   * `RangeError` at startup.
+   */
+  awsSigV4?: Record<string, AwsSigV4EndpointConfig>;
+  /**
+   * WR-116: resolves `awsSigV4` `secretRef`s to key material per
+   * delivery attempt. Defaults to `process.env[ref]`; inject a
+   * vault/KMS-backed function to keep secrets out of the environment.
+   */
+  awsSecretResolver?: SecretResolver;
+  /**
    * Outbound idempotency-key stamping (WR-44, see `IdempotencyKeyOptions`
    * in `src/idempotency-key.ts`): when `enabled`, every delivery made by
    * the default sender carries `x-relay-idempotency-key` — the
@@ -1729,7 +1774,29 @@ export function createDefaultSender(
    * `RangeError`/`TemplateError` at startup. `undefined` keeps the
    * exact pre-WR-115 wire shape.
    */
-  payloadTransformRules?: Record<string, PayloadTransformRules>
+  payloadTransformRules?: Record<string, PayloadTransformRules>,
+  /**
+   * WR-116: per-endpoint AWS SigV4 request signing (opt-in, see
+   * `src/sigv4.ts`): `{ "<exact targetUrl>": AwsSigV4EndpointConfig }`
+   * — access key id + secret *reference* + region + service. The secret
+   * itself is never in this config: it resolves per attempt through
+   * `awsSecretResolver` (default: the `secretRef` names an environment
+   * variable). Each attempt stamps `Authorization` + `x-amz-date` over
+   * the final wire bytes, after transform/compression/E2EE and
+   * orthogonal to the WR-26 HMAC `x-relay-signature` (both may be
+   * enabled; SigV4 never signs `x-relay-signature`, so the two never
+   * order-depend). Entries are validated at startup (`RangeError`);
+   * `undefined` keeps the exact pre-WR-116 wire shape.
+   */
+  awsSigV4?: Record<string, AwsSigV4EndpointConfig>,
+  /**
+   * WR-116: resolves `AwsSigV4EndpointConfig.secretRef` to key material
+   * per delivery attempt (rotation without restart). Defaults to
+   * reading `process.env[ref]`; a vault/KMS-backed function may be
+   * injected. An unresolvable ref fails the attempt with
+   * `SigV4SecretUnavailableError` (classified `non_retryable`).
+   */
+  awsSecretResolver?: SecretResolver
 ): PooledSender {
   if (tlsPins !== undefined) {
     for (const [endpoint, pins] of Object.entries(tlsPins)) {
@@ -1948,6 +2015,23 @@ export function createDefaultSender(
       throw new RangeError(
         `createDefaultSender: invalid payloadTransforms config: ${(err as Error).message}`
       );
+    }
+  }
+  // WR-116: RangeError on invalid values, at startup — never
+  // mid-delivery. Only the shape is validated here; the secret itself
+  // resolves per attempt (rotation without restart), so a missing env
+  // var fails attempts loudly instead of refusing to boot.
+  const sigv4Configs = new Map<string, AwsSigV4EndpointConfig>();
+  if (awsSigV4 !== undefined) {
+    for (const [endpoint, cfg] of Object.entries(awsSigV4)) {
+      try {
+        assertValidAwsSigV4Config(cfg, `awsSigV4[${endpoint}]`);
+      } catch (err) {
+        throw new RangeError(
+          `createDefaultSender: invalid awsSigV4 for ${endpoint}: ${(err as Error).message}`
+        );
+      }
+      sigv4Configs.set(endpoint, cfg);
     }
   }
   // RangeError on invalid values, at startup — never mid-delivery.
@@ -2238,6 +2322,49 @@ export function createDefaultSender(
       // own signature always wins.
       headers["x-relay-signature"] = signSha256(body, signing.secret);
       if (signing.keyId !== undefined) headers["x-relay-key-id"] = signing.keyId;
+    }
+    // WR-116: per-endpoint AWS SigV4 request signing (opt-in). Applied to
+    // the final wire body — after transform/compression/E2EE — so the
+    // payload hash authenticates exactly the bytes the downstream
+    // receives. Orthogonal to the WR-26 HMAC stamp above: both may be
+    // enabled, and SigV4 signs only host + x-amz-date (+ configured
+    // additional headers), never x-relay-signature, so the two never
+    // order-depend on each other. Skipped for the WebSocket path
+    // (SigV4 is an HTTP authorization scheme).
+    const sigv4Cfg = sigv4Configs.get(item.targetUrl);
+    if (sigv4Cfg !== undefined && wireOpts?.httpTransport !== false) {
+      // Anti-forgery: inbound Authorization / x-amz-date passthrough
+      // values are dropped first — the relay's own stamps always win.
+      for (const k of Object.keys(headers)) {
+        const lower = k.toLowerCase();
+        if (lower === AUTHORIZATION_HEADER || lower === AMZ_DATE_HEADER) delete headers[k];
+      }
+      const secret = (awsSecretResolver ?? defaultSecretResolver)(sigv4Cfg.secretRef);
+      if (typeof secret !== "string" || secret === "") {
+        throw new SigV4SecretUnavailableError(item.targetUrl, sigv4Cfg.secretRef);
+      }
+      const extraSignedHeaders: Record<string, string> = {};
+      for (const name of sigv4Cfg.additionalSignedHeaders ?? []) {
+        const wireValue = headerValueIgnoreCase(headers, name);
+        if (wireValue === undefined) {
+          throw new SigV4SigningError(
+            item.targetUrl,
+            `signed header "${name}" is absent from the wire request`
+          );
+        }
+        extraSignedHeaders[name] = wireValue;
+      }
+      const signed = signAwsSigV4({
+        method: "POST",
+        url: item.targetUrl,
+        body,
+        credentials: { accessKeyId: sigv4Cfg.accessKeyId, secretAccessKey: secret },
+        region: sigv4Cfg.region,
+        service: sigv4Cfg.service,
+        ...(Object.keys(extraSignedHeaders).length > 0 ? { extraSignedHeaders } : {}),
+      });
+      headers[AMZ_DATE_HEADER] = signed.amzDate;
+      headers[AUTHORIZATION_HEADER] = signed.authorization;
     }
     if (idempotencyKeyCfg !== undefined) {
       // WR-44: derive from (event id, 1-based attempt). The queue stamps
@@ -3777,7 +3904,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   }
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms)
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, opts.awsSigV4, opts.awsSecretResolver)
       : undefined;
   // WR-50: endpoints the operator may pause/resume over HTTP. The server
   // only ever delivers to these — the intake target plus every

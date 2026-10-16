@@ -29,6 +29,7 @@
  */
 
 import { PayloadTransformError } from "./transform.ts";
+import { SigV4SigningError } from "./sigv4.ts";
 
 /**
  * How a delivery failure should be treated by the retry queue.
@@ -133,6 +134,14 @@ export function classifyFailure(err: unknown): ClassifiedFailure {
   // same payload), so dead-letter immediately instead of burning the
   // retry budget and the backoff clock.
   if (err instanceof PayloadTransformError) {
+    return { failureClass: "non_retryable" };
+  }
+  // WR-116: a SigV4 signing failure is a local config problem (missing
+  // secret, absent signed header, unparsable URL) — the wire request was
+  // never built, let alone sent. Retrying can never succeed for this
+  // item, so dead-letter immediately instead of burning the retry
+  // budget and the backoff clock.
+  if (err instanceof SigV4SigningError) {
     return { failureClass: "non_retryable" };
   }
   let statusCode: number | undefined;
