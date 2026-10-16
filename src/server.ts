@@ -63,6 +63,11 @@ import {
 } from "./mesh.ts";
 import { UsageMeter, type UsageOptions } from "./usage.ts";
 import { buildHealthSummary } from "./health-summary.ts";
+import {
+  buildOpenApiDocument,
+  findOperatorRoute,
+  matchOperatorRoute,
+} from "./operator-routes.ts";
 import { InboundRateLimiter, type InboundRateLimitOptions } from "./ratelimit.ts";
 import type { TenantRateLimitOptions } from "./tenant-ratelimit.ts";
 import { InboundIpAcl, IpAclMetrics, type IpAclOptions } from "./ip-acl.ts";
@@ -3210,6 +3215,7 @@ function isOperatorPath(pathname: string): boolean {
     pathname === "/events" ||
     pathname === "/events/archive" ||
     pathname === "/metrics" ||
+    pathname === "/openapi.json" ||
     pathname === "/config/endpoint" ||
     pathname === "/config/snapshot" ||
     pathname === "/routing/rules" ||
@@ -4306,6 +4312,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       return;
     }
     const operatorKeyId = identity.id;
+    const isOpenApiJson = pathname === "/openapi.json";
     const isList = pathname === "/dead-letter";
     const isStats = pathname === "/dead-letter/stats";
     const isBatchReplay = pathname === "/dead-letter/replay";
@@ -4333,69 +4340,16 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     const scheduleActionMatch = /^\/scheduled\/([^/]+)\/(pause|resume)$/.exec(pathname);
     const deliveryMatch = /^\/deliveries\/([^/]+)$/.exec(pathname);
     const replayMatch = /^\/dead-letter\/([^/]+)\/replay$/.exec(pathname);
-    if (
-      !isList &&
-      !isStats &&
-      !isBatchReplay &&
-      !isAudit &&
-      !isAuditVerify &&
-      !isLatency &&
-      !isSloRisk &&
-      !isQuorum &&
-      !isQuorumStats &&
-      !isUsage &&
-      !isHealthSummary &&
-      !isEvents &&
-      !isEventsArchive &&
-      !isMetrics &&
-      !isAutoStatus &&
-      !isAutoPause &&
-      !isAutoResume &&
-      !isAutoTrigger &&
-      !isConfigEndpoint &&
-      !isConfigSnapshot &&
-      !isRoutingRules &&
-      !isEndpointsPause &&
-      !isEndpointsResume &&
-      !isScheduledList &&
-      !scheduleActionMatch &&
-      !deliveryMatch &&
-      !replayMatch
-    ) {
+    // WR-111: route recognition is driven by the operator route
+    // registry (`src/operator-routes.ts`) — the same registry
+    // `GET /openapi.json` documents, so the 404 surface and the published
+    // spec cannot drift apart.
+    if (findOperatorRoute(pathname) === undefined) {
       respondJson(res, 404, { error: "not found" });
       return;
     }
-    if (
-      !(
-        (isList && req.method === "GET") ||
-        (isStats && req.method === "GET") ||
-        (isBatchReplay && req.method === "POST") ||
-        (isAudit && req.method === "GET") ||
-        (isAuditVerify && req.method === "GET") ||
-        (isLatency && req.method === "GET") ||
-        (isSloRisk && req.method === "GET") ||
-        (isQuorum && req.method === "GET") ||
-        (isQuorumStats && req.method === "GET") ||
-        (isUsage && req.method === "GET") ||
-        (isHealthSummary && req.method === "GET") ||
-        (isEvents && req.method === "GET") ||
-        (isEventsArchive && req.method === "GET") ||
-        (isMetrics && req.method === "GET") ||
-        (isAutoStatus && req.method === "GET") ||
-        (isAutoPause && req.method === "POST") ||
-        (isAutoResume && req.method === "POST") ||
-        (isAutoTrigger && req.method === "POST") ||
-        (isConfigEndpoint && req.method === "POST") ||
-        (isConfigSnapshot && (req.method === "GET" || req.method === "POST")) ||
-        (isRoutingRules && (req.method === "GET" || req.method === "POST")) ||
-        (isEndpointsPause && req.method === "POST") ||
-        (isEndpointsResume && req.method === "POST") ||
-        (isScheduledList && req.method === "GET") ||
-        (scheduleActionMatch && req.method === "POST") ||
-        (deliveryMatch && req.method === "GET") ||
-        (replayMatch && req.method === "POST")
-      )
-    ) {
+    // WR-111: method allowance likewise comes from the registry.
+    if (matchOperatorRoute(pathname, req.method ?? "") === undefined) {
       respondJson(res, 405, { error: "method not allowed" });
       return;
     }
@@ -4406,6 +4360,15 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // authenticated above, but every operator path answers 403 here.
     if (!operatorMay(identity, req.method ?? "")) {
       respondJson(res, 403, { error: "forbidden" });
+      return;
+    }
+    if (isOpenApiJson) {
+      // WR-111: the operator API surface as an OpenAPI 3.1 document,
+      // generated from the route registry that also drives the 404/405
+      // dispatch above. Same operator authentication as every other
+      // operator route (fail-closed 404 without a credential, 403 on a
+      // bad bearer); read scope, like all GET operator routes.
+      respondJson(res, 200, buildOpenApiDocument());
       return;
     }
     if (isBatchReplay) {

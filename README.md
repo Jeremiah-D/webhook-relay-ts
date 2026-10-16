@@ -919,7 +919,12 @@ reliability primitives that matter for any signed-payload pipeline.
   `dead_letter_replayed`), and `GET /deliveries/:traceId` (per-trace delivery
   lifecycle snapshot: state machine timeline, retry trajectory with per-attempt
   errors, latency, replay records) are guarded by an `operatorToken` bearer token and
-  disabled (404, fail closed) when it is unset. For reconciliation workflows,
+  disabled (404, fail closed) when it is unset. `GET /openapi.json` serves the
+  full operator API as an OpenAPI 3.1 document — generated from the server's own
+  route registry (`src/operator-routes.ts`), which also drives the 404/405
+  dispatch, so the published spec cannot drift from the live routes (WR-111).
+  It carries the same operator authentication (fail-closed 404 without a
+  credential) and needs only the `read` scope. For reconciliation workflows,
   `POST /dead-letter/replay` batch-replays dead letters: the JSON body takes
   `{ endpoint?, tenant?, ids?, dryRun? }` — `endpoint` limits the replay to one
   downstream, `tenant` to one tenant's dead letters (WR-86; omitting it keeps
