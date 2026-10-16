@@ -29,6 +29,12 @@
  *   before the wire request was built, so no downstream verdict exists
  *   and retrying is futile. The item is dead-lettered immediately and
  *   audited as `schema_violation`.
+ * - a WR-118 `AssertionFailedError` → `"assertion_failed"`: the
+ *   downstream answered inside the rule's status whitelist, but the
+ *   response body failed the endpoint's declarative assertions. The
+ *   item follows the normal retryable path — backoff, circuit
+ *   breaker, retry budget — exactly like a transient downstream
+ *   failure.
  *
  * Zero dependencies (`node:` only where the caller's clock is needed).
  */
@@ -36,6 +42,7 @@
 import { PayloadTransformError } from "./transform.ts";
 import { OutboundSchemaViolationError } from "./outbound-schema.ts";
 import { SigV4SigningError } from "./sigv4.ts";
+import { AssertionFailedError } from "./response-assertions.ts";
 
 /**
  * How a delivery failure should be treated by the retry queue.
@@ -48,8 +55,13 @@ import { SigV4SigningError } from "./sigv4.ts";
  *   held the head of an ordered-delivery line (WR-113) longer than
  *   `maxHeadOfLineHoldMs` and was parked into the dead-letter list so the
  *   line could advance. Never silently dropped.
+ * - `"assertion_failed"`: the downstream answered inside the endpoint's
+ *   WR-118 status whitelist, but the response body failed the endpoint's
+ *   declarative assertions. Retryable — follows the normal backoff lane,
+ *   counts as a failure for the WR-10 breaker, and honors the retry
+ *   budget.
  */
-export type FailureClass = "retryable" | "non_retryable" | "head_of_line_timeout";
+export type FailureClass = "retryable" | "non_retryable" | "head_of_line_timeout" | "assertion_failed";
 
 /**
  * Structured delivery failure for a non-2xx downstream HTTP response.
@@ -114,7 +126,16 @@ export function parseRetryAfterMs(
 
 /** A classified delivery failure. */
 export interface ClassifiedFailure {
-  /** Whether the item may be retried (`"retryable"`) or is poison (`"non_retryable"`). */
+  /**
+   * How the failure is treated: `"retryable"` (another attempt may be
+   * scheduled, including `"assertion_failed"` assertion failures),
+   * `"non_retryable"` (the payload is poison — dead-letter immediately),
+   * `"head_of_line_timeout"` (WR-113 line parking — dead-letter, never
+   * silently dropped), or `"assertion_failed"` (WR-118: the downstream
+   * answered inside the status whitelist but the body failed the
+   * endpoint's declarative assertions; handled exactly like
+   * `"retryable"` — normal backoff lane, breaker, budget).
+   */
   failureClass: FailureClass;
   /** Downstream HTTP status, when the failure was an HTTP response. */
   statusCode?: number;
@@ -158,6 +179,18 @@ export function classifyFailure(err: unknown): ClassifiedFailure {
   // retry budget and the backoff clock. Audited as `schema_violation`.
   if (err instanceof OutboundSchemaViolationError) {
     return { failureClass: "non_retryable" };
+  }
+  // WR-118: an assertion failure is a retryable delivery failure — the
+  // downstream answered inside the rule's status whitelist, but the
+  // body failed the endpoint's declarative assertions. It follows the
+  // normal backoff lane and trips the circuit breaker like any other
+  // retryable failure. The status code rides along so the WR-54
+  // response summary on the dead-letter audit event stays honest.
+  if (err instanceof AssertionFailedError) {
+    return {
+      failureClass: "assertion_failed",
+      ...(err.statusCode !== undefined ? { statusCode: err.statusCode } : {}),
+    };
   }
   let statusCode: number | undefined;
   let retryAfterMs: number | undefined;

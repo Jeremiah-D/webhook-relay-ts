@@ -34,7 +34,7 @@ export interface DeliveryTimelineEntry {
   reason?: string;
   /** Scheduled delay before the next attempt (on `retrying`). */
   nextDelayMs?: number;
-  /** `"non_retryable" | "retryable"` (on `dead_letter`). */
+  /** `"non_retryable" | "retryable" | "assertion_failed"` (on `dead_letter`). */
   failureClass?: string;
 }
 

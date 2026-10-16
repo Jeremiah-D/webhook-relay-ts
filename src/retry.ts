@@ -36,6 +36,14 @@ import {
 } from "./failure.ts";
 import { OcspError } from "./ocsp.ts";
 import {
+  AssertionFailedError,
+  assertValidResponseAssertionRule,
+  evaluateResponseAssertionRule,
+  isResponseStatusWhitelisted,
+  type AssertionFailureInfo,
+  type ResponseAssertionRule,
+} from "./response-assertions.ts";
+import {
   LatencyTracker,
   type EndpointLatencyStats,
   type LatencyTrackerOptions,
@@ -227,6 +235,7 @@ import {
   type StalePauseMetricsInput,
   type OcspMetricsInput,
   type OrderedMetricsInput,
+  type AssertionFailureMetricsInput,
 } from "./metrics.ts";
 import {
   summarizeDeadLetterFailure,
@@ -274,6 +283,22 @@ export type {
 export type { OcspMetricsInput };
 export { HttpDeliveryError, classifyFailure, parseRetryAfterMs };
 export type { FailureClass, ClassifiedFailure };
+export {
+  AssertionFailedError,
+  assertValidResponseAssertion,
+  assertValidResponseAssertionRule,
+  evaluateResponseAssertionRule,
+  isResponseStatusWhitelisted,
+  parseAssertionPath,
+  resolveAssertionPath,
+} from "./response-assertions.ts";
+export type {
+  AssertionFailureInfo,
+  AssertionOperator,
+  ResponseAssertion,
+  ResponseAssertionRule,
+  ResponseAssertionVerdict,
+} from "./response-assertions.ts";
 export type { DownstreamResponseSummary };
 export type { FailoverConfig, FailoverEndpointStats, FailoverSwitchEvent };
 export type { WeightedConfig, WeightedEndpointStats, WeightedTargetConfig };
@@ -988,6 +1013,30 @@ export interface DeadLetterStats {
 }
 
 /**
+ * One row of {@link RetryQueue.getDeliveryStats} (WR-118): the WR-30
+ * per-endpoint delivery counters plus cumulative response-assertion
+ * failures. All JSON-serializable.
+ */
+export interface DeliveryStatsRow {
+  endpoint: string;
+  /** Tenant id (WR-48); absent for the default tenant. */
+  tenant?: string;
+  /** Deliveries that reached `delivered`. */
+  delivered: number;
+  /** Failed attempts (every failed attempt, including assertion failures). */
+  failed: number;
+  /** Retries scheduled. */
+  retried: number;
+  /** Items moved to the dead-letter list. */
+  deadLetter: number;
+  /**
+   * Cumulative response-assertion failures (WR-118). `0` when the
+   * feature is off or no assertion has failed yet.
+   */
+  assertionFailures: number;
+}
+
+/**
  * Per-endpoint end-to-end delivery deadline (WR-76): the SLO clock for a
  * delivery runs from queue admission (`RetryItem.enqueuedAt`) to delivery
  * confirmation — the full chain, not a connection or read timeout.
@@ -1374,6 +1423,34 @@ export interface RetryQueueOptions {
    * `reason: "semantic_failed"`.
    */
   onSemanticFailure?: (info: SemanticFailureInfo) => void;
+  /**
+   * Per-endpoint declarative response assertions (WR-118; see
+   * `src/response-assertions.ts`) — the declarative sibling of WR-37's
+   * programmatic `responseValidators`. An array of rules, each binding
+   * an exact `targetUrl` to an expected-status whitelist (default: all
+   * 2xx) plus JSON-body assertions (`$.status == "ok"` style) that run
+   * on responses that would otherwise be delivered.
+   *
+   * A failing assertion is a retryable delivery failure
+   * (`failure_class: "assertion_failed"`): it goes through the normal
+   * backoff lane, trips the WR-10 breaker like any retryable failure,
+   * and honors the retry budget. Evaluation is fail-closed — a body
+   * that is not JSON, a path that resolves to nothing, or an
+   * evaluation error counts as a failure, never a silent pass.
+   *
+   * Illegal rules (bad path syntax, unknown operator, missing `value`,
+   * empty status whitelist, duplicate `targetUrl`) throw `RangeError`
+   * at construction — fail-fast, with zero partial application.
+   * Disabled by default: endpoints without a rule behave exactly as
+   * before.
+   */
+  responseAssertions?: ResponseAssertionRule[];
+  /**
+   * Called once per delivery attempt that fails a response assertion.
+   * The server audits these as `failed` with
+   * `reason: "assertion_failed"`.
+   */
+  onAssertionFailure?: (info: AssertionFailureInfo) => void;
   /**
    * Global retry budget (WR-38; see `src/retry-budget.ts`). Caps scheduled
    * *retries* — not first attempts — at `retriesPerMinute` per minute,
@@ -2624,6 +2701,17 @@ export class RetryQueue {
   private readonly endpointResponseValidators = new Map<string, ResponseValidator>();
   private readonly globalResponseValidator?: ResponseValidator;
   private readonly onSemanticFailure?: (info: SemanticFailureInfo) => void;
+  /**
+   * WR-118: per-endpoint declarative response assertion rules, keyed by
+   * exact `targetUrl` (with the same physical-target → logical-endpoint
+   * fallback lookup as the WR-37 validators above). Empty when the
+   * feature is off — endpoints without a rule keep byte-exact current
+   * behavior.
+   */
+  private readonly responseAssertionRules = new Map<string, ResponseAssertionRule>();
+  private readonly onAssertionFailure?: (info: AssertionFailureInfo) => void;
+  /** WR-118: cumulative assertion failures per (tenant, endpoint) — see `getDeliveryStats` / `renderMetrics`. */
+  private readonly assertionFailureCounts = new Map<string, Map<string, number>>();
   /** WR-38: global retry budget; undefined when disabled. */
   private readonly retryBudget?: RetryBudget;
   /** WR-59: adaptive backoff options; undefined when disabled. */
@@ -3141,6 +3229,31 @@ export class RetryQueue {
       }
     }
     this.onSemanticFailure = opts.onSemanticFailure;
+    // WR-118: normalize the declarative response assertion rules —
+    // exact-`targetUrl` keying, like the WR-37 validator record. Every
+    // rule is validated before any of them is installed: an illegal
+    // rule throws RangeError at construction with zero partial
+    // application (a bad rule never silently disables the good ones).
+    const assertionRules = opts.responseAssertions;
+    if (assertionRules !== undefined) {
+      if (!Array.isArray(assertionRules)) {
+        throw new TypeError("responseAssertions must be an array of ResponseAssertionRule");
+      }
+      const staged = new Map<string, ResponseAssertionRule>();
+      assertionRules.forEach((rule, index) => {
+        assertValidResponseAssertionRule(rule, `responseAssertions[${index}]`);
+        if (staged.has(rule.targetUrl)) {
+          throw new RangeError(
+            `responseAssertions[${index}]: duplicate rule for targetUrl ${JSON.stringify(rule.targetUrl)}`
+          );
+        }
+        staged.set(rule.targetUrl, rule);
+      });
+      for (const [endpoint, rule] of staged) {
+        this.responseAssertionRules.set(endpoint, rule);
+      }
+    }
+    this.onAssertionFailure = opts.onAssertionFailure;
     // WR-38: a present-but-empty object means "enabled with the generous
     // default budget"; absent means disabled. RangeError comes from the
     // RetryBudget constructor on an illegal budget.
@@ -3572,6 +3685,12 @@ export class RetryQueue {
       inner.set(endpoint, c);
     }
     c[kind] += 1;
+  }
+
+  /** WR-118: count one response-assertion failure for `getDeliveryStats` / `renderMetrics`. */
+  private recordAssertionFailure(tenant: string | undefined, endpoint: string): void {
+    const inner = innerFor(this.assertionFailureCounts, tenant);
+    inner.set(endpoint, (inner.get(endpoint) ?? 0) + 1);
   }
 
   /** Count one failover switch for `relay_failover_switches_total{endpoint,from,to}` and fan out the hook. */
@@ -5260,6 +5379,42 @@ export class RetryQueue {
             );
           }
         }
+        // WR-118: per-endpoint declarative response assertions — the
+        // declarative sibling of the WR-37 validators above. They run on
+        // responses that would otherwise be delivered. A status outside
+        // the rule's whitelist (default: all 2xx) keeps the WR-30
+        // classification — thrown as the default sender's own
+        // `HttpDeliveryError`, so a custom sender that returns (instead
+        // of throwing on) a non-whitelisted status is treated exactly
+        // like the default sender's non-2xx. A whitelisted status whose
+        // body fails the assertions becomes an `AssertionFailedError`:
+        // classified "assertion_failed" (retryable), so it takes the
+        // normal backoff lane, trips the WR-10 breaker like any
+        // retryable failure, and honors the retry budget. Evaluation is
+        // fail-closed — a non-JSON body or an evaluation error counts
+        // as an assertion failure, never a silent pass.
+        const assertionRule =
+          this.responseAssertionRules.get(target) ??
+          this.responseAssertionRules.get(logicalEndpoint);
+        if (assertionRule !== undefined && response !== undefined) {
+          if (!isResponseStatusWhitelisted(response.statusCode, assertionRule)) {
+            throw new HttpDeliveryError(response.statusCode);
+          }
+          const assertionVerdict = evaluateResponseAssertionRule(assertionRule, response.body);
+          if (!assertionVerdict.passed) {
+            const reason = assertionVerdict.reason ?? "assertion failed";
+            this.recordAssertionFailure(tenant, target);
+            this.onAssertionFailure?.({
+              id: entry.id,
+              traceId,
+              ...(tenant === undefined ? {} : { tenant }),
+              endpoint: target,
+              attempts: entry.attempt + 1,
+              reason,
+            });
+            throw new AssertionFailedError(target, reason, response.statusCode);
+          }
+        }
         // WR-91: only the leader records the downstream-facing control
         // plane — one physical attempt, one breaker verdict. Followers
         // keep their own audit/counters/latency below, untouched.
@@ -5767,6 +5922,33 @@ export class RetryQueue {
   }
 
   /**
+   * WR-118: per-endpoint delivery stats — the WR-30 delivery counters
+   * (`delivered` / `failed` / `retried` / `deadLetter`) plus cumulative
+   * response-assertion failures (`assertionFailures`). One row per
+   * (tenant, endpoint) with recorded activity, in first-seen order;
+   * empty when nothing has been delivered yet.
+   */
+  getDeliveryStats(): DeliveryStatsRow[] {
+    const rows: DeliveryStatsRow[] = [];
+    for (const [tenantKey, inner] of this.deliveryCounters) {
+      const tenant = tenantKey === "" ? undefined : tenantKey;
+      const assertions = this.assertionFailureCounts.get(tenantKey);
+      for (const [endpoint, c] of inner) {
+        rows.push({
+          endpoint,
+          ...(tenant === undefined ? {} : { tenant }),
+          delivered: c.delivered,
+          failed: c.failed,
+          retried: c.retried,
+          deadLetter: c.deadLetter,
+          assertionFailures: assertions?.get(endpoint) ?? 0,
+        });
+      }
+    }
+    return rows;
+  }
+
+  /**
    * WR-91: coalescing counters (`physicalAttempts` / `mergedDeliveries` /
    * `inFlightKeys`). `undefined` when coalescing is disabled.
    */
@@ -6100,6 +6282,21 @@ export class RetryQueue {
         headOfLineParked: s.headOfLineParked,
         urgentBypassed: s.urgentBypassed,
       }));
+    // WR-118: one series per (tenant, endpoint) with at least one
+    // recorded assertion failure — activity-gated, so a relay with the
+    // feature off exposes no `relay_assertion_failures_total` series
+    // at all.
+    const assertionFailures: AssertionFailureMetricsInput[] = [];
+    for (const [tenantKey, inner] of this.assertionFailureCounts) {
+      const tenant = tenantKey === "" ? undefined : tenantKey;
+      for (const [endpoint, failures] of inner) {
+        assertionFailures.push({
+          endpoint,
+          ...(tenant === undefined ? {} : { tenant }),
+          failures,
+        });
+      }
+    }
     return renderPrometheus({
       deliveries,
       circuits,
@@ -6182,6 +6379,11 @@ export class RetryQueue {
       // feature off (or never exercised) exposes no `relay_ordered_*`
       // series at all.
       ...(orderedMetricsRows.length > 0 ? { ordered: orderedMetricsRows } : {}),
+      // WR-118: activity-gated — the assertion-failure series appear
+      // only for (tenant, endpoint) scopes with a recorded failure, so
+      // a relay with the feature off exposes no
+      // `relay_assertion_failures_total` series at all.
+      ...(assertionFailures.length > 0 ? { assertionFailures } : {}),
       // WR-83: enabled-gated — the OTLP series appear only when OTLP
       // export is configured, exactly like the probe series.
       ...(this.otlpExporter !== undefined

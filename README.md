@@ -2121,6 +2121,58 @@ const server = createRelayServer({
 - Endpoints without an entry send no `Accept-Encoding` and behave
   byte-identically to before.
 
+## Per-endpoint response assertions (opt-in)
+
+Some downstreams answer `200 OK` with a body that still means failure —
+a payment gateway's error code, `{"ok":false}`. WR-37 covers this with a
+programmatic validator; response assertions cover it *declaratively*, for
+operators who would rather write config than code:
+
+```ts
+const queue = new RetryQueue({
+  responseAssertions: [
+    {
+      targetUrl: "https://downstream.example/hook",
+      expectedStatuses: [200, 201], // default: every 2xx
+      assertions: [
+        { path: "$.status", op: "eq", value: "ok" },
+        { path: "$.data.latencyMs", op: "lt", value: 5000 },
+        { path: "$.code", op: "matches", value: "^PAY-[0-9]+$" },
+        { path: "$.traceId", op: "exists" },
+      ],
+    },
+  ],
+});
+queue.getDeliveryStats(); // per-endpoint rows incl. `assertionFailures`
+```
+
+- **Tiny, safe expression language** — a strict path (`$` for the whole
+  document, then `.name` / `[index]` segments) plus one operator:
+  `eq` / `ne` (strict equality, no coercion), `gt` / `gte` / `lt` /
+  `lte` (finite numbers only), `exists`, `matches` (regex on strings).
+  No `eval()`, no general expressions.
+- **Fail-fast config** — a bad path, an unknown operator, a missing
+  `value`, an empty status whitelist, or a duplicate `targetUrl` throws
+  `RangeError` at construction, with zero partial application: a bad
+  rule never silently disables the good ones.
+- **Fail-closed evaluation** — assertions run on the *decoded* response
+  body (post-decompression, like the WR-37 validator). A body that is
+  not JSON, a path that resolves to nothing, or an evaluation error
+  counts as a failure, never a silent pass.
+- **Failure semantics** — assertions apply to responses that would
+  otherwise be delivered (status inside the whitelist). A failing
+  assertion is a *retryable* delivery failure with
+  `failure_class: "assertion_failed"`: the normal backoff lane, the
+  WR-10 breaker counts it like any retryable failure, and it honors the
+  retry budget. A non-whitelisted status keeps the WR-30 classification
+  (a 404 is still `non_retryable`, never an assertion failure). Each
+  failure fires `onAssertionFailure` and is audited as `failed` with
+  `reason: "assertion_failed"`.
+- **Observability** — per-endpoint `assertionFailures` via
+  `queue.getDeliveryStats()` and the `relay_assertion_failures_total`
+  Prometheus counter (activity-gated: absent entirely when the feature
+  is off). Endpoints without a rule behave byte-identically to before.
+
 ## Outbound header forwarding allowlist
 
 Per-endpoint opt-in gate on the inbound headers the relay forwards
@@ -2976,7 +3028,11 @@ written to the audit log, so the log is the machine's trace.
   audited on the `dead_letter` event): `"retryable"` means every attempt was
   spent against a transient failure, `"non_retryable"` means the payload was
   poison and was dead-lettered on the first attempt without burning the
-  retry budget (see *Failure classification* below). The `dead_letter` audit
+  retry budget (see *Failure classification* below), and
+  `"assertion_failed"` means the downstream answered inside the
+  endpoint's status whitelist but the response body failed the
+  endpoint's declarative response assertions (see *Per-endpoint response
+  assertions* below) — handled exactly like `"retryable"`. The `dead_letter` audit
   event also carries a `response_summary` with the last attempt's HTTP
   status code (the only thing a failed attempt can honestly report — see
   *Downstream response summary* below).
@@ -3241,6 +3297,17 @@ accepted→delivered latency clock keeps running) and is audited as
 `failed` with `reason: "semantic_failed"`. The default sender captures up
 to 64 KiB of the response body for the validator (`truncated: true` when
 cut); a custom sender that returns no response skips validation.
+
+**Response assertions:** the declarative sibling of the validators above
+(see *Per-endpoint response assertions*). Per-endpoint rules in
+`retry: { responseAssertions }` bind an exact `targetUrl` to a status
+whitelist (default: all 2xx) plus JSON-body assertions (`$.status == "ok"`
+style, no `eval()`). A failing assertion is a *retryable* delivery failure
+with `failure_class: "assertion_failed"` — normal backoff lane, the WR-10
+breaker counts it like any retryable failure, and it honors the retry
+budget; evaluation is fail-closed (a non-JSON body or an evaluation error
+counts as a failure). Illegal rules throw `RangeError` at construction.
+A status outside the whitelist keeps the WR-30 classification above.
 
 **Batching:** when `retry.batch` is enabled, `accepted` →
 **`batching`** instead of straight to `delivering`: normal-priority items

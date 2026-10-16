@@ -135,6 +135,10 @@
  *   items that bypassed the ordered gate. All activity-gated: present
  *   only for ordered endpoints with recorded activity — absent entirely
  *   when the feature is off.
+ * - `relay_assertion_failures_total{endpoint}`: counter of downstream
+ *   response assertion failures (WR-118). Activity-gated: present only
+ *   for (tenant, endpoint) scopes with a recorded failure — absent
+ *   entirely when the feature is off.
  *
  * Cardinality note: labels are per endpoint (`targetUrl`), so a relay
  * fanning out to many distinct downstream URLs grows the series count —
@@ -224,6 +228,15 @@ export interface OrderedMetricsInput {
   headOfLineParked: number;
   /** Cumulative urgent items that bypassed the ordered gate. */
   urgentBypassed: number;
+}
+
+/** One endpoint's response-assertion failure count (WR-118), in Prometheus label order. */
+export interface AssertionFailureMetricsInput {
+  endpoint: string;
+  /** Tenant id (WR-48); when set it is rendered as a `tenant` label. */
+  tenant?: string;
+  /** Cumulative response-assertion failures for this scope. */
+  failures: number;
 }
 
 /** One endpoint's stale-endpoint auto-pause count (WR-100). */
@@ -381,6 +394,13 @@ export interface MetricsInput {
    * relay's exposition is byte-identical.
    */
   ordered?: OrderedMetricsInput[];
+  /**
+   * Present only when per-endpoint response assertions (WR-118) are
+   * configured; one counter series per (tenant, endpoint) scope with a
+   * recorded assertion failure — absent entirely when the feature is
+   * off, so an untouched relay's exposition is byte-identical.
+   */
+  assertionFailures?: AssertionFailureMetricsInput[];
 }
 
 /** One endpoint's starvation-guard activation count, in Prometheus label order. */
@@ -1027,6 +1047,22 @@ export function renderPrometheus(input: MetricsInput): string {
       lines.push(`relay_ordered_head_blocked_total{endpoint="${ep}"} ${s.headBlocked}`);
       lines.push(`relay_ordered_head_of_line_parked_total{endpoint="${ep}"} ${s.headOfLineParked}`);
       lines.push(`relay_ordered_urgent_bypassed_total{endpoint="${ep}"} ${s.urgentBypassed}`);
+    }
+  }
+  // WR-118: activity-gated like the ordered series — the assertion
+  // series appear only for (tenant, endpoint) scopes with a recorded
+  // failure, so a relay with the feature off exposes no
+  // `relay_assertion_failures_total` series at all.
+  if (input.assertionFailures !== undefined && input.assertionFailures.length > 0) {
+    lines.push(
+      "# HELP relay_assertion_failures_total Downstream response assertion failures by endpoint (WR-118)."
+    );
+    lines.push("# TYPE relay_assertion_failures_total counter");
+    for (const s of input.assertionFailures) {
+      const ep = escapeLabelValue(s.endpoint);
+      lines.push(
+        `relay_assertion_failures_total{endpoint="${ep}"${tenantLabel(s.tenant)}} ${s.failures}`
+      );
     }
   }
   return lines.join("\n") + "\n";

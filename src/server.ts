@@ -4492,6 +4492,22 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       });
       opts.retry?.onSemanticFailure?.(info);
     },
+    // Wrap the caller's onAssertionFailure so every assertion failure
+    // is audited as `failed` with reason `assertion_failed`, not just
+    // observed — mirroring the WR-37 semantic-failure audit above.
+    onAssertionFailure: (info) => {
+      opts.auditLog.append({
+        event: "failed",
+        id: info.id,
+        traceId: info.traceId,
+        ...(info.tenant !== undefined ? { tenant: info.tenant } : {}),
+        targetUrl: info.endpoint,
+        attempts: info.attempts,
+        reason: "assertion_failed",
+        assertionReason: info.reason,
+      });
+      opts.retry?.onAssertionFailure?.(info);
+    },
     // Wrap the caller's onRetryBudgetDepleted so every budget-parked retry
     // is audited, not just observed.
     onRetryBudgetDepleted: (info) => {
