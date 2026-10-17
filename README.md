@@ -171,7 +171,17 @@ reliability primitives that matter for any signed-payload pipeline.
   double rate-limiting. Guard activations are counted in
   `relay_starvation_guard_activations{endpoint}` and audited as
   `starvation_guard_activated`; `getLaneStats()` reports per-endpoint
-  turns granted per lane.
+  turns granted per lane. A second, admission-side guard caps how long the
+  fast lane may stay occupied in a row (WR-121,
+  `urgent.maxConsecutiveUrgent`, disabled by default): after that many
+  *consecutive* urgent admissions per endpoint, the next urgent item is
+  force-downgraded to the normal lane — audited per occurrence as
+  `urgent_downgraded` and counted in `getUrgentStats().downgraded` — without
+  consuming a token. Any normal admission (or any downgrade) resets the
+  streak, so genuinely interleaved demand never trips the guard; under a
+  sustained urgent flood the normal lane keeps at least
+  `1 / (maxConsecutiveUrgent + 1)` of the admission slots. Invalid values
+  (non-integer, < 1) throw `RangeError` at construction.
 - `src/quota.ts` — per-endpoint delivery quota (`EndpointQuota`): a token
   bucket sized to one minute of budget (`deliveriesPerMinute`), refilled
   lazily. An attempt that finds an empty bucket is rescheduled for the next
@@ -3949,6 +3959,18 @@ Requires Node 24+ (runs `.ts` directly via type stripping; zero dependencies).
   urgent token bucket (no double rate-limiting), `RangeError` on invalid
   shares, per-endpoint share overrides, and activation auditing +
   `relay_starvation_guard_activations` metrics.
+- `test/urgent-starvation-guard.test.ts` — the WR-121 fast-lane
+  consecutive-occupancy guard: `RangeError` on invalid
+  `maxConsecutiveUrgent`, complete no-op when disabled, the (N+1)-th
+  consecutive urgent force-downgraded to normal (audited as
+  `urgent_downgraded`, counted in `getUrgentStats().downgraded`), strict
+  alternation at bound 1 (normal keeps 1/2 of the slots), streak reset by
+  normal admissions and by WR-12 empty-bucket degrades (no
+  double-downgrade), per-endpoint streak isolation, composition with the
+  WR-35 deficit round-robin (guard fires at admission while DRR paces
+  turns — no deadlock, normal keeps its share), and an end-to-end run
+  through the WR-27 CONNECT proxy tunnel (one pooled CONNECT, five
+  deliveries, one downgrade, nothing dropped).
 - `test/latency.test.ts` — `LatencyTracker`: percentiles and SLO attainment
   over known samples, per-endpoint isolation and filtering, bounded rolling
   window eviction, discard/unknown-id no-ops, re-accept restarts the clock,

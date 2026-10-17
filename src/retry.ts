@@ -528,6 +528,25 @@ export interface UrgentLaneOptions {
    * {@link RetryQueue.setEndpointMinNormalShare}.
    */
   minNormalShare?: number;
+  /**
+   * WR-121 fast-lane starvation guard: the maximum number of *consecutive*
+   * urgent admissions the fast lane tolerates per endpoint before the next
+   * urgent item is force-downgraded to the normal lane (audited as
+   * `urgent_downgraded`, counted in `getUrgentStats().downgraded`). Any
+   * normal admission — or any downgrade — resets the streak, so under
+   * sustained contention the normal lane keeps at least
+   * `1 / (maxConsecutiveUrgent + 1)` of the admission slots. Composes with
+   * the WR-35 deficit round-robin (that one paces the urgent *share* while
+   * normal demand is backlogged; this one bounds the urgent *run length*
+   * regardless of backlog visibility) and with the WR-12 token bucket
+   * (guard-downgraded items never consume a token).
+   *
+   * Disabled by default: when unset the guard is a complete no-op (the
+   * streak is not even tracked) and behavior is byte-for-byte the
+   * pre-WR-121 one. When set it must be an integer >= 1 — anything else
+   * throws `RangeError` at construction.
+   */
+  maxConsecutiveUrgent?: number;
   /** Clock in ms; defaults to `Date.now`. Injectable for deterministic tests. */
   now?: () => number;
 }
@@ -1491,6 +1510,14 @@ export interface RetryQueueOptions {
    */
   onStarvationGuardAudit?: (event: StarvationGuardAuditEvent) => void;
   /**
+   * Called once per force-downgrade (see {@link UrgentDowngradedEvent}):
+   * the WR-121 fast-lane starvation guard capped a consecutive urgent run
+   * and moved one urgent delivery to the normal lane. Per-occurrence —
+   * one call per downgraded item, not per episode. The server audits these
+   * as `urgent_downgraded`; library users get the hook directly.
+   */
+  onUrgentDowngraded?: (event: UrgentDowngradedEvent) => void;
+  /**
    * Prometheus metrics tuning (see `src/metrics.ts`). Delivery counters
    * (`relay_deliveries_total`) and circuit gauges
    * (`relay_endpoint_circuit_state`) are always collected; the latency
@@ -2237,6 +2264,12 @@ export interface UrgentStats {
   retried: number;
   /** Urgent attempts that found an empty bucket and degraded to the normal lane. */
   throttled: number;
+  /**
+   * WR-121: urgent items force-downgraded to the normal lane because the
+   * fast lane was continuously occupied (`maxConsecutiveUrgent`
+   * consecutive admissions). 0 unless the starvation guard is configured.
+   */
+  downgraded: number;
 }
 
 /**
@@ -2259,6 +2292,29 @@ export interface StarvationGuardAuditEvent {
   waitingUrgent: number;
   /** Effective minimum normal share of dispatch turns, in (0, 1). */
   minNormalShare: number;
+}
+
+/**
+ * Fired once per force-downgrade (WR-121): the fast-lane starvation guard
+ * capped a consecutive urgent run and moved one urgent delivery to the
+ * normal lane. Per-occurrence — every downgraded item gets its own event
+ * (unlike the episode-level `starvation_guard_activated`), because the
+ * downgrade is a per-delivery outcome, exactly like a WR-12 empty-bucket
+ * degrade. The server audits these as `urgent_downgraded`; library users
+ * get the hook directly.
+ */
+export interface UrgentDowngradedEvent {
+  event: "urgent_downgraded";
+  /** The endpoint whose fast lane was continuously occupied. */
+  endpoint: string;
+  /** The downgraded delivery's id. */
+  id: string;
+  /** The downgraded delivery's trace id. */
+  traceId: string;
+  /** Consecutive urgent admissions that triggered the downgrade. */
+  consecutiveUrgent: number;
+  /** Configured `maxConsecutiveUrgent` bound. */
+  maxConsecutiveUrgent: number;
 }
 
 /** Per-endpoint lane-scheduler counters (WR-35 starvation guard). */
@@ -2616,7 +2672,15 @@ export class RetryQueue {
   private readonly fieldMask?: FieldMask;
   private readonly urgentRetryDelayMs: number;
   private readonly urgentLimiter: UrgentRateLimiter;
-  private readonly urgentStats = new Map<string, { delivered: number; retried: number; throttled: number }>();
+  private readonly urgentStats = new Map<string, { delivered: number; retried: number; throttled: number; downgraded: number }>();
+  /**
+   * WR-121: per-endpoint consecutive urgent fast-lane admissions. Tracked
+   * only while `maxConsecutiveUrgent` is configured — the guard is a
+   * complete no-op when unset (not even bookkept).
+   */
+  private readonly urgentConsecutive = new Map<string, number>();
+  /** WR-121: configured consecutive-occupancy bound; undefined = guard disabled. */
+  private readonly maxConsecutiveUrgent: number | undefined;
   /**
    * Deficit round-robin lane gate (WR-35): paces urgent dispatches while
    * normal deliveries are backlogged, guaranteeing the normal lane its
@@ -2625,6 +2689,7 @@ export class RetryQueue {
    */
   private readonly laneScheduler: LaneScheduler;
   private readonly onStarvationGuardAudit?: (event: StarvationGuardAuditEvent) => void;
+  private readonly onUrgentDowngraded?: (event: UrgentDowngradedEvent) => void;
   /**
    * WR-48: per-tenant latency trackers, keyed by tenant (`""` = default).
    * Accepted→delivered latency is sampled per (tenant, endpoint) so one
@@ -3058,7 +3123,19 @@ export class RetryQueue {
       opts.urgent?.maxUrgentPerSecond ?? 100,
       opts.urgent?.now ?? Date.now
     );
+    // WR-121: fail-fast on an invalid consecutive-occupancy bound; unset
+    // keeps the guard disabled (pre-WR-121 behavior, no bookkeeping).
+    const maxConsecutiveUrgent = opts.urgent?.maxConsecutiveUrgent;
+    if (maxConsecutiveUrgent !== undefined) {
+      if (!Number.isInteger(maxConsecutiveUrgent) || maxConsecutiveUrgent < 1) {
+        throw new RangeError(
+          `urgent.maxConsecutiveUrgent must be an integer >= 1, got ${opts.urgent?.maxConsecutiveUrgent}`
+        );
+      }
+    }
+    this.maxConsecutiveUrgent = maxConsecutiveUrgent;
     this.onStarvationGuardAudit = opts.onStarvationGuardAudit;
+    this.onUrgentDowngraded = opts.onUrgentDowngraded;
     // WR-39: built after the breaker so the manager can read live circuit
     // state for the "circuit open" switch trigger. Invalid configs throw
     // here, at construction — never mid-delivery.
@@ -3663,13 +3740,43 @@ export class RetryQueue {
     inner.set(endpoint, (inner.get(endpoint) ?? 0) + 1);
   }
 
-  private recordUrgentStat(endpoint: string, kind: "delivered" | "retried" | "throttled"): void {
+  private recordUrgentStat(endpoint: string, kind: "delivered" | "retried" | "throttled" | "downgraded"): void {
     let s = this.urgentStats.get(endpoint);
     if (!s) {
-      s = { delivered: 0, retried: 0, throttled: 0 };
+      s = { delivered: 0, retried: 0, throttled: 0, downgraded: 0 };
       this.urgentStats.set(endpoint, s);
     }
     s[kind] += 1;
+  }
+
+  /**
+   * WR-121: enforce the fast-lane consecutive-occupancy bound for
+   * `endpoint`. Returns `{ fired, streak }`: `fired` when the streak hit
+   * `maxConsecutiveUrgent` and the caller must downgrade the item to the
+   * normal lane (the streak resets), otherwise the admission proceeds and
+   * the streak increments. A complete no-op while the guard is disabled —
+   * nothing is tracked, so the hot path is untouched.
+   */
+  private checkUrgentConsecutiveGuard(endpoint: string): { fired: boolean; streak: number } {
+    const max = this.maxConsecutiveUrgent;
+    if (max === undefined) return { fired: false, streak: 0 };
+    const streak = this.urgentConsecutive.get(endpoint) ?? 0;
+    if (streak >= max) {
+      this.urgentConsecutive.set(endpoint, 0);
+      return { fired: true, streak };
+    }
+    this.urgentConsecutive.set(endpoint, streak + 1);
+    return { fired: false, streak: streak + 1 };
+  }
+
+  /**
+   * WR-121: reset the consecutive-urgent streak for `endpoint` — any
+   * normal admission, any WR-12 empty-bucket degrade, or any guard
+   * downgrade breaks the run. No-op while the guard is disabled.
+   */
+  private resetUrgentConsecutive(endpoint: string): void {
+    if (this.maxConsecutiveUrgent === undefined) return;
+    this.urgentConsecutive.delete(endpoint);
   }
 
   /** Increment one Prometheus delivery counter for (tenant, endpoint). */
@@ -5210,9 +5317,40 @@ export class RetryQueue {
     // endpoint's bucket. An empty bucket degrades the item to the normal
     // lane — the delivery still happens, just with exponential backoff —
     // so the lane can never be used to flood a downstream.
-    if (entry.priority === "urgent" && !this.urgentLimiter.take(target)) {
-      this.recordUrgentStat(target, "throttled");
-      entry.priority = "normal";
+    //
+    // WR-121: before the bucket, the consecutive-occupancy starvation
+    // guard caps how long the fast lane may stay occupied in a row. After
+    // `maxConsecutiveUrgent` consecutive urgent admissions, the next
+    // urgent item is force-downgraded to the normal lane (audited as
+    // `urgent_downgraded`, never consuming a token) — so a sustained
+    // urgent flood cannot occupy the fast lane forever, and the normal
+    // lane keeps at least 1/(N+1) of the admission slots under sustained
+    // contention. Any normal admission — or any downgrade — resets the
+    // streak, so genuinely interleaved demand never trips the guard.
+    // Disabled (unset): the helper short-circuits and this behaves
+    // exactly like the pre-WR-121 code above.
+    if (entry.priority === "urgent") {
+      const guard = this.checkUrgentConsecutiveGuard(target);
+      if (guard.fired) {
+        this.recordUrgentStat(target, "downgraded");
+        // `fired` implies the guard is enabled, so the bound is set.
+        const max = this.maxConsecutiveUrgent as number;
+        this.onUrgentDowngraded?.({
+          event: "urgent_downgraded",
+          endpoint: target,
+          id,
+          traceId,
+          consecutiveUrgent: guard.streak,
+          maxConsecutiveUrgent: max,
+        });
+        entry.priority = "normal";
+      } else if (!this.urgentLimiter.take(target)) {
+        this.recordUrgentStat(target, "throttled");
+        entry.priority = "normal";
+        this.resetUrgentConsecutive(target);
+      }
+    } else {
+      this.resetUrgentConsecutive(target);
     }
     const fastLane = entry.priority === "urgent";
     // WR-35 starvation guard: both lanes take a dispatch turn from the
@@ -5915,7 +6053,8 @@ export class RetryQueue {
 
   /**
    * Per-endpoint urgent-lane counters (`delivered` / `retried` /
-   * `throttled`). Empty when no urgent delivery has been attempted.
+   * `throttled` / `downgraded`; WR-121 adds the downgraded count). Empty
+   * when no urgent delivery has been attempted.
    */
   getUrgentStats(): UrgentStats[] {
     return [...this.urgentStats.entries()].map(([endpoint, s]) => ({ endpoint, ...s }));

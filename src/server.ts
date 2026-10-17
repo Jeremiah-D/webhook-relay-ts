@@ -4394,6 +4394,12 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       opts.auditLog.append(event);
       opts.retry?.onStarvationGuardAudit?.(event);
     },
+    // Wrap the caller's hook so every urgent fast-lane starvation-guard
+    // downgrade (WR-121) is audited, not just observed.
+    onUrgentDowngraded: (event) => {
+      opts.auditLog.append(event);
+      opts.retry?.onUrgentDowngraded?.(event);
+    },
     // Wrap the caller's hook so every failover switch is audited, not
     // just observed.
     onFailoverSwitch: (event) => {
