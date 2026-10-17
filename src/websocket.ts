@@ -162,7 +162,7 @@ const OP_CLOSE = 0x8;
 const OP_PING = 0x9;
 const OP_PONG = 0xa;
 const OP_CONT = 0x0;
-const WS_GUID = "258EAFA5-E91447DA-C5AB0DC85B11";
+const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 /** Encode one frame. Client-to-server frames are always masked (RFC 6455 §5.3). */
 export function encodeWsFrame(opcode: number, payload: Buffer, masked: boolean, rsv1 = false): Buffer {

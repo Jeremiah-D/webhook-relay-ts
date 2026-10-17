@@ -4,6 +4,11 @@ import { createServer, type Server, type Socket } from "node:net";
 import { createServer as createTlsServer, type TLSSocket } from "node:tls";
 import { createHash } from "node:crypto";
 import { WebSocketPool, encodeWsFrame, wsAcceptKey, WsFrameReader } from "../src/websocket.ts";
+import { inboundWsAcceptKey } from "../src/inbound-ws.ts";
+// The raw-socket test server answers with the independent server-side
+// accept computation (inbound-ws.ts), so the client handshake is
+// validated cross-implementation — never against its own GUID.
+// That is the trap WR-131 closed.
 import { createDefaultSender } from "../src/server.ts";
 import { HttpDeliveryError } from "../src/failure.ts";
 import { TlsPinMismatchError } from "../src/pinning.ts";
@@ -108,7 +113,7 @@ async function startTestServer(opts: { tls?: boolean; respond404?: boolean } = {
           "HTTP/1.1 101 Switching Protocols\r\n" +
             "Upgrade: websocket\r\n" +
             "Connection: Upgrade\r\n" +
-            `Sec-WebSocket-Accept: ${wsAcceptKey(key)}\r\n\r\n`
+            `Sec-WebSocket-Accept: ${inboundWsAcceptKey(key)}\r\n\r\n`
         );
         handshook = true;
         buf = head.subarray(end + 4);
@@ -193,6 +198,16 @@ async function trackServer(s: TestServer): Promise<TestServer> {
   servers.push(s);
   return s;
 }
+
+test("wsAcceptKey matches the RFC 6455 §1.3 worked example (WR-131)", () => {
+  // The worked example in RFC 6455 §1.3: request key
+  // "dGhlIHNhbXBsZSBub25jZQ==" must yield accept
+  // "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=". With the wrong GUID
+  // ("258EAFA5-E91447DA-C5AB0DC85B11", missing "-95CA") the client
+  // computed "6FTJhBD4otGYBPtt3wh7s12yeJI=" instead and no real
+  // server ever accepted its handshake.
+  assert.equal(wsAcceptKey("dGhlIHNhbXBsZSBub25jZQ=="), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+});
 
 test("echo: text frame in, text frame out, 200", async () => {
   const srv = await trackServer(await startTestServer());
@@ -281,7 +296,7 @@ test("clean close with no reply counts as accepted (200, empty body)", async () 
         if (end < 0) return;
         const key = head.subarray(0, end).toString("latin1").match(/sec-websocket-key:\s*(\S+)/i)?.[1] ?? "";
         socket.write(
-          `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${wsAcceptKey(key)}\r\n\r\n`
+          `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${inboundWsAcceptKey(key)}\r\n\r\n`
         );
         handshook = true;
         buf = head.subarray(end + 4);
