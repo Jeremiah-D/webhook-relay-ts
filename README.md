@@ -238,6 +238,24 @@ reliability primitives that matter for any signed-payload pipeline.
   `setEndpointDeliveryWindow()` / `setEndpointTzDeliveryWindow()` /
   `deleteEndpointDeliveryWindow()`. Injectable clock for deterministic
   tests.
+- `src/maintenance-window.ts` — per-endpoint one-shot maintenance
+  windows (WR-127): `retry: { maintenanceWindow: { windows: {
+  "<targetUrl>": [{ start: "2026-11-01T02:00:00Z", end:
+  "2026-11-01T06:00:00Z" }] } } }` — a downstream cutover's blackout
+  window, orthogonal to WR-52's *recurring* quiet hours (either gate
+  parks the item). A delivery due inside a window is parked until the
+  window ends ("flush at window close", close edge exclusive) with the
+  same no-burn semantics as quiet hours: no quota token, no
+  circuit-breaker verdict, no retry-budget token, never dead-lettered
+  for being in a window. Overlapping (or touching) windows merge on
+  insert; ended windows are pruned lazily. Window transitions are
+  observable via `onTransition` — the server audits them as
+  `maintenance_window_opened` / `maintenance_window_closed`.
+  `getMaintenanceWindows()` reports live windows, park counts, and
+  whether the endpoint is parked now; operators list and add windows at
+  `GET` / `POST /maintenance/windows` (operator token required).
+  RFC3339 validation is strict (`RangeError` on bad input); the clock
+  is injectable for deterministic tests.
 - `src/latency.ts` — accepted→delivered latency SLO tracking
   (`LatencyTracker`): `enqueue()` starts each delivery's clock, a successful
   delivery samples it into a bounded per-endpoint rolling window (default

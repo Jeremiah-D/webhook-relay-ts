@@ -16,7 +16,7 @@ import {
   type SigningKey,
   type Verifier,
 } from "./verify.ts";
-import { RetryQueue, type DeliveryEvent, type DeliveryPriority, type DownstreamResponse, type RetryItem, type Sender } from "./retry.ts";
+import { RetryQueue, type DeliveryEvent, type DeliveryPriority, type DownstreamResponse, type RetryItem, type Sender, type MaintenanceWindowTransition } from "./retry.ts";
 import { parseDeliverAtHeader, DELIVER_AT_HEADER } from "./retry.ts";
 import type { ShadowDeliveredInfo, ShadowFailedInfo, ShadowTargetConfig, ShadowTargetsConfig } from "./retry.ts";
 import type {
@@ -3721,7 +3721,9 @@ function isOperatorPath(pathname: string): boolean {
     pathname.startsWith("/endpoints/") ||
     pathname === "/scheduled" ||
     pathname.startsWith("/scheduled/") ||
-    pathname.startsWith("/deliveries/")
+    pathname.startsWith("/deliveries/") ||
+    // WR-127: one-shot per-endpoint maintenance windows.
+    pathname === "/maintenance/windows"
   );
 }
 
@@ -4209,6 +4211,26 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   const queue = new RetryQueue({
     sender: opts.sender ?? defaultSender,
     ...(opts.retry ?? {}),
+    // WR-127: one-shot per-endpoint maintenance windows (see
+    // `src/maintenance-window.ts`). Wrap the caller's `onTransition` so
+    // every window transition is audited as `maintenance_window_opened` /
+    // `maintenance_window_closed`, not just observed.
+    ...(opts.retry?.maintenanceWindow === undefined
+      ? {}
+      : {
+          maintenanceWindow: {
+            ...opts.retry.maintenanceWindow,
+            onTransition: (t: MaintenanceWindowTransition) => {
+              opts.auditLog.append({
+                event: t.kind === "opened" ? "maintenance_window_opened" : "maintenance_window_closed",
+                endpoint: t.endpoint,
+                start: t.window.start,
+                end: t.window.end,
+              });
+              opts.retry?.maintenanceWindow?.onTransition?.(t);
+            },
+          },
+        }),
     // WR-92: downstream health probes (WR-34) resolve through the shared
     // DNS cache when one is configured — the same stale-while-revalidate
     // treatment as the delivery path. An explicit `probe.lookup` still
@@ -5166,6 +5188,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     const isAudit = pathname === "/audit";
     const isAuditVerify = pathname === "/audit/verify";
     const isLatency = pathname === "/latency";
+    // WR-127: one-shot per-endpoint maintenance windows.
+    const isMaintenanceWindows = pathname === "/maintenance/windows";
     const isSloRisk = pathname === "/slo-risk";
     const isQuorum = pathname === "/quorum";
     const isQuorumStats = pathname === "/quorum/stats";
@@ -5353,6 +5377,57 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
           params.get("tenant") ?? undefined
         )
       );
+      return;
+    }
+    if (isMaintenanceWindows) {
+      // WR-127: `GET` lists the live one-shot maintenance windows per
+      // endpoint (read scope); `POST` adds one window (admin scope).
+      if (req.method === "GET") {
+        respondJson(res, 200, queue.getMaintenanceWindows());
+        return;
+      }
+      let body: Record<string, unknown>;
+      try {
+        // The body limit applies here too: operator bodies are small, and
+        // an unbounded read on an authenticated endpoint is a cheap DoS.
+        const raw = (await readRawBody(req, maxBodyBytes)).toString("utf8");
+        body = raw.trim() === "" ? {} : JSON.parse(raw);
+      } catch (err) {
+        if (err instanceof BodyTooLargeError) {
+          respondJson(res, 413, { error: "request body too large" });
+          return;
+        }
+        respondJson(res, 400, { error: "invalid JSON body" });
+        return;
+      }
+      if (typeof body !== "object" || body === null || Array.isArray(body)) {
+        respondJson(res, 400, { error: "body must be a JSON object" });
+        return;
+      }
+      const { endpoint, start, end } = body;
+      if (typeof endpoint !== "string" || endpoint.length === 0) {
+        respondJson(res, 400, { error: "endpoint must be a non-empty string" });
+        return;
+      }
+      if (typeof start !== "string" || typeof end !== "string") {
+        respondJson(res, 400, { error: "start and end must be RFC3339 strings" });
+        return;
+      }
+      let added: { start: string; end: string; startMs: number; endMs: number } | null;
+      try {
+        added = queue.addMaintenanceWindow(endpoint, start, end);
+      } catch (err) {
+        if (err instanceof RangeError) {
+          respondJson(res, 400, { error: (err as Error).message });
+          return;
+        }
+        throw err;
+      }
+      if (added === null) {
+        respondJson(res, 404, { error: "maintenance windows are not enabled" });
+        return;
+      }
+      respondJson(res, 200, { ok: true, window: added });
       return;
     }
     if (isSloRisk) {

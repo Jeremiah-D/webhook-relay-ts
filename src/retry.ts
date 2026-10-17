@@ -55,8 +55,11 @@ import {
   type SloRiskOptions,
 } from "./slo-risk.ts";
 import { EndpointDeliveryWindow, parseDeliveryWindowSpec, type DeliveryWindowOptions, type DeliveryWindowStats, type TimezoneWindowConfig } from "./delivery-window.ts";
+import { EndpointMaintenanceWindow, type MaintenanceWindowOptions, type MaintenanceWindowStats } from "./maintenance-window.ts";
 export { parseDeliveryWindowSpec, EndpointDeliveryWindow };
+export { EndpointMaintenanceWindow };
 export type { DeliveryWindowOptions, DeliveryWindowStats, TimezoneWindowConfig };
+export type { MaintenanceWindowOptions, MaintenanceWindowStats };
 import {
   ScheduledDeliveryQueue,
   parseDeliverAtHeader,
@@ -1731,6 +1734,22 @@ export interface RetryQueueOptions {
    */
   deliveryWindow?: DeliveryWindowOptions;
   /**
+   * Per-endpoint one-shot maintenance windows (WR-127, see
+   * `src/maintenance-window.ts`): exact `targetUrl` -> array of RFC3339
+   * `{ start, end }` blackout windows (e.g. a downstream cutover
+   * `"2026-11-01T02:00:00Z"`–`"2026-11-01T06:00:00Z"`). Opt-in: endpoints
+   * without a configured window are never parked. A delivery due inside
+   * a window is parked until the window ends — the same no-burn park
+   * semantics as WR-52 (no quota token, no circuit-breaker verdict, no
+   * retry-budget token, never dead-lettered for being in a window) —
+   * and the two gates stack orthogonally: either one parks the item.
+   * Window transitions are observable via the module's `onTransition`
+   * (`maintenance_window_opened`/`maintenance_window_closed`). Disabled
+   * (undefined) by default: purely backward-compatible. Invalid windows
+   * throw `RangeError` at construction.
+   */
+  maintenanceWindow?: MaintenanceWindowOptions;
+  /**
    * Timed delivery (WR-57; see `src/scheduled.ts`): clock/timer injection
    * for the deliver_at delay queue. The feature itself is always on — an
    * inbound `x-deliver-at` header parks the delivery until its instant —
@@ -2764,6 +2783,8 @@ export class RetryQueue {
    * of the downstream, not of the sender.
    */
   private readonly deliveryWindow?: EndpointDeliveryWindow;
+  /** WR-127: one-shot per-endpoint maintenance windows. */
+  private readonly maintenanceWindow?: EndpointMaintenanceWindow;
   /**
    * WR-57: the deliver_at delay queue. Always available (the header is a
    * per-request contract); `opts.scheduled` only injects the clock and
@@ -2773,6 +2794,8 @@ export class RetryQueue {
   private readonly scheduledNow: () => number;
   /** Attempts parked outside an endpoint's delivery window. Keyed by scoped key (WR-48). */
   private readonly deliveryWindowStats = new Map<string, Map<string, number>>();
+  /** WR-127: per-(tenant, endpoint) in-window park counts. */
+  private readonly maintenanceWindowStats = new Map<string, Map<string, number>>();
   /** WR-76: per-endpoint delivery deadline in ms (exact logical `targetUrl` match); undefined when disabled. */
   private readonly deliveryDeadlines?: Map<string, number>;
   /** WR-76: clock for the deadline; defaults to `Date.now`. Injectable for deterministic tests. */
@@ -3069,6 +3092,12 @@ export class RetryQueue {
     // quiet-hours config is a misconfiguration, never a runtime surprise.
     if (opts.deliveryWindow !== undefined) {
       this.deliveryWindow = new EndpointDeliveryWindow(opts.deliveryWindow);
+    }
+    // WR-127: invalid maintenance windows throw here, at construction —
+    // an invalid blackout config is a misconfiguration, never a runtime
+    // surprise.
+    if (opts.maintenanceWindow !== undefined) {
+      this.maintenanceWindow = new EndpointMaintenanceWindow(opts.maintenanceWindow);
     }
     // WR-76: invalid deadlines throw here, at construction — a typo must
     // not silently leave an endpoint without its SLO. `undefined` (no
@@ -3804,6 +3833,12 @@ export class RetryQueue {
   /** WR-52: count one window-outside park for the (tenant, endpoint) row. */
   private recordDeliveryWindowStat(tenant: string | undefined, endpoint: string): void {
     const inner = innerFor(this.deliveryWindowStats, tenant);
+    inner.set(endpoint, (inner.get(endpoint) ?? 0) + 1);
+  }
+
+  /** WR-127: count one in-window park for the (tenant, endpoint) row. */
+  private recordMaintenanceWindowStat(tenant: string | undefined, endpoint: string): void {
+    const inner = innerFor(this.maintenanceWindowStats, tenant);
     inner.set(endpoint, (inner.get(endpoint) ?? 0) + 1);
   }
 
@@ -5327,6 +5362,23 @@ export class RetryQueue {
       this.schedule(id, this.deliveryWindow.msUntilOpen(logicalEndpoint));
       return;
     }
+    // WR-127: one-shot maintenance windows — orthogonal to WR-52's
+    // recurring quiet hours, so either gate parks the item. Inside a
+    // maintenance window the delivery is parked until the window ends:
+    // it stays queued with its attempt count intact and consumes
+    // nothing — no quota token, no circuit-breaker verdict, no
+    // retry-budget token, no dead-letter. The re-schedule targets the
+    // window's end instant (exclusive edge), so boundary races resolve
+    // as "flush at window close". The first parked delivery per window
+    // announces the transition (`maintenance_window_opened` via the
+    // module's onTransition).
+    if (this.maintenanceWindow !== undefined && this.maintenanceWindow.isParked(logicalEndpoint)) {
+      this.recordMaintenanceWindowStat(tenant, logicalEndpoint);
+      this.maintenanceWindow.noteDelayed(logicalEndpoint);
+      this.maintenanceWindow.announcePark(logicalEndpoint);
+      this.schedule(id, this.maintenanceWindow.msUntilOpen(logicalEndpoint));
+      return;
+    }
     // Per-endpoint quota first: an exhausted budget delays the attempt
     // (rescheduled at the next token refill) instead of burning the retry
     // budget or tripping the circuit against a downstream we are
@@ -6740,6 +6792,58 @@ export class RetryQueue {
    */
   deleteEndpointDeliveryWindow(endpoint: string): boolean {
     return this.deliveryWindow?.deleteEndpointWindow(endpoint) ?? false;
+  }
+
+  /**
+   * WR-127: per-endpoint one-shot maintenance-window observability: each
+   * endpoint with at least one parked attempt reports its live windows,
+   * park count, and whether a window is parking it at the injected
+   * clock's current time. Empty when the feature is disabled or no
+   * attempt has been parked yet.
+   */
+  getMaintenanceWindows(): MaintenanceWindowStats[] {
+    const rows: MaintenanceWindowStats[] = [];
+    for (const [tenantKey, inner] of this.maintenanceWindowStats) {
+      const tenant = tenantKey === "" ? undefined : tenantKey;
+      for (const [endpoint, delayed] of inner) {
+        rows.push({
+          endpoint,
+          ...(tenant === undefined ? {} : { tenant }),
+          windows: (this.maintenanceWindow?.windowsFor(endpoint) ?? []).map((w) => ({
+            start: w.start,
+            end: w.end,
+          })),
+          delayed,
+          parked: this.maintenanceWindow?.isParked(endpoint) ?? false,
+        });
+      }
+    }
+    return rows;
+  }
+
+  /**
+   * WR-127: add one one-shot maintenance window for an endpoint at
+   * runtime (the queue-level twin of the operator
+   * `POST /maintenance/windows`). Invalid input throws `RangeError` and
+   * leaves the current table intact; overlapping windows merge. Returns
+   * `null` when the maintenance-window feature is disabled.
+   */
+  addMaintenanceWindow(
+    endpoint: string,
+    start: string,
+    end: string
+  ): { start: string; end: string; startMs: number; endMs: number } | null {
+    if (this.maintenanceWindow === undefined) return null;
+    return this.maintenanceWindow.addWindow(endpoint, start, end);
+  }
+
+  /**
+   * WR-127: remove every one-shot maintenance window for an endpoint at
+   * runtime. Returns `false` when the feature is disabled or the
+   * endpoint had no windows.
+   */
+  clearMaintenanceWindows(endpoint: string): boolean {
+    return this.maintenanceWindow?.clearEndpoint(endpoint) ?? false;
   }
 
   /** Attempts parked because the endpoint's circuit was open. */

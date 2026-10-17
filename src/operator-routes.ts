@@ -230,6 +230,25 @@ export const OPERATOR_ROUTES: readonly OperatorRoute[] = [
     ],
   },
   {
+    path: "/maintenance/windows",
+    pattern: exact("/maintenance/windows"),
+    methods: ["GET", "POST"],
+    summary: "List or add one-shot maintenance windows",
+    description:
+      "WR-127: per-endpoint one-shot maintenance windows (RFC3339 start/end) — a downstream cutover's blackout window, orthogonal to the WR-52 daily quiet hours. Deliveries due inside a window are parked until it ends without consuming the retry budget, a quota token, or a circuit-breaker verdict. GET lists the live window table; POST adds one window.",
+    okDescription:
+      "GET: array of { endpoint, windows: [{ start, end }], delayed, parked }. POST: { ok, window } for the added (possibly merged) window.",
+    requestBody: {
+      description: "One maintenance window to add for the endpoint.",
+      required: ["endpoint", "start", "end"],
+      properties: {
+        endpoint: { type: "string", description: "Exact targetUrl the window applies to." },
+        start: { type: "string", description: 'Window start, RFC3339, e.g. "2026-11-01T02:00:00Z".' },
+        end: { type: "string", description: "Window end, RFC3339; must be after start." },
+      },
+    },
+  },
+  {
     path: "/slo-risk",
     pattern: exact("/slo-risk"),
     methods: ["GET"],
