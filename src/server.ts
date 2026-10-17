@@ -1251,8 +1251,12 @@ export interface RelayServerOptions {
    * Replay protection for inbound webhooks. When set, each accepted POST must
    * carry a unique `x-nonce` header: a nonce seen inside the guard's window is
    * rejected with 409 (`duplicate_nonce`), a missing nonce or an `x-timestamp`
-   * (unix seconds) outside the window is rejected with 400. Rejections are
-   * audited as `rejected` with the guard's reason. Off by default, so
+   * (unix seconds) outside the window is rejected with 400. The nonce is
+   * scoped by the resolved `targetUrl` (WR-122), so unrelated targets never
+   * collide. Rejections are audited as `rejected` with the guard's reason.
+   * Construct the guard with `journalDir` to survive restarts (see
+   * `src/replay.ts`); call `await guard.flush()` before a planned shutdown
+   * when the journal tail must be durable. Off by default, so
    * unsigned-legacy senders keep working unless the operator opts in.
    */
   replay?: ReplayGuard;
@@ -6658,7 +6662,11 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       // x-timestamp is unix seconds (same unit as the `t=` signature field);
       // the guard works in ms. A non-numeric value fails the window check.
       const timestampMs = tsRaw === undefined ? undefined : Number(tsRaw) * 1000;
-      const verdict = opts.replay.check(nonce, timestampMs);
+      // WR-122: scope the nonce by the resolved targetUrl — the same nonce
+      // value reused for an unrelated target is not a replay of this
+      // delivery, so it must not false-positive. (targetUrl is resolved
+      // above via content routing; it falls back to opts.forwardUrl.)
+      const verdict = opts.replay.check(nonce, timestampMs, targetUrl);
       if (!verdict.ok) {
         const reason = verdict.reason as string;
         opts.auditLog.append({ ...correlation, event: "rejected", id, traceId, ...tenantLabel, reason });

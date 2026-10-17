@@ -284,7 +284,18 @@ reliability primitives that matter for any signed-payload pipeline.
   rejected as `missing_nonce` / `expired_timestamp` / `future_timestamp`.
   Memory-bounded: nonces expire with the window (lazy sweep per check) and a
   `maxEntries` cap evicts oldest-first. Injectable clock for deterministic
-  tests.
+  tests. The duplicate check is scoped by `(scope, nonce)` — the server
+  passes the resolved `targetUrl`, so the same nonce value reused for an
+  unrelated target is not a false-positive replay; unscoped callers keep the
+  legacy global-nonce behavior. Crash-safe mode: `new ReplayGuard({
+  journalDir })` journals every accepted nonce to append-only JSONL
+  (`nonces.jsonl`, keyed by `(scope, nonce)`) and rebuilds the window from
+  disk at construction, so a restart does not reopen the replay window.
+  Journal writes are async and batched — `check()` never blocks on disk —
+  so a crash can lose the unflushed tail; call `await guard.flush()` before
+  a planned restart when the tail must be durable. Corrupt lines are
+  skipped, expired entries are dropped at recovery, journal I/O never
+  throws on the hot path (failures are counted in `journalStats()`).
 - `src/dedup.ts` — idempotent delivery dedup (`DeliveryDeduplicator`): within
   `windowMs` (default 5 min), a `(targetUrl, sha256(payload))` pair already
   accepted is answered 202 with `duplicate: true` and never delivered — the
@@ -3863,7 +3874,11 @@ Requires Node 24+ (runs `.ts` directly via type stripping; zero dependencies).
   as `duplicate_nonce`; missing/empty nonce, stale and far-future timestamps
   (with window-edge inclusivity), non-numeric timestamps, nonce expiry after
   the window, oldest-first eviction beyond `maxEntries`, and `RangeError` on
-  invalid configs.
+  invalid configs. WR-122: durable journal — accepted nonces journaled and
+  flushed, restart recovery still 409s a replayed nonce, expired entries
+  dropped at recovery, corrupt lines skipped, `(scope, nonce)` isolation,
+  and a server-level restart test (new server + new guard, same journal
+  dir → replay is still 409).
 - `test/autoreplay.test.ts` — the opt-in dead-letter auto-replay
   scheduler: `triggerOnce` replays dead letters with fresh-budget semantics
   (a replayed item leaves the dead letter and delivers on attempt 1),
