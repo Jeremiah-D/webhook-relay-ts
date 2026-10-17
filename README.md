@@ -422,11 +422,19 @@ reliability primitives that matter for any signed-payload pipeline.
   HMAC-SHA256 of the forwarded body — plus `x-relay-key-id` when a `keyId`
   is given, so the downstream can prove the request really came from this
   relay (verify with `verifySignature(body, header, secret)` from
-  `src/verify.ts`). Inbound `x-relay-signature` / `x-relay-key-id` headers
-  are always stripped from the forwarded header set, so a sender can never
-  smuggle a forged relay signature downstream. The config applies to the
-  default sender only — an injected sender signs (or doesn't) on its own.
-  Invalid values throw `RangeError` at startup.
+  `src/verify.ts`). The opt-in `ed25519` sub-config (WR-124) additionally
+  stamps `x-relay-ed25519-signature: ed25519=<hex>` — the relay signs with
+  an Ed25519 private key (`node:crypto`, no dependencies) and the
+  downstream verifies with the public key alone (`Ed25519Verifier` /
+  `RotatingEd25519Verifier` from `src/outbound-ed25519.ts`, which keeps a
+  retired key verifiable inside a grace window); the delivery is accepted
+  when either signature verifies. Inbound `x-relay-signature` /
+  `x-relay-key-id` / `x-relay-ed25519-signature` /
+  `x-relay-ed25519-key-id` headers are always stripped from the forwarded
+  header set, so a sender can never smuggle a forged relay signature
+  downstream. The config applies to the default sender only — an injected
+  sender signs (or doesn't) on its own. Invalid values throw `RangeError`
+  at startup.
 - AWS SigV4 outbound signing (`awsSigV4`, off by default, WR-116): per
   endpoint, `{ "<exact targetUrl>": { accessKeyId, secretRef, region,
   service } }` stamps `Authorization` + `x-amz-date` per the AWS

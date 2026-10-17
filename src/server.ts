@@ -219,6 +219,14 @@ import {
   sealOutboundPayload,
   type E2eeRotationKey,
 } from "./e2ee.ts";
+import {
+  compileEd25519OutboundKey,
+  ED25519_KEY_ID_HEADER,
+  ED25519_SIGNATURE_HEADER,
+  signEd25519Outbound,
+  type CompiledEd25519OutboundKey,
+  type Ed25519OutboundKeyConfig,
+} from "./outbound-ed25519.ts";
 import type { KeyObject } from "node:crypto";
 import type { AuditLog } from "./audit.ts";
 import { DeliveryEventArchiver } from "./event-archive.ts";
@@ -1001,12 +1009,17 @@ export interface RelayServerOptions {
    * `x-relay-signature: sha256=<hex>` — the HMAC-SHA256 of the forwarded
    * body — plus `x-relay-key-id` when `keyId` is given, so the downstream
    * can prove the request really came from this relay (verify with
-   * `verifySignature(body, header, secret)` from `src/verify.ts`). Off by
-   * default; applies to the default sender only — an injected `sender`
-   * signs (or doesn't) on its own. Inbound `x-relay-signature` /
-   * `x-relay-key-id` headers are always stripped from the forwarded header
-   * set, so a sender can never smuggle a forged relay signature
-   * downstream. Invalid values throw `RangeError`.
+   * `verifySignature(body, header, secret)` from `src/verify.ts`). The
+   * opt-in `ed25519` sub-config (WR-124) additionally stamps
+   * `x-relay-ed25519-signature: ed25519=<hex>` for downstreams that
+   * verify with the public key alone — the delivery is accepted when
+   * either signature verifies. Off by default; applies to the default
+   * sender only — an injected `sender` signs (or doesn't) on its own.
+   * Inbound `x-relay-signature` / `x-relay-key-id` /
+   * `x-relay-ed25519-signature` / `x-relay-ed25519-key-id` headers are
+   * always stripped from the forwarded header set, so a sender can never
+   * smuggle a forged relay signature downstream. Invalid values throw
+   * `RangeError`.
    */
   outboundSigning?: OutboundSigningConfig;
   /**
@@ -1566,8 +1579,11 @@ export interface RelayServerOptions {
  * `outboundSigning` (see `OutboundSigningConfig`) makes every outbound
  * request carry `x-relay-signature: sha256=<hex>` (HMAC-SHA256 of the
  * forwarded body) plus `x-relay-key-id` when a `keyId` is given, so the
- * downstream can prove the request really came from this relay. Invalid
- * values throw `RangeError` at startup.
+ * downstream can prove the request really came from this relay. The
+ * opt-in `ed25519` sub-config (WR-124) additionally stamps
+ * `x-relay-ed25519-signature: ed25519=<hex>` for downstreams that verify
+ * with the public key alone — accepted when either signature verifies.
+ * Invalid values throw `RangeError` at startup.
  *
  * `proxies` is the per-endpoint outbound proxy map (see `src/proxy.ts` and
  * the `proxies` server option): `{ "<exact targetUrl>": "<proxyUrl>" }`.
@@ -2154,6 +2170,16 @@ export function createDefaultSender(
       throw new RangeError("createDefaultSender: `outboundSigning.keyId` must be a non-empty string");
     }
   }
+  // WR-124: compile the opt-in Ed25519 asymmetric outbound signing key
+  // once — RangeError on invalid values at startup, never mid-delivery.
+  // `undefined` (feature off) keeps the WR-26-only behavior byte-identical.
+  let compiledEd25519: CompiledEd25519OutboundKey | undefined;
+  if (outboundSigning?.ed25519 !== undefined) {
+    compiledEd25519 = compileEd25519OutboundKey(
+      outboundSigning.ed25519,
+      "createDefaultSender: `outboundSigning.ed25519`"
+    );
+  }
   // WR-58: RangeError on invalid values, at startup — never mid-delivery.
   // `undefined` (feature off) is the common case. Parsed keys are cached
   // so the per-delivery seal only does the ECDH + AEAD, never re-parse.
@@ -2438,12 +2464,22 @@ export function createDefaultSender(
     // WR-114: a registry `verifier` record replaces the global
     // `outboundSigning` for this endpoint. Resolved per attempt, like
     // pins and proxy above.
-    const signing = endpointRegistry?.getSigning(item.targetUrl) ?? outboundSigning;
+    const endpointSigning = endpointRegistry?.getSigning(item.targetUrl);
+    const signing = endpointSigning ?? outboundSigning;
     if (signing !== undefined) {
       // Stamp AFTER the passthrough headers: this guarantees the relay's
       // own signature always wins.
       headers["x-relay-signature"] = signSha256(body, signing.secret);
       if (signing.keyId !== undefined) headers["x-relay-key-id"] = signing.keyId;
+      // WR-124: opt-in Ed25519 asymmetric stamp — coexists with the HMAC
+      // one above, and the downstream accepts the delivery when either
+      // verifies. Only the global `outboundSigning` carries it: a WR-114
+      // per-endpoint `verifier` replaces the whole signing identity, so it
+      // disables the Ed25519 stamp for that endpoint too.
+      if (endpointSigning === undefined && compiledEd25519 !== undefined) {
+        headers[ED25519_SIGNATURE_HEADER] = signEd25519Outbound(body, compiledEd25519);
+        if (compiledEd25519.keyId !== undefined) headers[ED25519_KEY_ID_HEADER] = compiledEd25519.keyId;
+      }
     }
     // WR-116: per-endpoint AWS SigV4 request signing (opt-in). Applied to
     // the final wire body — after transform/compression/E2EE — so the
@@ -3553,6 +3589,20 @@ export interface OutboundSigningConfig {
   secret: string;
   /** Stable key identifier surfaced in the `x-relay-key-id` header. Optional. */
   keyId?: string;
+  /**
+   * WR-124: opt-in Ed25519 asymmetric outbound signing. When set, every
+   * delivery made by the default sender additionally carries
+   * `x-relay-ed25519-signature: ed25519=<hex>` — the Ed25519 signature of
+   * the forwarded body under this private key — plus
+   * `x-relay-ed25519-key-id` when `keyId` is given. Downstreams that
+   * cannot hold a shared secret (e.g. a bank's verification service)
+   * verify with the public key alone (`Ed25519Verifier` /
+   * `RotatingEd25519Verifier` from `src/outbound-ed25519.ts`); the HMAC
+   * stamp is kept alongside, and the downstream accepts the delivery
+   * when either signature verifies. Unset by default: existing behavior
+   * is byte-identical. Invalid values throw `RangeError` at startup.
+   */
+  ed25519?: Ed25519OutboundKeyConfig;
 }
 
 /**
@@ -6839,14 +6889,23 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       // `content-encoding: gzip` must not travel with the plain bytes —
       // the downstream would try to gunzip JSON and fail.
       if (k === "content-encoding" && inboundGzip) continue;
-      // `x-relay-signature` / `x-relay-key-id` / `x-relay-idempotency-key`
-      // are this relay's own namespace: an inbound client asserting them
-      // would impersonate the relay downstream. Strip them always; when
-      // outbound signing / idempotency keys are enabled the sender stamps
-      // fresh ones below. `x-tenant-id` is likewise relay-internal routing
-      // state (WR-48): the tenant is already on the queued item, and the
-      // downstream never asked for the caller's tenancy claim.
-      if (k === "x-relay-signature" || k === "x-relay-key-id" || k === IDEMPOTENCY_KEY_HEADER) continue;
+      // `x-relay-signature` / `x-relay-key-id` /
+      // `x-relay-ed25519-signature` / `x-relay-ed25519-key-id` /
+      // `x-relay-idempotency-key` are this relay's own namespace: an
+      // inbound client asserting them would impersonate the relay
+      // downstream. Strip them always; when outbound signing /
+      // idempotency keys are enabled the sender stamps fresh ones below.
+      // `x-tenant-id` is likewise relay-internal routing state (WR-48):
+      // the tenant is already on the queued item, and the downstream
+      // never asked for the caller's tenancy claim.
+      if (
+        k === "x-relay-signature" ||
+        k === "x-relay-key-id" ||
+        k === ED25519_SIGNATURE_HEADER ||
+        k === ED25519_KEY_ID_HEADER ||
+        k === IDEMPOTENCY_KEY_HEADER
+      )
+        continue;
       if (k === TENANT_ID_HEADER) continue;
       // WR-107: `x-relay-hops` is relay-internal mesh accounting, like
       // `x-tenant-id` above. The inbound value is consumed into
