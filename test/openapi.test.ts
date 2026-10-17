@@ -27,6 +27,7 @@ const OPERATOR_TOKEN = "openapi-operator-token";
  */
 const INVENTORY: Array<[string, Array<"GET" | "POST" | "PUT" | "DELETE">]> = [
   ["/dead-letter", ["GET"]],
+  ["/dead-letter/export", ["GET"]],
   ["/dead-letter/stats", ["GET"]],
   ["/dead-letter/replay", ["POST"]],
   ["/dead-letter/{id}/replay", ["POST"]],

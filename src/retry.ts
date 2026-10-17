@@ -4216,6 +4216,25 @@ export class RetryQueue {
   }
 
   /**
+   * WR-128: open a dead-letter entry's payload for operator export.
+   * Entries sealed at rest (WR-11) are transparently decrypted;
+   * cleartext entries are returned as-is. Throws when the entry is
+   * sealed but no `payloadEncryptor` is configured — an invariant
+   * violation, since sealing only happens with one configured.
+   */
+  decryptDeadLetterPayload(entry: DeadLetterEntry): Buffer {
+    if (entry.encryptedPayload !== undefined) {
+      if (!this.payloadEncryptor) {
+        throw new Error(
+          "decryptDeadLetterPayload: entry payload is encrypted but no payloadEncryptor is configured"
+        );
+      }
+      return this.payloadEncryptor.decrypt(entry.encryptedPayload);
+    }
+    return entry.payload;
+  }
+
+  /**
    * The opt-in dead-letter auto-replay scheduler, or `undefined` when no
    * `autoReplay` option was configured. The server exposes it through the
    * `POST/GET /dead-letter/auto-replay/*` operator endpoints.

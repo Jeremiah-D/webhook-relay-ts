@@ -105,6 +105,49 @@ export const OPERATOR_ROUTES: readonly OperatorRoute[] = [
     ],
   },
   {
+    path: "/dead-letter/export",
+    pattern: exact("/dead-letter/export"),
+    methods: ["GET"],
+    summary: "Export dead-letter entries (filtered download)",
+    description:
+      "WR-128: stream dead-letter entries as JSONL or CSV, filtered by endpoint/tenant/since/until (ms epoch or ISO-8601, inclusive). Sealed payloads (WR-11) are transparently decrypted; per-row payloads are truncated past 64 KiB (CSV cells carry a ...[truncated] marker, JSONL rows a payloadTruncated flag). Exports larger than 10000 rows answer 409 — re-request with ?cursor= to page (cursor is an inclusive start id). Audited as `dead_letter_exported`.",
+    okDescription:
+      "JSONL or CSV stream of dead-letter rows, with x-export-has-more / x-export-next-cursor headers for paging.",
+    queryParams: [
+      {
+        name: "endpoint",
+        type: "string",
+        description: "Only export entries dead-lettered for this target URL.",
+      },
+      {
+        name: "tenant",
+        type: "string",
+        description: "Only export this tenant's entries.",
+      },
+      {
+        name: "since",
+        type: "string",
+        description: "ms epoch or ISO-8601 lower bound (inclusive) on deadLetteredAt.",
+      },
+      {
+        name: "until",
+        type: "string",
+        description: "ms epoch or ISO-8601 upper bound (inclusive) on deadLetteredAt.",
+      },
+      {
+        name: "format",
+        type: "string",
+        description: '"jsonl" (default) or "csv".',
+      },
+      {
+        name: "cursor",
+        type: "string",
+        description:
+          "Inclusive dead-letter id to start the page at; pages hold 10000 rows in dead-letter order.",
+      },
+    ],
+  },
+  {
     path: "/dead-letter/stats",
     pattern: exact("/dead-letter/stats"),
     methods: ["GET"],

@@ -42,6 +42,18 @@ import type {
 import { TENANT_ID_HEADER, assertValidTenantId, tenantScopeKey } from "./tenant.ts";
 import type { AutoReplayOptions } from "./autoreplay.ts";
 import type { DeadLetterRetentionOptions } from "./deadletter-retention.ts";
+import {
+  DEAD_LETTER_EXPORT_ROW_LIMIT,
+  InvalidExportCursorError,
+  buildDeadLetterExportRow,
+  parseDeadLetterExportTime,
+  planDeadLetterExport,
+  renderDeadLetterExportHeader,
+  renderDeadLetterExportRow,
+  type DeadLetterExportFilter,
+  type DeadLetterExportFormat,
+  type DeadLetterExportPlan,
+} from "./deadletter-export.ts";
 import type { ReplayEgressOptions } from "./replay-egress.ts";
 import { HttpDeliveryError, parseRetryAfterMs } from "./failure.ts";
 import {
@@ -5183,6 +5195,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     const operatorKeyId = identity.id;
     const isOpenApiJson = pathname === "/openapi.json";
     const isList = pathname === "/dead-letter";
+    const isExport = pathname === "/dead-letter/export";
     const isStats = pathname === "/dead-letter/stats";
     const isBatchReplay = pathname === "/dead-letter/replay";
     const isAudit = pathname === "/audit";
@@ -5621,6 +5634,131 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
             encrypted: e.encryptedPayload !== undefined,
           }))
       );
+      return;
+    }
+    if (isExport) {
+      // WR-128: dead-letter export — filtered (endpoint/tenant/since/
+      // until) streaming download as JSONL or CSV. Sealed payloads
+      // (WR-11) are transparently decrypted through the queue; per-row
+      // payloads are truncated past 64 KiB so one giant payload cannot
+      // blow the export's memory. A filter matching more than
+      // DEAD_LETTER_EXPORT_ROW_LIMIT rows, requested without a `cursor`,
+      // answers 409 and asks the operator to page — the export never
+      // silently truncates.
+      const params = new URL(req.url ?? "/dead-letter/export", "http://internal").searchParams;
+      const param = (name: string): string | undefined => {
+        const v = params.get(name);
+        return v === null ? undefined : v;
+      };
+      const formatRaw = param("format") ?? "jsonl";
+      if (formatRaw !== "jsonl" && formatRaw !== "csv") {
+        respondJson(res, 400, { error: 'format must be "jsonl" or "csv"' });
+        return;
+      }
+      const format = formatRaw as DeadLetterExportFormat;
+      let filter: DeadLetterExportFilter;
+      try {
+        const endpoint = param("endpoint");
+        const tenant = param("tenant");
+        filter = {
+          ...(endpoint !== undefined ? { endpoint } : {}),
+          ...(tenant !== undefined ? { tenant } : {}),
+          since: parseDeadLetterExportTime(param("since"), "since"),
+          until: parseDeadLetterExportTime(param("until"), "until"),
+        };
+      } catch (err) {
+        respondJson(res, 400, { error: (err as Error).message });
+        return;
+      }
+      let plan: DeadLetterExportPlan;
+      try {
+        plan = planDeadLetterExport(
+          {
+            entries: () => queue.getDeadLetter(),
+            decrypt: (e) => queue.decryptDeadLetterPayload(e),
+          },
+          filter,
+          { format, cursor: param("cursor") }
+        );
+      } catch (err) {
+        if (err instanceof InvalidExportCursorError) {
+          respondJson(res, 400, { error: err.message });
+          return;
+        }
+        throw err;
+      }
+      if (plan.needsPaging) {
+        respondJson(res, 409, {
+          error: "export_exceeds_row_limit",
+          matched: plan.totalMatched,
+          limit: DEAD_LETTER_EXPORT_ROW_LIMIT,
+          hint: "re-request with ?cursor=<firstCursor> to page through the export; each page holds at most 10000 rows in dead-letter order",
+          firstCursor: plan.firstCursor,
+        });
+        return;
+      }
+      const writeChunk = async (chunk: string): Promise<boolean> => {
+        if (res.destroyed || res.writableEnded) return false;
+        if (res.write(chunk)) return true;
+        // Backpressure: wait for drain, but never hang on a client that
+        // went away mid-export.
+        return await new Promise<boolean>((resolve) => {
+          const onDrain = (): void => {
+            cleanup();
+            resolve(true);
+          };
+          const onClose = (): void => {
+            cleanup();
+            resolve(false);
+          };
+          const cleanup = (): void => {
+            res.off("drain", onDrain);
+            res.off("close", onClose);
+          };
+          res.once("drain", onDrain);
+          res.once("close", onClose);
+        });
+      };
+      res.writeHead(200, {
+        "content-type": format === "csv" ? "text/csv; charset=utf-8" : "application/x-ndjson",
+        "x-export-has-more": plan.hasMore ? "true" : "false",
+        ...(plan.nextCursor !== undefined ? { "x-export-next-cursor": plan.nextCursor } : {}),
+      });
+      let rows = 0;
+      let chunk = renderDeadLetterExportHeader(format);
+      for (const entry of plan.entries) {
+        const row = buildDeadLetterExportRow(
+          entry,
+          (e) => queue.decryptDeadLetterPayload(e),
+          plan.maxPayloadBytes
+        );
+        rows += 1;
+        chunk += renderDeadLetterExportRow(row, format);
+        // Stream in bounded chunks: a 10k-row page of 64 KiB-truncated
+        // payloads must never sit on the heap as one giant string.
+        if (rows % 128 === 0) {
+          if (!(await writeChunk(chunk))) break;
+          chunk = "";
+        }
+      }
+      if (chunk !== "" && !res.destroyed && !res.writableEnded) {
+        await writeChunk(chunk);
+      }
+      if (!res.destroyed && !res.writableEnded) res.end();
+      // Audited on completion with the row count actually streamed, the
+      // filter, the format, and the operator key id — never the payloads.
+      opts.auditLog.append({
+        event: "dead_letter_exported",
+        keyId: operatorKeyId,
+        rows,
+        format,
+        hasMore: plan.hasMore,
+        ...(filter.endpoint !== undefined ? { endpoint: filter.endpoint } : {}),
+        ...(filter.tenant !== undefined ? { tenant: filter.tenant } : {}),
+        ...(filter.since !== undefined ? { since: filter.since } : {}),
+        ...(filter.until !== undefined ? { until: filter.until } : {}),
+        ...(plan.nextCursor !== undefined ? { nextCursor: plan.nextCursor } : {}),
+      });
       return;
     }
     if (isStats) {

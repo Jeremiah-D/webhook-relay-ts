@@ -1041,7 +1041,20 @@ reliability primitives that matter for any signed-payload pipeline.
   letters past their per-endpoint TTL on a background sweep — each purge
   audited as `dead_letter_purged` with metadata only, never the payload —
   and exposes `{ total, purged, throttled, byEndpoint }` at
-  `GET /dead-letter/stats`. The same guard protects
+  `GET /dead-letter/stats`. For reconciliation against downstream systems,
+  `GET /dead-letter/export` streams dead letters *with* their payloads as
+  JSONL (`?format=jsonl`, default) or CSV (`?format=csv`, fixed 11-column
+  set): `?endpoint=` / `?tenant=` / `?since=` / `?until=` filter (since/until
+  are inclusive bounds on `deadLetteredAt`, ms epoch or ISO-8601), sealed
+  payloads (WR-11) are transparently decrypted, and per-row payloads are
+  truncated past 64 KiB (CSV cells carry a `...[truncated]` marker, JSONL
+  rows a `payloadTruncated` flag) so one giant payload cannot blow the
+  export's memory. One response carries at most 10,000 rows: a larger
+  export answers 409 `export_exceeds_row_limit` and asks the operator to
+  page with `?cursor=` (an inclusive start id; `x-export-has-more` /
+  `x-export-next-cursor` headers chain the pages). Each completed export
+  is audited as `dead_letter_exported` with the row count, filter,
+  format, and operator key id — never the payloads. The same guard protects
   `GET /audit` (`?endpoint=`, `?event=` repeatable, `?since=`/`?until=` ISO-8601,
   `?limit=`), which queries the audit log through its index — delivery
   forensics per endpoint and time range.
