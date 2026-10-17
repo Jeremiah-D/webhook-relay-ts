@@ -49,8 +49,12 @@
  *   mode is in use and only for (endpoint, target) pairs that actually
  *   received a dispatch.
  * - `relay_retry_budget_depleted_total`: counter of retries parked because
- *   the global retry budget (WR-38) was exhausted. Present only when the
- *   budget is enabled. No endpoint label — the budget is global.
+ *   the retry budget (WR-38) was exhausted. Present only when the
+ *   budget is enabled. The unlabeled series is the relay-wide total;
+ *   WR-125 adds one `{endpoint}`-labeled series per endpoint that
+ *   actually had a retry parked, so an operator can see whether the
+ *   parking came from one endpoint's own override budget or the shared
+ *   global bucket.
  * - `relay_global_concurrency_wait_total`: counter of dispatches that had
  *   to wait for a relay-level global concurrency slot (WR-51). Present
  *   only when the cap is configured (finite). No endpoint label — the
@@ -298,6 +302,13 @@ export interface MetricsInput {
   weighted?: WeightedMetricsInput[];
   /** Present only when the global retry budget (WR-38) is enabled. */
   retryBudgetDepleted?: number;
+  /**
+   * WR-125: per-endpoint retry-budget park counts. Present only for
+   * endpoints that actually had a retry parked — activity-gated, so
+   * exposition is byte-identical to the pre-WR-125 shape until the
+   * first park.
+   */
+  retryBudgetDepletedByEndpoint?: Array<{ endpoint: string; depleted: number }>;
   /** Present only when the relay-level global concurrency cap (WR-51) is configured (finite). */
   globalConcurrencyWaits?: number;
   /** Present only once a delivery has been parked for a future deliver_at (WR-57). */
@@ -889,10 +900,17 @@ export function renderPrometheus(input: MetricsInput): string {
   }
   if (input.retryBudgetDepleted !== undefined) {
     lines.push(
-      "# HELP relay_retry_budget_depleted_total Retries parked because the global retry budget was exhausted."
+      "# HELP relay_retry_budget_depleted_total Retries parked because the retry budget was exhausted."
     );
     lines.push("# TYPE relay_retry_budget_depleted_total counter");
     lines.push(`relay_retry_budget_depleted_total ${input.retryBudgetDepleted}`);
+    // WR-125: per-endpoint split — one series per endpoint that actually
+    // had a retry parked; the unlabeled global row above is retained.
+    for (const row of input.retryBudgetDepletedByEndpoint ?? []) {
+      lines.push(
+        `relay_retry_budget_depleted_total{endpoint="${escapeLabelValue(row.endpoint)}"} ${row.depleted}`
+      );
+    }
   }
   if (input.globalConcurrencyWaits !== undefined) {
     lines.push(

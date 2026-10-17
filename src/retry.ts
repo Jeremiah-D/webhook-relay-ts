@@ -853,7 +853,7 @@ export interface SemanticFailureInfo {
   reason: string;
 }
 
-/** Fired when the global retry budget (WR-38) parks a retry. */
+/** Fired when the retry budget (WR-38/WR-125) parks a retry. */
 export interface RetryBudgetDepletedInfo {
   /** Delivery id. */
   id: string;
@@ -867,6 +867,13 @@ export interface RetryBudgetDepletedInfo {
   attempts: number;
   /** Milliseconds the retry was parked for. */
   waitMs: number;
+  /**
+   * Which budget parked the retry (WR-125): `"endpoint"` when the
+   * endpoint's own override bucket was exhausted (only that endpoint's
+   * retries are parked), `"global"` when the shared WR-38 bucket was
+   * exhausted.
+   */
+  scope: "endpoint" | "global";
 }
 
 /**
@@ -907,12 +914,30 @@ export interface AttemptFailedInfo {
  */
 export type JitterStrategy = "additive" | "full";
 
-/** Global retry budget (WR-38) observability. */
+/** Per-endpoint retry-budget override (WR-125) observability. */
+export interface RetryBudgetEndpointStats {
+  /** Configured endpoint (exact `targetUrl`). */
+  endpoint: string;
+  /** Configured per-endpoint retries-per-minute budget. */
+  retriesPerMinute: number;
+  /** Retries parked because this endpoint's budget was exhausted. */
+  depleted: number;
+  /** Current tokens in this endpoint's bucket (a refill snapshot). */
+  remainingTokens: number;
+}
+
+/** Retry budget (WR-38/WR-125) observability. */
 export interface RetryBudgetStats {
   /** Configured retries-per-minute budget. */
   retriesPerMinute: number;
   /** Retries parked because the budget was exhausted. */
   depleted: number;
+  /**
+   * Per-endpoint override rows (WR-125), in first-configured order.
+   * Absent when no per-endpoint overrides are configured — the stats
+   * object is then byte-identical to the pre-WR-125 shape.
+   */
+  endpoints?: RetryBudgetEndpointStats[];
 }
 
 /**
@@ -2789,6 +2814,15 @@ export class RetryQueue {
   private readonly assertionFailureCounts = new Map<string, Map<string, number>>();
   /** WR-38: global retry budget; undefined when disabled. */
   private readonly retryBudget?: RetryBudget;
+  /**
+   * WR-125: per-endpoint retry-budget overrides, keyed by exact
+   * `targetUrl` (the logical endpoint, stable across WR-39 failover).
+   * Each is an independent token bucket sharing the global clock;
+   * endpoints without an override use the global budget only.
+   */
+  private readonly retryBudgetEndpoints = new Map<string, RetryBudget>();
+  /** WR-125: retries parked because the budget was exhausted, per logical endpoint. */
+  private readonly retryBudgetDepletedByEndpoint = new Map<string, number>();
   /** WR-59: adaptive backoff options; undefined when disabled. */
   private readonly adaptiveBackoffOpts?: AdaptiveBackoffOptions;
   /** WR-59: per-tenant adaptive backoff controllers (WR-48 scoping). */
@@ -3344,10 +3378,33 @@ export class RetryQueue {
     // WR-38: a present-but-empty object means "enabled with the generous
     // default budget"; absent means disabled. RangeError comes from the
     // RetryBudget constructor on an illegal budget.
+    const retryBudgetNow = opts.retryBudget?.now ?? Date.now;
     this.retryBudget =
       opts.retryBudget !== undefined
-        ? new RetryBudget(opts.retryBudget.retriesPerMinute, opts.retryBudget.now ?? Date.now)
+        ? new RetryBudget(opts.retryBudget.retriesPerMinute, retryBudgetNow)
         : undefined;
+    // WR-125: per-endpoint retry-budget overrides. Validated before any
+    // budget is installed: an illegal override throws RangeError at
+    // construction with zero partial application (a bad override never
+    // silently disables the good ones). Each endpoint bucket shares the
+    // global clock so tests pin both with one injected `now`.
+    const perEndpoint = opts.retryBudget?.perEndpointRetriesPerMinute;
+    if (perEndpoint !== undefined) {
+      if (typeof perEndpoint !== "object" || perEndpoint === null || Array.isArray(perEndpoint)) {
+        throw new RangeError(
+          "retryBudget.perEndpointRetriesPerMinute must be a record of targetUrl -> retriesPerMinute"
+        );
+      }
+      for (const [endpoint, perMinute] of Object.entries(perEndpoint)) {
+        if (typeof endpoint !== "string" || endpoint.length === 0) {
+          throw new RangeError(
+            "retryBudget.perEndpointRetriesPerMinute keys must be non-empty target URLs"
+          );
+        }
+        // RetryBudget constructor throws RangeError on an illegal budget.
+        this.retryBudgetEndpoints.set(endpoint, new RetryBudget(perMinute, retryBudgetNow));
+      }
+    }
     this.onRetryBudgetDepleted = opts.onRetryBudgetDepleted;
     // WR-59: opt-in adaptive backoff. The default tenant's controller is
     // created eagerly so invalid options throw at construction, never
@@ -5813,25 +5870,37 @@ export class RetryQueue {
             error,
             ...(retryingTraceSpan === undefined ? {} : { traceSpan: retryingTraceSpan }),
           });
-          // WR-38: gate every newly scheduled retry on the global retry
+          // WR-38/WR-125: gate every newly scheduled retry on the retry
           // budget. When the budget is exhausted the retry is parked
           // until the next token refill instead of joining a retry
           // storm: the failure above was already accounted (attempt +
           // circuit), and the parking itself is neutral — it consumes
           // neither another attempt, a budget token, nor a circuit
           // event. Retries resume automatically when the budget refills.
+          // WR-125: an endpoint with a per-endpoint override gates on its
+          // own bucket first, then on the global budget — a storm on one
+          // endpoint parks only that endpoint's retries.
           let scheduledDelayMs = retryDelayMs;
           // WR-50: a retry for a paused endpoint parks without touching
           // the global budget — `schedule()` below parks it, and the
           // parking itself must consume neither a budget token, another
           // attempt, nor a circuit event.
-          if (
-            this.retryBudget !== undefined &&
-            !this.pausedEndpoints.has(logicalEndpoint) &&
-            !this.retryBudget.take()
-          ) {
-            const waitMs = this.retryBudget.msUntilToken() + this.random() * 50;
+          const budgetGate =
+            this.retryBudget !== undefined && !this.pausedEndpoints.has(logicalEndpoint)
+              ? this.gateRetryBudget(logicalEndpoint)
+              : { ok: true as const };
+          if (!budgetGate.ok) {
+            const waitMs = budgetGate.waitMs + this.random() * 50;
             this.retryBudgetDepleted += 1;
+            // WR-125: the per-endpoint split is tracked only when
+            // overrides are configured — without them the relay renders
+            // byte-identical exposition to the pre-WR-125 shape.
+            if (this.retryBudgetEndpoints.size > 0) {
+              this.retryBudgetDepletedByEndpoint.set(
+                logicalEndpoint,
+                (this.retryBudgetDepletedByEndpoint.get(logicalEndpoint) ?? 0) + 1
+              );
+            }
             this.onRetryBudgetDepleted?.({
               id: entry.id,
               traceId,
@@ -5839,6 +5908,7 @@ export class RetryQueue {
               endpoint: target,
               attempts: entry.attempt,
               waitMs: Math.max(0, Math.round(waitMs)),
+              scope: budgetGate.scope,
             });
             scheduledDelayMs = waitMs;
           }
@@ -6245,6 +6315,8 @@ export class RetryQueue {
    * (`relay_starvation_guard_activations`) for endpoints where the WR-35
    * lane guard engaged, and the global retry-budget depletion counter
    * (`relay_retry_budget_depleted_total`) when the WR-38 budget is enabled,
+   * plus one `{endpoint}`-labeled series per endpoint that actually had
+   * a retry parked (WR-125),
    * and the global-concurrency wait counter
    * (`relay_global_concurrency_wait_total`) when the WR-51 cap is
    * configured, and the scheduled-delivery counters
@@ -6460,6 +6532,17 @@ export class RetryQueue {
       // absent until a dispatch has actually been weighted.
       ...(weighted.length > 0 ? { weighted } : {}),
       ...(this.retryBudget !== undefined ? { retryBudgetDepleted: this.retryBudgetDepleted } : {}),
+      // WR-125: activity-gated — the per-endpoint split stays absent
+      // until a retry has actually been parked for an endpoint, so a
+      // relay that never exhausts the budget renders byte-identical
+      // exposition to the pre-WR-125 shape.
+      ...(this.retryBudget !== undefined && this.retryBudgetDepletedByEndpoint.size > 0
+        ? {
+            retryBudgetDepletedByEndpoint: [...this.retryBudgetDepletedByEndpoint]
+              .filter(([, depleted]) => depleted > 0)
+              .map(([endpoint, depleted]) => ({ endpoint, depleted })),
+          }
+        : {}),
       // WR-51: the wait counter is exposed only when the cap is
       // configured (finite) — the default unlimited gate never waits,
       // so the series stays absent exactly like the other opt-in
@@ -6912,14 +6995,51 @@ export class RetryQueue {
   }
 
   /**
-   * Global retry budget (WR-38) snapshot. `undefined` when the budget is
-   * disabled; otherwise the configured per-minute budget and the number
-   * of retries parked because the budget was exhausted.
+   * WR-38/WR-125: take one retry-budget token for `logicalEndpoint`. The
+   * per-endpoint override bucket (WR-125), when configured, gates first;
+   * the global budget (WR-38) is always the final gate. The caller must
+   * have checked `this.retryBudget !== undefined`. Never throws.
+   */
+  private gateRetryBudget(
+    logicalEndpoint: string
+  ): { ok: true } | { ok: false; scope: "endpoint" | "global"; waitMs: number } {
+    const endpointBudget = this.retryBudgetEndpoints.get(logicalEndpoint);
+    if (endpointBudget !== undefined && !endpointBudget.take()) {
+      // The endpoint's own budget is exhausted: park on its refill
+      // horizon without touching the global bucket — the retry is not
+      // scheduled, so no global token may be consumed for it.
+      return { ok: false, scope: "endpoint", waitMs: endpointBudget.msUntilToken() };
+    }
+    const global = this.retryBudget as RetryBudget;
+    if (!global.take()) {
+      return { ok: false, scope: "global", waitMs: global.msUntilToken() };
+    }
+    return { ok: true };
+  }
+
+  /**
+   * Retry budget (WR-38/WR-125) snapshot. `undefined` when the budget is
+   * disabled; otherwise the configured per-minute budget, the number of
+   * retries parked because the budget was exhausted, and — when
+   * per-endpoint overrides are configured — one row per overridden
+   * endpoint with its own budget, park count, and remaining tokens.
    */
   getRetryBudgetStats(): RetryBudgetStats | undefined {
-    return this.retryBudget === undefined
-      ? undefined
-      : { retriesPerMinute: this.retryBudget.limit(), depleted: this.retryBudgetDepleted };
+    if (this.retryBudget === undefined) return undefined;
+    const rows: RetryBudgetEndpointStats[] = [];
+    for (const [endpoint, budget] of this.retryBudgetEndpoints) {
+      rows.push({
+        endpoint,
+        retriesPerMinute: budget.limit(),
+        depleted: this.retryBudgetDepletedByEndpoint.get(endpoint) ?? 0,
+        remainingTokens: budget.remaining(),
+      });
+    }
+    return {
+      retriesPerMinute: this.retryBudget.limit(),
+      depleted: this.retryBudgetDepleted,
+      ...(rows.length > 0 ? { endpoints: rows } : {}),
+    };
   }
 
   /**

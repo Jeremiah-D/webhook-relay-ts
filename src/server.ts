@@ -4625,6 +4625,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         targetUrl: info.endpoint,
         attempts: info.attempts,
         waitMs: info.waitMs,
+        // WR-125: which budget parked the retry — "endpoint" means only
+        // that endpoint's own override bucket was exhausted.
+        budgetScope: info.scope,
       });
       opts.retry?.onRetryBudgetDepleted?.(info);
     },

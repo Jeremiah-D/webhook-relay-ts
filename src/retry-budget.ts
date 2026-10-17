@@ -25,6 +25,17 @@ export interface RetryBudgetOptions {
    * 6000 (generous — a guard rail, not a throttle).
    */
   retriesPerMinute?: number;
+  /**
+   * Per-endpoint retry-budget overrides (WR-125): exact `targetUrl` →
+   * retries-per-minute. An endpoint with an override gates on its own
+   * bucket *first*, then on the global bucket — a retry storm on one
+   * endpoint parks only that endpoint's retries instead of starving the
+   * others of the shared budget. Endpoints without an override use the
+   * global budget only. Each value must be a finite number > 0; illegal
+   * values throw `RangeError` at construction. Opt-in: absent by default
+   * (zero behavior change).
+   */
+  perEndpointRetriesPerMinute?: Record<string, number>;
   /** Clock in ms; defaults to `Date.now`. Injectable for deterministic tests. */
   now?: () => number;
 }
@@ -90,5 +101,15 @@ export class RetryBudget {
     if (this.tokens >= 1) return 0;
     const needed = 1 - this.tokens;
     return Math.ceil((needed * 60_000) / this.perMinute);
+  }
+
+  /**
+   * Current token count (a refill snapshot). WR-125: feeds the
+   * per-endpoint `remainingTokens` rows in `getRetryBudgetStats()` so an
+   * operator can see each override budget's headroom.
+   */
+  remaining(): number {
+    this.refill();
+    return this.tokens;
   }
 }

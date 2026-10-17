@@ -204,7 +204,19 @@ reliability primitives that matter for any signed-payload pipeline.
   `getRetryBudgetStats()` reports the budget and the `depleted` park count,
   parkings are audited as `retry_budget_depleted`, and
   `relay_retry_budget_depleted_total` exposes the count to Prometheus.
-  Injectable clock for deterministic tests.
+  Injectable clock for deterministic tests. WR-125 adds opt-in
+  per-endpoint overrides — `retry: { retryBudget: { perEndpointRetriesPerMinute:
+  { "<targetUrl>": n } } }`: an overridden endpoint gates on its own
+  bucket first, then on the global bucket, so one endpoint's retry storm
+  parks only that endpoint's retries instead of starving the shared
+  budget; endpoints without an override use the global budget only.
+  `getRetryBudgetStats().endpoints` exposes each override's budget, park
+  count, and remaining tokens, `relay_retry_budget_depleted_total` gains
+  one `{endpoint}`-labeled series per parked endpoint (the unlabeled
+  global row is retained), and the `retry_budget_depleted` audit event
+  records which budget parked the retry (`budgetScope:
+  "endpoint" | "global"`). Illegal values throw `RangeError` at
+  construction; without overrides the relay is byte-identical to before.
 - `src/latency.ts` — accepted→delivered latency SLO tracking
   (`LatencyTracker`): `enqueue()` starts each delivery's clock, a successful
   delivery samples it into a bounded per-endpoint rolling window (default
