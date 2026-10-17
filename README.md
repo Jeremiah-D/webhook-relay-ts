@@ -891,6 +891,39 @@ reliability primitives that matter for any signed-payload pipeline.
   kills the fresh connection instead of leaking an orphan socket (the
   handshake future resolves after the pool is gone, so `checkout`
   re-checks `destroyed` before the connection can enter the pool).
+- `src/inbound-ws.ts` — inbound WebSocket event intake (WR-130): a
+  `ws(s)://` upgrade endpoint (opt-in via `RelayServerOptions.inboundWs`,
+  default path `/ingest/ws`) so producers can push events over one
+  long-lived connection instead of one HTTP POST per event. Zero
+  dependencies — the RFC 6455 server-side handshake and frame codec are
+  hand-rolled (`node:crypto` only) and covered by
+  `test/inbound-ws.test.ts` against raw sockets; the frame encoder is
+  shared with the WR-45 outbound client but every semantic is
+  server-side (inbound client frames MUST be masked — an unmasked frame
+  is a 1002 protocol error; no extensions, so any RSV bit is a 1002;
+  fragmented messages reassemble with a byte cap, 1009 past it). Wire
+  protocol: one text frame per event, a JSON envelope shaped exactly
+  like a WR-61 batch item (`{ "payload": "<base64>", "headers": {
+  "x-signature": "…", … } }`); the server answers each event with a text
+  frame `{ "type": "event-ack", "status": "accepted" | "rejected", … }`
+  mirroring the HTTP 202 / 4xx outcome. Each event walks the full intake
+  pipeline — HMAC/Ed25519 signature verification, per-endpoint API keys,
+  the WR-22 inbound rate limiter (per event, before verification),
+  dedup, schema validation, the `maxBodyBytes` / `endpointBodyLimits`
+  budget (413 + close on overflow), tenant, gzip, replay guard — and
+  lands in the normal `RetryQueue`, so retry / dead-letter / replay
+  semantics are unchanged. `x-relay-*` and other connection-level headers
+  ride the upgrade request and apply to every event (the relay-namespace
+  strip still applies); the envelope's per-event headers overlay them.
+  Keep-alive: the server pings every `pingIntervalMs` (default 30s, `0`
+  disables), answers client pings with pongs, and closes connections
+  idle longer than `idleTimeoutMs` (default 120s); a client whose
+  outbound buffer passes 1MiB is disconnected like a slow SSE `/events`
+  consumer. A TLS-terminating intake listener serves `wss://` on the same
+  port — no second listener. In split-plane mode the endpoint lives on
+  the intake plane only. Invalid option values throw `RangeError` at
+  startup; connect/disconnect and every admission decision are audited
+  (`ws_connected` / `ws_disconnected` / `rejected` / `accepted`).
 - `src/deflate.ts` — WebSocket permessage-deflate (RFC 7692, WR-46),
   opt-in per pool via the `permessageDeflate` WebSocket option (`true` for
   defaults, `{ thresholdBytes? }` to tune the payload size at which

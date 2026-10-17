@@ -1,6 +1,6 @@
 import { Agent as HttpAgent, createServer, request as httpRequest } from "node:http";
 import { request as httpsRequest, createServer as createHttpsServer } from "node:https";
-import type { Server } from "node:http";
+import type { IncomingMessage, Server } from "node:http";
 import { randomUUID } from "node:crypto";
 import {
   assertValidEndpointBodyLimitRules,
@@ -155,6 +155,21 @@ import {
   type ResolvedIdempotencyKeyConfig,
 } from "./idempotency-key.ts";
 import type { TLSSocket, Server as TlsServer } from "node:tls";
+import type { Socket } from "node:net";
+import {
+  checkInboundWsHandshake,
+  inboundWsAcceptKey,
+  InboundWsParser,
+  resolveInboundWsOptions,
+  wsCloseFrame,
+  wsPingFrame,
+  wsPongFrame,
+  wsTextFrame,
+  WsProtocolError,
+  type InboundWsMessage,
+  type InboundWsOptions,
+  type ResolvedInboundWsOptions,
+} from "./inbound-ws.ts";
 import { assertValidPins, normalizePin, spkiFingerprint, TlsPinMismatchError } from "./pinning.ts";
 import {
   assertValidClientCert,
@@ -1476,6 +1491,32 @@ export interface RelayServerOptions {
    * nothing. Disabled by default.
    */
   rateLimit?: InboundRateLimitOptions;
+  /**
+   * Inbound WebSocket event intake (WR-130; see `src/inbound-ws.ts`): serve
+   * a `ws(s)://` upgrade endpoint so producers can push events over one
+   * long-lived connection instead of one HTTP POST per event.
+   *
+   * The endpoint reuses the HTTP intake semantics per event: HMAC/Ed25519
+   * signature verification (`verifier`, `endpointVerifiers`), the
+   * WR-22 inbound rate limiter, dedup (`dedup`), schema validation
+   * (`payloadSchemas`), the `maxBodyBytes` / `endpointBodyLimits`
+   * budget, per-endpoint API keys (`apiKeys`), and `x-trace-id` trace
+   * propagation. Each text frame carries one JSON envelope shaped like a
+   * WR-61 batch item (`{ "payload": "<base64>", "headers": { … } }`);
+   * `x-relay-*` headers ride the upgrade request and apply to every
+   * event on the connection. The server answers each event with a text
+   * frame `{ "type": "event-ack", "status": "accepted" | "rejected", … }`
+   * mirroring the HTTP 202 / 4xx outcome.
+   *
+   * Keep-alive: the server pings every `pingIntervalMs` (answering
+   * client pings with pongs) and closes connections idle longer than
+   * `idleTimeoutMs`; a client whose outbound buffer exceeds 1MiB is
+   * disconnected like a slow SSE `/events` consumer. When the intake
+   * listener terminates TLS the same listener serves `wss://` — no
+   * second port. Disabled by default; invalid config throws `RangeError`
+   * at startup.
+   */
+  inboundWs?: InboundWsOptions;
   /**
    * Per-(tenant, endpoint) outbound rate limiting (WR-97; see
    * `src/tenant-ratelimit.ts` and `RetryQueueOptions.tenantRateLimit`).
@@ -3939,6 +3980,23 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   const maxBodyBytes = opts.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
   if (!Number.isInteger(maxBodyBytes) || maxBodyBytes <= 0) {
     throw new RangeError("createRelayServer: `maxBodyBytes` must be a positive integer");
+  }
+  // WR-130: inbound WebSocket intake — validated once at startup so a bad
+  // path or timer can never fail an upgrade mid-flight. The path must not
+  // collide with the operator surface: an upgrade handler runs before the
+  // HTTP dispatch, so it would shadow operator routes.
+  let inboundWs: ResolvedInboundWsOptions | undefined;
+  if (opts.inboundWs !== undefined) {
+    try {
+      inboundWs = resolveInboundWsOptions(opts.inboundWs);
+    } catch (err) {
+      throw new RangeError(`createRelayServer: invalid inboundWs config: ${(err as Error).message}`);
+    }
+    if (isOperatorPath(inboundWs.path)) {
+      throw new RangeError(
+        `createRelayServer: inboundWs.path must not be an operator path: ${inboundWs.path}`
+      );
+    }
   }
   // WR-107: relay mesh config + activity-gated metrics. `undefined` =
   // mesh disabled: the header is stripped at intake and never stamped.
@@ -6494,6 +6552,37 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     auditReputationTransition(reputation.recordPenalty(key, kind), extra);
   };
 
+  /**
+   * WR-22 base inbound rate-limit check, shared by the HTTP intake gates
+   * and the WR-130 WebSocket intake: per-sender-IP + per-endpoint token
+   * buckets, checked before signature verification so a flood costs
+   * almost nothing. Audits the rejection and records the WR-119
+   * reputation penalty; the caller renders the transport-specific
+   * rejection (HTTP 429 vs. a WS `event-ack`). A no-op when no limiter
+   * is configured.
+   */
+  const checkInboundRateLimit = (
+    ip: string,
+    senderKey: string,
+    id: string,
+    traceId: string
+  ): { ok: true } | { ok: false; retryAfterMs: number; dimension: string } => {
+    if (rateLimiter === undefined) return { ok: true };
+    const verdict = rateLimiter.take(ip, opts.forwardUrl);
+    if (verdict.ok) return { ok: true };
+    // WR-119: a rate-limit hit is a reputation penalty event.
+    recordReputationPenalty(senderKey, "rate_limit", { id, traceId });
+    opts.auditLog.append({
+      event: "rejected",
+      id,
+      traceId,
+      reason: "rate_limited",
+      dimension: verdict.dimension,
+      retryAfterMs: verdict.retryAfterMs,
+    });
+    return { ok: false, retryAfterMs: verdict.retryAfterMs, dimension: verdict.dimension };
+  };
+
   const runIntakeGates = async (
     req: Parameters<Parameters<typeof createServer>[0]>[0],
     res: Parameters<Parameters<typeof createServer>[0]>[1],
@@ -6614,23 +6703,13 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       // WR-119: the sender dimension is the matched API key id, or
       // "anonymous" when no key guards the endpoint.
       const senderKey = apiKey?.keyId ?? "anonymous";
-      const verdict = rateLimiter.take(ip, opts.forwardUrl);
-      if (!verdict.ok) {
-        // WR-119: a rate-limit hit is a reputation penalty event.
-        recordReputationPenalty(senderKey, "rate_limit", { id, traceId });
-        opts.auditLog.append({
-          event: "rejected",
-          id,
-          traceId,
-          reason: "rate_limited",
-          dimension: verdict.dimension,
-          retryAfterMs: verdict.retryAfterMs,
-        });
+      const limitCheck = checkInboundRateLimit(ip, senderKey, id, traceId);
+      if (!limitCheck.ok) {
         res
           .writeHead(429, {
             "content-type": "text/plain",
             // Ceiling seconds, minimum 1: a Retry-After of 0 is meaningless.
-            "retry-after": String(Math.max(1, Math.ceil(verdict.retryAfterMs / 1000))),
+            "retry-after": String(Math.max(1, Math.ceil(limitCheck.retryAfterMs / 1000))),
           })
           .end("Too many requests");
         return undefined;
@@ -8117,6 +8196,523 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     operatorServer.listen(operatorPlane.port, operatorPlane.host ?? "127.0.0.1");
   }
 
+  /**
+   * Inbound WebSocket event intake (WR-130).
+   *
+   * `ws(s)://` upgrade endpoint: one long-lived client connection pushes
+   * one text frame per event (a JSON envelope shaped exactly like a WR-61
+   * batch item: `{ "payload": "<base64>", "headers": { … } }`). Each event
+   * walks the full intake pipeline through `admitOneEvent` — signature
+   * verification (HMAC/Ed25519/rotation), per-endpoint API keys, tenant,
+   * gzip budget, schema, replay guard, dedup, enqueue — and the server
+   * answers with a text frame `{ "type": "event-ack", "status":
+   * "accepted" | "rejected", … }` mirroring the HTTP 202 / 4xx outcome.
+   *
+   * Transport mapping vs. HTTP:
+   * - the upgrade request carries the connection-level headers
+   *   (`x-relay-*`, `x-api-key`, `x-trace-id`); each envelope's headers
+   *   overlay them per event (lowercased — JSON gets no node header
+   *   normalization);
+   * - the WR-53 IP ACL and WR-65 API-key gates run once at upgrade (they
+   *   see headers only); the WR-22 rate limiter runs per event, before
+   *   signature verification, like one HTTP request's gate check;
+   * - the `maxBodyBytes` / `endpointBodyLimits` budget caps each decoded
+   *   event body (413 + close, like the HTTP `connection: close`);
+   * - server pings keep the connection alive, an idle connection is
+   *   closed, and a client whose outbound buffer passes 1MiB is dropped
+   *   like a slow SSE `/events` consumer.
+   *
+   * The handler is attached to the intake listener only — in split-plane
+   * mode the operator plane never upgrades — and a TLS-terminating
+   * intake listener serves `wss://` on the same port with no extra
+   * configuration.
+   */
+  interface InboundWsHandle {
+    /** Tear the connection down: audit once, send a close frame, destroy. */
+    tearDown: (auditReason: string, code: number, reasonText: string) => void;
+  }
+  /** Live inbound WS connections — the server close path drains them. */
+  const inboundWsHandles = new Set<InboundWsHandle>();
+  /** Slow-consumer guard shared with SSE `/events`: 1MiB of unflushed bytes. */
+  const INBOUND_WS_SLOW_CONSUMER_BYTES = 1_048_576;
+
+  const openInboundWsConnection = (
+    wsOpts: ResolvedInboundWsOptions,
+    req: IncomingMessage,
+    socket: Socket
+  ): void => {
+    const connId = randomUUID();
+    // WR-98: a propagated W3C trace id wins, then a client-supplied
+    // x-trace-id, otherwise fresh — resolved before any admission
+    // decision so even rejections stay traceable, like the HTTP intake.
+    const inboundTrace =
+      traceContextOpts === undefined
+        ? undefined
+        : parseInboundTraceContext(req.headers[TRACEPARENT_HEADER], req.headers[TRACESTATE_HEADER]);
+    const connTraceId = inboundTrace?.traceId ?? resolveTraceId(req.headers[TRACE_ID_HEADER]);
+    const clientIp = socket.remoteAddress ?? "unknown";
+
+    const rejectUpgradeHttp = (status: number, statusText: string, body: string): void => {
+      if (!socket.destroyed) {
+        socket.write(
+          `HTTP/1.1 ${status} ${statusText}\r\n` +
+            "content-type: text/plain\r\n" +
+            `content-length: ${Buffer.byteLength(body)}\r\n` +
+            "connection: close\r\n\r\n" +
+            body
+        );
+      }
+      socket.destroy();
+    };
+
+    // Inbound IP allowlist/denylist (WR-53): the outermost admission gate —
+    // on the upgrade headers alone, before the handshake completes, so a
+    // hostile IP costs zero bandwidth and zero downstream state.
+    if (ipAcl !== undefined) {
+      const aclIp = ipAcl.clientIp(socket.remoteAddress, req.headers["x-forwarded-for"]);
+      const aclVerdict = ipAcl.check(wsOpts.path, aclIp);
+      if (!aclVerdict.ok) {
+        ipAclMetrics.record(aclVerdict.pattern);
+        opts.auditLog.append({
+          event: "rejected",
+          id: connId,
+          traceId: connTraceId,
+          reason: "ip_denied",
+          ip: aclIp,
+          endpoint: aclVerdict.pattern,
+        });
+        rejectUpgradeHttp(403, "Forbidden", "Forbidden");
+        return;
+      }
+    }
+
+    // Inbound per-endpoint API key authentication (WR-65): the second
+    // admission gate — on the upgrade headers alone, like the WR-53 gate.
+    // The matched key rides `admitOneEvent` per event, exactly as if each
+    // frame were its own HTTP request.
+    let wsApiKey: { keyId: string; rule: EndpointApiKeyRule } | undefined;
+    if (apiKeyAuth !== undefined) {
+      const rule = apiKeyAuth.ruleFor(wsOpts.path);
+      if (rule !== undefined) {
+        const presentedRaw = req.headers["x-api-key"];
+        const presented = Array.isArray(presentedRaw) ? presentedRaw[0] : presentedRaw;
+        if (typeof presented !== "string" || presented === "") {
+          opts.auditLog.append({
+            event: "rejected",
+            id: connId,
+            traceId: connTraceId,
+            reason: "api_key_missing",
+            keyId: "unknown",
+            endpoint: rule.pattern,
+          });
+          rejectUpgradeHttp(401, "Unauthorized", "Unauthorized");
+          return;
+        }
+        const matchedId = apiKeyAuth.verifyKey(rule, presented);
+        if (matchedId === null) {
+          opts.auditLog.append({
+            event: "rejected",
+            id: connId,
+            traceId: connTraceId,
+            reason: "api_key_invalid",
+            keyId: "unknown",
+            endpoint: rule.pattern,
+          });
+          rejectUpgradeHttp(401, "Unauthorized", "Unauthorized");
+          return;
+        }
+        wsApiKey = { keyId: matchedId, rule };
+      }
+    }
+
+    // Inbound per-endpoint body size budget (WR-102): resolved from headers
+    // alone, so the endpoint's own budget governs every frame on the
+    // connection — the transport layer, orthogonal to schema validation.
+    const bodyBudget = selectEndpointBodyLimit(wsOpts.path, opts.endpointBodyLimits) ?? maxBodyBytes;
+
+    const keyRaw = req.headers["sec-websocket-key"];
+    const clientKey = (Array.isArray(keyRaw) ? keyRaw[0] : keyRaw) ?? "";
+    socket.write(
+      "HTTP/1.1 101 Switching Protocols\r\n" +
+        "Upgrade: websocket\r\n" +
+        "Connection: Upgrade\r\n" +
+        `Sec-WebSocket-Accept: ${inboundWsAcceptKey(clientKey)}\r\n` +
+        "\r\n"
+    );
+    socket.setNoDelay(true);
+
+    opts.auditLog.append({
+      event: "ws_connected",
+      id: connId,
+      traceId: connTraceId,
+      path: wsOpts.path,
+      ip: clientIp,
+      ...(wsApiKey === undefined ? {} : { keyId: wsApiKey.keyId }),
+    });
+
+    const parser = new InboundWsParser(wsOpts.maxMessageBytes);
+    let lastActivity = Date.now();
+    let tornDown = false;
+    let timer: ReturnType<typeof setInterval> | undefined;
+
+    const tearDown = (auditReason: string, code: number, reasonText: string): void => {
+      if (tornDown) return;
+      tornDown = true;
+      if (timer !== undefined) clearInterval(timer);
+      inboundWsHandles.delete(handle);
+      opts.auditLog.append({
+        event: "ws_disconnected",
+        id: connId,
+        traceId: connTraceId,
+        reason: auditReason,
+        path: wsOpts.path,
+      });
+      if (!socket.destroyed) {
+        try {
+          socket.write(wsCloseFrame(code, reasonText), () => socket.destroy());
+          // If the peer never drains, don't linger: the audit is written.
+          const killer = setTimeout(() => socket.destroy(), 1000);
+          (killer as unknown as { unref?: () => unknown }).unref?.();
+        } catch {
+          socket.destroy();
+        }
+      }
+    };
+    const handle: InboundWsHandle = { tearDown };
+    inboundWsHandles.add(handle);
+
+    const sendJson = (obj: Record<string, unknown>): boolean => {
+      // Slow-consumer guard — the same 1MiB policy as SSE `/events`: a
+      // client that cannot keep up is disconnected instead of buffering
+      // without bound.
+      if (socket.writableLength > INBOUND_WS_SLOW_CONSUMER_BYTES) {
+        tearDown("slow_consumer", 1011, "slow consumer");
+        return false;
+      }
+      if (tornDown || socket.destroyed) return false;
+      socket.write(wsTextFrame(JSON.stringify(obj)));
+      return true;
+    };
+
+    const touch = (): void => {
+      lastActivity = Date.now();
+    };
+
+    const onTextMessage = (data: Buffer): void => {
+      let raw: unknown;
+      try {
+        raw = JSON.parse(data.toString("utf8"));
+      } catch {
+        sendJson({
+          type: "event-error",
+          code: 400,
+          reason: "malformed_envelope",
+          id: randomUUID(),
+          traceId: connTraceId,
+        });
+        return;
+      }
+      const eventId = randomUUID();
+      const checked = checkIngestBatchItem(raw);
+      if (!("item" in checked)) {
+        opts.auditLog.append({
+          event: "rejected",
+          id: eventId,
+          traceId: connTraceId,
+          reason: "invalid_item",
+          detail: checked.problem,
+          path: wsOpts.path,
+        });
+        sendJson({
+          type: "event-error",
+          code: 400,
+          reason: checked.problem,
+          id: eventId,
+          traceId: connTraceId,
+        });
+        return;
+      }
+      if (checked.body.length > bodyBudget) {
+        // Like the HTTP intake's 413: the event is dead and the
+        // connection goes with it (flood protection).
+        opts.auditLog.append({
+          event: "rejected",
+          id: eventId,
+          traceId: connTraceId,
+          reason: "body_too_large",
+          path: wsOpts.path,
+        });
+        sendJson({
+          type: "event-ack",
+          status: "rejected",
+          id: eventId,
+          traceId: connTraceId,
+          code: 413,
+          reason: "body_too_large",
+        });
+        tearDown("message_too_large", 1009, "message exceeds the intake body budget");
+        return;
+      }
+      // Per-event headers: the upgrade request's headers with the
+      // envelope's per-event headers overlaid (lowercased — a JSON object
+      // gets none of node's header normalization). `x-relay-*` and other
+      // connection-level headers ride the upgrade request and apply to
+      // every event on the connection.
+      const headers: Record<string, string | string[] | undefined> = { ...req.headers };
+      for (const [k, v] of Object.entries(checked.item.headers ?? {})) {
+        headers[k.toLowerCase()] = v;
+      }
+      // WR-98: per-event W3C trace context, like the batch items — gated
+      // on the option, never a 400. A per-event x-trace-id wins, then the
+      // connection's trace id (never a fresh one per event — the frames
+      // share the connection's trace by default).
+      const itemTrace =
+        traceContextOpts === undefined
+          ? undefined
+          : parseInboundTraceContext(headers[TRACEPARENT_HEADER], headers[TRACESTATE_HEADER]);
+      const traceId = itemTrace?.traceId ?? resolveTraceId(headers[TRACE_ID_HEADER] ?? connTraceId);
+      // WR-22 per-event inbound rate limit — the WS analogue of one HTTP
+      // request's gate check, before signature verification.
+      const limitCheck = checkInboundRateLimit(
+        clientIp,
+        wsApiKey?.keyId ?? "anonymous",
+        eventId,
+        traceId
+      );
+      if (!limitCheck.ok) {
+        sendJson({
+          type: "event-ack",
+          status: "rejected",
+          id: eventId,
+          traceId,
+          code: 429,
+          reason: "rate_limited",
+          // Ceiling seconds, minimum 1: a Retry-After of 0 is meaningless
+          // (the WR-22 convention, without a header to carry it).
+          retryAfter: Math.max(1, Math.ceil(limitCheck.retryAfterMs / 1000)),
+        });
+        return;
+      }
+      void admitOneEvent(
+        eventId,
+        traceId,
+        checked.body,
+        headers,
+        wsOpts.path,
+        {},
+        wsApiKey,
+        itemTrace,
+        bodyBudget
+      )
+        .then((outcome) => {
+          if (tornDown) return;
+          const ack: Record<string, unknown> =
+            outcome.status === 202
+              ? {
+                  type: "event-ack",
+                  status: "accepted",
+                  id: outcome.id,
+                  traceId: outcome.traceId,
+                  ...(outcome.duplicate === true ? { duplicate: true } : {}),
+                  ...(outcome.tenantId === undefined ? {} : { tenant: outcome.tenantId }),
+                  ...(outcome.scheduledAt === undefined
+                    ? {}
+                    : {
+                        scheduled: true,
+                        deliverAt: new Date(outcome.scheduledAt).toISOString(),
+                      }),
+                  ...(outcome.scheduleId === undefined
+                    ? {}
+                    : {
+                        scheduled: true,
+                        recurring: true,
+                        scheduleId: outcome.scheduleId,
+                        cron: outcome.cron,
+                        ...(outcome.nextAt === undefined
+                          ? {}
+                          : { nextAt: new Date(outcome.nextAt).toISOString() }),
+                      }),
+                }
+              : {
+                  type: "event-ack",
+                  status: "rejected",
+                  id: outcome.id,
+                  traceId: outcome.traceId,
+                  code: outcome.status,
+                  ...(outcome.reason === undefined ? {} : { reason: outcome.reason }),
+                  ...(outcome.retryAfterMs === undefined
+                    ? {}
+                    : {
+                        retryAfter: Math.max(1, Math.ceil(outcome.retryAfterMs / 1000)),
+                      }),
+                };
+          if (!sendJson(ack)) return;
+          if (outcome.closeConnection === true) {
+            // The admission wants the connection gone (the HTTP intake
+            // would have answered `connection: close`).
+            tearDown("admission_close", 1000, "rejected");
+          }
+        })
+        .catch(() => {
+          if (tornDown) return;
+          opts.auditLog.append({
+            event: "rejected",
+            id: eventId,
+            traceId,
+            reason: "internal_error",
+            path: wsOpts.path,
+          });
+          sendJson({
+            type: "event-error",
+            code: 500,
+            reason: "internal_error",
+            id: eventId,
+            traceId,
+          });
+        });
+    };
+
+    const onMessage = (msg: InboundWsMessage): void => {
+      switch (msg.kind) {
+        case "ping":
+          touch();
+          if (!tornDown && !socket.destroyed) socket.write(wsPongFrame(msg.data));
+          return;
+        case "pong":
+          touch();
+          return;
+        case "close":
+          tearDown("client_close", 1000, "");
+          return;
+        case "binary":
+          opts.auditLog.append({
+            event: "rejected",
+            id: randomUUID(),
+            traceId: connTraceId,
+            reason: "ws_binary_unsupported",
+            path: wsOpts.path,
+          });
+          tearDown("unsupported_data", 1003, "binary frames are not supported");
+          return;
+        case "text":
+          touch();
+          onTextMessage(msg.data);
+          return;
+      }
+    };
+
+    socket.on("data", (chunk: Buffer) => {
+      if (tornDown) return;
+      let messages: InboundWsMessage[];
+      try {
+        messages = parser.push(chunk);
+      } catch (err) {
+        if (err instanceof WsProtocolError) {
+          opts.auditLog.append({
+            event: "rejected",
+            id: randomUUID(),
+            traceId: connTraceId,
+            reason: "ws_protocol_error",
+            detail: err.message,
+            path: wsOpts.path,
+          });
+          tearDown("protocol_error", err.closeCode, err.message);
+        } else {
+          tearDown("transport_error", 1011, "internal error");
+        }
+        return;
+      }
+      for (const msg of messages) {
+        if (tornDown) break;
+        onMessage(msg);
+      }
+    });
+    socket.on("close", () => tearDown("transport_close", 1000, ""));
+    socket.on("error", () => {});
+
+    // Ping/pong keep-alive + idle timeout. The timer ticks at the finer of
+    // the two configured intervals so an idle connection is reaped
+    // promptly even when server pings are disabled. Only inbound frames
+    // count as activity — our own pings never keep a dead peer alive.
+    const tickMs = Math.min(
+      wsOpts.pingIntervalMs > 0 ? wsOpts.pingIntervalMs : wsOpts.idleTimeoutMs,
+      wsOpts.idleTimeoutMs
+    );
+    timer = setInterval(() => {
+      if (tornDown) return;
+      if (wsOpts.pingIntervalMs > 0 && !socket.destroyed) {
+        socket.write(wsPingFrame());
+      }
+      if (Date.now() - lastActivity > wsOpts.idleTimeoutMs) {
+        tearDown("idle_timeout", 1000, "idle timeout");
+      }
+    }, tickMs);
+    (timer as unknown as { unref?: () => unknown }).unref?.();
+  };
+
+  const handleInboundWsUpgrade = (req: IncomingMessage, rawSocket: unknown): void => {
+    const wsOpts = inboundWs;
+    const socket = rawSocket as Socket;
+    if (wsOpts === undefined) {
+      socket.destroy();
+      return;
+    }
+    let pathname = "/";
+    try {
+      pathname = new URL(req.url ?? "/", "http://internal").pathname;
+    } catch {
+      socket.destroy();
+      return;
+    }
+    if (pathname !== wsOpts.path) {
+      // Not our upgrade endpoint — nothing else serves upgrades, so drop
+      // it instead of leaking a half-open socket.
+      socket.destroy();
+      return;
+    }
+    const hs = checkInboundWsHandshake(req.headers);
+    if (!hs.ok) {
+      const connId = randomUUID();
+      const traceId = resolveTraceId(req.headers[TRACE_ID_HEADER]);
+      opts.auditLog.append({
+        event: "rejected",
+        id: connId,
+        traceId,
+        reason: "ws_handshake_invalid",
+        detail: hs.reason,
+        path: wsOpts.path,
+      });
+      // RFC 6455 §4.2.1: an unsupported version gets 426 with the version
+      // the server speaks; anything else is a plain 400.
+      const versionMismatch = hs.reason === "unsupported_version";
+      const status = versionMismatch ? 426 : 400;
+      const statusText = versionMismatch ? "Upgrade Required" : "Bad Request";
+      const body = `websocket upgrade required (${hs.reason})`;
+      const versionHeader = versionMismatch ? "sec-websocket-version: 13\r\n" : "";
+      socket.write(
+        `HTTP/1.1 ${status} ${statusText}\r\n` +
+          "content-type: text/plain\r\n" +
+          versionHeader +
+          `content-length: ${Buffer.byteLength(body)}\r\n` +
+          "connection: close\r\n\r\n" +
+          body
+      );
+      socket.destroy();
+      return;
+    }
+    try {
+      openInboundWsConnection(wsOpts, req, socket);
+    } catch {
+      socket.destroy();
+    }
+  };
+
+  if (inboundWs !== undefined) {
+    server.on("upgrade", (req, socket) => {
+      handleInboundWsUpgrade(req, socket as unknown as Socket);
+    });
+  }
+
   server.on("close", () => {
     queue.stop();
     // WR-90: halt the audit-sink worker with the server — no new polls,
@@ -8132,6 +8728,11 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // lifecycle — closing it closes the operator listener too.
     if (operatorServer?.listening) operatorServer.close();
     defaultSender?.destroy();
+    // WR-130: drain inbound WebSocket intake connections with the server —
+    // each gets a 1001 close frame before its socket is destroyed.
+    for (const handle of [...inboundWsHandles]) {
+      handle.tearDown("server_shutdown", 1001, "server shutting down");
+    }
   });
 
   // WR-47 runtime loop check: a callback URL that resolves to this relay's
