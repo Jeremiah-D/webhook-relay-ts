@@ -722,6 +722,16 @@ export interface DeliveryEvent {
    * context resolved; subscribers must not assume it.
    */
   traceSpan?: { spanId: string; sampled: boolean };
+  /**
+   * WR-123: monotonic per-event sequence assigned by the delivery-event
+   * archiver (`DeliveryEventArchiver.record`, which stamps it on the event
+   * object before later subscribers run). It is the SSE `Last-Event-ID`
+   * cursor: dense, strictly increasing across restarts, and ordered by
+   * archive file order. Note `id` is NOT a sequence — it is the delivery's
+   * UUID, shared by that delivery's `delivered`/`retrying`/`dead_letter`
+   * events. Absent when no archive is configured.
+   */
+  eventSeq?: number;
 }
 
 /** Fired every time a batch is flushed (one merged item enqueued). */

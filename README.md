@@ -3406,6 +3406,21 @@ records the same event stream durably, while the audit log (`GET /audit`)
 records operator actions; the three surfaces are complementary, not
 redundant.
 
+**Stream resume (`Last-Event-ID`, opt-in):** with `eventArchive` configured
+*and* `events: { sseReplay: true }`, every frame carries an `id:` field with
+the archiver-assigned monotonic `eventSeq` (dense, strictly increasing
+across restarts — note this is *not* `DeliveryEvent.id`, which is a
+per-delivery UUID). A client that reconnects with the standard SSE
+`Last-Event-ID` header gets the missed events replayed in order before the
+live stream continues. `Last-Event-ID: 0` replays everything retained. When
+the cursor is older than the retained archive (retention-rotated), newer
+than anything produced, the archive is empty, or the gap exceeds the
+per-reconnect cap (10,000 events), the server answers `210 Gone` with an
+`events_gone` body — the client rebuilds from `GET /events/archive`
+instead of silently missing events. A malformed cursor answers `400`.
+Off by default: the header is then ignored and the stream stays live-only,
+zero behavior change.
+
 **Shutdown:** SIGTERM moves every `retrying` item straight out of the
 machine (dropped, never delivered) while `delivering` items are awaited;
 see Graceful shutdown above.
@@ -4027,6 +4042,16 @@ Requires Node 24+ (runs `.ts` directly via type stripping; zero dependencies).
   on persistent failure; heartbeat comments arrive on idle connections; a
   disconnected client stops receiving without breaking the server for the
   remaining subscribers.
+- `test/sse-replay.test.ts` — `Last-Event-ID` reconnect resume (WR-123):
+  live frames carry the monotonic `id:` cursor; reconnect replays the missed
+  range in order then continues live; `0` replays everything retained; a
+  caught-up cursor replays nothing; rotated/future/empty cursors answer
+  `210 Gone`; malformed cursor answers `400`; without `sseReplay` the header
+  is ignored (live-only); `sseReplay` without an archive never crashes;
+  the cursor survives a server restart via the archive. Plus
+  `DeliveryEventArchiver` sequence unit tests: dense seq assignment +
+  event stamping, `eventsAfter`, cross-restart continuation, one-time
+  resequence of pre-WR-123 lines, retention advancing the cursor range.
 - `test/operator-keys.test.ts` — scoped operator API keys (`operatorKeys`):
   `read` keys reach every read-only operator path with byte-identical
   response bodies but get 403 on every mutating path; `admin` keys read and

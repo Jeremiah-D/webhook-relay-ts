@@ -17,7 +17,14 @@
  *   event stream**. Decoupled by design — they answer different questions.
  *
  * Line format: one JSON object per line —
- * `{type, id, traceId, tenant?, targetUrl, attempts, at, error?}`.
+ * `{seq, type, id, traceId, tenant?, targetUrl, attempts, at, error?}`.
+ * `seq` (WR-123) is a dense, strictly increasing per-event sequence
+ * assigned at record time: it is the SSE `Last-Event-ID` cursor for
+ * reconnect replay. Lines written before WR-123 (no `seq`) are assigned
+ * seqs in file order once, at construction — after that every line has
+ * one. Rolling retention may evict old lines, so `seq` is dense only
+ * between retention passes; `minSeq`/`maxSeq` always describe what is
+ * actually on disk.
  *
  * Rolling retention (both opt-in):
  * - `maxAgeMs`: lines whose event `at` is older than `now - maxAgeMs` are
@@ -117,6 +124,16 @@ export interface EventArchiveStats {
   bytes: number;
 }
 
+/** What `DeliveryEventArchiver.seqRange` reports about the retained history. */
+export interface EventArchiveSeqRange {
+  /** Smallest `seq` currently retained (1-based; 0 when the archive is empty). */
+  minSeq: number;
+  /** Largest `seq` currently retained (0 when the archive is empty). */
+  maxSeq: number;
+  /** Number of events currently retained. */
+  total: number;
+}
+
 export class DeliveryEventArchiver {
   private readonly path: string;
   private readonly maxAgeMs?: number;
@@ -126,6 +143,15 @@ export class DeliveryEventArchiver {
   private writeErrors = 0;
   private bytes = 0;
   private appendsSinceRetain = 0;
+  /**
+   * WR-123: monotonic event sequence state. `nextSeq` is the last assigned
+   * seq (the next `record()` assigns `nextSeq + 1`); `minSeq`/`total` track
+   * what retention currently keeps on disk. Recovered from the file at
+   * construction, so seqs stay dense and increasing across restarts.
+   */
+  private nextSeq = 0;
+  private minSeq = 0;
+  private totalEvents = 0;
 
   /**
    * `dir` is created (recursively) when missing — a missing directory is
@@ -170,6 +196,10 @@ export class DeliveryEventArchiver {
     if (maxAgeMs !== undefined || maxBytes !== undefined) {
       this.retain();
     }
+    // WR-123: recover the monotonic sequence from disk (assigning seqs to
+    // any pre-WR-123 lines that lack one), so the Last-Event-ID cursor
+    // stays dense and increasing across restarts.
+    this.recoverSeq();
   }
 
   /** Unsubscribe from the event source. The file stays on disk. */
@@ -185,10 +215,18 @@ export class DeliveryEventArchiver {
    * Append one event. Never throws: a failed write is counted in
    * `writeErrors` and swallowed, so archiving can never fail a delivery.
    * Runs on the queue's synchronous delivery path — kept O(1).
+   *
+   * WR-123: assigns the next monotonic `seq`, stamps it on the passed event
+   * as `event.eventSeq` (the archiver subscribes before the server's SSE
+   * handlers, so live frames carry the same seq the archive persists), and
+   * returns it. The stamp is what makes `Last-Event-ID` resume work across
+   * restarts: the cursor is durable, not a process-local counter.
    */
-  record(event: DeliveryEvent): void {
+  record(event: DeliveryEvent): number {
+    const seq = this.nextSeq + 1;
     const line =
       JSON.stringify({
+        seq,
         type: event.type,
         id: event.id,
         traceId: event.traceId,
@@ -202,10 +240,17 @@ export class DeliveryEventArchiver {
       appendFileSync(this.path, line, "utf8");
     } catch {
       // The delivery path is authoritative; a failed archive write degrades
-      // to unarchived history, never a delivery failure.
+      // to unarchived history, never a delivery failure. The seq is not
+      // consumed on failure, so the next successful record keeps density.
       this.writeErrors += 1;
-      return;
+      return this.nextSeq;
     }
+    // Stamp only on success: a failed append must not hand out a seq that
+    // has no line on disk, or a reconnect could 210 on a gap we created.
+    this.nextSeq = seq;
+    event.eventSeq = seq;
+    if (this.minSeq === 0) this.minSeq = seq;
+    this.totalEvents += 1;
     this.appends += 1;
     this.bytes += Buffer.byteLength(line, "utf8");
     this.appendsSinceRetain += 1;
@@ -214,6 +259,7 @@ export class DeliveryEventArchiver {
     if (overBytes || ageCheckDue) {
       this.retain();
     }
+    return seq;
   }
 
   /** Force a retention pass now. Never throws; failures are counted. */
@@ -268,11 +314,176 @@ export class DeliveryEventArchiver {
         attempts: typeof obj["attempts"] === "number" ? obj["attempts"] : 0,
         at,
         ...(typeof obj["error"] === "string" ? { error: obj["error"] } : {}),
+        ...(typeof obj["seq"] === "number" ? { eventSeq: obj["seq"] } : {}),
       });
     }
     // Stable sort: equal `at` keeps file (chronological) order.
     out.sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
     return out;
+  }
+
+  /**
+   * WR-123: the retained sequence range — the `Last-Event-ID` cursor space.
+   * `minSeq` is 0 and `total` is 0 when the archive is empty.
+   */
+  seqRange(): EventArchiveSeqRange {
+    return { minSeq: this.minSeq, maxSeq: this.nextSeq, total: this.totalEvents };
+  }
+
+  /**
+   * WR-123: events with `seq` strictly greater than `afterSeq`, in archive
+   * (chronological) order — the reconnect replay set. `limit` bounds how
+   * much history one reconnect may pull; when the gap is larger the result
+   * is `truncated` and the caller must answer 210 Gone (the client rebuilds
+   * from `GET /events/archive`) instead of replaying a partial gap.
+   * Corrupt lines are skipped, exactly like `query()`.
+   */
+  eventsAfter(
+    afterSeq: number,
+    limit = 10_000
+  ): { events: DeliveryEvent[]; truncated: boolean } & EventArchiveSeqRange {
+    let raw: string;
+    try {
+      raw = readFileSync(this.path, "utf8");
+    } catch {
+      return { events: [], truncated: false, ...this.seqRange() };
+    }
+    const out: DeliveryEvent[] = [];
+    let truncated = false;
+    for (const rawLine of raw.split("\n")) {
+      if (rawLine.trim() === "") continue;
+      let obj: Record<string, unknown>;
+      try {
+        obj = JSON.parse(rawLine) as Record<string, unknown>;
+      } catch {
+        continue; // torn line from a crash mid-append — skip, never fail a replay
+      }
+      if (obj["type"] !== "delivered" && obj["type"] !== "retrying" && obj["type"] !== "dead_letter") {
+        continue;
+      }
+      const seq = obj["seq"];
+      if (typeof seq !== "number" || seq <= afterSeq) continue;
+      if (out.length >= limit) {
+        truncated = true;
+        break;
+      }
+      const at = typeof obj["at"] === "string" ? obj["at"] : "";
+      out.push({
+        type: obj["type"] as DeliveryEventType,
+        id: String(obj["id"] ?? ""),
+        traceId: String(obj["traceId"] ?? ""),
+        ...(typeof obj["tenant"] === "string" ? { tenant: obj["tenant"] } : {}),
+        targetUrl: String(obj["targetUrl"] ?? ""),
+        attempts: typeof obj["attempts"] === "number" ? obj["attempts"] : 0,
+        at,
+        ...(typeof obj["error"] === "string" ? { error: obj["error"] } : {}),
+        eventSeq: seq,
+      });
+    }
+    return { events: out, truncated, ...this.seqRange() };
+  }
+
+  /**
+   * WR-123: rebuild the monotonic sequence state from disk. Lines that
+   * predate the `seq` field (written before WR-123) have no cursor a client
+   * could have observed, so when any line lacks a valid seq the whole file
+   * is renumbered 1..N in file order via one atomic rewrite — after
+   * construction every retained line has a dense, increasing seq and file
+   * order == seq order. Corrupt lines are kept verbatim (they stay out of
+   * cursor replay but remain visible to `query()`), exactly the
+   * fail-safe-toward-evidence policy `retain()` uses. Never throws.
+   */
+  private recoverSeq(): void {
+    let raw: string;
+    try {
+      raw = readFileSync(this.path, "utf8");
+    } catch {
+      return;
+    }
+    const lines: string[] = [];
+    let needsResequence = false;
+    for (const rawLine of raw.split("\n")) {
+      if (rawLine.trim() === "") continue;
+      lines.push(rawLine);
+      try {
+        const s = (JSON.parse(rawLine) as { seq?: unknown }).seq;
+        if (!(typeof s === "number" && Number.isInteger(s) && s >= 1)) {
+          needsResequence = true;
+        }
+      } catch {
+        /* corrupt line: kept verbatim, never carries a seq */
+      }
+    }
+    if (needsResequence && lines.length > 0) {
+      let seq = 0;
+      const rewritten: string[] = [];
+      for (const rawLine of lines) {
+        let obj: Record<string, unknown> | undefined;
+        try {
+          obj = JSON.parse(rawLine) as Record<string, unknown>;
+        } catch {
+          rewritten.push(rawLine);
+          continue;
+        }
+        seq += 1;
+        obj["seq"] = seq;
+        rewritten.push(JSON.stringify(obj));
+      }
+      const tmp = this.path + ARCHIVE_TMP_SUFFIX;
+      try {
+        writeFileSync(tmp, rewritten.join("\n") + "\n", "utf8");
+        renameSync(tmp, this.path);
+      } catch {
+        this.writeErrors += 1;
+        return;
+      }
+      try {
+        this.bytes = statSync(this.path).size;
+      } catch {
+        /* best effort */
+      }
+      this.nextSeq = seq;
+      this.minSeq = 1;
+      this.totalEvents = seq;
+      return;
+    }
+    // All lines sequenced: recover the range from disk.
+    let maxSeq = 0;
+    let minSeq = 0;
+    let total = 0;
+    for (const rawLine of lines) {
+      try {
+        const s = (JSON.parse(rawLine) as { seq?: unknown }).seq;
+        if (typeof s === "number" && Number.isInteger(s) && s >= 1) {
+          total += 1;
+          if (s > maxSeq) maxSeq = s;
+          if (minSeq === 0 || s < minSeq) minSeq = s;
+        }
+      } catch {
+        /* kept-verbatim corrupt line: no seq */
+      }
+    }
+    this.nextSeq = maxSeq;
+    this.minSeq = minSeq;
+    this.totalEvents = total;
+  }
+
+  /**
+   * WR-123: recompute the retained cursor range from a set of kept seqs
+   * (0 = line without a seq, e.g. a corrupt line kept verbatim — it holds
+   * no cursor). `nextSeq` is deliberately untouched: seqs are never reused.
+   */
+  private syncSeqRange(seqs: number[]): void {
+    let minSeq = 0;
+    let total = 0;
+    for (const s of seqs) {
+      if (s >= 1) {
+        total += 1;
+        if (minSeq === 0 || s < minSeq) minSeq = s;
+      }
+    }
+    this.minSeq = minSeq;
+    this.totalEvents = total;
   }
 
   /**
@@ -291,17 +502,21 @@ export class DeliveryEventArchiver {
       this.writeErrors += 1;
       return;
     }
-    const parsed: Array<{ line: string; atMs: number }> = [];
+    const parsed: Array<{ line: string; atMs: number; seq: number }> = [];
     for (const rawLine of raw.split("\n")) {
       if (rawLine.trim() === "") continue;
       let atMs = NaN;
+      let seq = 0;
       try {
-        const obj = JSON.parse(rawLine) as { at?: unknown };
+        const obj = JSON.parse(rawLine) as { at?: unknown; seq?: unknown };
         atMs = typeof obj.at === "string" ? Date.parse(obj.at) : NaN;
+        if (typeof obj.seq === "number" && Number.isInteger(obj.seq) && obj.seq >= 1) {
+          seq = obj.seq;
+        }
       } catch {
         /* corrupt line: fail-safe toward evidence — kept, never ages out */
       }
-      parsed.push({ line: rawLine, atMs });
+      parsed.push({ line: rawLine, atMs, seq });
     }
     const cutoff = this.maxAgeMs !== undefined ? Date.now() - this.maxAgeMs : Number.NEGATIVE_INFINITY;
     let kept = parsed.filter((p) => Number.isNaN(p.atMs) || p.atMs >= cutoff);
@@ -325,6 +540,10 @@ export class DeliveryEventArchiver {
       }
       return;
     }
+    // WR-123: retention evicts the oldest lines, so the cursor range moves.
+    // It is recomputed after the atomic rename, from what actually
+    // survived; nextSeq (the high-water mark) is untouched — seqs are
+    // never reused.
     const tmp = this.path + ARCHIVE_TMP_SUFFIX;
     try {
       const data = kept.length > 0 ? kept.map((p) => p.line).join("\n") + "\n" : "";
@@ -337,6 +556,7 @@ export class DeliveryEventArchiver {
       }
       renameSync(tmp, this.path);
       this.bytes = Buffer.byteLength(data, "utf8");
+      this.syncSeqRange(kept.map((p) => p.seq));
     } catch {
       // The pre-retention file is untouched — retention is retried later,
       // never half-applied.

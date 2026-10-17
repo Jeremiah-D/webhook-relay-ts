@@ -16,7 +16,7 @@ import {
   type SigningKey,
   type Verifier,
 } from "./verify.ts";
-import { RetryQueue, type DeliveryPriority, type DownstreamResponse, type RetryItem, type Sender } from "./retry.ts";
+import { RetryQueue, type DeliveryEvent, type DeliveryPriority, type DownstreamResponse, type RetryItem, type Sender } from "./retry.ts";
 import { parseDeliverAtHeader, DELIVER_AT_HEADER } from "./retry.ts";
 import type { ShadowDeliveredInfo, ShadowFailedInfo, ShadowTargetConfig, ShadowTargetsConfig } from "./retry.ts";
 import type {
@@ -289,6 +289,13 @@ import {
   type CompiledForwardHeadersRule,
   type ForwardHeadersRuleConfig,
 } from "./forward-headers.ts";
+
+/**
+ * WR-123: cap on how many archived events one `Last-Event-ID` reconnect
+ * may pull. A larger gap is not replayed partially — the client gets
+ * 210 Gone and rebuilds from `GET /events/archive` instead.
+ */
+const SSE_REPLAY_MAX_EVENTS = 10_000;
 
 /**
  * Operator/intake plane split (WR-56). When set, the relay listens on two
@@ -1487,8 +1494,19 @@ export interface RelayServerOptions {
    * without bound. The stream is live-only — no replay of past events; use
    * `GET /audit` for history. Like the other operator endpoints, it answers
    * 404 when no `operatorToken` is configured.
+   *
+   * WR-123: `sseReplay: true` (opt-in, default off) enables reconnect
+   * resume via the standard SSE `Last-Event-ID` header. It requires the
+   * `eventArchive` option: each frame carries an `id:` field with the
+   * archiver-assigned monotonic `eventSeq`, and a reconnecting client that
+   * sends `Last-Event-ID` gets the missed events replayed in order before
+   * the live stream continues. When the cursor is older than the retained
+   * archive, newer than anything produced, or the gap exceeds
+   * `SSE_REPLAY_MAX_EVENTS`, the server answers `210 Gone` so the client
+   * rebuilds from `GET /events/archive` instead of silently missing
+   * events. Off by default: zero behavior change, `Last-Event-ID` ignored.
    */
-  events?: { heartbeatMs?: number };
+  events?: { heartbeatMs?: number; sseReplay?: boolean };
   /**
    * Persistent delivery-event archive (WR-55; see `src/event-archive.ts`).
    * Opt-in: subscribes to the queue's delivery events and appends every
@@ -4912,40 +4930,148 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // WR-48: `?tenant=` subscribes to one tenant's stream only.
     const tenantFilter =
       new URL(req.url ?? "/events", "http://internal").searchParams.get("tenant") ?? undefined;
-    res.writeHead(200, {
-      "content-type": "text/event-stream",
-      "cache-control": "no-cache",
-      connection: "keep-alive",
-      // Tell buffering proxies (e.g. nginx) not to hold frames back.
-      "x-accel-buffering": "no",
-    });
-    // A comment frame right away: some clients only consider the stream
-    // open once the first bytes arrive.
-    res.write(": connected\n\n");
+    const matchesTenant = (event: DeliveryEvent): boolean =>
+      tenantFilter === undefined || event.tenant === tenantFilter;
+
+    // WR-123: opt-in reconnect resume via the standard SSE `Last-Event-ID`
+    // header. The cursor is the archiver-assigned monotonic `eventSeq`
+    // (NOT `DeliveryEvent.id`, which is a per-delivery UUID shared by that
+    // delivery's delivered/retrying/dead_letter events). Resume requires
+    // the event archive (`eventArchive` option — the durable source of the
+    // missed events) plus `events.sseReplay: true`. With either unset, a
+    // `Last-Event-ID` header is ignored and the stream stays live-only,
+    // exactly the pre-WR-123 behavior.
+    const lastEventIdRaw = req.headers["last-event-id"];
+    const lastEventId = Array.isArray(lastEventIdRaw) ? lastEventIdRaw[0] : lastEventIdRaw;
+    let replayCursor: number | undefined;
+    if (typeof lastEventId === "string" && lastEventId.length > 0) {
+      if (opts.events?.sseReplay === true && eventArchiver !== undefined) {
+        if (!/^\d+$/.test(lastEventId)) {
+          respondJson(res, 400, { error: "invalid_last_event_id" });
+          return;
+        }
+        const cursor = Number(lastEventId);
+        const range = eventArchiver.seqRange();
+        // 0 = "from the start of retained history". Any other cursor must
+        // name a retained seq: older (retention-rotated), newer (never
+        // produced), or an empty archive all mean continuity cannot be
+        // established — 210 Gone tells the client to rebuild from
+        // `GET /events/archive` instead of silently missing events.
+        if (range.total === 0 || cursor > range.maxSeq || (cursor !== 0 && cursor < range.minSeq)) {
+          respondJson(res, 210, {
+            error: "events_gone",
+            message:
+              "Last-Event-ID is older than the retained archive, newer than anything produced, or the archive is empty; rebuild from GET /events/archive",
+          });
+          return;
+        }
+        replayCursor = cursor;
+      }
+    }
+
     let closed = false;
-    const heartbeat = setInterval(() => {
-      if (!closed) res.write(": ping\n\n");
-    }, opts.events?.heartbeatMs ?? 15_000);
-    // Never let an idle dashboard pin the process open.
-    (heartbeat as unknown as { unref?: () => unknown }).unref?.();
+    // Assigned exactly once below, before any event can arrive.
+    let unsubscribe: () => void = () => {};
+    let heartbeat: ReturnType<typeof setInterval> | undefined;
     const cleanup = (): void => {
       if (closed) return;
       closed = true;
-      clearInterval(heartbeat);
+      if (heartbeat !== undefined) clearInterval(heartbeat);
       unsubscribe();
     };
-    const unsubscribe = queue.subscribeDeliveryEvents((event) => {
-      if (closed) return;
-      if (tenantFilter !== undefined && event.tenant !== tenantFilter) return;
-      // Slow-consumer guard: a dashboard that cannot keep up gets
-      // disconnected instead of buffering without bound.
+    const writeFrame = (event: DeliveryEvent): void => {
+      // The `id:` field is what SSE clients echo back as `Last-Event-ID`
+      // on reconnect; it is absent without an archive (zero behavior
+      // change there).
+      const idField = event.eventSeq !== undefined ? `id: ${event.eventSeq}\n` : "";
+      res.write(`${idField}event: delivery\ndata: ${JSON.stringify(event)}\n\n`);
+    };
+    // Slow-consumer guard: a dashboard that cannot keep up gets
+    // disconnected instead of buffering without bound. Shared by the
+    // live and replay paths.
+    const guardSlowConsumer = (): boolean => {
       if (res.writableLength > 1_048_576) {
         cleanup();
         res.end();
+        return true;
+      }
+      return false;
+    };
+    const openStream = (): void => {
+      res.writeHead(200, {
+        "content-type": "text/event-stream",
+        "cache-control": "no-cache",
+        connection: "keep-alive",
+        // Tell buffering proxies (e.g. nginx) not to hold frames back.
+        "x-accel-buffering": "no",
+      });
+      // A comment frame right away: some clients only consider the stream
+      // open once the first bytes arrive.
+      res.write(": connected\n\n");
+      heartbeat = setInterval(() => {
+        if (!closed) res.write(": ping\n\n");
+      }, opts.events?.heartbeatMs ?? 15_000);
+      // Never let an idle dashboard pin the process open.
+      (heartbeat as unknown as { unref?: () => unknown }).unref?.();
+    };
+
+    if (replayCursor !== undefined && eventArchiver !== undefined) {
+      // Reconnect resume. The live listener attaches FIRST, in buffering
+      // mode: the archive query below races with newly emitted events, and
+      // the archiver appends each event to the file before our listener
+      // runs, so an event emitted mid-query is both in the file and in the
+      // buffer — deduped below by seq, never lost, never doubled.
+      const buffered: DeliveryEvent[] = [];
+      let live = false;
+      unsubscribe = queue.subscribeDeliveryEvents((event) => {
+        if (closed || !matchesTenant(event)) return;
+        if (!live) {
+          buffered.push(event);
+          return;
+        }
+        if (guardSlowConsumer()) return;
+        writeFrame(event);
+      });
+      const replayed = eventArchiver.eventsAfter(replayCursor, SSE_REPLAY_MAX_EVENTS);
+      if (replayed.truncated) {
+        // The gap is larger than one reconnect may pull — replaying a
+        // partial gap would silently drop the middle. 210 instead; the
+        // client rebuilds from `GET /events/archive`.
+        cleanup();
+        respondJson(res, 210, {
+          error: "events_gone",
+          message: `gap exceeds the per-reconnect replay limit (${SSE_REPLAY_MAX_EVENTS} events); rebuild from GET /events/archive`,
+        });
         return;
       }
-      res.write(`event: delivery\ndata: ${JSON.stringify(event)}\n\n`);
-    });
+      openStream();
+      let lastReplayed = replayCursor;
+      for (const event of replayed.events) {
+        if (closed || !matchesTenant(event)) continue;
+        if (guardSlowConsumer()) return;
+        writeFrame(event);
+        if (event.eventSeq !== undefined && event.eventSeq > lastReplayed) {
+          lastReplayed = event.eventSeq;
+        }
+      }
+      for (const event of buffered) {
+        if (closed) break;
+        // At-least-once, never a gap: an unstamped event (cannot happen
+        // with an archive present, but fail-safe) is treated as newer.
+        const seq = event.eventSeq ?? Number.MAX_SAFE_INTEGER;
+        if (seq <= lastReplayed) continue;
+        if (guardSlowConsumer()) return;
+        writeFrame(event);
+      }
+      live = true;
+    } else {
+      openStream();
+      unsubscribe = queue.subscribeDeliveryEvents((event) => {
+        if (closed || !matchesTenant(event)) return;
+        if (guardSlowConsumer()) return;
+        writeFrame(event);
+      });
+    }
     req.on("close", cleanup);
     res.on("close", cleanup);
   };
