@@ -2,7 +2,7 @@ import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { connect, type Socket } from "node:net";
 import { connect as tlsConnect } from "node:tls";
-import { generateKeyPairSync, randomBytes } from "node:crypto";
+import { generateKeyPairSync, randomBytes, X509Certificate } from "node:crypto";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,6 +13,7 @@ import { AuditLog } from "../src/audit.ts";
 import { HttpDeliveryError } from "../src/failure.ts";
 import { createRequiredFieldsSchema } from "../src/schema.ts";
 import { generateInboundMtlsFixture } from "./inbound-mtls-fixture.ts";
+import { peerCertFingerprint } from "../src/inbound-mtls.ts";
 import type { RetryItem } from "../src/retry.ts";
 
 // Never name a constant SECRET here: the runtime secret redaction rewrites
@@ -86,12 +87,15 @@ interface WsClient {
   destroy: () => void;
 }
 
-/** Raw upgrade: returns the status line, headers, and the live socket. */
+/** Raw upgrade: returns the status line, headers, any bytes that arrived
+ *  past the header terminator (the server writes the 401 body in the same
+ *  write as the head — without this they would be lost when
+ *  removeAllListeners("data") runs), and the live socket. */
 function rawUpgrade(
   port: number,
   requestText: string,
   mkSocket: () => Socket = () => connect(port, "127.0.0.1")
-): Promise<{ status: number; headers: Record<string, string>; socket: Socket }> {
+): Promise<{ status: number; headers: Record<string, string>; socket: Socket; rest: Buffer }> {
   return new Promise((resolve, reject) => {
     const socket = mkSocket();
     let buf = Buffer.alloc(0);
@@ -117,8 +121,9 @@ function rawUpgrade(
         const i = line.indexOf(":");
         if (i > 0) headers[line.slice(0, i).trim().toLowerCase()] = line.slice(i + 1).trim();
       }
+      const rest = buf.subarray(idx + 4);
       socket.removeAllListeners("data");
-      resolve({ status, headers, socket });
+      resolve({ status, headers, socket, rest });
     });
     socket.on("error", (err) => {
       if (!done) {
@@ -700,5 +705,144 @@ describe("inbound WebSocket intake (WR-130)", () => {
     assert.equal(ack.status, "accepted");
     await waitFor(() => seen.length === 1);
     assert.equal(seen[0].payload.toString("utf8"), JSON.stringify({ secure: "ws" }));
+  });
+
+  describe("inbound WebSocket mTLS gate (WR-132)", () => {
+    const FIX = generateInboundMtlsFixture();
+    const CLIENT_FINGERPRINT = peerCertFingerprint(new X509Certificate(FIX.clientCertPem).raw);
+    const CLIENT_SUBJECT = new X509Certificate(FIX.clientCertPem).subject;
+
+    function mtlsRelay(
+      requireCert: boolean
+    ): Promise<{ port: number; audit: AuditLog; seen: RetryItem[] }> {
+      const dir = mkdtempSync(join(tmpdir(), "audit-ws-mtls-"));
+      const audit = new AuditLog(join(dir, "audit.jsonl"));
+      const seen: RetryItem[] = [];
+      const relay = createRelayServer({
+        secret: TEST_KEY,
+        forwardUrl: "http://127.0.0.1:1/unused",
+        auditLog: audit,
+        sender: async (item: RetryItem) => {
+          seen.push(item);
+        },
+        retry: { baseDelayMs: 10, jitterMs: 0, maxAttempts: 3 },
+        inboundWs: {},
+        inboundMtls: {
+          key: FIX.serverKeyPem,
+          cert: FIX.serverCertPem,
+          ca: FIX.caCertPem,
+          requireCert,
+        },
+      });
+      relays.push(relay);
+      return listen(relay).then((port) => ({ port, audit, seen }));
+    }
+
+    /** TLS socket factory; omit cert/key for an anonymous (uncertified) client. */
+    function mtlsTlsSocket(port: number, cert?: string, key?: string): () => Socket {
+      return () =>
+        tlsConnect({
+          host: "127.0.0.1",
+          port,
+          ca: FIX.caCertPem,
+          servername: "localhost",
+          cert,
+          key,
+        }) as unknown as Socket;
+    }
+
+    function lastEvent(audit: AuditLog, event: string): Record<string, unknown> {
+      const matches = audit.query({ event }) as Record<string, unknown>[];
+      assert.ok(matches.length > 0, `expected at least one ${event} audit event`);
+      return matches[matches.length - 1] as Record<string, unknown>;
+    }
+
+    /** Body after the upgrade head: the gate writes 401 JSON then destroys the socket. */
+    function readRemainder(socket: Socket): Promise<string> {
+      return new Promise((resolve) => {
+        const chunks: Buffer[] = [];
+        const done = (): void => {
+          socket.removeAllListeners("data");
+          socket.removeAllListeners("close");
+          socket.removeAllListeners("end");
+          resolve(Buffer.concat(chunks).toString("utf8"));
+        };
+        socket.on("data", (c: Buffer) => chunks.push(c));
+        socket.on("close", done);
+        socket.on("end", done);
+        const t = setTimeout(done, 2000);
+        t.unref?.();
+      });
+    }
+
+    it("rejects the upgrade with 401 when requireCert is set and no client certificate is presented", async () => {
+      const { port, audit } = await mtlsRelay(true);
+      const { status, headers, socket, rest } = await rawUpgrade(
+        port,
+        handshakeRequest("/ingest/ws"),
+        mtlsTlsSocket(port)
+      );
+      const body = rest.length > 0 ? rest.toString("utf8") : await readRemainder(socket);
+      socket.destroy();
+      assert.equal(status, 401);
+      assert.match(headers["content-type"] ?? "", /application\/json/);
+      assert.deepEqual(JSON.parse(body), {
+        error: "client certificate required",
+        reason: "client_cert_required",
+      });
+      const rejected = lastEvent(audit, "rejected");
+      assert.equal(rejected.reason, "client_cert_required");
+      assert.equal(rejected.path, "/ingest/ws");
+      assert.ok(!("clientCertFingerprint" in rejected), "no identity without a presented cert");
+    });
+
+    it("rejects the upgrade with 401 for a client certificate outside the CA chain", async () => {
+      const { port, audit } = await mtlsRelay(true);
+      const { status, socket, rest } = await rawUpgrade(
+        port,
+        handshakeRequest("/ingest/ws"),
+        mtlsTlsSocket(port, FIX.evilClientCertPem, FIX.evilClientKeyPem)
+      );
+      const body = rest.length > 0 ? rest.toString("utf8") : await readRemainder(socket);
+      socket.destroy();
+      assert.equal(status, 401);
+      assert.equal((JSON.parse(body) as { reason: string }).reason, "client_cert_invalid");
+      const rejected = lastEvent(audit, "rejected");
+      assert.equal(rejected.reason, "client_cert_invalid");
+      assert.equal(rejected.clientCertSubject, "CN=evil-client");
+      assert.ok(typeof rejected.clientCertFingerprint === "string");
+    });
+
+    it("accepts a valid client certificate, delivers, and records the identity on ws_connected", async () => {
+      const { port, audit, seen } = await mtlsRelay(true);
+      const client = await wsConnect(
+        port,
+        "/ingest/ws",
+        {},
+        mtlsTlsSocket(port, FIX.clientCertPem, FIX.clientKeyPem)
+      );
+      clients.push(client);
+      client.sendText(envelope({ mtls: "ws" }));
+      const ack = await client.nextText();
+      assert.equal(ack.status, "accepted");
+      await waitFor(() => seen.length === 1);
+      assert.equal(seen[0].payload.toString("utf8"), JSON.stringify({ mtls: "ws" }));
+      const connected = lastEvent(audit, "ws_connected");
+      assert.equal(connected.clientCertFingerprint, CLIENT_FINGERPRINT);
+      assert.equal(connected.clientCertSubject, CLIENT_SUBJECT);
+    });
+
+    it("leaves anonymous ws upgrades open when requireCert is false (HTTP parity)", async () => {
+      // requireCert: false (without operatorMtls) keeps the intake
+      // listener plain HTTP — the upgrade rides plain ws://, exactly
+      // like the pre-WR-132 HTTP behavior.
+      const { port, seen } = await mtlsRelay(false);
+      const client = await wsConnect(port, "/ingest/ws");
+      clients.push(client);
+      client.sendText(envelope({ anon: "ws" }));
+      const ack = await client.nextText();
+      assert.equal(ack.status, "accepted");
+      await waitFor(() => seen.length === 1);
+    });
   });
 });

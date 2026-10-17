@@ -8239,7 +8239,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   const openInboundWsConnection = (
     wsOpts: ResolvedInboundWsOptions,
     req: IncomingMessage,
-    socket: Socket
+    socket: Socket,
+    mtlsIdentity?: InboundMtlsIdentity
   ): void => {
     const connId = randomUUID();
     // WR-98: a propagated W3C trace id wins, then a client-supplied
@@ -8348,6 +8349,14 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       path: wsOpts.path,
       ip: clientIp,
       ...(wsApiKey === undefined ? {} : { keyId: wsApiKey.keyId }),
+      // WR-132: the verified client identity rides the connection audit,
+      // exactly as it rides `accepted` events on the HTTP intake.
+      ...(mtlsIdentity === undefined
+        ? {}
+        : {
+            clientCertFingerprint: mtlsIdentity.fingerprint,
+            clientCertSubject: mtlsIdentity.subject,
+          }),
     });
 
     const parser = new InboundWsParser(wsOpts.maxMessageBytes);
@@ -8650,6 +8659,69 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     (timer as unknown as { unref?: () => unknown }).unref?.();
   };
 
+  /**
+   * WR-132: the WR-103 inbound-mTLS gate for the `ws(s)://` upgrade
+   * path. HTTP upgrade requests never reach `createListener`'s
+   * (req, res) handler, so `enforceInboundMtls` cannot run on them —
+   * without this gate a WS client could upgrade anonymously while
+   * `requireCert: true` rejects the identical HTTP request. Same
+   * `decideInboundMtls` semantics and the same `rejected` audit event,
+   * but the 401 is written directly on the upgrade socket (an upgrade
+   * can never produce a normal HTTP response; the connection closes
+   * either way). Runs right after the path check, before handshake
+   * validation — authentication precedes protocol details, exactly as
+   * the WR-103 gate runs before routing on the HTTP intake.
+   */
+  const enforceInboundMtlsForWsUpgrade = (
+    req: IncomingMessage,
+    socket: Socket,
+    pathname: string
+  ): { proceed: true; identity?: InboundMtlsIdentity } | { proceed: false } => {
+    const cfg = inboundMtls;
+    if (cfg === undefined) return { proceed: true };
+    const peer = extractPeerCertInfo(req.socket as TLSSocket);
+    const decision = decideInboundMtls(cfg, peer, false);
+    if (decision.allowed) {
+      return decision.identity === undefined
+        ? { proceed: true }
+        : { proceed: true, identity: decision.identity };
+    }
+    const id = randomUUID();
+    const inboundTrace =
+      traceContextOpts === undefined
+        ? undefined
+        : parseInboundTraceContext(req.headers[TRACEPARENT_HEADER], req.headers[TRACESTATE_HEADER]);
+    const traceId = inboundTrace?.traceId ?? resolveTraceId(req.headers[TRACE_ID_HEADER]);
+    opts.auditLog.append({
+      event: "rejected",
+      id,
+      traceId,
+      reason: decision.reason,
+      path: pathname,
+      ...(decision.fingerprint !== undefined
+        ? { clientCertFingerprint: decision.fingerprint, clientCertSubject: decision.subject ?? "" }
+        : {}),
+    });
+    const body = JSON.stringify({
+      error:
+        decision.reason === "client_cert_required"
+          ? "client certificate required"
+          : "client certificate invalid",
+      reason: decision.reason,
+    });
+    if (!socket.destroyed) {
+      socket.write(
+        "HTTP/1.1 401 Unauthorized\r\n" +
+          "content-type: application/json\r\n" +
+          `content-length: ${Buffer.byteLength(body)}\r\n` +
+          "connection: close\r\n\r\n" +
+          body
+      );
+    }
+    socket.destroy();
+    return { proceed: false };
+  };
+
   const handleInboundWsUpgrade = (req: IncomingMessage, rawSocket: unknown): void => {
     const wsOpts = inboundWs;
     const socket = rawSocket as Socket;
@@ -8670,6 +8742,12 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       socket.destroy();
       return;
     }
+    // WR-132: the WR-103 mTLS gate applies to upgrades too — a client
+    // without (or with an invalid) certificate is rejected here, with
+    // the same 401 semantics and `rejected` audit event as the HTTP
+    // intake.
+    const mtlsGate = enforceInboundMtlsForWsUpgrade(req, socket, pathname);
+    if (!mtlsGate.proceed) return;
     const hs = checkInboundWsHandshake(req.headers);
     if (!hs.ok) {
       const connId = randomUUID();
@@ -8701,7 +8779,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       return;
     }
     try {
-      openInboundWsConnection(wsOpts, req, socket);
+      openInboundWsConnection(wsOpts, req, socket, mtlsGate.identity);
     } catch {
       socket.destroy();
     }
