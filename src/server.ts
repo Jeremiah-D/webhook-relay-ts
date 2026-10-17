@@ -54,6 +54,11 @@ import {
   type DeadLetterExportFormat,
   type DeadLetterExportPlan,
 } from "./deadletter-export.ts";
+import {
+  OAuth2TokenCache,
+  resolveOAuth2ClientConfig,
+  type OAuth2ClientCredentialsConfig,
+} from "./oauth-client.ts";
 import type { ReplayEgressOptions } from "./replay-egress.ts";
 import { HttpDeliveryError, parseRetryAfterMs } from "./failure.ts";
 import {
@@ -1129,6 +1134,23 @@ export interface RelayServerOptions {
    */
   awsSigV4?: Record<string, AwsSigV4EndpointConfig>;
   /**
+   * Per-endpoint OAuth2 `client_credentials` token management (WR-129,
+   * see `src/oauth-client.ts`): `{ "<exact targetUrl>":
+   * OAuth2ClientCredentialsConfig }` — when set, the default sender
+   * fetches, caches, and refreshes an access token for the downstream
+   * and stamps `Authorization: Bearer <token>` on every delivery to
+   * that endpoint (http/https only). The token cache expires entries
+   * 30s before `expires_in` (clock-skew reserve) and is isolated per
+   * `(token_endpoint, scope)`; a downstream 401 triggers exactly one
+   * forced refresh + redelivery inside the same attempt. The
+   * `client_secret` lives in memory only — never logged, never audited.
+   * Orthogonal to `outboundSigning` (WR-26 HMAC), the WR-124 Ed25519
+   * stamp, and `awsSigV4`: any combination may be enabled for one
+   * endpoint (downstream picks either or requires both). Applies to the
+   * default sender only. Invalid values throw `RangeError` at startup.
+   */
+  oauth2?: Record<string, OAuth2ClientCredentialsConfig>;
+  /**
    * WR-116: resolves `awsSigV4` `secretRef`s to key material per
    * delivery attempt. Defaults to `process.env[ref]`; inject a
    * vault/KMS-backed function to keep secrets out of the environment.
@@ -1918,7 +1940,24 @@ export function createDefaultSender(
    * PayloadSchema }`. Validated at startup (`RangeError`); `undefined`
    * keeps the exact pre-WR-117 wire shape.
    */
-  outboundSchemas?: Record<string, PayloadSchema>
+  outboundSchemas?: Record<string, PayloadSchema>,
+  /**
+   * WR-129: per-endpoint OAuth2 `client_credentials` token management
+   * (opt-in, see `src/oauth-client.ts`): `{ "<exact targetUrl>":
+   * OAuth2ClientCredentialsConfig }` — when set, the relay fetches,
+   * caches, and refreshes a bearer token for the downstream and stamps
+   * `Authorization: Bearer <token>` on every delivery to that endpoint.
+   * Validated at startup (`RangeError`); `undefined` keeps the exact
+   * pre-WR-129 wire shape. Orthogonal to the WR-26/WR-124/WR-116
+   * request signatures: all stamps may coexist on one delivery.
+   */
+  oauth2?: Record<string, OAuth2ClientCredentialsConfig>,
+  /**
+   * WR-129: the token cache backing `oauth2` — injectable for tests.
+   * When `oauth2` is set but no cache is passed, one is created
+   * internally. Ignored when `oauth2` is unset.
+   */
+  oauth2TokenCache?: OAuth2TokenCache
 ): PooledSender {
   if (tlsPins !== undefined) {
     for (const [endpoint, pins] of Object.entries(tlsPins)) {
@@ -1944,6 +1983,25 @@ export function createDefaultSender(
       }
     }
   }
+  // WR-129: fail fast on a misconfigured OAuth2 entry — a bad token
+  // endpoint or an empty credential must never surface as a mid-delivery
+  // 401 storm. The secret is validated, never logged.
+  if (oauth2 !== undefined) {
+    if (oauth2 === null || typeof oauth2 !== "object" || Array.isArray(oauth2)) {
+      throw new RangeError(
+        "createDefaultSender: `oauth2` must be a Record<targetUrl, OAuth2ClientCredentialsConfig>"
+      );
+    }
+    for (const [endpoint, cfg] of Object.entries(oauth2)) {
+      if (endpoint === "") {
+        throw new RangeError(
+          "createDefaultSender: `oauth2` keys must be non-empty endpoint strings"
+        );
+      }
+      resolveOAuth2ClientConfig(cfg, `createDefaultSender: \`oauth2["${endpoint}"]\``);
+    }
+  }
+  const oauthTokenCache = oauth2 !== undefined ? (oauth2TokenCache ?? new OAuth2TokenCache()) : undefined;
   // WR-101: fail fast on a misconfigured OCSP entry — a bad mode or
   // responder URL must not silently leave an endpoint unprotected (or
   // unknowingly fail-closed). When entries exist but no monitor was
@@ -2326,7 +2384,7 @@ export function createDefaultSender(
    */
   const buildWireRequest = (
     item: RetryItem,
-    wireOpts?: { forcePlaintext?: boolean; httpTransport?: boolean }
+    wireOpts?: { forcePlaintext?: boolean; httpTransport?: boolean; oauthToken?: string }
   ): {
     headers: Record<string, string | string[]>;
     body: Buffer;
@@ -2536,6 +2594,20 @@ export function createDefaultSender(
       headers[AMZ_DATE_HEADER] = signed.amzDate;
       headers[AUTHORIZATION_HEADER] = signed.authorization;
     }
+    // WR-129: per-endpoint OAuth2 client_credentials bearer token
+    // (opt-in). Stamped after signing (WR-26/WR-124/WR-116): the token
+    // authenticates the relay to the downstream, orthogonal to the
+    // relay's own request signatures — HMAC, Ed25519, SigV4, and the
+    // bearer token may all coexist on one delivery. Inbound
+    // `authorization` values are stripped first so a sender can never
+    // smuggle a forged bearer token downstream (the same anti-forgery
+    // rule as the SigV4 Authorization handling above).
+    if (wireOpts?.oauthToken !== undefined) {
+      for (const k of Object.keys(headers)) {
+        if (k.toLowerCase() === AUTHORIZATION_HEADER) delete headers[k];
+      }
+      headers[AUTHORIZATION_HEADER] = `Bearer ${wireOpts.oauthToken}`;
+    }
     if (idempotencyKeyCfg !== undefined) {
       // WR-44: derive from (event id, 1-based attempt). The queue stamps
       // `attempt` (0-based, attempts consumed so far) on the sender-bound
@@ -2593,7 +2665,14 @@ export function createDefaultSender(
      * connection handshaked without OCSP stapling can never silently
      * serve an OCSP endpoint.
      */
-    ocsp?: { cfg: ResolvedOcspEndpointOptions; monitor: OcspMonitor }
+    ocsp?: { cfg: ResolvedOcspEndpointOptions; monitor: OcspMonitor },
+    /**
+     * WR-129: resolved OAuth2 bearer value for this delivery
+     * (`undefined` when the endpoint has no `oauth2` entry). Resolved
+     * once per attempt in `defaultSender`, before the wire request is
+     * built.
+     */
+    oauthToken?: string
   ): Promise<DownstreamResponse | void> => {
     // WR-75: the guarded 415→plaintext fallback needs the compression
     // decision outside the attempt promise. The decision is deterministic
@@ -2641,7 +2720,7 @@ export function createDefaultSender(
         // the same answer the wire builder used — without compressing
         // twice. The byte savings are noted per guarded-compressed
         // dispatch (the sender committed to sending it compressed).
-        const wire = buildWireRequest(item, { forcePlaintext, httpTransport: true });
+        const wire = buildWireRequest(item, { forcePlaintext, httpTransport: true, oauthToken });
         if (!forcePlaintext && wire.guardedCompressed) {
           guardedApplied = true;
           guardedBytesSaved = wire.guardedBytesSaved;
@@ -3215,7 +3294,12 @@ export function createDefaultSender(
     tlsSni: ResolvedTlsSniOverride | undefined,
     minTlsVersion: MinTlsVersion | undefined,
     /** WR-89: rotation set for this endpoint (mutually exclusive with `clientCert`). */
-    clientCertRotation?: RotatingClientCertSet
+    clientCertRotation?: RotatingClientCertSet,
+    /**
+     * WR-129: resolved OAuth2 bearer value for this delivery
+     * (`undefined` when the endpoint has no `oauth2` entry).
+     */
+    oauthToken?: string
   ): Promise<DownstreamResponse> => {
     // WR-75: same guarded 415→plaintext fallback as the HTTP/1.1 path —
     // the resend rides a fresh H2 stream inside the same delivery
@@ -3269,7 +3353,7 @@ export function createDefaultSender(
           if (sock !== undefined) certExpiryMonitor.observePeerCertificate(sock, item.targetUrl);
         }
         try {
-          const wire = buildWireRequest(item, { forcePlaintext, httpTransport: true });
+          const wire = buildWireRequest(item, { forcePlaintext, httpTransport: true, oauthToken });
           if (!forcePlaintext && wire.guardedCompressed) {
             guardedApplied = true;
             guardedBytesSaved = wire.guardedBytesSaved;
@@ -3447,9 +3531,17 @@ export function createDefaultSender(
         new Error(`outbound proxy: proxy configured for non-HTTP(S) target ${item.targetUrl}`)
       );
     }
+    // WR-129: per-endpoint OAuth2 client_credentials (exact targetUrl
+    // match, http/https only — the WS upgrade path keeps its
+    // `x-relay-*` header contract). `undefined` for endpoints without
+    // an entry keeps the exact pre-WR-129 wire shape.
+    const oauthCfg =
+      url.protocol === "http:" || url.protocol === "https:"
+        ? oauth2?.[item.targetUrl]
+        : undefined;
     // WR-99: the physical attempt dispatch, wrapped below with the
     // deadline-budget race when the queue stamped a remaining budget.
-    const dispatch = (): Promise<DownstreamResponse | void> => {
+    const dispatch = (oauthToken: string | undefined): Promise<DownstreamResponse | void> => {
       // WebSocket (WR-45): ws:/wss: targets ride the pooled RFC 6455 path.
       // Proxied ws: is rejected above (explicit proxy + non-HTTP(S)
       // target), same as any other non-HTTP scheme.
@@ -3464,16 +3556,40 @@ export function createDefaultSender(
       // session pool owns its own handshake and has no revocation gate,
       // so H2 would silently skip the check. HTTP/1.1 instead, loudly.
       if (h2pool !== undefined && proxyUrl === undefined && ocsp === undefined && h2pool.eligibleFor(url)) {
-        return deliverViaHttp2(item, url, pins, clientCert, tlsSni, minTlsVersion, clientCertRotation).catch((err) => {
+        return deliverViaHttp2(item, url, pins, clientCert, tlsSni, minTlsVersion, clientCertRotation, oauthToken).catch((err) => {
           if (err instanceof Http2UnavailableError) {
             h2pool!.noteFallback();
-            return deliverViaHttp1(item, url, pins, clientCert, proxyUrl, tlsSni, minTlsVersion, clientCertRotation, ocsp);
+            return deliverViaHttp1(item, url, pins, clientCert, proxyUrl, tlsSni, minTlsVersion, clientCertRotation, ocsp, oauthToken);
           }
           throw err;
         });
       }
-      return deliverViaHttp1(item, url, pins, clientCert, proxyUrl, tlsSni, minTlsVersion, clientCertRotation, ocsp);
+      return deliverViaHttp1(item, url, pins, clientCert, proxyUrl, tlsSni, minTlsVersion, clientCertRotation, ocsp, oauthToken);
     };
+    // WR-129: resolve the bearer value once per delivery attempt
+    // (cached); a 401 forces exactly one refresh + redelivery inside the
+    // same attempt — the queue still sees a single attempt, so the
+    // refresh consumes no retry budget. A second 401 follows the normal
+    // classify → retry / dead-letter path. A token-endpoint failure
+    // (OAuth2TokenError) is not a 401 and fails the delivery directly.
+    const attemptWithOAuth = (forceRefresh: boolean): Promise<DownstreamResponse | void> => {
+      if (oauthCfg === undefined || oauthTokenCache === undefined) return dispatch(undefined);
+      const tokenP = forceRefresh
+        ? oauthTokenCache.refreshFor(oauthCfg)
+        : oauthTokenCache.tokenFor(oauthCfg);
+      return tokenP.then((token) => dispatch(token));
+    };
+    const dispatchWithOAuth = (): Promise<DownstreamResponse | void> =>
+      attemptWithOAuth(false).catch((err) => {
+        if (
+          oauthCfg !== undefined &&
+          err instanceof HttpDeliveryError &&
+          err.statusCode === 401
+        ) {
+          return attemptWithOAuth(true);
+        }
+        throw err;
+      });
     // WR-99: enforce the propagated deadline budget on the physical
     // attempt. The race bounds every transport (H1/H2/WS) at the
     // remaining budget — the HTTP/1.1 path additionally destroys its
@@ -3483,7 +3599,7 @@ export function createDefaultSender(
     // deadline-expiry path, not the retry path. No budget stamped —
     // byte-identical behavior to before.
     const budgetMs = readDeadlineBudgetMs(item);
-    if (budgetMs === undefined) return dispatch();
+    if (budgetMs === undefined) return dispatchWithOAuth();
     return new Promise<DownstreamResponse | void>((resolve, reject) => {
       let settled = false;
       const timer = setTimeout(() => {
@@ -3493,7 +3609,7 @@ export function createDefaultSender(
       }, budgetMs);
       // An SLO timer must never pin process exit.
       timer.unref?.();
-      dispatch().then(
+      dispatchWithOAuth().then(
         (res) => {
           if (settled) return;
           settled = true;
@@ -4094,7 +4210,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   }
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, opts.awsSigV4, opts.awsSecretResolver, opts.outboundSchemas)
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, opts.awsSigV4, opts.awsSecretResolver, opts.outboundSchemas, opts.oauth2)
       : undefined;
   // WR-50: endpoints the operator may pause/resume over HTTP. The server
   // only ever delivers to these — the intake target plus every

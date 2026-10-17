@@ -497,6 +497,17 @@ reliability primitives that matter for any signed-payload pipeline.
   Orthogonal to `outboundSigning` above (both may be enabled); see
   *AWS SigV4 outbound signing (opt-in)*. Invalid values throw
   `RangeError` at startup.
+- Outbound OAuth2 `client_credentials` (`oauth2`, off by default,
+  WR-129): per endpoint, `{ "<exact targetUrl>": { token_endpoint,
+  client_id, client_secret, scope? } }` makes the relay fetch, cache,
+  and refresh a bearer token for the downstream and stamp
+  `Authorization: Bearer <token>` on every delivery (http/https only).
+  Tokens are isolated per `(token_endpoint, scope)`, expire 30s before
+  `expires_in` (clock-skew reserve), and a downstream 401 triggers one
+  forced refresh + redelivery inside the same attempt. The secret stays
+  in memory only — never logged or audited. Composes with the HMAC /
+  Ed25519 / SigV4 stamps; see *Outbound OAuth2 client_credentials
+  (opt-in)*. Invalid values throw `RangeError` at startup.
 - Outbound end-to-end encryption (`outboundEncryption`, off by default,
   WR-58; key rotation WR-81): per endpoint, `{ "<exact targetUrl>": { publicKey } }` with the
   downstream's base64 X25519 public key (mint with `generateX25519KeyPair()`
@@ -2466,6 +2477,49 @@ fails the attempt loudly instead of signing a lie).
   function (`signAwsSigV4`) cross-validated against an independent
   SigV4 implementation on GET/POST/PUT/DELETE vectors (query sorting,
   RFC 3986 path encoding, duplicate params, non-default ports).
+
+## Outbound OAuth2 client_credentials (opt-in)
+
+Some downstreams (a bank's API gateway, a partner's token-gated webhook
+receiver) require OAuth2 bearer tokens instead of — or in addition to —
+the relay's own request signatures. `oauth2` (off by default, WR-129;
+`src/oauth-client.ts`, zero new dependencies) makes the relay act as the
+OAuth2 client on the downstream's behalf, per endpoint:
+
+```ts
+createRelayServer({
+  // ...
+  oauth2: {
+    "https://partner.example.com/hook": {
+      token_endpoint: "https://auth.partner.example.com/oauth/token",
+      client_id: "relay-client",
+      client_secret: process.env.PARTNER_OAUTH_SECRET!,
+      scope: "webhooks:write", // optional
+    },
+  },
+});
+```
+
+Every delivery to a configured endpoint (http/https only) carries
+`Authorization: Bearer <token>`, fetched from the token endpoint with
+the RFC 6749 `client_credentials` grant (`node:https`, form-encoded
+POST) and cached in memory. The cache is isolated per
+`(token_endpoint, scope)` and treats tokens as expired 30s before
+`expires_in` (clock-skew reserve); concurrent deliveries share one
+in-flight fetch. A downstream 401 triggers exactly one forced refresh
+plus redelivery inside the same attempt — the queue still sees a single
+attempt, so the refresh consumes no retry budget; a second 401 follows
+the normal retry / dead-letter path.
+
+- **Secret handling** — `client_secret` lives in memory only: it is
+  never logged, never audited, and `OAuth2TokenError` messages never
+  carry it (only the endpoint host and status).
+- **Orthogonal to WR-26/WR-124/WR-116** — HMAC, Ed25519, SigV4, and the
+  bearer token may all coexist on one delivery (the downstream picks
+  either or requires several). Inbound `authorization` headers are
+  stripped before stamping, so a sender can never smuggle a forged
+  bearer token downstream.
+- Invalid configs throw `RangeError` at startup — never mid-delivery.
 
 ## W3C trace-context propagation (opt-in)
 
