@@ -54,9 +54,9 @@ import {
   type SloRiskObservation,
   type SloRiskOptions,
 } from "./slo-risk.ts";
-import { EndpointDeliveryWindow, parseDeliveryWindowSpec, type DeliveryWindowOptions, type DeliveryWindowStats } from "./delivery-window.ts";
+import { EndpointDeliveryWindow, parseDeliveryWindowSpec, type DeliveryWindowOptions, type DeliveryWindowStats, type TimezoneWindowConfig } from "./delivery-window.ts";
 export { parseDeliveryWindowSpec, EndpointDeliveryWindow };
-export type { DeliveryWindowOptions, DeliveryWindowStats };
+export type { DeliveryWindowOptions, DeliveryWindowStats, TimezoneWindowConfig };
 import {
   ScheduledDeliveryQueue,
   parseDeliverAtHeader,
@@ -6691,10 +6691,12 @@ export class RetryQueue {
       const tenant = tenantKey === "" ? undefined : tenantKey;
       for (const [endpoint, delayed] of inner) {
         const spec = this.deliveryWindow?.specFor(endpoint);
+        const timezone = this.deliveryWindow?.timezoneFor(endpoint);
         rows.push({
           endpoint,
           ...(tenant === undefined ? {} : { tenant }),
           window: spec?.raw ?? "",
+          ...(timezone === undefined ? {} : { timezone }),
           delayed,
           open: this.deliveryWindow?.isOpen(endpoint) ?? true,
         });
@@ -6717,9 +6719,24 @@ export class RetryQueue {
   }
 
   /**
+   * WR-126: set (or replace) the timezone-aware delivery window for one
+   * endpoint at runtime — the same hot-reload convention as the UTC
+   * window above. An invalid window/timezone throws `RangeError` and
+   * leaves the current window intact; an endpoint with a UTC window
+   * throws (mutual exclusion — delete it first). Returns `false` when
+   * the delivery-window feature is disabled.
+   */
+  setEndpointTzDeliveryWindow(endpoint: string, window: string, timezone: string): boolean {
+    if (this.deliveryWindow === undefined) return false;
+    this.deliveryWindow.setEndpointTzWindow(endpoint, window, timezone);
+    return true;
+  }
+
+  /**
    * WR-52: remove the delivery window for one endpoint at runtime — it
-   * becomes always deliverable. Returns `false` when the feature is
-   * disabled or no window was configured.
+   * becomes always deliverable. Removes a UTC or a timezone window
+   * alike. Returns `false` when the feature is disabled or no window was
+   * configured.
    */
   deleteEndpointDeliveryWindow(endpoint: string): boolean {
     return this.deliveryWindow?.deleteEndpointWindow(endpoint) ?? false;

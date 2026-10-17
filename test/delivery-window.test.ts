@@ -270,6 +270,7 @@ describe("RetryQueue delivery windows (WR-52)", () => {
     assert.equal(def.window, "09:00-18:00");
     assert.equal(def.delayed, 1);
     assert.equal(def.open, false);
+    assert.ok(!("timezone" in def)); // WR-126: UTC rows keep the pre-tz shape
     const ten = byTenant("tenant-x")!;
     assert.equal(ten.endpoint, URL_A);
     assert.equal(ten.window, "09:00-18:00");

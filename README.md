@@ -217,6 +217,27 @@ reliability primitives that matter for any signed-payload pipeline.
   records which budget parked the retry (`budgetScope:
   "endpoint" | "global"`). Illegal values throw `RangeError` at
   construction; without overrides the relay is byte-identical to before.
+- `src/delivery-window.ts` — per-endpoint delivery time windows ("quiet
+  hours", WR-52): `retry: { deliveryWindow: { windows: { "<targetUrl>":
+  "HH:MM-HH:MM" } } }` in UTC (open edge inclusive, close edge
+  exclusive, may cross midnight). A delivery due outside its window is
+  parked until the window opens — never dropped, never consuming the
+  retry budget, a quota token, or a circuit-breaker verdict, and never
+  dead-lettered for being out of window ("flush at window open").
+  WR-126 adds opt-in per-endpoint IANA time zones —
+  `deliveryWindow: { tzWindows: { "<targetUrl>": { window, timezone } } }`
+  — evaluated against the zone's local wall clock (e.g. repayment
+  reminders that must go out 09:00–18:00 in the *borrower's* zone);
+  a UTC window and a timezone window are mutually exclusive per
+  endpoint (`RangeError` at construction, as are unknown IANA zones).
+  DST is handled honestly against wall-clock minutes (a spring-forward
+  gap hour never matches; a fall-back repeated hour is indistinguishable
+  from its first occurrence), via `Intl.DateTimeFormat` with zero new
+  dependencies. `getDeliveryWindowStats()` reports per-endpoint
+  `delayed` counts plus the effective `timezone`; runtime overrides via
+  `setEndpointDeliveryWindow()` / `setEndpointTzDeliveryWindow()` /
+  `deleteEndpointDeliveryWindow()`. Injectable clock for deterministic
+  tests.
 - `src/latency.ts` — accepted→delivered latency SLO tracking
   (`LatencyTracker`): `enqueue()` starts each delivery's clock, a successful
   delivery samples it into a bounded per-endpoint rolling window (default
