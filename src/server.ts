@@ -16,6 +16,13 @@ import {
   type SigningKey,
   type Verifier,
 } from "./verify.ts";
+import {
+  SIGNATURE_ALG_HEADER,
+  assertValidSignatureAlgorithmRules,
+  normalizeSignatureAlg,
+  selectSignatureAlgorithmVerifier,
+  type SignatureAlgorithmRule,
+} from "./signature-alg.ts";
 import { RetryQueue, type DeliveryEvent, type DeliveryPriority, type DownstreamResponse, type RetryItem, type Sender, type MaintenanceWindowTransition } from "./retry.ts";
 import { parseDeliverAtHeader, DELIVER_AT_HEADER } from "./retry.ts";
 import type { ShadowDeliveredInfo, ShadowFailedInfo, ShadowTargetConfig, ShadowTargetsConfig } from "./retry.ts";
@@ -447,6 +454,22 @@ export interface RelayServerOptions {
    * rules throw `RangeError` at startup.
    */
   endpointVerifiers?: EndpointVerifierRule[];
+  /**
+   * Inbound signature algorithm negotiation (WR-138, see
+   * `src/signature-alg.ts`): upstreams name the algorithm they signed
+   * with in the `x-signature-alg` header (`"hmac-sha256"` / `"ed25519"`)
+   * and the relay verifies with the matching rule's verifier instead of
+   * the global default. The rules array is the allowlist — a negotiated
+   * name that is not listed is answered 400 and audited as `rejected`
+   * with reason `unsupported_algorithm`, never enqueued. Unset means
+   * negotiation is disabled: the header is ignored and the legacy
+   * default verifier applies, fully backward compatible (effectively
+   * "only hmac-sha256", the default). Negotiation never widens a
+   * per-endpoint verifier rule (WR-29): a pinned path keeps its
+   * verifier and the header is ignored there. Invalid rules throw
+   * `RangeError` at startup.
+   */
+  signatureAlgorithms?: SignatureAlgorithmRule[];
   /**
    * Inbound HMAC secret dual-version zero-downtime rotation (WR-67, see
    * `src/secret-rotation.ts`): per-endpoint `currentSecret` +
@@ -5169,6 +5192,10 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // Per-endpoint verifier rules are validated once at startup so a bad
   // pattern or verifier can never fail a request mid-flight.
   assertValidEndpointVerifierRules(opts.endpointVerifiers);
+  // WR-138: the signature-algorithm allowlist is validated once at
+  // startup for the same reason — an unknown name or a bad verifier
+  // can never fail a request mid-flight.
+  assertValidSignatureAlgorithmRules(opts.signatureAlgorithms);
   // WR-102: per-endpoint body limit rules are validated once at startup
   // for the same reason — a bad pattern or budget can never fail a
   // request mid-flight.
@@ -7148,7 +7175,43 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // trusted verifier; anything unmatched falls back to the global one.
     // A mismatch here is answered 401 below and never enqueues, so it can
     // never trip the downstream circuit breaker.
-    const activeVerifier = selectEndpointVerifier(pathname, opts.endpointVerifiers) ?? verifier;
+    let activeVerifier = selectEndpointVerifier(pathname, opts.endpointVerifiers) ?? verifier;
+    // WR-138: inbound signature algorithm negotiation — the
+    // `x-signature-alg` header names the algorithm the upstream used
+    // ("hmac-sha256" | "ed25519") and the allowlisted rule's verifier
+    // replaces the default for this request's signature check. Unset
+    // `signatureAlgorithms` (the default) disables negotiation entirely:
+    // the header is ignored and the legacy default applies, fully
+    // backward compatible. Negotiation never widens a per-endpoint
+    // verifier rule: a pinned path keeps its verifier. An allowlisted-
+    // but-unknown name is answered 400 and audited as `rejected` with
+    // reason `unsupported_algorithm` — never enqueued.
+    let negotiatedAlg: string | undefined;
+    if (activeVerifier === verifier && opts.signatureAlgorithms !== undefined) {
+      const algRaw = headers[SIGNATURE_ALG_HEADER];
+      const alg = normalizeSignatureAlg(Array.isArray(algRaw) ? algRaw[0] : algRaw);
+      if (alg !== undefined) {
+        const negotiated = selectSignatureAlgorithmVerifier(alg, opts.signatureAlgorithms);
+        if (negotiated === undefined) {
+          opts.auditLog.append({ ...correlation,
+            event: "rejected",
+            id,
+            traceId,
+            reason: "unsupported_algorithm",
+            algorithm: alg,
+          });
+          return {
+            status: 400,
+            id,
+            traceId,
+            reason: "unsupported_algorithm",
+            detail: `Unsupported signature algorithm: ${alg}`,
+          };
+        }
+        activeVerifier = negotiated;
+        negotiatedAlg = alg;
+      }
+    }
     const perEndpointVerifier = activeVerifier !== verifier;
 
     // With key rotation, learn which key id verified so it can go on the
@@ -7253,6 +7316,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       // Name the verifier that rejected, so a multi-scheme relay's audit
       // trail shows which trust rule fired.
       if (perEndpointVerifier) rejectedEvent.verifier = activeVerifier.name;
+      // WR-138: name the negotiated algorithm, so a multi-algorithm
+      // relay's audit trail shows which algorithm the upstream claimed.
+      if (negotiatedAlg !== undefined) rejectedEvent.algorithm = negotiatedAlg;
       opts.auditLog.append(rejectedEvent);
       // WR-119: a signature verification failure is a reputation penalty
       // event for the sender dimension.
@@ -7798,6 +7864,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // are in play.
     if (apiKey !== undefined) acceptedEvent.keyId = apiKey.keyId;
     if (perEndpointVerifier) acceptedEvent.verifier = activeVerifier.name;
+    // WR-138: the negotiated algorithm, so operators can see which
+    // algorithm each accepted webhook verified under.
+    if (negotiatedAlg !== undefined) acceptedEvent.algorithm = negotiatedAlg;
     if (priority) acceptedEvent.priority = priority;
     if (inboundGzip) acceptedEvent.contentEncoding = "gzip";
     if (opts.auditPayloads) acceptedEvent.payload = body;

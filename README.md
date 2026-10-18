@@ -2252,6 +2252,46 @@ const server = createRelayServer({
   non-positive-integer `maxBodyBytes`) throw `RangeError` at startup, so
   a bad config can never fail a request mid-flight.
 
+## Inbound signature algorithm negotiation (opt-in)
+
+Upstreams name the algorithm they signed with in the `x-signature-alg`
+header (`hmac-sha256` / `ed25519`) and the relay verifies with the
+matching verifier from the operator-configured allowlist instead of the
+global default — one relay can front producers that sign differently
+(e.g. HMAC-SHA256 for a legacy PSP, Ed25519 for a Solana program's
+callbacks) without weakening either:
+
+```ts
+createRelayServer({
+  secret,
+  signatureAlgorithms: [
+    { alg: "hmac-sha256", verifier: new HmacSha256Verifier(secret) },
+    { alg: "ed25519", verifier: new Ed25519Verifier(solanaProgramPubkeyPem) },
+  ],
+});
+```
+
+```bash
+curl -X POST http://relay/hooks/solana \
+  -H "x-signature-alg: ed25519" \
+  -H "x-signature: ed25519=<hex>" \
+  -d '{"event":"program.callback"}'
+# → 202; accepted audit events carry algorithm: "ed25519"
+```
+
+- **Allowlist, fail-closed** — a negotiated name that is not listed is
+  answered `400` and audited as `rejected` with reason
+  `unsupported_algorithm`; it is never enqueued. Invalid rules throw
+  `RangeError` at startup.
+- **Default is backward compatible** — unset `signatureAlgorithms`
+  disables negotiation entirely: the header is ignored and the legacy
+  default verifier applies (effectively "only hmac-sha256").
+- **Never widens pinned trust** — a per-endpoint verifier rule
+  (`endpointVerifiers`) keeps its verifier; the header is ignored on
+  pinned paths.
+- Works on single webhooks and on every `POST /batch` item (each item
+  negotiates independently).
+
 ## Batch inbound ingestion
 
 `POST /ingest/batch` accepts one JSON envelope carrying many events, so a
