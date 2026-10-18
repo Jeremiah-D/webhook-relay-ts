@@ -57,6 +57,16 @@ import type { MinTlsVersion } from "./tls-version.ts";
  *   backstop for that case. Disable with `healthProbe: false`.
  * - observability: `getStats()` exposes per-endpoint created / reused /
  *   reaped / probeHits / probeMisses counters plus live socket counts.
+ * - adaptive sizing (WR-134, opt-in via `adaptiveSockets`): each origin's
+ *   socket cap moves inside `[minSockets, maxSockets]` from the agent's
+ *   queued-request pressure — scale up on queue depth, scale down when
+ *   the queue drains, `cooldownMs` between moves; shrinking only reaps
+ *   idle sockets. Unset = the fixed `maxSocketsPerHost` cap, exactly as
+ *   before. Note: raising the cap takes effect for new socket decisions
+ *   immediately; requests already queued inside the agent drain as
+ *   sockets free — Node's agent does not re-evaluate queued requests on
+ *   a cap change, so a scale-up shortens the queue for what comes next
+ *   rather than instantly serving what is already waiting.
  *
  * Zero dependencies (`node:http(s)` + `node:crypto` only).
  */
@@ -102,6 +112,46 @@ export interface KeepAlivePoolOptions {
    * function when provided.
    */
   lookup?: LookupFunction;
+  /**
+   * WR-134: adaptive per-origin socket-cap sizing. Opt-in: the fixed
+   * `maxSocketsPerHost` becomes the *initial* cap (clamped into
+   * `[minSockets, maxSockets]`), and a background evaluator moves each
+   * origin's cap inside that interval from the agent's queued-request
+   * pressure — scale up when the queue depth reaches
+   * `scaleUpQueueDepth`, scale down toward `minSockets` when the queue
+   * drains, with `cooldownMs` between moves on one origin. Shrinking
+   * only reaps idle sockets (in-flight deliveries are never touched).
+   * Unset = disabled: byte-identical fixed-cap behavior, exactly as
+   * before.
+   */
+  adaptiveSockets?: AdaptiveSocketsOptions;
+}
+
+/**
+ * Tuning for WR-134 adaptive per-origin socket-cap sizing. All values
+ * are validated up front (`RangeError` on invalid values).
+ */
+export interface AdaptiveSocketsOptions {
+  /**
+   * Lower bound of the adaptive cap. Default: 1. Must be a positive
+   * integer.
+   */
+  minSockets?: number;
+  /**
+   * Upper bound of the adaptive cap. Default: `maxSocketsPerHost`. Must
+   * be a positive integer >= `minSockets`.
+   */
+  maxSockets?: number;
+  /**
+   * Queued requests (waiting for a socket) at or above this depth trigger
+   * a scale-up. Default: 16. Must be a positive integer.
+   */
+  scaleUpQueueDepth?: number;
+  /**
+   * Minimum ms between cap moves on one origin (flap guard). Default:
+   * 30_000. Must be a finite number >= 0.
+   */
+  cooldownMs?: number;
 }
 
 const DEFAULTS = {
@@ -143,6 +193,16 @@ export interface ResolvedKeepAlivePoolOptions {
   keepAliveMsecs: number;
   healthProbe: boolean;
   lookup: LookupFunction | undefined;
+  /** WR-134: resolved adaptive sizing; undefined when disabled. */
+  adaptive: ResolvedAdaptiveSockets | undefined;
+}
+
+/** `AdaptiveSocketsOptions` with defaults applied (what the pool reads). */
+export interface ResolvedAdaptiveSockets {
+  minSockets: number;
+  maxSockets: number;
+  scaleUpQueueDepth: number;
+  cooldownMs: number;
 }
 
 /** Validate pool options the way a constructor would; returns the resolved values. */
@@ -167,7 +227,35 @@ export function resolveKeepAlivePoolOptions(
   if (lookup !== undefined && typeof lookup !== "function") {
     throw new RangeError("OutboundConnectionPool: lookup must be a function");
   }
-  return { maxSocketsPerHost, maxFreeSockets, idleTimeoutMs, keepAliveMsecs, healthProbe, lookup };
+  const adaptive = resolveAdaptiveSockets(opts.adaptiveSockets, maxSocketsPerHost);
+  return { maxSocketsPerHost, maxFreeSockets, idleTimeoutMs, keepAliveMsecs, healthProbe, lookup, adaptive };
+}
+
+/** WR-134: validate the opt-in adaptive sizing block; undefined when disabled. */
+function resolveAdaptiveSockets(
+  opts: AdaptiveSocketsOptions | undefined,
+  maxSocketsPerHost: number
+): ResolvedAdaptiveSockets | undefined {
+  if (opts === undefined) return undefined;
+  if (opts === null || typeof opts !== "object") {
+    throw new RangeError(
+      `OutboundConnectionPool: adaptiveSockets must be an object, got ${opts === null ? "null" : typeof opts}`
+    );
+  }
+  const minSockets = opts.minSockets ?? 1;
+  const maxSockets = opts.maxSockets ?? maxSocketsPerHost;
+  const scaleUpQueueDepth = opts.scaleUpQueueDepth ?? 16;
+  const cooldownMs = opts.cooldownMs ?? 30_000;
+  assertPositiveInt("adaptiveSockets.minSockets", minSockets);
+  assertPositiveInt("adaptiveSockets.maxSockets", maxSockets);
+  if (maxSockets < minSockets) {
+    throw new RangeError(
+      `OutboundConnectionPool: adaptiveSockets.maxSockets (${maxSockets}) must be >= adaptiveSockets.minSockets (${minSockets})`
+    );
+  }
+  assertPositiveInt("adaptiveSockets.scaleUpQueueDepth", scaleUpQueueDepth);
+  assertNonNegativeFinite("adaptiveSockets.cooldownMs", cooldownMs);
+  return { minSockets, maxSockets, scaleUpQueueDepth, cooldownMs };
 }
 
 /**
@@ -220,6 +308,16 @@ export interface PoolEndpointStats {
   probeHits: number;
   /** Idle sockets culled by the health probe (never handed to a delivery). */
   probeMisses: number;
+  /**
+   * WR-134: the origin's current socket cap — the fixed
+   * `maxSocketsPerHost` when adaptive sizing is disabled, otherwise the
+   * adaptively moved cap inside `[minSockets, maxSockets]`.
+   */
+  currentMaxSockets: number;
+  /** WR-134: adaptive scale-up moves applied to this origin. */
+  scaleUps: number;
+  /** WR-134: adaptive scale-down moves applied to this origin. */
+  scaleDowns: number;
 }
 
 /** Whole-pool snapshot from {@link OutboundConnectionPool.getStats}. */
@@ -250,6 +348,14 @@ interface PoolEntry {
   reaped: number;
   probeHits: number;
   probeMisses: number;
+  /** WR-134: this origin's current socket cap (moves inside [min, max] when adaptive). */
+  currentMaxSockets: number;
+  /** WR-134: ms epoch of the last cap move on this origin (flap guard). */
+  lastScaleAtMs: number;
+  /** WR-134: scale-up moves applied. */
+  scaleUps: number;
+  /** WR-134: scale-down moves applied. */
+  scaleDowns: number;
 }
 
 function countSockets(table: unknown): number {
@@ -257,6 +363,23 @@ function countSockets(table: unknown): number {
   for (const sockets of Object.values((table ?? {}) as Record<string, Socket[]>)) {
     n += sockets.length;
   }
+  return n;
+}
+
+/**
+ * WR-134: requests currently queued inside a Node agent, waiting for a
+ * socket. `agent.requests` is keyed by the agent's origin name; each
+ * entry holds the requests that could not be assigned a socket because
+ * the origin is at its cap. This is the queue-pressure signal adaptive
+ * sizing scales on. (`addRequest` is deliberately absent from
+ * @types/node — `requests` is the same kind of runtime-internal API the
+ * checkout probe already relies on.)
+ */
+function countQueuedRequests(agent: HttpAgent): number {
+  let n = 0;
+  const requests = (agent as unknown as { requests?: Record<string, unknown[]> }).requests;
+  if (requests === undefined) return 0;
+  for (const queued of Object.values(requests)) n += queued.length;
   return n;
 }
 
@@ -269,6 +392,8 @@ export class OutboundConnectionPool {
   /** SPKI fingerprint presented at handshake, per socket (TLS pin cache). */
   private readonly presentedPins = new WeakMap<Socket, string>();
   private readonly reapTimer: ReturnType<typeof setInterval> | undefined;
+  /** WR-134: adaptive cap evaluator; undefined when adaptive sizing is disabled. */
+  private readonly adaptiveTimer: ReturnType<typeof setInterval> | undefined;
 
   constructor(opts: KeepAlivePoolOptions = {}) {
     this.opts = resolveKeepAlivePoolOptions(opts);
@@ -278,6 +403,14 @@ export class OutboundConnectionPool {
       const everyMs = Math.max(100, Math.min(this.opts.idleTimeoutMs, 1000));
       this.reapTimer = setInterval(() => this.reap(), everyMs);
       this.reapTimer.unref();
+    }
+    if (this.opts.adaptive !== undefined) {
+      // Evaluate at most once per second, and no slower than the
+      // configured cooldown — a move can never be due before the
+      // evaluator has had a chance to see it. Unref'd like the reaper.
+      const everyMs = Math.max(50, Math.min(1000, this.opts.adaptive.cooldownMs));
+      this.adaptiveTimer = setInterval(() => this.evaluateAdaptive(), everyMs);
+      this.adaptiveTimer.unref();
     }
   }
 
@@ -343,10 +476,17 @@ export class OutboundConnectionPool {
     if (ocsp === true) key += "|ocsp";
     let entry = this.entries.get(key);
     if (entry === undefined) {
+      // WR-134: the fixed cap is the *initial* cap, clamped into
+      // [minSockets, maxSockets] when adaptive sizing is on.
+      const adaptive = this.opts.adaptive;
+      const initialMax =
+        adaptive === undefined
+          ? this.opts.maxSocketsPerHost
+          : Math.min(adaptive.maxSockets, Math.max(adaptive.minSockets, this.opts.maxSocketsPerHost));
       const agentOpts = {
         keepAlive: true,
         keepAliveMsecs: this.opts.keepAliveMsecs,
-        maxSockets: this.opts.maxSocketsPerHost,
+        maxSockets: initialMax,
         maxFreeSockets: this.opts.maxFreeSockets,
         // WR-92: when a DNS cache lookup is configured, every new pooled
         // connection resolves through it — the pool key stays the logical
@@ -384,7 +524,7 @@ export class OutboundConnectionPool {
           : scheme === "https"
             ? new HttpsAgent(agentOpts)
             : new HttpAgent(agentOpts);
-      entry = { key, scheme, host, port, pinned, clientCert: clientCertId !== undefined, pinWhitelist, agent, seen: new WeakSet(), created: 0, reused: 0, reaped: 0, probeHits: 0, probeMisses: 0 };
+      entry = { key, scheme, host, port, pinned, clientCert: clientCertId !== undefined, pinWhitelist, agent, seen: new WeakSet(), created: 0, reused: 0, reaped: 0, probeHits: 0, probeMisses: 0, currentMaxSockets: initialMax, lastScaleAtMs: 0, scaleUps: 0, scaleDowns: 0 };
       this.entries.set(key, entry);
       this.byAgent.set(agent, entry);
       if (this.opts.healthProbe) this.installCheckoutProbe(entry);
@@ -499,6 +639,77 @@ export class OutboundConnectionPool {
     return this.presentedPins.get(socket);
   }
 
+  /**
+   * WR-134: adaptive per-origin cap evaluation, on the pool's unref'd
+   * timer. For each origin, the agent's queued-request pressure (requests
+   * waiting for a socket inside Node's agent) moves the cap inside
+   * [minSockets, maxSockets]: scale up when the queue reaches
+   * scaleUpQueueDepth, scale down toward minSockets when the queue
+   * drains, with cooldownMs between moves on one origin (flap guard).
+   * Shrinking only reaps idle sockets — in-flight deliveries are never
+   * touched. A no-op when adaptive sizing is disabled.
+   */
+  private evaluateAdaptive(): void {
+    const adaptive = this.opts.adaptive;
+    if (adaptive === undefined) return;
+    const now = Date.now();
+    for (const entry of this.entries.values()) {
+      if (now - entry.lastScaleAtMs < adaptive.cooldownMs) continue;
+      const queued = countQueuedRequests(entry.agent);
+      if (queued >= adaptive.scaleUpQueueDepth && entry.currentMaxSockets < adaptive.maxSockets) {
+        // Multiplicative growth, at least +1: bursts open headroom fast
+        // without overshooting on a single queued request.
+        const next = Math.min(
+          adaptive.maxSockets,
+          Math.max(entry.currentMaxSockets + 1, entry.currentMaxSockets * 2)
+        );
+        this.setEntryMaxSockets(entry, next, now);
+        entry.scaleUps += 1;
+      } else if (queued === 0 && entry.currentMaxSockets > adaptive.minSockets) {
+        // Halve toward the floor: idle capacity is released promptly,
+        // while the cooldown stops a sawtooth on bursty traffic.
+        const next = Math.max(
+          adaptive.minSockets,
+          Math.min(entry.currentMaxSockets - 1, Math.ceil(entry.currentMaxSockets / 2))
+        );
+        this.setEntryMaxSockets(entry, next, now);
+        entry.scaleDowns += 1;
+        this.shrinkIdleSockets(entry);
+      }
+    }
+  }
+
+  /** Apply a new cap to one origin's agent (Node reads `maxSockets` live). */
+  private setEntryMaxSockets(entry: PoolEntry, next: number, nowMs: number): void {
+    entry.currentMaxSockets = next;
+    entry.lastScaleAtMs = nowMs;
+    entry.agent.maxSockets = next;
+  }
+
+  /**
+   * WR-134: destroy idle (free) sockets on `entry` until its total socket
+   * count fits the current cap. Active (in-flight) sockets are never
+   * touched — shrinking only reaps idle connections. Reaped sockets
+   * count in `reaped`, like the idle-timeout reaper's.
+   */
+  private shrinkIdleSockets(entry: PoolEntry): void {
+    for (const sockets of Object.values(entry.agent.freeSockets)) {
+      const list = sockets as Socket[];
+      for (let i = list.length - 1; i >= 0; i--) {
+        if (
+          countSockets(entry.agent.sockets) + countSockets(entry.agent.freeSockets) <=
+          entry.currentMaxSockets
+        ) {
+          return;
+        }
+        const socket = list[i];
+        list.splice(i, 1);
+        entry.reaped++;
+        socket.destroy();
+      }
+    }
+  }
+
   getStats(): KeepAlivePoolStats {
     const endpoints = [...this.entries.values()].map((e) => ({
       key: e.key,
@@ -514,6 +725,9 @@ export class OutboundConnectionPool {
       freeSockets: countSockets(e.agent.freeSockets),
       probeHits: e.probeHits,
       probeMisses: e.probeMisses,
+      currentMaxSockets: e.currentMaxSockets,
+      scaleUps: e.scaleUps,
+      scaleDowns: e.scaleDowns,
     }));
     return {
       endpoints,
@@ -528,6 +742,7 @@ export class OutboundConnectionPool {
   /** Destroy every pooled socket and stop the reaper. Idempotent. */
   destroy(): void {
     if (this.reapTimer !== undefined) clearInterval(this.reapTimer);
+    if (this.adaptiveTimer !== undefined) clearInterval(this.adaptiveTimer);
     for (const entry of this.entries.values()) entry.agent.destroy();
     this.entries.clear();
   }

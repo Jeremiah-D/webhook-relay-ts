@@ -790,6 +790,23 @@ reliability primitives that matter for any signed-payload pipeline.
   (`close` → `queue.stop()` → pool `destroy()`), covering the
   graceful-shutdown drain path. Invalid option values throw `RangeError` at
   startup.
+- Adaptive per-origin socket-cap sizing (WR-134, opt-in): pass
+  `adaptiveSockets: { minSockets, maxSockets, scaleUpQueueDepth, cooldownMs }`
+  inside `outboundKeepAlive` and the fixed `maxSocketsPerHost` becomes the
+  *initial* cap (clamped into `[minSockets, maxSockets]`). A background
+  evaluator (unref'd, at most once per second and no slower than the
+  cooldown) moves each origin's cap from the agent's queued-request
+  pressure — requests waiting for a socket inside Node's agent: scale up
+  (doubling, at least +1) when the queue reaches `scaleUpQueueDepth`,
+  scale down (halving) toward `minSockets` when the queue drains, with
+  `cooldownMs` between moves on one origin as the flap guard. Shrinking
+  only reaps *idle* sockets — in-flight deliveries are never touched.
+  `getStats()` exposes `currentMaxSockets`, `scaleUps`, and `scaleDowns`
+  per origin. Note: raising the cap applies to new socket decisions
+  immediately; requests already queued inside the agent drain as sockets
+  free (Node does not re-evaluate queued requests on a cap change), so a
+  scale-up shortens the queue for what comes next. Unset = the fixed cap,
+  byte-identical behavior to before.
 - `src/warmup.ts` — outbound connection warm-up (WR-70): pre-connects the
   keep-alive pool to configured origins at startup so the first deliveries
   skip the TCP/TLS handshake. `warmupOutboundPool(pool, endpoints, cfg)`
