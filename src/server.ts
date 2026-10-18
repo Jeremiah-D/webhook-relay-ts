@@ -4737,6 +4737,12 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       opts.auditLog.append(event);
       opts.retry?.onStarvationGuardAudit?.(event);
     },
+    // WR-137: wrap the caller's hook so every tenant budget exceedance
+    // is audited as `budget_exceeded`, not just observed.
+    onBudgetExceeded: (event) => {
+      opts.auditLog.append(event);
+      opts.retry?.onBudgetExceeded?.(event);
+    },
     // Wrap the caller's hook so every urgent fast-lane starvation-guard
     // downgrade (WR-121) is audited, not just observed.
     onUrgentDowngraded: (event) => {

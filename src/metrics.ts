@@ -412,6 +412,15 @@ export interface MetricsInput {
    * off, so an untouched relay's exposition is byte-identical.
    */
   assertionFailures?: AssertionFailureMetricsInput[];
+  /**
+   * WR-137: per-tenant monthly delivery budget (see `src/budget.ts`).
+   * One gauge row per tenant with a configured budget — the month's
+   * counted deliveries (`relay_tenant_budget_deliveries_total`) and the
+   * configured allowance (`relay_tenant_budget_deliveries_limit`).
+   * Absent entirely when no tenant carries a budget, so a relay without
+   * budgets renders byte-identical exposition to the pre-WR-137 shape.
+   */
+  tenantBudget?: TenantBudgetMetricsInput[];
 }
 
 /** One endpoint's starvation-guard activation count, in Prometheus label order. */
@@ -576,6 +585,51 @@ export function renderTenantRateLimitedBlock(series: TenantRateLimitMetricsInput
   for (const s of series) {
     lines.push(
       `relay_tenant_ratelimited_total{endpoint="${escapeLabelValue(s.endpoint)}"${tenantLabel(s.tenant)}} ${s.limited}`
+    );
+  }
+  return lines;
+}
+
+/**
+ * One tenant's monthly delivery budget state (WR-137), in Prometheus
+ * label order.
+ */
+export interface TenantBudgetMetricsInput {
+  /** Tenant id (WR-48), or `"default"` for the default tenant. */
+  tenant: string;
+  /** Deliveries counted against the budget in the current UTC month. */
+  used: number;
+  /** Configured monthly allowance (deliveries per UTC month). */
+  budget: number;
+}
+
+/**
+ * Render just the per-tenant monthly delivery budget block (WR-137) as
+ * exposition lines: `relay_tenant_budget_deliveries_total{tenant}`
+ * (gauge — this month's counted deliveries) and
+ * `relay_tenant_budget_deliveries_limit{tenant}` (gauge — the configured
+ * allowance), so operators can watch usage against budget. `[]` when the
+ * series is empty, so callers keep byte-identical output until the first
+ * budget is configured.
+ */
+export function renderTenantBudgetBlock(series: TenantBudgetMetricsInput[]): string[] {
+  if (series.length === 0) return [];
+  const lines = [
+    "# HELP relay_tenant_budget_deliveries_total Monthly delivered deliveries counted against the tenant delivery budget (WR-137).",
+    "# TYPE relay_tenant_budget_deliveries_total gauge",
+  ];
+  for (const s of series) {
+    lines.push(
+      `relay_tenant_budget_deliveries_total{tenant="${escapeLabelValue(s.tenant)}"} ${s.used}`
+    );
+  }
+  lines.push(
+    "# HELP relay_tenant_budget_deliveries_limit Configured monthly delivery budget, in deliveries per UTC month (WR-137).",
+    "# TYPE relay_tenant_budget_deliveries_limit gauge"
+  );
+  for (const s of series) {
+    lines.push(
+      `relay_tenant_budget_deliveries_limit{tenant="${escapeLabelValue(s.tenant)}"} ${s.budget}`
     );
   }
   return lines;
@@ -956,6 +1010,10 @@ export function renderPrometheus(input: MetricsInput): string {
   // WR-97: activity-gated the same way — the series appears only once a
   // (tenant, endpoint) scope has actually been rate-limited.
   lines.push(...renderTenantRateLimitedBlock(input.tenantRateLimited ?? []));
+  // WR-137: activity-gated the same way — the budget gauges appear only
+  // once a tenant budget is configured, so a relay without budgets
+  // exposes no `relay_tenant_budget_*` series at all.
+  lines.push(...renderTenantBudgetBlock(input.tenantBudget ?? []));
   // WR-106: activity-gated the same way — the quorum series appears only
   // once a target has actually acknowledged or died, so a relay with the
   // feature off exposes no `relay_quorum_*` series at all.

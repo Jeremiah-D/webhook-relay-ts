@@ -114,6 +114,13 @@ export type {
 };
 import { EndpointQuota, type QuotaOptions, type QuotaStats } from "./quota.ts";
 import {
+  TenantBudgetEnforcer,
+  type TenantBudgetAuditEvent,
+  type TenantBudgetConfig,
+  type TenantBudgetOptions,
+  type TenantBudgetStatsRow,
+} from "./budget.ts";
+import {
   OrderedTracker,
   assertValidOrderedConfig,
   resolveOrderedClock,
@@ -251,6 +258,7 @@ import {
   type OcspMetricsInput,
   type OrderedMetricsInput,
   type AssertionFailureMetricsInput,
+  type TenantBudgetMetricsInput,
 } from "./metrics.ts";
 import {
   summarizeDeadLetterFailure,
@@ -349,6 +357,14 @@ export type { FieldMask, FieldMaskRule, MaskStrategy };
 export { PayloadTransformer, PayloadTransformError, TemplateError };
 export type { PayloadTransformRules, TransformContext };
 export type { QuotaOptions, QuotaStats };
+export { TenantBudgetEnforcer };
+export type {
+  TenantBudgetAuditEvent,
+  TenantBudgetConfig,
+  TenantBudgetOptions,
+  TenantBudgetStatsRow,
+  TenantBudgetStats,
+};
 export type { ReplayEgressOptions };
 export { ReplayEgressGate, DEFAULT_REPLAY_EGRESS_RPS };
 export type { RetryBudgetOptions } from "./retry-budget.ts";
@@ -1482,6 +1498,19 @@ export interface RetryQueueOptions {
    */
   quota?: QuotaOptions;
   /**
+   * WR-137: per-tenant monthly delivery budget (see `src/budget.ts`).
+   * Counts terminal `delivered` outcomes (the WR-78 billing vocabulary)
+   * against each tenant's allowance; an over-budget tenant's dispatches
+   * are rescheduled for the next UTC month — never dropped, never
+   * charged to the retry budget, never shown to the circuit breaker —
+   * exactly the WR-15 quota pattern, tenant-scoped and
+   * calendar-month-windowed. A tenant without a configured budget is
+   * unlimited, so the default relay is byte-identical to the pre-WR-137
+   * one. Configure budgets at construction (`budgets`) or at runtime
+   * (`setTenantBudget`).
+   */
+  budget?: TenantBudgetOptions;
+  /**
    * Batch delivery merging (see `src/batch.ts`). When set, normal-priority
    * items for the same endpoint are held for `windowMs` and merged into a
    * single delivery with a JSON envelope (uniform contract: even a lone
@@ -1616,6 +1645,14 @@ export interface RetryQueueOptions {
    * as `urgent_downgraded`; library users get the hook directly.
    */
   onUrgentDowngraded?: (event: UrgentDowngradedEvent) => void;
+  /**
+   * WR-137: called on the first over-budget dispatch for a tenant in a
+   * UTC calendar month (see {@link TenantBudgetAuditEvent}). Edge-
+   * triggered per tenant per month — one call, never an audit flood;
+   * the month rollover re-arms it. The server audits these as
+   * `budget_exceeded`; library users get the hook directly.
+   */
+  onBudgetExceeded?: (event: TenantBudgetAuditEvent) => void;
   /**
    * Prometheus metrics tuning (see `src/metrics.ts`). Delivery counters
    * (`relay_deliveries_total`) and circuit gauges
@@ -2729,6 +2766,16 @@ export class LaneScheduler {
 }
 
 /**
+ * One row of {@link RetryQueue.getTenantBudgetStats} (WR-137): the
+ * enforcer's monthly row plus the queue's cumulative budget-parked
+ * reschedule count. All JSON-serializable.
+ */
+export interface TenantBudgetStats extends TenantBudgetStatsRow {
+  /** Dispatches rescheduled because the tenant was over budget (cumulative). */
+  delayed: number;
+}
+
+/**
  * RetryQueue holds outbound deliveries and retries them with exponential
  * backoff + jitter. Items that exhaust `maxAttempts` are moved to an
  * in-memory dead-letter list for later inspection.
@@ -2877,6 +2924,19 @@ export class RetryQueue {
   private readonly quotaNow: () => number;
   /** Attempts rescheduled because the endpoint's quota bucket was empty. Keyed by scoped key (WR-48). */
   private readonly quotaStats = new Map<string, Map<string, number>>();
+  /**
+   * WR-137: tenant monthly delivery budget enforcer. Always present — a
+   * tenant without a configured budget is unlimited, so the gate is a
+   * cheap no-op until the first budget is set.
+   */
+  private readonly budget: TenantBudgetEnforcer;
+  private readonly onBudgetExceeded?: (event: TenantBudgetAuditEvent) => void;
+  /**
+   * WR-137: dispatches rescheduled because the tenant was over its
+   * monthly delivery budget. Keyed by tenant key (`"default"` for the
+   * default tenant).
+   */
+  private readonly budgetDelayed = new Map<string, number>();
   /**
    * WR-52: per-endpoint delivery time windows ("quiet hours"). Shared
    * across tenants like the WR-50 pause switch — the window is a property
@@ -3318,6 +3378,12 @@ export class RetryQueue {
     this.maxConsecutiveUrgent = maxConsecutiveUrgent;
     this.onStarvationGuardAudit = opts.onStarvationGuardAudit;
     this.onUrgentDowngraded = opts.onUrgentDowngraded;
+    // WR-137: the enforcer is always constructed — unlimited-by-default
+    // keeps it a no-op until the first budget is set; option validation
+    // (initial `budgets`, `maxTenants`, clock) still throws at
+    // construction, never mid-request.
+    this.budget = new TenantBudgetEnforcer(opts.budget ?? {});
+    this.onBudgetExceeded = opts.onBudgetExceeded;
     // WR-39: built after the breaker so the manager can read live circuit
     // state for the "circuit open" switch trigger. Invalid configs throw
     // here, at construction — never mid-delivery.
@@ -3986,6 +4052,11 @@ export class RetryQueue {
   private recordQuotaStat(tenant: string | undefined, endpoint: string): void {
     const inner = innerFor(this.quotaStats, tenant);
     inner.set(endpoint, (inner.get(endpoint) ?? 0) + 1);
+  }
+
+  /** WR-137: count one budget-parked reschedule for the tenant row. */
+  private recordBudgetDelayed(tenantKey: string): void {
+    this.budgetDelayed.set(tenantKey, (this.budgetDelayed.get(tenantKey) ?? 0) + 1);
   }
 
   /** WR-52: count one window-outside park for the (tenant, endpoint) row. */
@@ -5652,6 +5723,30 @@ export class RetryQueue {
       this.schedule(id, this.maintenanceWindow.msUntilOpen(logicalEndpoint));
       return;
     }
+    // WR-137: tenant monthly delivery budget — checked before the
+    // quota gate, so an over-budget tenant consumes neither a quota
+    // token, a retry-budget token, nor a circuit-breaker verdict. Like
+    // quota, an over-budget attempt is rescheduled at the next budget
+    // window (the next UTC month) — never dropped. The first
+    // over-budget verdict per tenant per month fires the
+    // `budget_exceeded` audit hook; tenants without a configured budget
+    // are unlimited, so this is a no-op by default.
+    const budgetVerdict = this.budget.checkOver(tenant);
+    if (budgetVerdict.over) {
+      this.recordBudgetDelayed(budgetVerdict.tenant);
+      if (budgetVerdict.auditDue) {
+        this.onBudgetExceeded?.({
+          event: "budget_exceeded",
+          tenant: budgetVerdict.tenant,
+          deliveriesPerMonth: budgetVerdict.budget as number,
+          used: budgetVerdict.used,
+          month: budgetVerdict.month,
+          at: budgetVerdict.at,
+        });
+      }
+      this.schedule(id, budgetVerdict.retryAfterMs + this.random() * 50);
+      return;
+    }
     // Per-endpoint quota first: an exhausted budget delays the attempt
     // (rescheduled at the next token refill) instead of burning the retry
     // budget or tripping the circuit against a downstream we are
@@ -5980,6 +6075,10 @@ export class RetryQueue {
         this.recordEndpointSuccess(entry.targetUrl);
         this.armedNextAt.delete(id);
         this.recordDelivery(tenant, target, "delivered");
+        // WR-137: count the terminal delivery against the tenant's
+        // monthly budget (the WR-78 billing vocabulary — retries and
+        // dead letters never count).
+        this.budget.recordDelivered(tenant);
         if (fastLane) this.recordUrgentStat(target, "delivered");
         const latency = this.latencyFor(tenant);
         const latencyMs = latency?.recordDelivered(entry.id, target);
@@ -6941,6 +7040,18 @@ export class RetryQueue {
       // a relay with the feature off exposes no
       // `relay_assertion_failures_total` series at all.
       ...(assertionFailures.length > 0 ? { assertionFailures } : {}),
+      // WR-137: activity-gated — the budget gauges appear only once a
+      // tenant budget is configured, so a relay without budgets renders
+      // byte-identical exposition to the pre-WR-137 shape.
+      ...(this.budget.hasBudgets()
+        ? {
+            tenantBudget: this.budget.snapshot().map((row) => ({
+              tenant: row.tenant,
+              used: row.used,
+              budget: row.budget,
+            })),
+          }
+        : {}),
       // WR-83: enabled-gated — the OTLP series appear only when OTLP
       // export is configured, exactly like the probe series.
       ...(this.otlpExporter !== undefined
@@ -7328,6 +7439,39 @@ export class RetryQueue {
       }
     }
     return rows;
+  }
+
+  /**
+   * WR-137: set (or replace) a tenant's monthly delivery budget. Takes
+   * effect immediately — a tenant already past the new allowance parks
+   * its next dispatch. See
+   * {@link TenantBudgetEnforcer.setTenantBudget} for validation
+   * (`RangeError` on non-positive budgets; the current budget stays
+   * intact).
+   */
+  setTenantBudget(tenantId: string, config: TenantBudgetConfig): void {
+    this.budget.setTenantBudget(tenantId, config);
+  }
+
+  /**
+   * WR-137: drop a tenant's monthly delivery budget — the tenant falls
+   * back to unlimited. Never throws for unknown tenants.
+   */
+  clearTenantBudget(tenantId: string): void {
+    this.budget.clearTenantBudget(tenantId);
+  }
+
+  /**
+   * WR-137: one row per tenant with a configured budget — the current
+   * UTC month, counted deliveries, the allowance, the over flag, and
+   * the cumulative budget-parked reschedules (`delayed`). Empty when no
+   * tenant carries a budget.
+   */
+  getTenantBudgetStats(): TenantBudgetStats[] {
+    return this.budget.snapshot().map((row) => ({
+      ...row,
+      delayed: this.budgetDelayed.get(row.tenant) ?? 0,
+    }));
   }
 
   /**

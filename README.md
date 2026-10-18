@@ -1813,6 +1813,48 @@ const queue = new RetryQueue({
   `RangeError` at construction; the clock is injectable for
   deterministic tests.
 
+## Per-tenant monthly delivery budgets
+
+Usage-based billing needs a ceiling, not just a meter. `retry.budget`
+(opt-in; unlimited by default) adds a per-tenant monthly delivery budget
+enforcement layer on top of the WR-78 usage metering:
+
+```ts
+const queue = new RetryQueue({
+  budget: {
+    budgets: { acme: 10_000 }, // tenant -> deliveries per UTC month
+  },
+});
+queue.setTenantBudget("globex", { deliveriesPerMonth: 500 }); // runtime change, immediate
+```
+
+- **What counts** — terminal `delivered` outcomes only (the WR-78 billing
+  vocabulary; `failed === retried + dead_letter`, so `delivered` is the
+  only terminal-success counter), counted per UTC calendar month. The
+  enforcer keeps its own monthly buckets — the UsageMeter's window is
+  rolling, so it cannot serve a calendar-month budget — fed from the same
+  `delivered` events. Orthogonal to the WR-15 quota counts.
+- **Over budget** — an over-budget tenant's dispatch is rescheduled for
+  the next UTC month boundary (plus a little jitter): never dropped,
+  never charged to the retry budget, never shown to the circuit breaker —
+  the WR-15 quota pattern, tenant-scoped. The gate runs before the quota
+  gate, so an over-budget tenant consumes no quota tokens either.
+- **One audit event per month** — the first over-budget dispatch per
+  tenant per month fires `budget_exceeded` (tenant, allowance, usage,
+  month); the month rollover re-arms it — never an audit flood.
+- **Opt-in, unlimited by default** — a tenant without a configured budget
+  is unlimited; the default relay behaves byte-identically to the
+  pre-WR-137 one.
+- **Observability** — `getTenantBudgetStats()` exposes per-tenant month,
+  usage, allowance, the over flag, and the cumulative parked-reschedule
+  count; `relay_tenant_budget_deliveries_total{tenant}` (gauge: this
+  month's counted deliveries) and
+  `relay_tenant_budget_deliveries_limit{tenant}` (gauge: the allowance)
+  export usage against budget to Prometheus (activity-gated — absent
+  until the first budget is configured). Invalid budgets throw
+  `RangeError` at configuration; the clock is injectable for
+  deterministic tests.
+
 ## Endpoint failover (active/standby)
 
 One logical endpoint (the configured primary `targetUrl`) can own an
@@ -3561,7 +3603,8 @@ when metering is off) or scrape the Prometheus exposition:
 `relay_tenant_bytes_out_total{tenant}`,
 `relay_tenant_urgent_total{tenant}`. The meter never gates, delays, or
 drops anything — it is orthogonal to the delivery quota (WR-15), which is
-the protective gate. Memory-bounded: per-tenant samples are capped
+the protective gate. To *enforce* a monthly ceiling on top of the meter,
+see per-tenant monthly delivery budgets (WR-137). Memory-bounded: per-tenant samples are capped
 (`maxEventsPerTenant`, oldest dropped first) and the tenant population is
 capped (`maxTenants`, least-recently-active evicted).
 
