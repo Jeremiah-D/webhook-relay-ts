@@ -50,6 +50,7 @@ const INVENTORY: Array<[string, Array<"GET" | "POST" | "PUT" | "DELETE">]> = [
   ["/metrics", ["GET"]],
   ["/config/endpoint", ["POST"]],
   ["/config/snapshot", ["GET", "POST"]],
+  ["/config/version-sunset", ["GET", "POST"]],
   ["/routing/rules", ["GET", "POST"]],
   ["/endpoints/pause", ["POST"]],
   ["/endpoints/resume", ["POST"]],

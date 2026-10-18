@@ -443,6 +443,23 @@ export const OPERATOR_ROUTES: readonly OperatorRoute[] = [
     },
   },
   {
+    path: "/config/version-sunset",
+    pattern: exact("/config/version-sunset"),
+    methods: ["GET", "POST"],
+    summary: "Inspect / hot-update per-version sunsets",
+    description:
+      "WR-144: `GET` returns every version route's effective sunset (`{ prefix, version, sunsetAt, source }`, read scope); `POST` sets or clears one version's sunset (`{ prefix, sunsetAt }` — epoch-ms, ISO-8601 string, or `null` to clear; admin scope) with immediate effect and no restart. Changes are audited as `version_sunset_updated`. A sunset version's intakes answer `410 Gone` with the RFC 8594 `Sunset` header and are audited as `rejected` with reason `version_sunset`.",
+    okDescription: "GET: `{ sunsets }`. POST: `{ prefix, version, sunsetAt }`.",
+    requestBody: {
+      description: "POST body. `sunsetAt` is required: epoch-ms, ISO-8601 string, or `null` to clear.",
+      required: ["prefix", "sunsetAt"],
+      properties: {
+        prefix: { type: "string", description: "Version route prefix, e.g. \"/v1\"." },
+        sunsetAt: { type: "string", description: "Epoch-ms or ISO-8601 moment, or null to clear." },
+      },
+    },
+  },
+  {
     path: "/routing/rules",
     pattern: exact("/routing/rules"),
     methods: ["GET", "POST"],

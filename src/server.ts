@@ -520,6 +520,15 @@ export interface RelayServerOptions {
    * count under `version="none"`). Paths without a registered prefix are
    * untouched — no `version` field anywhere, exactly the legacy behavior.
    * Invalid routes throw `RangeError` at startup.
+   *
+   * WR-144: each route accepts an opt-in `sunsetAt` (epoch-ms or an
+   * ISO-8601 string). Once reached, intakes matching the version are
+   * answered `410 Gone` with the RFC 8594 `Sunset` header and audited as
+   * `rejected` with reason `version_sunset` — they never enter the retry
+   * queue. Sunsets can be set/cleared at runtime (immediate effect, no
+   * restart) via `POST /config/version-sunset` (operator, admin scope;
+   * audited as `version_sunset_updated`) and inspected with
+   * `GET /config/version-sunset` (operator, read scope).
    */
   versions?: ApiVersionOptions;
   /**
@@ -4305,6 +4314,8 @@ function isOperatorPath(pathname: string): boolean {
     pathname === "/openapi.json" ||
     pathname === "/config/endpoint" ||
     pathname === "/config/snapshot" ||
+    // WR-144: per-version sunset inspection / hot updates.
+    pathname === "/config/version-sunset" ||
     pathname === "/routing/rules" ||
     pathname === "/endpoints" ||
     pathname.startsWith("/endpoints/") ||
@@ -5895,6 +5906,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     const isAutoTrigger = pathname === "/dead-letter/auto-replay/trigger";
     const isConfigEndpoint = pathname === "/config/endpoint";
     const isConfigSnapshot = pathname === "/config/snapshot";
+    // WR-144: per-version sunset hot updates (GET = inspect, POST = set/clear).
+    const isVersionSunset = pathname === "/config/version-sunset";
     const isRoutingRules = pathname === "/routing/rules";
     const isEndpointsPause = pathname === "/endpoints/pause";
     const isEndpointsResume = pathname === "/endpoints/resume";
@@ -6652,6 +6665,84 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
           )
         );
         respondJson(res, 200, { endpoint, ...(tenant !== undefined ? { tenant } : {}), changes });
+      } catch (err) {
+        if (err instanceof RangeError) {
+          respondJson(res, 400, { error: err.message });
+          return;
+        }
+        throw err;
+      }
+      return;
+    }
+    if (isVersionSunset) {
+      // WR-144: per-version sunset hot updates (the WR-32 convention).
+      // `GET` inspects every route's effective sunset (read scope);
+      // `POST` sets or clears one version's sunset (admin scope, body
+      // `{ prefix, sunsetAt }` where `sunsetAt` is epoch-ms, an
+      // ISO-8601 string, or `null` to clear). The change takes effect
+      // on the next intake — no restart — and is audited as
+      // `version_sunset_updated` with the operator's `keyId`. A
+      // RangeError from the router (unknown prefix, invalid moment)
+      // surfaces as a 400 and means "nothing changed".
+      if (versionRouter === undefined) {
+        respondJson(res, 404, { error: "API versioning is not configured" });
+        return;
+      }
+      if (req.method === "GET") {
+        respondJson(res, 200, {
+          sunsets: versionRouter.sunsetEntries().map((e) => ({
+            prefix: e.prefix,
+            version: e.version,
+            sunsetAt: e.sunsetAt === null ? null : new Date(e.sunsetAt).toISOString(),
+            source: e.source,
+          })),
+        });
+        return;
+      }
+      let body: Record<string, unknown>;
+      try {
+        const raw = (await readRawBody(req, maxBodyBytes)).toString("utf8");
+        body = raw.trim() === "" ? {} : JSON.parse(raw);
+      } catch (err) {
+        if (err instanceof BodyTooLargeError) {
+          respondJson(res, 413, { error: "request body too large" });
+          return;
+        }
+        respondJson(res, 400, { error: "invalid JSON body" });
+        return;
+      }
+      if (typeof body !== "object" || body === null || Array.isArray(body)) {
+        respondJson(res, 400, { error: "body must be a JSON object" });
+        return;
+      }
+      const { prefix, sunsetAt } = body;
+      if (typeof prefix !== "string" || prefix.length === 0) {
+        respondJson(res, 400, { error: "prefix must be a non-empty string" });
+        return;
+      }
+      if (sunsetAt === undefined) {
+        respondJson(res, 400, { error: "sunsetAt is required (epoch-ms, ISO-8601 string, or null to clear)" });
+        return;
+      }
+      try {
+        // `null` clears the sunset entirely (explicit "never sunset"),
+        // valid moments set it; the override wins over any configured
+        // `sunsetAt` on the route.
+        versionRouter.setSunset(prefix, sunsetAt as number | string | null);
+        const effective = versionRouter.effectiveSunset(prefix);
+        const route = versionRouter.sunsetEntries().find((e) => e.prefix === prefix);
+        opts.auditLog.append({
+          event: "version_sunset_updated",
+          prefix,
+          version: route?.version,
+          sunsetAt: effective === undefined ? null : new Date(effective).toISOString(),
+          ...(operatorKeyId !== undefined ? { keyId: operatorKeyId } : {}),
+        });
+        respondJson(res, 200, {
+          prefix,
+          version: route?.version,
+          sunsetAt: effective === undefined ? null : new Date(effective).toISOString(),
+        });
       } catch (err) {
         if (err instanceof RangeError) {
           respondJson(res, 400, { error: err.message });
@@ -7535,6 +7626,12 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
      * the `retry-after` response header (ceiling seconds, minimum 1).
      */
     retryAfterMs?: number;
+    /**
+     * WR-144: extra response headers for a rejection — rendered
+     * verbatim on the rejection response (e.g. the RFC 8594 `Sunset`
+     * header on a version-sunset 410).
+     */
+    responseHeaders?: Record<string, string>;
   }
 
   /**
@@ -7824,6 +7921,34 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       versionRoute = versionRouter.match(pathname);
       if (versionRoute !== undefined) {
         version = versionRoute.adapter.version;
+        // WR-144: per-version sunset. Once the configured (or hot-updated)
+        // sunset moment is reached, the version is gone: answer 410 with
+        // the RFC 8594 `Sunset` header and audit `rejected` with reason
+        // `version_sunset`. A sunset version never reaches the adapter
+        // (the adapter may already be retired) and never enters the
+        // retry queue. Unset versions behave exactly as before.
+        const sunsetMs = versionRouter.effectiveSunset(versionRoute.prefix);
+        if (sunsetMs !== undefined && Date.now() >= sunsetMs) {
+          const sunsetIso = new Date(sunsetMs).toISOString();
+          versionMetrics.record(version, "rejected");
+          opts.auditLog.append({ ...correlation,
+            event: "rejected",
+            id,
+            traceId,
+            ...tenantLabel,
+            reason: "version_sunset",
+            version,
+            sunsetAt: sunsetIso,
+          });
+          return {
+            status: 410,
+            id,
+            traceId,
+            reason: "version_sunset",
+            detail: `API version ${version} was sunset at ${sunsetIso}; migrate to a current version`,
+            responseHeaders: { Sunset: new Date(sunsetMs).toUTCString() },
+          };
+        }
         try {
           body = versionRoute.adapter.adapt(body, { version, path: pathname, traceId });
         } catch (err) {
@@ -8433,6 +8558,11 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     if (outcome.retryAfterMs !== undefined) {
       rejHeaders["retry-after"] = String(Math.max(1, Math.ceil(outcome.retryAfterMs / 1000)));
     }
+    // WR-144: extra rejection headers (e.g. the RFC 8594 `Sunset` header
+    // on a version-sunset 410).
+    if (outcome.responseHeaders !== undefined) {
+      Object.assign(rejHeaders, outcome.responseHeaders);
+    }
     res.writeHead(outcome.status, rejHeaders).end(outcome.detail ?? "Rejected");
   };
 
@@ -8648,6 +8778,11 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       // WR-97: a 429'd batch item carries the honest retry delay in the
       // per-item result (batch responses have no per-item headers).
       if (outcome.retryAfterMs !== undefined) result.retryAfterMs = outcome.retryAfterMs;
+      // WR-144: a 410'd batch item carries the version's sunset moment
+      // (batch responses have no per-item headers).
+      if (outcome.responseHeaders?.["Sunset"] !== undefined) {
+        result.sunset = outcome.responseHeaders["Sunset"];
+      }
       if (outcome.duplicate === true) result.duplicate = true;
       if (outcome.scheduledAt !== undefined) {
         result.scheduled = true;

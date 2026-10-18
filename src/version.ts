@@ -59,11 +59,52 @@ export interface ApiVersionRoute {
    */
   prefix: string;
   adapter: ApiVersionAdapter;
+  /**
+   * WR-144: opt-in sunset moment for this version — epoch milliseconds
+   * or an ISO-8601 timestamp string. Once `Date.now()` reaches the
+   * moment (inclusive), intakes matching this version are answered
+   * `410 Gone` with the RFC 8594 `Sunset` header and audited as
+   * `rejected` with reason `version_sunset`; they never enter the retry
+   * queue. Absent means the version never sunsets (fully backward
+   * compatible). Invalid values throw `RangeError` at startup.
+   */
+  sunsetAt?: number | string;
 }
 
 /** Inbound API version routing config, embedded in `RelayServerOptions`. */
 export interface ApiVersionOptions {
   routes: ApiVersionRoute[];
+}
+
+/**
+ * Normalize a `sunsetAt` value to epoch milliseconds. Throws
+ * `RangeError` for anything that is not a usable moment (non-finite or
+ * negative numbers, unparseable strings, other types) so a bad sunset
+ * can never silently become "already sunset" or "never sunset" at
+ * runtime.
+ */
+export function normalizeVersionSunsetAt(value: unknown): number | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value) || value < 0) {
+      throw new RangeError(
+        `version route sunsetAt must be a finite epoch-ms >= 0, got ${String(value)}`
+      );
+    }
+    return Math.floor(value);
+  }
+  if (typeof value === "string") {
+    const ms = Date.parse(value);
+    if (Number.isNaN(ms) || ms < 0) {
+      throw new RangeError(
+        `version route sunsetAt must be an ISO-8601 timestamp, got ${JSON.stringify(value)}`
+      );
+    }
+    return ms;
+  }
+  throw new RangeError(
+    `version route sunsetAt must be epoch-ms or an ISO-8601 string, got ${typeof value}`
+  );
 }
 
 /**
@@ -103,21 +144,36 @@ export function assertValidVersionRoutes(routes: ApiVersionRoute[]): void {
     if (typeof adapter.adapt !== "function") {
       throw new RangeError(`version route ${prefix}: adapter.adapt must be a function`);
     }
+    // WR-144: normalize the opt-in sunset moment now — an invalid moment
+    // throws at startup, never mid-request.
+    normalizeVersionSunsetAt(route.sunsetAt);
   }
 }
 
 /**
  * Matches inbound paths against the version route table (longest prefix
  * wins, segment-boundary matching only).
+ *
+ * WR-144: per-version sunsets live here too. Each route's configured
+ * `sunsetAt` seeds a `configured` map at construction; operator
+ * hot-updates (the WR-32 convention) write an `overrides` map keyed by
+ * prefix — an override of `null` explicitly clears the sunset. The
+ * effective sunset for a prefix is `override ?? configured`.
  */
 export class ApiVersionRouter {
   private readonly routes: ApiVersionRoute[];
+  private readonly configuredSunsets = new Map<string, number>();
+  private readonly sunsetOverrides = new Map<string, number | null>();
 
   constructor(routes: ApiVersionRoute[]) {
     // Fail fast at startup; a route table that throws mid-request is a bug.
     assertValidVersionRoutes(routes);
     // Longest prefix first so the first match is the winner.
     this.routes = [...routes].sort((a, b) => b.prefix.length - a.prefix.length);
+    for (const route of routes) {
+      const ms = normalizeVersionSunsetAt(route.sunsetAt);
+      if (ms !== undefined) this.configuredSunsets.set(route.prefix, ms);
+    }
   }
 
   /** The route owning `pathname`, or `undefined` when unversioned. */
@@ -128,6 +184,77 @@ export class ApiVersionRouter {
       }
     }
     return undefined;
+  }
+
+  /**
+   * The effective sunset moment (epoch ms) for `prefix`, or `undefined`
+   * when the version never sunsets. An operator override wins over the
+   * configured `sunsetAt`; an override of `null` clears the sunset.
+   */
+  effectiveSunset(prefix: string): number | undefined {
+    if (this.sunsetOverrides.has(prefix)) {
+      return this.sunsetOverrides.get(prefix) ?? undefined;
+    }
+    return this.configuredSunsets.get(prefix);
+  }
+
+  /**
+   * WR-144: hot-update one version's sunset at runtime (the WR-32
+   * convention — immediate effect, no restart). `null` clears the
+   * sunset entirely; anything else must be a valid moment. Unknown
+   * prefixes and invalid moments throw `RangeError`.
+   */
+  setSunset(prefix: string, sunsetAt: number | string | null): void {
+    if (!this.hasPrefix(prefix)) {
+      throw new RangeError(`unknown version route prefix ${JSON.stringify(prefix)}`);
+    }
+    this.sunsetOverrides.set(
+      prefix,
+      sunsetAt === null ? null : normalizeVersionSunsetAt(sunsetAt)
+    );
+  }
+
+  /**
+   * WR-144: drop the runtime sunset override for `prefix`, restoring the
+   * route's configured `sunsetAt` (or no sunset). Unknown prefixes throw
+   * `RangeError`.
+   */
+  clearSunset(prefix: string): void {
+    if (!this.hasPrefix(prefix)) {
+      throw new RangeError(`unknown version route prefix ${JSON.stringify(prefix)}`);
+    }
+    this.sunsetOverrides.delete(prefix);
+  }
+
+  /** Current sunset state for every route (operator introspection). */
+  sunsetEntries(): Array<{
+    prefix: string;
+    version: string;
+    sunsetAt: number | null;
+    source: "config" | "override" | "none";
+  }> {
+    return this.routes.map((route) => {
+      if (this.sunsetOverrides.has(route.prefix)) {
+        const v = this.sunsetOverrides.get(route.prefix);
+        return {
+          prefix: route.prefix,
+          version: route.adapter.version,
+          sunsetAt: v ?? null,
+          source: v === null ? ("none" as const) : ("override" as const),
+        };
+      }
+      const configured = this.configuredSunsets.get(route.prefix);
+      return {
+        prefix: route.prefix,
+        version: route.adapter.version,
+        sunsetAt: configured ?? null,
+        source: configured === undefined ? ("none" as const) : ("config" as const),
+      };
+    });
+  }
+
+  private hasPrefix(prefix: string): boolean {
+    return this.routes.some((route) => route.prefix === prefix);
   }
 }
 

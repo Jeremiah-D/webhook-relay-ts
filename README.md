@@ -84,6 +84,17 @@ reliability primitives that matter for any signed-payload pipeline.
   count under `version="none"`); paths without a registered prefix are
   untouched — no `version` field anywhere, exactly the legacy behavior.
   Invalid routes throw `RangeError` at startup.
+  - WR-144 per-version sunset (opt-in): a route's `sunsetAt` (epoch-ms or
+    ISO-8601) retires the version — once reached, matching intakes are
+    answered `410 Gone` with the RFC 8594 `Sunset` header and audited as
+    `rejected` with reason `version_sunset`; they never reach the adapter
+    or the retry queue. Sunsets are hot-updatable (immediate effect, no
+    restart) via `POST /config/version-sunset` (operator, admin scope;
+    body `{ prefix, sunsetAt }`, `null` clears) and audited as
+    `version_sunset_updated`; `GET /config/version-sunset` (operator,
+    read scope) inspects every route's effective sunset. Invalid moments
+    throw `RangeError` at startup and 400 on the operator endpoint —
+    a 400 always means "nothing changed".
 - `src/schema.ts` — inbound payload JSON schema registry
   (`selectEndpointSchema`). Per-endpoint pluggable shape validation, off
   by default: inbound paths match `{ pattern, schema }` rules (exact
