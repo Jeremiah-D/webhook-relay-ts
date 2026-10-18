@@ -65,6 +65,16 @@ export interface HealthSummaryRetryBudget {
   depleted: number;
 }
 
+/** WR-136 adaptive inbound throttle snapshot (intake self-protection). */
+export interface HealthSummaryInboundRateLimit {
+  /** Whether the throttle has engaged (queue depth at/above the high mark). */
+  throttled: boolean;
+  /** Per-endpoint budget currently enforced (requests/sec). */
+  effectivePerEndpointPerSecond: number;
+  /** Retry-queue pending depth the snapshot was taken at. */
+  pendingDepth: number;
+}
+
 /** One WR-78 usage row, trimmed to the fields a health reader needs. */
 export interface HealthSummaryTenantUsage {
   tenant: string;
@@ -84,6 +94,11 @@ export interface HealthSummary {
   at: string;
   /** Global retry budget (WR-38); absent when the budget is disabled. */
   retryBudget?: HealthSummaryRetryBudget;
+  /**
+   * Adaptive inbound throttle (WR-136); absent when the adaptive
+   * limiter is unconfigured.
+   */
+  inboundRateLimit?: HealthSummaryInboundRateLimit;
   /** One row per (tenant, endpoint) with any health signal, first-seen order. */
   endpoints: HealthSummaryEndpoint[];
   /** Top tenants by delivery volume in the usage window (WR-78); empty when usage metering is unconfigured. */
@@ -98,6 +113,11 @@ export interface HealthSummaryInput {
   retryBudget?: HealthSummaryRetryBudget;
   /** `undefined` (or empty) when usage metering is unconfigured. */
   usage?: TenantUsage[];
+  /**
+   * WR-136 adaptive inbound throttle state; `undefined` when the
+   * adaptive limiter is not configured.
+   */
+  inboundRateLimit?: HealthSummaryInboundRateLimit;
   /** Rows to keep in `tenantUsageTop`. Default 10. */
   topTenants?: number;
 }
@@ -192,6 +212,15 @@ export function buildHealthSummary(input: HealthSummaryInput): HealthSummary {
           retryBudget: {
             retriesPerMinute: input.retryBudget.retriesPerMinute,
             depleted: input.retryBudget.depleted,
+          },
+        }
+      : {}),
+    ...(input.inboundRateLimit !== undefined
+      ? {
+          inboundRateLimit: {
+            throttled: input.inboundRateLimit.throttled,
+            effectivePerEndpointPerSecond: input.inboundRateLimit.effectivePerEndpointPerSecond,
+            pendingDepth: input.inboundRateLimit.pendingDepth,
           },
         }
       : {}),

@@ -455,7 +455,18 @@ reliability primitives that matter for any signed-payload pipeline.
   buckets, and the check is peek-then-consume so a rejection never burns the
   other dimension's token. Wired into the server via `rateLimit: {...}`
   (off by default); over-budget requests are answered 429 with `retry-after`
-  and audited as `rejected` (reason `rate_limited`). Injectable clock for
+  and audited as `rejected` (reason `rate_limited`). The opt-in
+  `rateLimit.adaptiveInbound` (WR-136) scales the per-endpoint budget with the
+  retry queue's pending depth: past `queueDepthHigh` the budget throttles
+  toward `minPerEndpointPerSecond` (linear in depth), and the full budget is
+  restored only after depth falls back below `queueDepthLow` (hysteresis — the
+  band between keeps the current state, so the budget never flaps at the
+  threshold). A wide downstream outage thus slows the intake instead of
+  piling the backlog deeper; the IP dimension is untouched. 429 /
+  `retry-after` semantics are unchanged (computed against the effective
+  budget), and the current effective budget is exposed via
+  `InboundRateLimiter.adaptiveStats()` and the operator `GET /health/summary`
+  (`inboundRateLimit`). Injectable clock for
   deterministic tests.
 - Inbound request body limit (`maxBodyBytes`, `DEFAULT_MAX_BODY_BYTES` = 1 MiB):
   a POST whose body exceeds the budget is answered 413 and audited as

@@ -5187,7 +5187,13 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     opts.payloadSchemas !== undefined ? new InboundSchemaRegistry(opts.payloadSchemas) : undefined;
   const schemaMetrics = new SchemaMetrics();
   const deduplicator = opts.dedup ? new DeliveryDeduplicator(opts.dedup) : undefined;
-  const rateLimiter = opts.rateLimit ? new InboundRateLimiter(opts.rateLimit) : undefined;
+  // WR-136: the adaptive inbound throttle (when `rateLimit.adaptiveInbound`
+  // is set) reads the live retry-queue depth, so a wide downstream outage
+  // slows the intake instead of piling the backlog deeper. `queue` is
+  // built above; the provider is never called when adaptive is off.
+  const rateLimiter = opts.rateLimit
+    ? new InboundRateLimiter(opts.rateLimit, () => queue.pendingCount())
+    : undefined;
   // Inbound IP allowlist/denylist (WR-53): rules and trusted proxies are
   // validated (and every CIDR pre-parsed) once at startup, so a bad CIDR
   // can never fail a request mid-flight.
@@ -5859,6 +5865,20 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
           probes: queue.getProbeStats(),
           retryBudget: queue.getRetryBudgetStats(),
           usage: usageMeter?.snapshot(),
+          // WR-136: surface the adaptive inbound throttle state (absent
+          // when the adaptive limiter is unconfigured). Only the
+          // operator-token-guarded health summary grows — no new
+          // operator route.
+          inboundRateLimit: (() => {
+            const s = rateLimiter?.adaptiveStats();
+            return s !== undefined && s.enabled
+              ? {
+                  throttled: s.throttled,
+                  effectivePerEndpointPerSecond: s.effectivePerEndpointPerSecond!,
+                  pendingDepth: s.pendingDepth!,
+                }
+              : undefined;
+          })(),
         })
       );
       return;
