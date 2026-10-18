@@ -218,7 +218,10 @@ describe("RetryQueue globalMaxConcurrent", () => {
     q.start();
     await timer.step();
     assert.deepEqual(new Set(started), new Set(["a", "c"]));
-    assert.equal(q.getGlobalConcurrencyStats().inFlight, 2);
+    // WR-140: the per-endpoint limiter is the innermost gate now, so b
+    // holds a global slot while queued on it — the gate counts held
+    // slots, not just actively sending dispatches.
+    assert.equal(q.getGlobalConcurrencyStats().inFlight, 3);
     assert.equal(q.getGlobalConcurrencyStats().queuedDepth, 0); // b waits on the limiter, not the gate
     release("a");
     await flush();

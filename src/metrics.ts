@@ -59,6 +59,10 @@
  *   to wait for a relay-level global concurrency slot (WR-51). Present
  *   only when the cap is configured (finite). No endpoint label — the
  *   cap is relay-wide.
+ * - `relay_tenant_concurrency_wait_total{tenant}`: counter of dispatches
+ *   that had to wait for a per-tenant concurrency slot (WR-140), by
+ *   tenant. Present only when the per-tenant cap is configured (finite),
+ *   and only for tenants that actually waited (activity-gated).
  * - `relay_scheduled_total` / `relay_scheduled_due_total` /
  *   `relay_scheduled_canceled_total`: counters of deliveries parked for a
  *   future `deliver_at` (WR-57), of parked deliveries whose instant
@@ -277,6 +281,16 @@ export interface TenantRateLimitMetricsInput {
   limited: number;
 }
 
+/**
+ * One tenant's dispatch-gate waits (WR-140), in Prometheus label order.
+ */
+export interface TenantConcurrencyWaitMetricsInput {
+  /** Tenant id (WR-48), always set — rendered as the `tenant` label. */
+  tenant: string;
+  /** Cumulative dispatches that waited for one of this tenant's slots. */
+  waits: number;
+}
+
 export interface MetricsInput {
   deliveries: DeliveryCountersInput[];
   circuits: CircuitStateInput[];
@@ -383,6 +397,14 @@ export interface MetricsInput {
    * untouched relay's exposition is byte-identical.
    */
   tenantRateLimited?: TenantRateLimitMetricsInput[];
+  /**
+   * Present only when the per-tenant concurrency cap (WR-140) is
+   * configured (finite); one counter series per tenant that actually
+   * waited for a tenant slot — activity-gated, so a relay whose tenants
+   * never waited exposes no `relay_tenant_concurrency_wait_total` series
+   * at all.
+   */
+  tenantConcurrencyWaits?: TenantConcurrencyWaitMetricsInput[];
   /**
    * Present only when quorum fan-out (WR-106) is enabled; one series per
    * (tenant, endpoint) with a recorded acknowledgement or loss — absent
@@ -566,6 +588,25 @@ export function renderAdaptiveConcurrencyBlock(series: AdaptiveConcurrencyMetric
   for (const s of series) {
     lines.push(
       `relay_adaptive_concurrency_limit{endpoint="${escapeLabelValue(s.endpoint)}"${tenantLabel(s.tenant)}} ${s.limit}`
+    );
+  }
+  return lines;
+}
+
+/**
+ * Render just the per-tenant concurrency wait block (WR-140) as
+ * exposition lines; `[]` when the series is empty, so callers can keep
+ * their output byte-identical until the first tenant actually waits.
+ */
+export function renderTenantConcurrencyWaitBlock(series: TenantConcurrencyWaitMetricsInput[]): string[] {
+  if (series.length === 0) return [];
+  const lines = [
+    "# HELP relay_tenant_concurrency_wait_total Dispatches that waited for a per-tenant concurrency slot (WR-140), by tenant.",
+    "# TYPE relay_tenant_concurrency_wait_total counter",
+  ];
+  for (const s of series) {
+    lines.push(
+      `relay_tenant_concurrency_wait_total{tenant="${escapeLabelValue(s.tenant)}"} ${s.waits}`
     );
   }
   return lines;
@@ -1010,6 +1051,9 @@ export function renderPrometheus(input: MetricsInput): string {
   // WR-97: activity-gated the same way — the series appears only once a
   // (tenant, endpoint) scope has actually been rate-limited.
   lines.push(...renderTenantRateLimitedBlock(input.tenantRateLimited ?? []));
+  // WR-140: activity-gated the same way — the series appears only once
+  // a tenant has actually waited for a tenant concurrency slot.
+  lines.push(...renderTenantConcurrencyWaitBlock(input.tenantConcurrencyWaits ?? []));
   // WR-137: activity-gated the same way — the budget gauges appear only
   // once a tenant budget is configured, so a relay without budgets
   // exposes no `relay_tenant_budget_*` series at all.

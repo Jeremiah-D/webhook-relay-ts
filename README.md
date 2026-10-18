@@ -1705,6 +1705,41 @@ queue.getGlobalConcurrencyStats();
   check bails it out instead of dispatching, so a shutdown waits only
   for genuinely in-flight deliveries.
 
+## Per-tenant outbound concurrency cap
+
+`globalMaxConcurrent` bounds in-flight deliveries across the whole
+relay; `tenantMaxConcurrent` (`retry.tenantMaxConcurrent`) bounds them
+*per tenant across all of that tenant's endpoints* — the fairness valve
+between tenants. Each tenant gets an independent gate (WR-48 isolation,
+created lazily), so one tenant's flood queues against its own cap and
+never occupies another tenant's slots.
+
+```ts
+const queue = new RetryQueue({
+  tenantMaxConcurrent: 16, // per tenant (WR-140); default Infinity
+});
+queue.getTenantConcurrencyStats();
+// → [{ tenant: "acme", maxConcurrent: 16, inFlight: 3, queuedDepth: 1, waitsTotal: 9 }]
+```
+
+- **Placement** — the gate sits inside the WR-51 global gate and outside
+  the per-endpoint limiter: a dispatch takes the global slot, then its
+  tenant's slot, then the per-endpoint slot; releases run in reverse
+  order. The urgent lane bypasses it like the per-endpoint limiter
+  (both are tenant policy, not relay-level capacity) but not the global
+  gate.
+- **Waiting is neutral** — excess dispatches wait FIFO: never dropped,
+  never burning retry budget, never touching the circuit breaker.
+- **Tenant-less deliveries skip it entirely** — with no `x-tenant-id`
+  the dispatch path is byte-for-byte the pre-WR-140 behavior.
+- **Observability** — `getTenantConcurrencyStats()` reports one row per
+  tenant in first-seen order; tenants that actually waited also export
+  `relay_tenant_concurrency_wait_total{tenant}` (activity-gated —
+  absent until a tenant waits, and only when the cap is configured).
+  Invalid values throw `RangeError` at construction.
+- **Shutdown-safe** — promise-FIFO only (no timers, nothing to unref);
+  `stop()`/`shutdown()` wake every tenant's waiters.
+
 ## Adaptive outbound concurrency (AIMD)
 
 The fixed per-endpoint cap (`maxConcurrentPerEndpoint`, WR-06) is static:
@@ -3628,6 +3663,9 @@ Per (tenant, endpoint), the relay isolates:
 
 - **concurrency limiter** — one tenant's slow downstream never starves
   another's deliveries;
+- **outbound concurrency gate** — per-tenant in-flight cap across the
+  tenant's endpoints (`tenantMaxConcurrent`); one tenant's flood queues
+  against its own cap;
 - **delivery quota** — token buckets are per tenant;
 - **circuit breaker** — a tripped breaker only parks its own tenant's
   attempts (probes still feed every tenant's breaker, so shared-downstream

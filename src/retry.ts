@@ -239,6 +239,10 @@ import {
   type GlobalConcurrencyStats,
 } from "./global-concurrency.ts";
 import {
+  TenantConcurrencyGates,
+  type TenantConcurrencyStats,
+} from "./tenant-concurrency.ts";
+import {
   renderPrometheus,
   type CircuitStateInput,
   type CircuitErrorRateInput,
@@ -1842,6 +1846,23 @@ export interface RetryQueueOptions {
    */
   globalMaxConcurrent?: number;
   /**
+   * Per-tenant cap on concurrent in-flight deliveries *for one tenant
+   * across all of its endpoints* (see {@link TenantConcurrencyGates}).
+   * Each tenant gets an independent gate (WR-48 isolation): one tenant's
+   * flood queues against its own cap and never occupies another tenant's
+   * slots. The gate sits inside the WR-51 global gate and outside the
+   * per-endpoint limiter — the last tenant-granularity gate before the
+   * sender. When the cap is hit, excess dispatches wait FIFO: never
+   * dropped, never burning retry budget, never touching the circuit
+   * breaker. The urgent lane bypasses it (like the per-endpoint limiter —
+   * both are tenant policy, not relay-level capacity) but not the global
+   * gate. Tenant-less deliveries never touch it: with no `x-tenant-id`
+   * the path is exactly the pre-WR-140 behavior. Default: `Infinity`
+   * (unlimited). Must be a positive integer or `Infinity`; anything else
+   * throws `RangeError` at construction.
+   */
+  tenantMaxConcurrent?: number;
+  /**
    * Per-endpoint delivery time windows ("quiet hours"; WR-52, see
    * `src/delivery-window.ts`): exact `targetUrl` -> window spec
    * (`"HH:MM-HH:MM"` in UTC, e.g. `"09:00-18:00"` for daytime-only
@@ -3192,6 +3213,15 @@ export class RetryQueue {
    */
   private readonly globalGate: GlobalConcurrencyGate;
   private readonly globalMaxConcurrent: number;
+  /**
+   * WR-140: per-tenant dispatch gates (one independent gate per tenant,
+   * created lazily). Always constructed; with the default `Infinity` cap
+   * every acquisition grants immediately, and tenant-less deliveries skip
+   * the gate entirely, so unconfigured behavior is byte-for-byte the
+   * pre-WR-140 behavior.
+   */
+  private readonly tenantGates: TenantConcurrencyGates;
+  private readonly tenantMaxConcurrent: number;
   /** Deliveries currently executing (inside `deliver()`), for graceful drain. */
   private readonly inFlight = new Set<Promise<void>>();
   private running = false;
@@ -3257,6 +3287,9 @@ export class RetryQueue {
     // WR-51: invalid values throw here, at construction — never mid-delivery.
     this.globalMaxConcurrent = opts.globalMaxConcurrent ?? Infinity;
     this.globalGate = new GlobalConcurrencyGate(this.globalMaxConcurrent);
+    // WR-140: invalid values throw here, at construction — never mid-delivery.
+    this.tenantMaxConcurrent = opts.tenantMaxConcurrent ?? Infinity;
+    this.tenantGates = new TenantConcurrencyGates(this.tenantMaxConcurrent);
     // WR-52: invalid window specs throw here, at construction — an invalid
     // quiet-hours config is a misconfiguration, never a runtime surprise.
     if (opts.deliveryWindow !== undefined) {
@@ -5188,6 +5221,8 @@ export class RetryQueue {
     // liveness check bails them out instead of dispatching, so a stop
     // never leaves a deliver parked on the gate across a restart.
     this.globalGate.releaseWaiters();
+    // WR-140: same for every tenant's gate waiters.
+    this.tenantGates.releaseWaiters();
     // The timers are gone, so no retry fire-time is armed anymore; the
     // next start() (or a restart, via the journaled enqueue lines)
     // schedules fresh.
@@ -5262,6 +5297,8 @@ export class RetryQueue {
     // the stopped queue and bail out, so shutdown() waits only for
     // deliveries genuinely in flight instead of hanging on the gate.
     this.globalGate.releaseWaiters();
+    // WR-140: same for every tenant's gate waiters.
+    this.tenantGates.releaseWaiters();
     this.durablePendingRetry.clear();
     // WR-83: best-effort OTLP export flush — bounded (1s) so a dead
     // collector can never pin shutdown; the exporter clears its own
@@ -5857,17 +5894,14 @@ export class RetryQueue {
       target,
       fastLane ? "urgent" : "normal"
     );
-    // The fast lane bypasses the per-endpoint concurrency limiter entirely:
-    // an urgent delivery never waits behind queued normal deliveries. Its
-    // own bound is the token bucket above. WR-48: the limiter is per
-    // (tenant, endpoint).
-    const release = fastLane ? undefined : await this.limiterFor(tenant).acquire(target);
-    // WR-51: released by the finally below; undefined until the global
-    // gate is acquired. Declared outside the try on purpose: besides
-    // early bail-outs, Node v24.20.0 has a scope bug where a `const`
-    // declared inside a `try` block is invisible in its `finally`
-    // (ReferenceError, not TDZ) — hoisting is the workaround.
+    // WR-51 + WR-140 + WR-06: released by the finally below; undefined
+    // until their gate is acquired. Declared outside the try on purpose:
+    // besides early bail-outs, Node v24.20.0 has a scope bug where a
+    // `const` declared inside a `try` block is invisible in its
+    // `finally` (ReferenceError, not TDZ) — hoisting is the workaround.
     let releaseGlobalSlot: (() => void) | undefined;
+    let releaseTenantSlot: (() => void) | undefined;
+    let releaseLimiter: (() => void) | undefined;
     try {
       // The queue may have stopped, or the item may have been settled, while
       // we waited for a turn or a concurrency slot. Bail out; the releases
@@ -5885,15 +5919,13 @@ export class RetryQueue {
         this.park(id, 0);
         return;
       }
-      // A normal dispatch earns the urgent lane its proportional deficit
-      // (only while urgent demand is backlogged) — the DRR earning event.
-      if (!fastLane) this.laneScheduler.recordNormalDispatch(target);
-      // WR-51: relay-level global dispatch gate — the last acquisition
-      // before the sender, so quota/circuit/budget verdicts and lane
+      // WR-51: relay-level global dispatch gate — the outermost of the
+      // three dispatch gates, so quota/circuit/budget verdicts and lane
       // ordering are all settled before a global slot is taken, and a
       // paused endpoint (checked above) never holds a slot while parked.
-      // The urgent lane bypasses the per-endpoint limiter but NOT this
-      // gate: the cap is relay-level capacity, not per-endpoint policy.
+      // The urgent lane bypasses the per-endpoint limiter and the WR-140
+      // tenant gate (both are tenant policy) but NOT this gate: the cap
+      // is relay-level capacity, not per-endpoint policy.
       releaseGlobalSlot = await this.globalGate.acquire();
       // The gate may have woken us via releaseWaiters() during
       // stop()/shutdown(), or the pause may have landed while we waited:
@@ -5908,6 +5940,52 @@ export class RetryQueue {
         this.park(id, 0);
         return;
       }
+      // WR-140: per-tenant dispatch gate — inside the global gate,
+      // outside the per-endpoint limiter: the last tenant-granularity
+      // gate before the sender. Tenant-less deliveries skip it entirely
+      // (zero behavior change vs pre-WR-140); the urgent lane bypasses it
+      // like the per-endpoint limiter, so an urgent delivery never waits
+      // behind queued normal deliveries of its tenant. Each tenant's
+      // waiters queue against that tenant's own cap only.
+      if (tenant !== undefined && !fastLane) {
+        releaseTenantSlot = await this.tenantGates.acquire(tenant);
+        // Same wake-up re-check as the global gate above.
+        if ((!this.running && !force) || !this.queue.has(id)) {
+          if (probe) breaker?.cancelProbe(target);
+          return;
+        }
+        if (this.pausedEndpoints.has(logicalEndpoint)) {
+          if (probe) breaker?.cancelProbe(target);
+          this.park(id, 0);
+          return;
+        }
+      }
+      // WR-06: per-endpoint concurrency limiter — the innermost gate
+      // since WR-140 moved it inside the tenant gate. The fast lane
+      // bypasses it entirely: an urgent delivery never waits behind
+      // queued normal deliveries. Its own bound is the token bucket
+      // above. WR-48: the limiter is per (tenant, endpoint).
+      releaseLimiter = fastLane ? undefined : await this.limiterFor(tenant).acquire(target);
+      // The limiter may have queued us while the queue stopped or the
+      // endpoint paused: re-check liveness before touching the sender.
+      if ((!this.running && !force) || !this.queue.has(id)) {
+        if (probe) breaker?.cancelProbe(target);
+        return;
+      }
+      if (this.pausedEndpoints.has(logicalEndpoint)) {
+        if (probe) breaker?.cancelProbe(target);
+        this.park(id, 0);
+        return;
+      }
+      // A normal dispatch earns the urgent lane its proportional deficit
+      // (only while urgent demand is backlogged) — the DRR earning event.
+      // Runs after the innermost gate granted (the per-endpoint limiter
+      // since WR-140 moved it inside the tenant gate): the turn stays
+      // tracked as undispatched while the delivery waits on any gate, so
+      // the scheduler never sees a transient "drained" backlog while a
+      // normal delivery moves from a gate queue to its dispatch — the
+      // same invariant the limiter-outermost order provided before.
+      if (!fastLane) this.laneScheduler.recordNormalDispatch(target);
       // WR-85: the exact wire copy this attempt sends. Shadow targets
       // receive this same item (payload, headers, 0-based `attempt`
       // index) with only the `targetUrl` swapped, so an independent
@@ -6352,22 +6430,23 @@ export class RetryQueue {
         }
       }
     } finally {
-      // WR-51: the global slot brackets the attempt exactly — released
-      // once the attempt has settled (success, failure-scheduled, or
-      // dead-lettered), handing it to the oldest waiter. Outermost
-      // resource first, then the turn and the limiter slot as before.
-      // Undefined when the gate was never acquired (early bail-out):
-      // nothing to release.
+      // Released in reverse acquisition order: the limiter slot first
+      // (innermost), then the tenant slot, then the global slot, then
+      // the turn. Each release hands its slot to that gate's oldest
+      // waiter, so the most-downstream waiter is served first and every
+      // slot brackets its attempt exactly (released once the attempt has
+      // settled: success, failure-scheduled, or dead-lettered). The turn
+      // goes last: gate waiters wake on microtasks, so at scheduler
+      // re-run time none has dispatched yet and the scheduler still sees
+      // every queued successor as backlogged — no transient dip that
+      // would work-conservingly release parked urgent turns one dispatch
+      // early (the WR-35 rationale, kept with the gates reordered).
+      // Undefined when a gate was never acquired (early bail-out or a
+      // bypassed lane): nothing to release.
+      releaseLimiter?.();
+      releaseTenantSlot?.();
       releaseGlobalSlot?.();
-      // Released in reverse acquisition order: the turn first, so the
-      // scheduler still sees the limiter-queued successor as backlogged
-      // (no transient dip that would work-conservingly release every
-      // parked urgent turn one dispatch early), then the limiter slot.
-      // Releasing the turn re-runs the lane scheduler: parked urgent
-      // turns may have become affordable, and a drained normal backlog
-      // releases them all (work-conserving).
       releaseTurn();
-      release?.();
     }
   }
 
@@ -6553,6 +6632,17 @@ export class RetryQueue {
    */
   getGlobalConcurrencyStats(): GlobalConcurrencyStats {
     return this.globalGate.stats();
+  }
+
+  /**
+   * Per-tenant dispatch gate snapshots (WR-140): one row per tenant that
+   * has dispatched through the gate, in first-seen order — the
+   * configured per-tenant cap, current in-flight dispatches, FIFO waiter
+   * depth, and cumulative waiter count per tenant. Empty when no tenant
+   * has dispatched yet (tenant-less deliveries never touch the gate).
+   */
+  getTenantConcurrencyStats(): TenantConcurrencyStats[] {
+    return this.tenantGates.stats();
   }
 
   /**
@@ -6743,7 +6833,9 @@ export class RetryQueue {
    * a retry parked (WR-125),
    * and the global-concurrency wait counter
    * (`relay_global_concurrency_wait_total`) when the WR-51 cap is
-   * configured, and the scheduled-delivery counters
+   * configured, plus one `relay_tenant_concurrency_wait_total{tenant}`
+   * series per tenant that actually waited (WR-140, activity-gated),
+   * and the scheduled-delivery counters
    * (`relay_scheduled_total`, `relay_scheduled_due_total`,
    * `relay_scheduled_canceled_total`) once a delivery has actually been
    * parked for a future deliver_at (WR-57), and the SLO-risk headroom gauge
@@ -6973,6 +7065,18 @@ export class RetryQueue {
       // counters.
       ...(this.globalMaxConcurrent !== Infinity
         ? { globalConcurrencyWaits: this.globalGate.waitedTotal() }
+        : {}),
+      // WR-140: one series per tenant that actually waited for a
+      // tenant slot — activity-gated (tenants that never waited expose
+      // nothing), and only when the per-tenant cap is configured
+      // (finite), mirroring the WR-51 convention above.
+      ...(this.tenantMaxConcurrent !== Infinity
+        ? {
+            tenantConcurrencyWaits: this.tenantGates
+              .stats()
+              .filter((s) => s.waitsTotal > 0)
+              .map((s) => ({ tenant: s.tenant, waits: s.waitsTotal })),
+          }
         : {}),
       // WR-57: activity-gated (see above).
       ...(scheduledStats.scheduled > 0

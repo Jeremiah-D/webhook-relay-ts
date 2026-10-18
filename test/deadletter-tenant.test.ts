@@ -173,12 +173,14 @@ describe("tenant-scoped dead-letter replay filter", () => {
       { endpoint: EP_A, count: 3 },
       { endpoint: EP_B, count: 1 },
     ]);
+    // First-seen order: the tenant-less delivery skips the WR-140 tenant
+    // gate (one fewer microtask per attempt), so it dead-letters first.
     assert.deepEqual(stats.byTenantEndpoint, [
+      // The default tenant's row carries no `tenant` field.
+      { endpoint: EP_A, count: 1 },
       { tenant: "acme", endpoint: EP_A, count: 1 },
       { tenant: "acme", endpoint: EP_B, count: 1 },
       { tenant: "globex", endpoint: EP_A, count: 1 },
-      // The default tenant's row carries no `tenant` field.
-      { endpoint: EP_A, count: 1 },
     ]);
   });
 });
