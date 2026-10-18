@@ -7944,6 +7944,12 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       await handleIngestBatch(req, res, mtlsIdentity);
       return;
     }
+    // WR-139: lightweight batch ingestion — per-item signatures only,
+    // no envelope signature; auth follows the inbound intake rules.
+    if (pathname === "/batch") {
+      await handleBatch(req, res, mtlsIdentity);
+      return;
+    }
     const id = randomUUID();
     // WR-98: parse the inbound W3C trace context before any admission
     // decision — gated on the option, so an unset option means zero
@@ -8261,6 +8267,239 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         "content-type": "application/json",
       })
       .end(JSON.stringify({ batchId, traceId: batchTraceId, results }));
+  };
+
+  /**
+   * Lightweight batch ingestion (WR-139): `POST /batch` accepts one JSON
+   * envelope carrying many events, each walking the full per-item
+   * admission chain through `admitOneEvent` (signature — including the
+   * WR-138 `x-signature-alg` negotiation — → tenant → gzip → version →
+   * schema → replay guard → dedup → rate limit → enqueue).
+   *
+   * Trust model vs `POST /ingest/batch` (WR-61): there is NO envelope
+   * signature here. The batcher is authenticated by the intake gates
+   * (IP allowlist, API key, mTLS — "auth follows the inbound rules")
+   * and each event authenticates itself with its own `x-signature`.
+   * This serves producers that aggregate events but cannot hold a
+   * batch-signing key; WR-61 stays the choice when the batcher itself
+   * must be authenticated.
+   *
+   * Fail-fast size gate: any single item whose decoded body exceeds the
+   * global per-event body budget rejects the WHOLE batch with 413 before
+   * any per-item admission runs — zero side effects, no partial
+   * processing. The envelope itself is still capped by the resolved
+   * (possibly per-endpoint) budget; the per-item budget stays global so
+   * an `endpointBodyLimits` rule that widens `/batch` transport cannot
+   * smuggle an oversized event. (WR-61 has no per-item size gate.)
+   *
+   * Envelope shape: `{ "events": [{ "payload": "<base64>", "headers":
+   * { "x-signature": "sha256=…", … } }, …] }`, same as WR-61.
+   * Per-item header names are lowercased before admission (HTTP
+   * semantics; WR-61 passes them through verbatim).
+   *
+   * Responses: 202 when every item was accepted, 207 Multi-Status
+   * otherwise, with `{ batchId, traceId, accepted,
+   * rejected: [{ index, reason }] }`. A malformed envelope is 400 and
+   * never touches per-item admission. The batch is audited once as
+   * `batch_received` (totals), plus the normal per-item `accepted` /
+   * `rejected` / `duplicate_suppressed` events, each carrying `batchId`
+   * for correlation.
+   */
+  const handleBatch = async (
+    req: Parameters<Parameters<typeof createServer>[0]>[0],
+    res: Parameters<Parameters<typeof createServer>[0]>[1],
+    /**
+     * WR-103: the verified client identity from the inbound mTLS gate
+     * (undefined when mTLS is unconfigured or the request presented no
+     * verifiable certificate). Rides the `batch_received` event and every
+     * per-item `accepted` / `rejected` event via `correlation`.
+     */
+    mtlsIdentity?: InboundMtlsIdentity
+  ): Promise<void> => {
+    const batchId = randomUUID();
+    const batchTraceId = resolveTraceId(req.headers[TRACE_ID_HEADER]);
+    const gates = await runIntakeGates(req, res, "/batch", batchId, batchTraceId);
+    if (gates === undefined) return;
+    const body = gates.body;
+
+    // A batch-level tenant is validated once here; a per-item
+    // `x-tenant-id` overrides it for that item (WR-48, same as WR-61).
+    const batchTenantHeader = req.headers[TENANT_ID_HEADER];
+    const batchTenantRaw = Array.isArray(batchTenantHeader)
+      ? batchTenantHeader[0]
+      : batchTenantHeader;
+    let batchTenantId: string | undefined;
+    if (batchTenantRaw !== undefined) {
+      try {
+        assertValidTenantId(batchTenantRaw);
+        batchTenantId = batchTenantRaw;
+      } catch {
+        opts.auditLog.append({
+          event: "rejected",
+          id: batchId,
+          traceId: batchTraceId,
+          path: "/batch",
+          reason: "invalid_tenant_id",
+        });
+        res.writeHead(400, { "content-type": "text/plain" }).end("Invalid x-tenant-id");
+        return;
+      }
+    }
+
+    let envelope: unknown;
+    try {
+      envelope = JSON.parse(body.toString("utf8"));
+    } catch {
+      envelope = undefined;
+    }
+    const events =
+      typeof envelope === "object" && envelope !== null
+        ? (envelope as { events?: unknown }).events
+        : undefined;
+    if (!Array.isArray(events) || events.length === 0) {
+      opts.auditLog.append({
+        event: "rejected",
+        id: batchId,
+        traceId: batchTraceId,
+        path: "/batch",
+        reason: !Array.isArray(events) ? "invalid_batch_shape" : "empty_batch",
+      });
+      res.writeHead(400, { "content-type": "text/plain" }).end("Invalid batch envelope");
+      return;
+    }
+
+    // Validate every item's shape first, then fail the whole batch fast
+    // when any single item exceeds the per-event body budget — before any
+    // per-item admission runs, so an oversized item can never cause
+    // partial processing. Malformed items are NOT a batch failure: like
+    // WR-61 they are reported per item and the rest of the batch is
+    // still admitted.
+    //
+    // The per-item budget is the GLOBAL maxBodyBytes (the WR-25
+    // per-event invariant), not the resolved per-endpoint budget: an
+    // `endpointBodyLimits` rule for `/batch` sizes the envelope
+    // (transport — big batches of normal-sized events stay welcome),
+    // while a single event over the global event cap still fails the
+    // batch fast. (Checking against the resolved budget would be dead
+    // code: base64 inflates every item, so the envelope gate would
+    // always fire first.)
+    const correlation = { batchId,
+      // WR-103: the verified client identity rides every per-item audit
+      // event (`accepted` / `rejected`) through the correlation spread.
+      ...(mtlsIdentity !== undefined
+        ? { clientCertFingerprint: mtlsIdentity.fingerprint, clientCertSubject: mtlsIdentity.subject }
+        : {}),
+    };
+    const bodies: Array<Buffer | undefined> = new Array(events.length);
+    const headerMaps: Record<number, Record<string, string | string[]>> = {};
+    const rejected: Array<{ index: number; reason: string }> = [];
+    for (let index = 0; index < events.length; index++) {
+      const checked = checkIngestBatchItem(events[index]);
+      if (!("item" in checked)) {
+        opts.auditLog.append({
+          event: "rejected",
+          ...correlation,
+          id: randomUUID(),
+          traceId: resolveTraceId(undefined),
+          path: "/batch",
+          reason: "invalid_item",
+          index,
+          detail: checked.problem,
+        });
+        rejected.push({ index, reason: "invalid_item" });
+        continue;
+      }
+      bodies[index] = checked.body;
+      const lowered: Record<string, string | string[]> = {};
+      for (const [k, v] of Object.entries(checked.item.headers ?? {})) {
+        lowered[k.toLowerCase()] = v;
+      }
+      headerMaps[index] = lowered;
+    }
+    const oversizedIndex = bodies.findIndex(
+      (b) => b !== undefined && b.length > maxBodyBytes
+    );
+    if (oversizedIndex !== -1) {
+      opts.auditLog.append({
+        event: "rejected",
+        id: batchId,
+        traceId: batchTraceId,
+        path: "/batch",
+        reason: "item_too_large",
+        index: oversizedIndex,
+        itemBytes: (bodies[oversizedIndex] as Buffer).length,
+        maxBodyBytes,
+      });
+      // `connection: close` like the WR-25 413: the sender already proved
+      // it will push oversized items, don't let it stream more into a
+      // dead request.
+      res
+        .writeHead(413, { "content-type": "text/plain", connection: "close" })
+        .end("Batch item exceeds body size limit");
+      return;
+    }
+
+    let accepted = 0;
+    for (let index = 0; index < events.length; index++) {
+      const itemBody = bodies[index];
+      if (itemBody === undefined) continue; // already recorded as invalid_item above
+      const itemHeaderMap = headerMaps[index] ?? {};
+      const itemId = randomUUID();
+      // WR-98: per-item W3C trace context, like the single-event intake —
+      // gated on the option; an invalid item-level `traceparent` is
+      // ignored, never a 400 for the item.
+      const itemTrace =
+        traceContextOpts === undefined
+          ? undefined
+          : parseInboundTraceContext(
+              itemHeaderMap[TRACEPARENT_HEADER],
+              itemHeaderMap[TRACESTATE_HEADER]
+            );
+      const itemTraceId =
+        itemTrace?.traceId ?? resolveTraceId(itemHeaderMap[TRACE_ID_HEADER]);
+      const itemHeaders: Record<string, string | string[] | undefined> = {
+        ...itemHeaderMap,
+      };
+      if (itemHeaders[TENANT_ID_HEADER] === undefined && batchTenantId !== undefined) {
+        itemHeaders[TENANT_ID_HEADER] = batchTenantId;
+      }
+      const outcome = await admitOneEvent(
+        itemId,
+        itemTraceId,
+        itemBody,
+        itemHeaders,
+        "/batch",
+        correlation,
+        undefined,
+        itemTrace,
+        gates.maxBodyBytes
+      );
+      if (outcome.status === 202) {
+        accepted++;
+      } else {
+        rejected.push({ index, reason: outcome.reason ?? "unknown" });
+      }
+    }
+
+    opts.auditLog.append({
+      event: "batch_received",
+      id: batchId,
+      traceId: batchTraceId,
+      path: "/batch",
+      total: events.length,
+      accepted,
+      rejected: rejected.length,
+      ...(batchTenantId !== undefined ? { tenant: batchTenantId } : {}),
+      // WR-103: verified client identity on the batch-level audit event.
+      ...(mtlsIdentity !== undefined
+        ? { clientCertFingerprint: mtlsIdentity.fingerprint, clientCertSubject: mtlsIdentity.subject }
+        : {}),
+    });
+    res
+      .writeHead(accepted === events.length ? 202 : 207, {
+        "content-type": "application/json",
+      })
+      .end(JSON.stringify({ batchId, traceId: batchTraceId, accepted, rejected }));
   };
 
   /**

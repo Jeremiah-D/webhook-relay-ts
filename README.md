@@ -2328,6 +2328,42 @@ curl -X POST http://relay/ingest/batch \
   carrying `batchId` for correlation. A batch-level `x-tenant-id` is
   validated once and inherited; a per-item `x-tenant-id` overrides it.
 
+## Lightweight batch ingestion (`POST /batch`)
+
+Same envelope shape as `/ingest/batch`, but **no envelope signature**:
+the batcher is authenticated by the intake gates (IP allowlist, API key,
+mTLS — auth follows the inbound rules) and each event authenticates
+itself with its own `x-signature`. For producers that aggregate events
+but cannot hold a batch-signing key; `/ingest/batch` stays the choice
+when the batcher itself must be authenticated.
+
+```bash
+curl -X POST http://relay/batch \
+  -d '{"events":[{"payload":"eyJvcmRlciI6IjEyMyJ9","headers":{"x-signature":"sha256=<item-signature>"}}]}'
+# → 202 { batchId, traceId, accepted: 1, rejected: [] }
+# → 207 { batchId, traceId, accepted: 1, rejected: [{ index: 1, reason: "invalid_signature" }] }
+```
+
+- **Full per-item pipeline** — every item walks the same admission as a
+  single webhook: signature (including `x-signature-alg` negotiation) →
+  tenant → gzip → version adaptation → schema → replay guard → dedup →
+  rate limit → enqueue. Per-item header names are lowercased before
+  admission (HTTP semantics).
+- **Fail-fast size gate** — any single item whose decoded body exceeds
+  the global per-event body budget rejects the *whole* batch with `413`
+  before any per-item admission runs (zero side effects, no partial
+  processing; audited as `rejected` with reason `item_too_large`).
+  The envelope itself is still capped by the resolved (possibly
+  per-endpoint) budget, so an `endpointBodyLimits` rule can widen
+  `/batch` transport for big batches without letting one oversized
+  event through.
+- **Per-item failure isolation** — malformed items are reported per item
+  (`{ index, reason: "invalid_item" }`) and never fail the batch; only
+  the size gate and a malformed envelope (`400`) fail the whole batch.
+- **Audit** — one `batch_received` event (totals) plus the normal
+  per-item `accepted` / `rejected` / `duplicate_suppressed` events, each
+  carrying `batchId` for correlation.
+
 ## Content-based routing
 
 Route an inbound webhook to a target endpoint by matching rules against
