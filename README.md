@@ -468,6 +468,20 @@ reliability primitives that matter for any signed-payload pipeline.
   `InboundRateLimiter.adaptiveStats()` and the operator `GET /health/summary`
   (`inboundRateLimit`). Injectable clock for
   deterministic tests.
+- `src/tenant-inbound-ratelimit.ts` — per-tenant inbound rate limiting
+  (`InboundTenantRateLimiter`): one token bucket per `x-tenant-id`
+  guarding the webhook intake — the inbound counterpart to the WR-22
+  limiter and orthogonal to the WR-97 per-(tenant, endpoint) *outbound*
+  limiter. Checked after the WR-22 limiter and before signature
+  verification, so one abusive tenant's flood is rejected before it burns
+  verifier CPU. Same lazy-refill / peek-then-consume / clock-skew-clamped
+  mechanics as `src/ratelimit.ts`; invalid budgets throw `RangeError` at
+  construction; injectable clock for deterministic tests. Wired into the
+  server via `inboundTenantRateLimit: {...}` (off by default); over-budget
+  requests are answered 429 with `retry-after` and audited as `rejected`
+  (reason `tenant_rate_limited`), and denials are exported as
+  `relay_inbound_tenant_limited_total{tenant}` (activity-gated — absent
+  until the first denial).
 - Inbound request body limit (`maxBodyBytes`, `DEFAULT_MAX_BODY_BYTES` = 1 MiB):
   a POST whose body exceeds the budget is answered 413 and audited as
   `rejected` (reason `body_too_large`). Two lines of defense: the declared
@@ -1074,7 +1088,12 @@ reliability primitives that matter for any signed-payload pipeline.
   are answered 429 with a `retry-after` header and audited as `rejected`
   with reason `rate_limited` and the exhausted `dimension`. The check runs
   before the body is read and before signature verification, so a flood
-  costs almost nothing), enqueue for forwarding to
+  costs almost nothing), optionally per-tenant intake rate limiting
+  (`inboundTenantRateLimit: { perTenantPerSecond }` — one token bucket per
+  `x-tenant-id`, checked after the WR-22 limiter and before verification so
+  one abusive tenant's flood is rejected before it burns verifier CPU;
+  over-budget requests are answered 429 and audited as `rejected` with
+  reason `tenant_rate_limited`), enqueue for forwarding to
   `forwardUrl`, audit accept / delivered / dead-letter events. A failed verification returns 401 + audit entry.
   Operator endpoints `GET /dead-letter` (list dead letters with
   attempts/lastError/timestamp metadata, no raw payloads),
@@ -3666,6 +3685,9 @@ Per (tenant, endpoint), the relay isolates:
 - **outbound concurrency gate** — per-tenant in-flight cap across the
   tenant's endpoints (`tenantMaxConcurrent`); one tenant's flood queues
   against its own cap;
+- **inbound rate limiter** — per-`x-tenant-id` token bucket at intake
+  (`inboundTenantRateLimit`), checked before signature verification so
+  one tenant's flood never burns verifier CPU meant for others;
 - **delivery quota** — token buckets are per tenant;
 - **circuit breaker** — a tripped breaker only parks its own tenant's
   attempts (probes still feed every tenant's breaker, so shared-downstream

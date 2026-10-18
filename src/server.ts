@@ -124,6 +124,11 @@ import {
   matchOperatorRoute,
 } from "./operator-routes.ts";
 import { InboundRateLimiter, type InboundRateLimitOptions } from "./ratelimit.ts";
+import {
+  InboundTenantRateLimiter,
+  InboundTenantRateLimitMetrics,
+  type InboundTenantRateLimitOptions,
+} from "./tenant-inbound-ratelimit.ts";
 import type { TenantRateLimitOptions } from "./tenant-ratelimit.ts";
 import { InboundIpAcl, IpAclMetrics, type IpAclOptions } from "./ip-acl.ts";
 import { InboundApiKeyAuth, type ApiKeyOptions, type EndpointApiKeyRule } from "./api-key.ts";
@@ -1532,6 +1537,19 @@ export interface RelayServerOptions {
    * nothing. Disabled by default.
    */
   rateLimit?: InboundRateLimitOptions;
+  /**
+   * Per-tenant inbound rate limiting (see
+   * `src/tenant-inbound-ratelimit.ts`): a token bucket per `x-tenant-id`
+   * guarding the webhook intake. A request over its tenant's per-second
+   * budget is answered 429 with a `retry-after` header and audited as
+   * `rejected` with reason `tenant_rate_limited`. The check runs after
+   * the WR-22 limiter and before signature verification, so one abusive
+   * tenant's flood is rejected before it burns verifier CPU. Disabled by
+   * default; requests without `x-tenant-id` are untouched (zero behavior
+   * change). Orthogonal to `tenantRateLimit` (WR-97), which paces
+   * *outbound* dispatch per (tenant, endpoint).
+   */
+  inboundTenantRateLimit?: InboundTenantRateLimitOptions;
   /**
    * Inbound WebSocket event intake (WR-130; see `src/inbound-ws.ts`): serve
    * a `ws(s)://` upgrade endpoint so producers can push events over one
@@ -5227,6 +5245,15 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   const rateLimiter = opts.rateLimit
     ? new InboundRateLimiter(opts.rateLimit, () => queue.pendingCount())
     : undefined;
+  // WR-141: per-tenant inbound rate limiter (one token bucket per
+  // x-tenant-id), checked after the WR-22 limiter and before signature
+  // verification. Unset = unlimited: the intake path is byte-identical.
+  // The metrics renderer is always built — it renders "" until the first
+  // denial, so an untouched relay's /metrics stays byte-identical.
+  const inboundTenantRateLimiter = opts.inboundTenantRateLimit
+    ? new InboundTenantRateLimiter(opts.inboundTenantRateLimit)
+    : undefined;
+  const inboundTenantRateLimitMetrics = new InboundTenantRateLimitMetrics();
   // Inbound IP allowlist/denylist (WR-53): rules and trusted proxies are
   // validated (and every CIDR pre-parsed) once at startup, so a bad CIDR
   // can never fail a request mid-flight.
@@ -5731,7 +5758,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       // new series. Absent entirely with a custom sender (no pool).
       res
         .writeHead(200, { "content-type": "text/plain; version=0.0.4" })
-        .end(queue.renderMetrics() + versionMetrics.render() + schemaMetrics.render() + (schemaRegistry?.renderMetrics() ?? "") + ipAclMetrics.render() + certExpiryMonitor.render() + tlsVersionMonitor.render() + (ocspMonitor?.render() ?? "") + (usageMeter?.render() ?? "") + (defaultSender?.compressionStats.render() ?? "") + (defaultSender?.dnsCache?.render() ?? "") + (defaultSender?.wsPool.renderMetrics() ?? "") + meshMetrics.render() + (defaultSender?.outboundSchemaMetrics?.render() ?? "") + (reputation?.renderMetrics() ?? ""));
+        .end(queue.renderMetrics() + versionMetrics.render() + schemaMetrics.render() + (schemaRegistry?.renderMetrics() ?? "") + ipAclMetrics.render() + inboundTenantRateLimitMetrics.render() + certExpiryMonitor.render() + tlsVersionMonitor.render() + (ocspMonitor?.render() ?? "") + (usageMeter?.render() ?? "") + (defaultSender?.compressionStats.render() ?? "") + (defaultSender?.dnsCache?.render() ?? "") + (defaultSender?.wsPool.renderMetrics() ?? "") + meshMetrics.render() + (defaultSender?.outboundSchemaMetrics?.render() ?? "") + (reputation?.renderMetrics() ?? ""));
       return;
     }
     if (isEvents) {
@@ -7016,6 +7043,51 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
             })
             .end("Too many requests");
           return undefined;
+        }
+      }
+    }
+
+    // Per-tenant inbound rate limiting (WR-141): the x-tenant-id token
+    // bucket, checked after the WR-22 limiter and before signature
+    // verification, so one abusive tenant's flood is rejected before it
+    // burns verifier CPU. The tenant id format is validated with the
+    // WR-48 validator; an invalid id skips this check — the request still
+    // fails verification/validation downstream exactly as before, so
+    // unauthenticated callers learn nothing new. No header or unconfigured
+    // limiter: zero behavior change.
+    if (inboundTenantRateLimiter !== undefined) {
+      const tenantHeader = req.headers[TENANT_ID_HEADER];
+      const tenantRaw = Array.isArray(tenantHeader) ? tenantHeader[0] : tenantHeader;
+      if (typeof tenantRaw === "string" && tenantRaw !== "") {
+        let limitedTenant: string | undefined;
+        try {
+          assertValidTenantId(tenantRaw);
+          limitedTenant = tenantRaw;
+        } catch {
+          // Invalid tenant id: not rate-limited here; the WR-48 400
+          // below (after verification) still applies unchanged.
+        }
+        if (limitedTenant !== undefined) {
+          const tenantCheck = inboundTenantRateLimiter.take(limitedTenant);
+          if (!tenantCheck.ok) {
+            inboundTenantRateLimitMetrics.record(limitedTenant);
+            opts.auditLog.append({
+              event: "rejected",
+              id,
+              traceId,
+              reason: "tenant_rate_limited",
+              tenant: limitedTenant,
+              retryAfterMs: tenantCheck.retryAfterMs,
+            });
+            res
+              .writeHead(429, {
+                "content-type": "text/plain",
+                // Ceiling seconds, minimum 1: a Retry-After of 0 is meaningless.
+                "retry-after": String(Math.max(1, Math.ceil(tenantCheck.retryAfterMs / 1000))),
+              })
+              .end("Too many requests");
+            return undefined;
+          }
         }
       }
     }
