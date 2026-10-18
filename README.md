@@ -1220,6 +1220,50 @@ const server = createRelayServer({
   journaled — the window is sub-second by default and `shutdown()` flushes
   it into the queue first.
 
+Opt-in crash recovery for *scheduled* (`deliver_at`) deliveries (WR-133,
+`durableScheduledDir`, also available as `retry.durableScheduledDir`):
+one-shot parked deliveries are journaled to `<dir>/scheduled.jsonl`
+(append-only JSONL, fsync'd per append) and restored when the process
+restarts. Items still in the future resume parked with their remaining
+delay; items past-due at recovery skip the delay queue and go straight to
+the normal delivery path (past-due semantics match the live intake).
+Nothing is attempted while parked, so a recovered item always carries zero
+consumed attempts.
+
+```ts
+const server = createRelayServer({
+  secret, forwardUrl, auditLog,
+  durableScheduledDir: "/var/lib/relay/scheduled", // opt-in; unset = in-memory parking
+  payloadEncryptor,                                 // payloads sealed at rest (WR-11)
+});
+```
+
+- **Payload secrecy** follows the WR-49 rule: sealed with the
+  `payloadEncryptor` when one is configured, base64-encoded in the clear
+  otherwise. Configure an encryptor in production.
+- **At-least-once**: `park` and `cancel` lines are written *before* the
+  in-memory mutation they describe, so a crash between the two can only
+  redeliver, never lose. `fired` is the deliberate exception — written
+  *after* the item entered the normal path, so a crash in between re-parks
+  instead of losing the delivery.
+- **Recovery is audited**: every boot with the journal enabled appends a
+  `scheduled_restored` event (`restoredParked`, `restoredPastDue`,
+  `skippedLines`). Corrupt lines (torn writes, payloads whose key was
+  rotated) are skipped and counted, never fatal.
+- **Compaction**: superseded lines are rewritten away amortized (and on
+  every recovery and shutdown), so the journal stays proportional to live
+  parked state. Compaction rewrites the original `park` lines verbatim —
+  payloads are never re-encrypted, so a rotated key cannot strand live
+  items.
+- **Recurring cron schedules (WR-80) are not journaled**: future
+  occurrences do not exist yet as deliveries; registrations stay
+  in-memory. `shutdown()` with the journal enabled keeps the parked set
+  (disarmed) instead of dropping it, so a restart resumes it via the
+  journal.
+- **Cost**: one fsync'd append per park, cancel, and fire. That is the
+  durability price — leave the option off when you don't need crash
+  recovery for scheduled deliveries.
+
 ## Runtime config hot reload
 
 Delivery policy can be retuned without restarting the process:
@@ -1500,12 +1544,15 @@ curl http://127.0.0.1:PORT/scheduled \
   audited as `scheduled` (queryable via `GET /audit?event=scheduled`).
   `queue.cancelScheduled(id)` drops a parked item; unknown ids return
   `false`.
-- **In-memory only, honestly** — the delay queue is *not* journaled: a
-  restart does not recover parked deliveries (orthogonal to the WR-49
-  durable queue, which still journals a delivery once its instant arrives
-  and it enters the normal path). `stop()` keeps parked items and re-arms
-  on `start()`; `shutdown()` drops parked-but-not-due items exactly like
-  backoff-waiting ones — they were never delivered.
+- **In-memory only, honestly** — the delay queue is *not* journaled by
+  default: a restart does not recover parked deliveries (orthogonal to the
+  WR-49 durable queue, which still journals a delivery once its instant
+  arrives and it enters the normal path). Opt-in with `durableScheduledDir`
+  (WR-133) to journal parked one-shot deliveries and resume them after a
+  restart. `stop()` keeps parked items and re-arms on `start()`; `shutdown()`
+  without the journal drops parked-but-not-due items exactly like
+  backoff-waiting ones — they were never delivered (with the journal, the
+  parked set is kept disarmed and compacted instead).
 - **Timer hygiene** — the single arming timer is unref'd, so a far-future
   `deliver_at` never pins the process open; delays beyond `2^31 - 1` ms
   are clamped and re-armed instead of overflowing `setTimeout`. The clock

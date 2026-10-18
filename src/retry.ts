@@ -70,6 +70,12 @@ import {
 } from "./scheduled.ts";
 export { ScheduledDeliveryQueue, parseDeliverAtHeader, DELIVER_AT_HEADER };
 export type { ScheduledQueueOptions, ScheduledStats, ScheduledDeliveryInfo };
+import {
+  ScheduledDeliveryJournal,
+  type ScheduledJournalRecovery,
+} from "./scheduled-journal.ts";
+export { ScheduledDeliveryJournal };
+export type { ScheduledJournalRecovery };
 export { CRON_HEADER, parseCronExpression, nextCronOccurrence } from "./cron.ts";
 export type { CronExpression } from "./cron.ts";
 import {
@@ -1181,6 +1187,16 @@ export class DeliveryDeadlineExceededError extends Error {
   }
 }
 
+/** What a scheduled-delivery journal recovery (WR-133) restored. */
+export interface ScheduledRestoredInfo {
+  dir: string;
+  /** Parked items restored into the delay queue (still future-dated). */
+  restoredParked: number;
+  /** Items past-due at recovery, sent straight to the normal path. */
+  restoredPastDue: number;
+  skippedLines: number;
+}
+
 export interface RetryQueueOptions {
   /** Sender function; defaults to a no-op success sender. Injectable for tests. */
   sender?: Sender;
@@ -1692,6 +1708,30 @@ export interface RetryQueueOptions {
    * nothing). The server audits this as `queue_restored`.
    */
   onQueueRestored?: (info: QueueRestoredInfo) => void;
+  /**
+   * Durable scheduled deliveries (WR-133; see `src/scheduled-journal.ts`).
+   * Opt-in: when set to a directory path, one-shot `deliver_at` parked
+   * deliveries are journaled to `<dir>/scheduled.jsonl` (append-only
+   * JSONL, fsync'd per append) and restored on restart — items past-due
+   * at recovery go straight to the normal delivery path, the rest resume
+   * parked with their remaining delay. Payloads are sealed with the WR-11
+   * `payloadEncryptor` when one is configured, base64-encoded in the
+   * clear otherwise (the same at-rest rule as the WR-49 queue journal).
+   * Unset (or empty) means disabled: purely in-memory parking, exactly as
+   * before. A set but invalid value throws `RangeError` at construction;
+   * an uncreatable directory throws (fail-fast: crash recovery that
+   * cannot write is a misconfiguration, not a degradation). Recurring
+   * cron schedules (WR-80) are intentionally not journaled — their
+   * future occurrences do not exist yet as deliveries.
+   */
+  durableScheduledDir?: string;
+  /**
+   * Called once after a scheduled-delivery journal recovery at
+   * construction (only when `durableScheduledDir` is set and recovery
+   * ran — even when it restored nothing). The server audits this as
+   * `scheduled_restored`.
+   */
+  onScheduledRestored?: (info: ScheduledRestoredInfo) => void;
   /**
    * Called once per endpoint pause-state transition (see
    * {@link RetryQueue.pauseEndpoint}). Edge-triggered: a pause of an
@@ -2792,6 +2832,13 @@ export class RetryQueue {
    */
   private readonly scheduler: ScheduledDeliveryQueue;
   private readonly scheduledNow: () => number;
+  /**
+   * WR-133: opt-in durable scheduled-delivery journal (undefined when
+   * `durableScheduledDir` is unset). Parked one-shot deliveries are
+   * journaled before the in-memory mutation — a crash between the two
+   * can only cause a redelivery (at-least-once), never a loss.
+   */
+  private readonly scheduledJournal?: ScheduledDeliveryJournal;
   /** Attempts parked outside an endpoint's delivery window. Keyed by scoped key (WR-48). */
   private readonly deliveryWindowStats = new Map<string, Map<string, number>>();
   /** WR-127: per-(tenant, endpoint) in-window park counts. */
@@ -3613,6 +3660,45 @@ export class RetryQueue {
       // Recovery rewrites the journal down to live state: superseded
       // lines from before the crash never accumulate.
       this.compactDurable(true);
+    }
+    // WR-133: opt-in durable scheduled-delivery journal. Recovery runs at
+    // construction, like the WR-49 queue journal: parked one-shot
+    // deliveries come back with their remaining delay, past-due items go
+    // straight to the normal delivery path (past-due semantics match the
+    // live intake — a past-due deliver_at never parks).
+    if (opts.durableScheduledDir !== undefined) {
+      if (typeof opts.durableScheduledDir !== "string" || opts.durableScheduledDir.length === 0) {
+        throw new RangeError(
+          `durableScheduledDir must be a non-empty string, got ${JSON.stringify(opts.durableScheduledDir)}`
+        );
+      }
+      this.scheduledJournal = new ScheduledDeliveryJournal(
+        opts.durableScheduledDir,
+        this.payloadEncryptor
+      );
+      const rec = this.scheduledJournal.recover();
+      let restoredParked = 0;
+      let restoredPastDue = 0;
+      const now = this.scheduledNow();
+      for (const item of rec.items) {
+        if (item.deliverAt <= now) {
+          // Past-due: straight into the normal path. The `fired` line is
+          // written after the item entered the queue (at-least-once —
+          // see the journal module doc).
+          this.enqueueNow(item);
+          this.scheduledJournal.appendFired(item.id);
+          restoredPastDue += 1;
+        } else {
+          this.scheduler.park(item);
+          restoredParked += 1;
+        }
+      }
+      opts.onScheduledRestored?.({
+        dir: opts.durableScheduledDir,
+        restoredParked,
+        restoredPastDue,
+        skippedLines: rec.skippedLines,
+      });
     }
   }
 
@@ -4631,7 +4717,11 @@ export class RetryQueue {
     // or circuit consumption until the instant arrives. A past-due value
     // falls through to the normal path below.
     if (traced.deliverAt !== undefined && traced.deliverAt > this.scheduledNow()) {
+      // WR-133: journal before the in-memory mutation — a crash between
+      // the two can only cause a redelivery (at-least-once), never a loss.
+      this.scheduledJournal?.appendPark(traced);
       this.scheduler.park(traced);
+      this.scheduledJournal?.maybeCompact();
       return;
     }
     // The urgent lane is never batched: an urgent delivery must go out
@@ -4697,6 +4787,15 @@ export class RetryQueue {
         });
       }
       this.enqueueNow(item);
+      // WR-133: the `fired` line is written *after* the item entered the
+      // normal path — a crash in between leaves the `park` line live and
+      // recovery re-parks (at-least-once) instead of losing the delivery.
+      // Cron occurrences (WR-80) were never journaled, so only one-shot
+      // items (no `scheduleId`) write here.
+      if (item.scheduleId === undefined) {
+        this.scheduledJournal?.appendFired(item.id);
+        this.scheduledJournal?.maybeCompact();
+      }
     }
   }
 
@@ -4707,7 +4806,14 @@ export class RetryQueue {
    * fired or were never scheduled.
    */
   cancelScheduled(id: string): boolean {
-    return this.scheduler.cancel(id);
+    // WR-133: journal the tombstone before the in-memory cancel — a crash
+    // between the two can only cause a redelivery, never a loss.
+    if (this.scheduledJournal !== undefined && this.scheduler.has(id)) {
+      this.scheduledJournal.appendCancel(id);
+    }
+    const canceled = this.scheduler.cancel(id);
+    this.scheduledJournal?.maybeCompact();
+    return canceled;
   }
 
   /** True when `id` is currently parked in the deliver_at delay queue (WR-57). */
@@ -4926,7 +5032,17 @@ export class RetryQueue {
     // WR-57: parked-but-not-due deliveries are dropped, exactly like
     // backoff-waiting ones — they were never delivered. (The delay queue
     // is in-memory only; a restart does not recover it either.)
-    this.scheduler.clear();
+    // WR-133: with a durable scheduled journal the parked set survives a
+    // restart via the journal, so shutdown keeps the heap (disarmed) and
+    // compacts the journal to the parked set instead of dropping it —
+    // a same-instance start() keeps the items, and a new process
+    // recovers them from the journal.
+    if (this.scheduledJournal !== undefined) {
+      this.scheduler.disarm();
+      this.scheduledJournal.compact();
+    } else {
+      this.scheduler.clear();
+    }
     this.running = false;
     for (const [id, s] of this.timers) {
       this.clearTimer(s.handle);

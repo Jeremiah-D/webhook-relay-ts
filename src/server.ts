@@ -1572,6 +1572,16 @@ export interface RelayServerOptions {
    */
   durableQueueDir?: string;
   /**
+   * Durable scheduled deliveries (WR-133; see `src/scheduled-journal.ts`).
+   * Opt-in: one-shot `deliver_at` parked deliveries are journaled to
+   * `<dir>/scheduled.jsonl` and restored on restart — past-due items go
+   * straight to the normal delivery path, the rest resume parked, and a
+   * `scheduled_restored` audit event records what came back. Payloads are
+   * sealed with `payloadEncryptor` when one is configured. Wins over
+   * `retry.durableScheduledDir` when both are set.
+   */
+  durableScheduledDir?: string;
+  /**
    * Live delivery-event stream (`GET /events`, Server-Sent Events). Emits
    * `delivered` / `retrying` / `dead_letter` frames as JSON
    * (`event: delivery`) in real time, so an operator can watch the delivery
@@ -4441,6 +4451,21 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         skippedLines: info.skippedLines,
       });
       opts.retry?.onQueueRestored?.(info);
+    },
+    // WR-133: an explicit server-level `durableScheduledDir` wins over the
+    // nested `retry.durableScheduledDir`; either way the queue owns the
+    // journal. Wrap the caller's hook so every recovery is audited as
+    // `scheduled_restored`, not just observed.
+    durableScheduledDir: opts.durableScheduledDir ?? opts.retry?.durableScheduledDir,
+    onScheduledRestored: (info) => {
+      opts.auditLog.append({
+        event: "scheduled_restored",
+        dir: info.dir,
+        restoredParked: info.restoredParked,
+        restoredPastDue: info.restoredPastDue,
+        skippedLines: info.skippedLines,
+      });
+      opts.retry?.onScheduledRestored?.(info);
     },
     // An explicit server-level `autoReplay` wins over the nested
     // `retry.autoReplay`; either way the queue owns the scheduler.
