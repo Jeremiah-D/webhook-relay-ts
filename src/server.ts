@@ -316,6 +316,11 @@ import {
 import type { ProbeOptions } from "./downstream-probe.ts";
 import type { OtlpExporterOptions } from "./otlp.ts";
 import {
+  assertValidBrotliCompressConfig,
+  maybeCompressBrotliOutbound,
+  type BrotliCompressOptions,
+} from "./brotli.ts";
+import {
   assertValidCompressOutboundConfig,
   DecompressionFailedError,
   DecompressionTooLargeError,
@@ -907,6 +912,27 @@ export interface RelayServerOptions {
    */
   compressThreshold?: Record<string, GuardedCompressOptions>;
   /**
+   * Outbound brotli compression (WR-142, see `src/brotli.ts`):
+   * per-endpoint opt-in, keyed by exact delivery `targetUrl`. Payloads at
+   * or above `thresholdBytes` (default 1024) are brotli-compressed when
+   * (and only when) the compressed form is actually smaller;
+   * `Content-Encoding: br` is stamped and `Content-Length` reflects the
+   * compressed size. The relay signature (`x-relay-signature`) covers the
+   * compressed wire bytes — exactly what the downstream receives.
+   * Precedence: when an endpoint is configured in `compressBrotli`, the
+   * brotli path wins over both gzip paths (`compressOutbound`,
+   * `compressThreshold`) for that endpoint — compression is never
+   * stacked. Fire-and-forget like WR-40: no content-type whitelist, no
+   * 415 fallback (an endpoint whose downstream may reject `br` should
+   * use `compressThreshold` instead). Applies to the HTTP/1.1 and HTTP/2
+   * delivery paths only — WebSocket deliveries keep their RFC 7692
+   * permessage-deflate story (`src/deflate.ts`) and never pass through
+   * here. Compressed bytes saved per endpoint are counted in
+   * `relay_compressed_bytes_saved_total` (the same tracker as the gzip
+   * paths). Invalid values throw `RangeError` at startup.
+   */
+  compressBrotli?: Record<string, BrotliCompressOptions>;
+  /**
    * Outbound response compression negotiation (WR-62, see
    * `src/response-encoding.ts`): per-endpoint opt-in, keyed by exact
    * delivery `targetUrl`. An opted-in endpoint advertises
@@ -1127,7 +1153,8 @@ export interface RelayServerOptions {
    * speaks a different dialect than the producer — e.g. a payment
    * gateway that wants `amount_cents` instead of `amount`, or a ledger
    * hook that requires a static `x-tenant` header. Interaction order:
-   * transform → gzip (WR-40/WR-75) → E2EE (WR-58) → sign (WR-26); for
+   * transform → brotli/gzip (WR-142/WR-40/WR-75) → E2EE (WR-58) → sign
+   * (WR-26); for
    * WR-09 batched deliveries the merged envelope is transformed as one
    * JSON document. A non-JSON payload (or any runtime transform
    * failure) dead-letters the item on the first attempt and audits
@@ -1142,8 +1169,8 @@ export interface RelayServerOptions {
    * — a pluggable shape gate on the *post-transform* payload, keyed by
    * exact `targetUrl` (no prefix matching — the outbound config
    * convention in this relay: WR-60 `tlsSniOverrides`, WR-42 H2 pool
-   * keys). Pipeline order: transform (WR-115) → schema → gzip
-   * (WR-40/WR-75) → E2EE (WR-58) → sign (WR-26), so `x-relay-signature`
+   * keys). Pipeline order: transform (WR-115) → schema → brotli/gzip
+   * (WR-142/WR-40/WR-75) → E2EE (WR-58) → sign (WR-26), so `x-relay-signature`
    * always covers the validated bytes — exactly what the downstream
    * receives and verifies. A violation throws
    * `OutboundSchemaViolationError`, classified `"non_retryable"`: the
@@ -1826,8 +1853,9 @@ export interface PooledSender extends Sender {
    */
   dnsCache: DnsCache | undefined;
   /**
-   * WR-75: cumulative per-endpoint guarded-compression byte savings;
-   * rendered into `GET /metrics` as `relay_compressed_bytes_saved_total`.
+   * WR-75/WR-142: cumulative per-endpoint byte savings from guarded gzip
+   * (WR-75) and brotli (WR-142) compression; rendered into `GET /metrics`
+   * as `relay_compressed_bytes_saved_total`.
    */
   compressionStats: OutboundCompressionTracker;
   /**
@@ -2010,7 +2038,7 @@ export function createDefaultSender(
    * injection (static or `{{event_id}}` / `{{endpoint}}` / `{{attempt}}`
    * / `{{timestamp}}` templates), applied to the JSON payload just
    * before the wire request is built. The transform runs before
-   * compression (WR-40/WR-75) and E2EE sealing (WR-58) — which produce
+   * compression (WR-142/WR-40/WR-75) and E2EE sealing (WR-58) — which produce
    * non-JSON wire bytes — and before signing (WR-26), so
    * `x-relay-signature` always covers the transformed bytes. Opt-in:
    * endpoints without rules keep the exact current behavior. A
@@ -2067,7 +2095,14 @@ export function createDefaultSender(
    * When `oauth2` is set but no cache is passed, one is created
    * internally. Ignored when `oauth2` is unset.
    */
-  oauth2TokenCache?: OAuth2TokenCache
+  oauth2TokenCache?: OAuth2TokenCache,
+  /**
+   * WR-142: per-endpoint outbound brotli compression (see `src/brotli.ts`):
+   * `{ "<exact targetUrl>": BrotliCompressOptions }`. Validated at
+   * startup (`RangeError`); `undefined` keeps the exact pre-WR-142 wire
+   * shape.
+   */
+  compressBrotli?: Record<string, BrotliCompressOptions>
 ): PooledSender {
   if (tlsPins !== undefined) {
     for (const [endpoint, pins] of Object.entries(tlsPins)) {
@@ -2255,9 +2290,20 @@ export function createDefaultSender(
     }
   }
   // WR-75: the byte-savings tracker is always created (cheap, empty) so
-  // `sender.compressionStats` is available even with no guarded endpoint
-  // configured; its exposition stays absent until the first byte saved.
+  // `sender.compressionStats` is available even with no compression
+  // endpoint configured; its exposition stays absent until the first
+  // byte saved.
   const compressionTracker = new OutboundCompressionTracker();
+  // WR-142: RangeError on invalid values, at startup — never mid-delivery.
+  if (compressBrotli !== undefined) {
+    try {
+      assertValidBrotliCompressConfig(compressBrotli);
+    } catch (err) {
+      throw new RangeError(
+        `createDefaultSender: invalid compressBrotli config: ${(err as Error).message}`
+      );
+    }
+  }
   // WR-62: RangeError on invalid values, at startup — never mid-delivery.
   if (responseCompression !== undefined) {
     try {
@@ -2502,6 +2548,10 @@ export function createDefaultSender(
     guardedCompressed: boolean;
     /** WR-75: payload bytes saved by the guarded compression (0 otherwise). */
     guardedBytesSaved: number;
+    /** WR-142: true when the brotli path compressed this request. */
+    brotliCompressed: boolean;
+    /** WR-142: payload bytes saved by the brotli compression (0 otherwise). */
+    brotliBytesSaved: number;
   } => {
     const headers: Record<string, string | string[]> = {};
     // WR-69: per-endpoint header forwarding allowlist. Evaluated on the
@@ -2517,7 +2567,7 @@ export function createDefaultSender(
       headers[k] = v;
     }
     // WR-115: per-endpoint payload transform — runs on the raw inbound
-    // payload *before* compression (WR-40/WR-75) and E2EE sealing
+    // payload *before* compression (WR-142/WR-40/WR-75) and E2EE sealing
     // (WR-58), which both produce non-JSON wire bytes, and before
     // signing (WR-26), so `x-relay-signature` covers the transformed
     // bytes — exactly what the downstream receives. Opt-in: endpoints
@@ -2549,7 +2599,8 @@ export function createDefaultSender(
       Object.assign(headers, injectedHeaders);
     }
     // WR-117: per-endpoint outbound payload schema validation — runs on
-    // the post-transform JSON payload BEFORE compression (WR-40/WR-75)
+    // the post-transform JSON payload BEFORE compression
+    // (WR-142/WR-40/WR-75)
     // and E2EE sealing (WR-58) — which produce non-JSON wire bytes — and
     // before signing (WR-26), so `x-relay-signature` covers exactly the
     // validated bytes the downstream receives. Opt-in: endpoints without
@@ -2587,48 +2638,68 @@ export function createDefaultSender(
       headers[TRACEPARENT_HEADER] = formatTraceparent(outboundTrace.traceId, spanId, outboundTrace.sampled);
       if (outboundTrace.traceState !== undefined) headers[TRACESTATE_HEADER] = outboundTrace.traceState;
     }
-    // WR-75: the guarded path is decided first — when both records
-    // configure an endpoint it wins outright (safer superset: whitelist +
-    // 415 fallback), so the two compressions never stack or disagree. It
-    // engages only on HTTP transports: WebSocket deliveries keep their
-    // RFC 7692 permessage-deflate story (`src/deflate.ts`) and never pass
-    // through here. The 415 fallback resend forces both compressions off.
+    // WR-142: the brotli path is decided first — when it configures an
+    // endpoint it wins outright over both gzip paths (WR-40 and WR-75),
+    // so the compressions never stack or disagree. It engages only on
+    // HTTP transports: WebSocket deliveries keep their RFC 7692
+    // permessage-deflate story (`src/deflate.ts`) and never pass through
+    // here. The 415 fallback resend forces all compressions off.
     let wireBody = sourcePayload;
-    let contentEncoding: "gzip" | undefined;
+    let contentEncoding: "gzip" | "br" | undefined;
     let guardedCompressed = false;
     let guardedBytesSaved = 0;
+    let brotliCompressed = false;
+    let brotliBytesSaved = 0;
     const forcePlaintext = wireOpts?.forcePlaintext === true;
     if (!forcePlaintext) {
-      const guardedOpts =
-        wireOpts?.httpTransport === false ? undefined : compressThreshold?.[item.targetUrl];
-      if (guardedOpts !== undefined) {
-        const decision = guardedCompressOutbound(
-          sourcePayload,
-          outboundContentType(item.headers),
-          guardedOpts
-        );
-        wireBody = decision.body;
-        contentEncoding = decision.contentEncoding;
-        guardedCompressed = decision.contentEncoding === "gzip";
-        guardedBytesSaved = decision.bytesSaved;
-      } else {
-        // WR-40: per-endpoint opt-in gzip (fire-and-forget: no whitelist,
-        // no fallback). Compression happens before signing so
+      const brotliOpts =
+        wireOpts?.httpTransport === false ? undefined : compressBrotli?.[item.targetUrl];
+      if (brotliOpts !== undefined) {
+        // WR-142: per-endpoint opt-in brotli (fire-and-forget: no
+        // whitelist, no fallback). Compression happens before signing so
         // `x-relay-signature` covers the exact wire bytes the downstream
         // receives.
-        const legacy = maybeCompressOutbound(sourcePayload, compressOutbound?.[item.targetUrl]);
-        wireBody = legacy.body;
-        contentEncoding = legacy.contentEncoding;
+        const decision = maybeCompressBrotliOutbound(sourcePayload, brotliOpts);
+        wireBody = decision.body;
+        contentEncoding = decision.contentEncoding;
+        brotliCompressed = decision.contentEncoding === "br";
+        brotliBytesSaved = decision.bytesSaved;
+      } else {
+        // WR-75: the guarded path is decided before the legacy one — when
+        // both records configure an endpoint it wins outright (safer
+        // superset: whitelist + 415 fallback), so the two compressions
+        // never stack or disagree.
+        const guardedOpts =
+          wireOpts?.httpTransport === false ? undefined : compressThreshold?.[item.targetUrl];
+        if (guardedOpts !== undefined) {
+          const decision = guardedCompressOutbound(
+            sourcePayload,
+            outboundContentType(item.headers),
+            guardedOpts
+          );
+          wireBody = decision.body;
+          contentEncoding = decision.contentEncoding;
+          guardedCompressed = decision.contentEncoding === "gzip";
+          guardedBytesSaved = decision.bytesSaved;
+        } else {
+          // WR-40: per-endpoint opt-in gzip (fire-and-forget: no whitelist,
+          // no fallback). Compression happens before signing so
+          // `x-relay-signature` covers the exact wire bytes the downstream
+          // receives.
+          const legacy = maybeCompressOutbound(sourcePayload, compressOutbound?.[item.targetUrl]);
+          wireBody = legacy.body;
+          contentEncoding = legacy.contentEncoding;
+        }
       }
     }
     // WR-58: per-endpoint end-to-end encryption. Seals the (possibly
     // compressed) wire body with the downstream's X25519 public key BEFORE
     // signing, so `x-relay-signature` covers the ciphertext wire bytes —
     // exactly what the downstream receives and verifies. The envelope
-    // carries the pre-seal content encoding (WR-40), so the HTTP
-    // `content-encoding` header is dropped when a body is sealed: the wire
-    // bytes are the JSON envelope, not the gzip stream. Endpoints without
-    // a configured key behave exactly as before.
+    // carries the pre-seal content encoding (WR-40/WR-75/WR-142), so the
+    // HTTP `content-encoding` header is dropped when a body is sealed:
+    // the wire bytes are the JSON envelope, not the compressed stream.
+    // Endpoints without a configured key behave exactly as before.
     const e2eeKey = e2eeKeys?.get(item.targetUrl);
     const e2eeSealer = e2eeSealers?.get(item.targetUrl);
     let body = wireBody;
@@ -2733,8 +2804,8 @@ export function createDefaultSender(
         idempotencyKeyCfg.keyPrefix
       );
     }
-    // WR-58: a sealed body is the JSON envelope, not the gzip stream — the
-    // pre-seal encoding travels inside the envelope instead.
+    // WR-58: a sealed body is the JSON envelope, not the compressed stream
+    // — the pre-seal encoding travels inside the envelope instead.
     if (contentEncoding !== undefined && e2eeKey === undefined) headers["content-encoding"] = contentEncoding;
     // WR-62: per-endpoint opt-in — advertise compressed responses, so a
     // downstream that compresses saves us (and itself) bytes on the way
@@ -2744,7 +2815,7 @@ export function createDefaultSender(
       headers["accept-encoding"] = respCompress.acceptEncoding ?? DEFAULT_OUTBOUND_ACCEPT_ENCODING;
     }
     headers["content-length"] = String(body.length);
-    return { headers, body, guardedCompressed, guardedBytesSaved };
+    return { headers, body, guardedCompressed, guardedBytesSaved, brotliCompressed, brotliBytesSaved };
   };
 
   /**
@@ -2835,6 +2906,13 @@ export function createDefaultSender(
           guardedApplied = true;
           guardedBytesSaved = wire.guardedBytesSaved;
           compressionTracker.noteSaved(item.targetUrl, wire.guardedBytesSaved);
+        }
+        // WR-142: brotli byte savings feed the same tracker (the same
+        // `relay_compressed_bytes_saved_total` exposition as the gzip
+        // paths); no 415 fallback for brotli — it is fire-and-forget
+        // like WR-40.
+        if (!forcePlaintext && wire.brotliCompressed) {
+          compressionTracker.noteSaved(item.targetUrl, wire.brotliBytesSaved);
         }
         // WR-54: time-to-first-byte — request-issued timestamp; the diff is
         // taken when the downstream's first response bytes arrive (the
@@ -3468,6 +3546,12 @@ export function createDefaultSender(
             guardedApplied = true;
             guardedBytesSaved = wire.guardedBytesSaved;
             compressionTracker.noteSaved(item.targetUrl, wire.guardedBytesSaved);
+          }
+          // WR-142: brotli byte savings feed the same tracker (the same
+          // `relay_compressed_bytes_saved_total` exposition as the gzip
+          // paths).
+          if (!forcePlaintext && wire.brotliCompressed) {
+            compressionTracker.noteSaved(item.targetUrl, wire.brotliBytesSaved);
           }
           const res = await runHttp2Stream(session, {
             method: "POST",
@@ -4354,7 +4438,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   }
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, opts.awsSigV4, opts.awsSecretResolver, opts.outboundSchemas, opts.oauth2)
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, opts.awsSigV4, opts.awsSecretResolver, opts.outboundSchemas, opts.oauth2, undefined, opts.compressBrotli)
       : undefined;
   // WR-50: endpoints the operator may pause/resume over HTTP. The server
   // only ever delivers to these — the intake target plus every
@@ -4384,7 +4468,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     if (validators !== undefined && typeof validators === "object") {
       for (const endpoint of Object.keys(validators)) knownEndpoints.add(endpoint);
     }
-    for (const record of [opts.tlsPins, opts.tlsClientCerts, opts.tlsClientCertRotation, opts.compressOutbound, opts.compressThreshold, opts.proxies, opts.outboundEncryption, opts.responseCompression, opts.forwardHeaders, opts.minTlsVersions, opts.tlsOcsp, opts.payloadTransforms, opts.outboundSchemas]) {
+    for (const record of [opts.tlsPins, opts.tlsClientCerts, opts.tlsClientCertRotation, opts.compressOutbound, opts.compressThreshold, opts.compressBrotli, opts.proxies, opts.outboundEncryption, opts.responseCompression, opts.forwardHeaders, opts.minTlsVersions, opts.tlsOcsp, opts.payloadTransforms, opts.outboundSchemas]) {
       if (record) for (const endpoint of Object.keys(record)) knownEndpoints.add(endpoint);
     }
     for (const endpoint of opts.retry?.probe?.endpoints ?? []) knownEndpoints.add(endpoint);
@@ -4473,7 +4557,17 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
                   undefined,
                   // WR-115: shadow deliveries mirror the identical wire
                   // request, so they apply the same payload transform.
-                  opts.payloadTransforms
+                  opts.payloadTransforms,
+                  // WR-116/WR-129: shadow copies are byte-identical
+                  // mirrors — SigV4/OAuth2 stay off (pre-existing).
+                  undefined,
+                  undefined,
+                  undefined,
+                  undefined,
+                  undefined,
+                  // WR-142: like the gzip compressions, the brotli
+                  // config mirrors onto shadow senders.
+                  opts.compressBrotli
                 ),
               })
             ),

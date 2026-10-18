@@ -2269,6 +2269,67 @@ payment-webhook JSON, Node v24.20.0 / AMD EPYC 9D25):
 
 gzip p50: ~34µs per payload — negligible next to a network round trip.
 
+## Outbound brotli compression
+
+Outbound deliveries can be brotli-compressed per endpoint (opt-in),
+independent of the gzip options above:
+
+```ts
+const server = createRelayServer({
+  secret, forwardUrl, auditLog,
+  compressBrotli: {
+    "https://downstream/hook": { thresholdBytes: 2048 }, // default 1024
+  },
+});
+```
+
+- **Outbound** — payloads at or above the threshold are brotli-compressed
+  when (and only when) the compressed form is actually smaller;
+  `Content-Encoding: br` is stamped and `Content-Length` reflects the
+  compressed size. `x-relay-signature` covers the compressed wire bytes
+  — exactly what the downstream receives and verifies.
+- **Precedence** — when an endpoint is configured in `compressBrotli`,
+  the brotli path wins over *both* gzip paths (`compressOutbound` and
+  `compressThreshold`) for that endpoint: the compressions are never
+  stacked, and the gzip records are never consulted. The two transports
+  behave like the gzip paths — the compression engages on the HTTP/1.1
+  and HTTP/2 delivery paths only, and WebSocket deliveries keep their
+  RFC 7692 permessage-deflate story (`src/deflate.ts`) and never pass
+  through here.
+- **Pipeline position** — brotli compresses at the same position as
+  gzip: after the WR-115 payload transform and the WR-117 outbound
+  schema validation, before WR-58 E2EE sealing (a sealed envelope
+  carries the pre-seal encoding as `innerEncoding: "br"`, with no
+  `content-encoding` header on the wire) and before WR-26 signing, so
+  the signature always covers the brotli bytes the downstream receives.
+- **Fire-and-forget** — like `compressOutbound` and unlike the guarded
+  path, there is no content-type whitelist and no 415→plaintext fallback:
+  a downstream that rejects `br` answers `415` like any other delivery
+  failure (retry / dead-letter as usual). An endpoint whose downstream
+  may reject compressed bodies should use `compressThreshold` instead.
+- **Shared accounting** — byte savings feed the same
+  `OutboundCompressionTracker` (and the same
+  `relay_compressed_bytes_saved_total` exposition) as the gzip paths.
+- **Inbound** — `Content-Encoding: br` on a downstream *response* is
+  already decoded by the WR-62 `decodeResponseBody` path
+  (`src/response-encoding.ts`); nothing new was added for inbound
+  *request* brotli decode (that belongs to WR-62's inbound-decode work).
+
+Measured wire savings (`bench/brotli-bench.ts`, same ~3.4 KiB
+payment-webhook JSON as the gzip bench, Node v24.20.0 / x64):
+
+| | bytes |
+|---|---|
+| original payload | 3422 |
+| brotli-compressed | 607 |
+| ratio | 0.177 (**5.6x smaller**) |
+
+brotli p50: ~6.9ms per payload — the quality-11 default trades CPU for
+size (brotli ships ~22% smaller than gzip on this payload: 607 vs 780
+bytes); the cost still lands far below a network round trip.
+
+Invalid values throw `RangeError` at startup, like every other module.
+
 ## Per-endpoint body size limits
 
 `endpointBodyLimits` overrides the global `maxBodyBytes` on selected
