@@ -73,6 +73,13 @@ import {
   DeadlineBudgetTimeoutError,
   readDeadlineBudgetMs,
 } from "./deadline-budget.ts";
+import {
+  PhaseTimeoutError,
+  assertValidPhaseTimeoutBudgets,
+  resolvePhaseTimeouts,
+  type PhaseTimeoutBudgets,
+  type PhaseTimeoutPhase,
+} from "./phase-timeouts.ts";
 import { installGracefulShutdown } from "./shutdown.ts";
 import { SourceBaselineDetector, type SourceBaselineOptions } from "./source-baseline.ts";
 import type { PayloadEncryptor } from "./encrypt.ts";
@@ -864,6 +871,40 @@ export interface RelayServerOptions {
    * empty/malformed `alpnProtocols` throw `RangeError` at startup.
    */
   tlsSniOverrides?: Record<string, TlsSniOverride>;
+  /**
+   * Outbound per-endpoint phase timeout budgets (WR-143, see
+   * `src/phase-timeouts.ts`): `{ "<exact targetUrl>": { connectMs?,
+   * tlsMs?, firstByteMs?, bodyMs? } }`, keyed by exact delivery
+   * `targetUrl`. Each entry budgets the WR-95 delivery phases of one
+   * attempt separately: `connect` (socket-assigned → TCP established),
+   * `tls` (TCP established → TLS handshake complete, https only),
+   * `firstByte` (request-issued → first response bytes), `body`
+   * (first response bytes → response end, 2xx only). When a phase's
+   * budget expires before the sender observes that phase's completion,
+   * the attempt fails with a typed `PhaseTimeoutError` — classified
+   * `"retryable"` by the default fallthrough (see `src/failure.ts`),
+   * so it takes the normal backoff / dead-letter path. A `connect`
+   * or `tls` budget firing destroys the request before a single
+   * payload byte is written (the pinning.ts/ocsp.ts zero-leak
+   * standard).
+   *
+   * Off by default: endpoints without an entry keep the current
+   * single attempt-total-timeout behavior untouched. `dns` is never
+   * budgeted (not attributable per-request, WR-95 convention).
+   * `connect`/`tls` are only measurable on a fresh direct socket
+   * (WR-95): on pooled reuse or behind a proxy they report
+   * unavailable, so their timers never arm there — budgets fire
+   * against measured phases only. Applies to the HTTP/1.1 path;
+   * phase-timeout endpoints are kept off the opt-in HTTP/2 path
+   * (per-request phases don't exist on a multiplexed session — the
+   * WR-101 OCSP precedent), and `wss:` targets are not covered.
+   * Layering with WR-76 `deliveryDeadline` / WR-99: the phase budgets
+   * are per-attempt allocations *inside* one attempt; the delivery
+   * deadline stays end-to-end — both may be configured. All values
+   * must be positive integers (ms) with at least one phase per
+   * entry; invalid entries throw `RangeError` at startup.
+   */
+  phaseTimeouts?: Record<string, PhaseTimeoutBudgets>;
   /**
    * Downstream + own TLS certificate expiry warning (WR-73, see
    * `src/cert-expiry.ts`): `{ enabled: true, thresholdSeconds? }`. When
@@ -2102,7 +2143,15 @@ export function createDefaultSender(
    * startup (`RangeError`); `undefined` keeps the exact pre-WR-142 wire
    * shape.
    */
-  compressBrotli?: Record<string, BrotliCompressOptions>
+  compressBrotli?: Record<string, BrotliCompressOptions>,
+  /**
+   * WR-143: per-endpoint phase timeout budgets (see
+   * `src/phase-timeouts.ts` and the `phaseTimeouts` server option):
+   * `{ "<exact targetUrl>": PhaseTimeoutBudgets }`. Validated at
+   * startup (`RangeError`); `undefined` keeps the exact pre-WR-143
+   * behavior.
+   */
+  phaseTimeouts?: Record<string, PhaseTimeoutBudgets>
 ): PooledSender {
   if (tlsPins !== undefined) {
     for (const [endpoint, pins] of Object.entries(tlsPins)) {
@@ -2147,6 +2196,20 @@ export function createDefaultSender(
     }
   }
   const oauthTokenCache = oauth2 !== undefined ? (oauth2TokenCache ?? new OAuth2TokenCache()) : undefined;
+  // WR-143: fail fast on a misconfigured phase budget — a typo'd phase
+  // name or a non-positive budget must not silently leave an endpoint
+  // unbudgeted (or budgeted against a phase that can never complete).
+  if (phaseTimeouts !== undefined) {
+    for (const [endpoint, budgets] of Object.entries(phaseTimeouts)) {
+      try {
+        assertValidPhaseTimeoutBudgets(budgets);
+      } catch (err) {
+        throw new RangeError(
+          `createDefaultSender: invalid phaseTimeouts for ${endpoint}: ${(err as Error).message}`
+        );
+      }
+    }
+  }
   // WR-101: fail fast on a misconfigured OCSP entry — a bad mode or
   // responder URL must not silently leave an endpoint unprotected (or
   // unknowingly fail-closed). When entries exist but no monitor was
@@ -2853,7 +2916,14 @@ export function createDefaultSender(
      * once per attempt in `defaultSender`, before the wire request is
      * built.
      */
-    oauthToken?: string
+    oauthToken?: string,
+    /**
+     * WR-143: per-endpoint phase timeout budgets for this delivery
+     * (`undefined` when the endpoint has no `phaseTimeouts` entry).
+     * Enforced on the HTTP/1.1 path only — see the arming block in
+     * `runWithClientCert` below.
+     */
+    phaseTimeout?: PhaseTimeoutBudgets
   ): Promise<DownstreamResponse | void> => {
     // WR-75: the guarded 415→plaintext fallback needs the compression
     // decision outside the attempt promise. The decision is deterministic
@@ -2954,7 +3024,18 @@ export function createDefaultSender(
                 { keepAlive: false, maxSockets: 1, maxFreeSockets: 0 }
               ))
             : undefined);
+        // WR-143: phase-timeout response hook — assigned below when the
+        // endpoint configures `phaseTimeouts`. `onResponse` invokes it so
+        // the firstByte → body budget handoff observes exactly the
+        // response the attempt processes.
+        let phaseResponseHook:
+          | ((res: Parameters<Parameters<typeof httpsRequest>[2]>[0]) => void)
+          | undefined;
         const onResponse = (res: Parameters<Parameters<typeof httpsRequest>[2]>[0]): void => {
+          // WR-143: first response bytes arrived — hand the body phase
+          // its own budget (assigned below when the endpoint configures
+          // phaseTimeouts; a no-op otherwise).
+          phaseResponseHook?.(res);
           // WR-89: response bytes arrived — the handshake completed and
           // the downstream answered, so this attempt's failure (if any)
           // is never attributable to client-cert rejection.
@@ -3146,6 +3227,116 @@ export function createDefaultSender(
           req.on("close", () => clearTimeout(budgetTimer));
         }
 
+        // WR-143: per-endpoint phase timeout budgets (opt-in via the
+        // `phaseTimeouts` record). One unref'd timer per configured
+        // phase, armed per delivery attempt: when a phase's budget
+        // expires before the sender observes that phase's completion,
+        // the request is destroyed with a typed `PhaseTimeoutError`
+        // (classified "retryable" by the default fallthrough — the
+        // normal backoff / dead-letter path). A `connect` or `tls`
+        // budget firing destroys the request before a single payload
+        // byte is written (the pinning.ts/ocsp.ts zero-leak standard —
+        // the plain-path write is deferred below when a pre-write
+        // budget is configured). Timers are cleared when their phase
+        // completes or the request settles, and never pin process
+        // exit. Endpoints without a `phaseTimeouts` entry skip this
+        // block entirely: the current single attempt-total-timeout
+        // behavior is untouched.
+        //
+        // Budget origins mirror the WR-95 phase definitions, with one
+        // deliberate difference: `connect` arms at socket assignment
+        // (not request issue) so a reused pooled socket can never
+        // spuriously trip it — `connect`/`tls` budgets fire against
+        // measured phases only. A reused pooled socket or a proxied
+        // tunnel reports `connect`/`tls` as unavailable (WR-95), so
+        // their timers are never armed there; `tls` is meaningless on
+        // plain http and never armed there either. `firstByte` runs
+        // request-issued → first response bytes (overlapping
+        // connect/tls on a fresh connection by construction —
+        // documented, not hidden, same convention as WR-95's
+        // overlapping firstByteMs); `body` runs first-bytes →
+        // response end on 2xx responses only — a non-2xx attempt is
+        // already doomed on its status code, so budgeting its body
+        // would only convert a poison verdict into a retryable
+        // timeout.
+        let phaseConnectTimer: NodeJS.Timeout | undefined;
+        let phaseTlsTimer: NodeJS.Timeout | undefined;
+        let phaseFirstByteTimer: NodeJS.Timeout | undefined;
+        let phaseBodyTimer: NodeJS.Timeout | undefined;
+        const clearPhaseTimer = (phase: PhaseTimeoutPhase): void => {
+          if (phase === "connect" && phaseConnectTimer !== undefined) {
+            clearTimeout(phaseConnectTimer);
+            phaseConnectTimer = undefined;
+          } else if (phase === "tls" && phaseTlsTimer !== undefined) {
+            clearTimeout(phaseTlsTimer);
+            phaseTlsTimer = undefined;
+          } else if (phase === "firstByte" && phaseFirstByteTimer !== undefined) {
+            clearTimeout(phaseFirstByteTimer);
+            phaseFirstByteTimer = undefined;
+          } else if (phase === "body" && phaseBodyTimer !== undefined) {
+            clearTimeout(phaseBodyTimer);
+            phaseBodyTimer = undefined;
+          }
+        };
+        if (phaseTimeout !== undefined) {
+          const armPhaseTimer = (phase: PhaseTimeoutPhase, timeoutMs: number | undefined): void => {
+            if (timeoutMs === undefined) return;
+            const timer = setTimeout(() => {
+              // The phase may have completed between arm and fire with
+              // the completion hook not yet run — only fire while still
+              // armed.
+              const armed =
+                phase === "connect"
+                  ? phaseConnectTimer
+                  : phase === "tls"
+                    ? phaseTlsTimer
+                    : phase === "firstByte"
+                      ? phaseFirstByteTimer
+                      : phaseBodyTimer;
+              if (armed !== timer) return;
+              req.destroy(new PhaseTimeoutError(item.targetUrl, phase, timeoutMs));
+            }, timeoutMs);
+            timer.unref?.();
+            if (phase === "connect") phaseConnectTimer = timer;
+            else if (phase === "tls") phaseTlsTimer = timer;
+            else if (phase === "firstByte") phaseFirstByteTimer = timer;
+            else phaseBodyTimer = timer;
+          };
+          // firstByte is measurable on every transport — arm at request
+          // issue. connect/tls arm below, on socket assignment, and
+          // only for fresh direct sockets (see above).
+          armPhaseTimer("firstByte", phaseTimeout.firstByteMs);
+          req.on("socket", (socket) => {
+            if (!socket.connecting || proxyUrl !== undefined) return;
+            socket.once("connect", () => {
+              clearPhaseTimer("connect");
+              // tls is budgeted TCP-established → handshake complete.
+              if (url.protocol === "https:") armPhaseTimer("tls", phaseTimeout.tlsMs);
+            });
+            armPhaseTimer("connect", phaseTimeout.connectMs);
+          });
+          phaseResponseHook = (res) => {
+            // firstByte completed: the downstream's first response bytes
+            // arrived — hand the body phase its own budget.
+            clearPhaseTimer("firstByte");
+            if (
+              phaseTimeout.bodyMs !== undefined &&
+              res.statusCode !== undefined &&
+              res.statusCode >= 200 &&
+              res.statusCode < 300
+            ) {
+              armPhaseTimer("body", phaseTimeout.bodyMs);
+              res.once("end", () => clearPhaseTimer("body"));
+            }
+          };
+          req.on("close", () => {
+            clearPhaseTimer("connect");
+            clearPhaseTimer("tls");
+            clearPhaseTimer("firstByte");
+            clearPhaseTimer("body");
+          });
+        }
+
         // WR-95: per-phase delivery timing (opt-in via
         // `measureLatencyPhases`, which `createRelayServer` enables exactly
         // when `retry.latencyPhases` is configured). Only a fresh direct
@@ -3278,7 +3469,55 @@ export function createDefaultSender(
             });
             return;
           }
-          writePayload();
+          // WR-143: when a pre-write phase budget is configured, the
+          // payload write waits for the budgeted phase to complete — a
+          // connect/tls budget firing destroys the request before a
+          // single payload byte is written (the pinning.ts/ocsp.ts
+          // zero-leak standard). The pinned and OCSP paths already gate
+          // their writes on the handshake, so only this plain path
+          // needs the deferral; proxied endpoints keep their existing
+          // write point (the tunnel's TLS belongs to the proxy leg, and
+          // connect/tls budgets never arm there).
+          const deferWriteForPhaseBudget =
+            phaseTimeout !== undefined &&
+            proxyUrl === undefined &&
+            (phaseTimeout.connectMs !== undefined || phaseTimeout.tlsMs !== undefined);
+          if (deferWriteForPhaseBudget) {
+            let phaseWriteDone = false;
+            const writeOnBudgetedPhase = (): void => {
+              if (phaseWriteDone) return;
+              phaseWriteDone = true;
+              writePayload();
+            };
+            // A tls budget holds the write until the handshake
+            // completes; otherwise the TCP connect is the last
+            // pre-write phase to wait for.
+            const waitForTls =
+              phaseTimeout !== undefined &&
+              phaseTimeout.tlsMs !== undefined &&
+              url.protocol === "https:";
+            req.on("socket", (socket) => {
+              if (!socket.connecting) {
+                // Reused pooled socket: the budgeted phases are
+                // unavailable (WR-95), so nothing is left to wait for.
+                writeOnBudgetedPhase();
+                return;
+              }
+              if (waitForTls) {
+                const tlsSocket = socket as TLSSocket;
+                const already = (tlsSocket.getPeerCertificate() as { raw?: unknown }).raw;
+                if (already !== undefined) {
+                  writeOnBudgetedPhase();
+                } else {
+                  socket.once("secureConnect", writeOnBudgetedPhase);
+                }
+              } else {
+                socket.once("connect", writeOnBudgetedPhase);
+              }
+            });
+          } else {
+            writePayload();
+          }
           return;
         }
         // Normalized once, up front, so the per-handshake path is a plain compare.
@@ -3706,6 +3945,14 @@ export function createDefaultSender(
       ocspForEndpoint !== undefined && ocspMonitor !== undefined
         ? { cfg: ocspForEndpoint, monitor: ocspMonitor }
         : undefined;
+    // WR-143: per-endpoint phase timeout budgets (exact targetUrl
+    // match, http/https only — the WebSocket pool owns its own
+    // handshake). `undefined` for endpoints without an entry keeps the
+    // exact current behavior.
+    const phaseTimeout =
+      url.protocol === "http:" || url.protocol === "https:"
+        ? resolvePhaseTimeouts(item.targetUrl, phaseTimeouts)
+        : undefined;
     // Outbound proxy for this endpoint: the WR-114 registry override
     // first, then explicit per-endpoint config, then the environment
     // (read per delivery, so proxy rotation needs no restart;
@@ -3749,16 +3996,19 @@ export function createDefaultSender(
       // WR-101: an OCSP-configured endpoint never rides H2 — the H2
       // session pool owns its own handshake and has no revocation gate,
       // so H2 would silently skip the check. HTTP/1.1 instead, loudly.
-      if (h2pool !== undefined && proxyUrl === undefined && ocsp === undefined && h2pool.eligibleFor(url)) {
+      // WR-143: a phase-timeout endpoint is likewise kept off H2 — a
+      // multiplexed session has no per-request connect/tls/firstByte
+      // phases to budget, so H2 would silently skip the budgets.
+      if (h2pool !== undefined && proxyUrl === undefined && ocsp === undefined && phaseTimeout === undefined && h2pool.eligibleFor(url)) {
         return deliverViaHttp2(item, url, pins, clientCert, tlsSni, minTlsVersion, clientCertRotation, oauthToken).catch((err) => {
           if (err instanceof Http2UnavailableError) {
             h2pool!.noteFallback();
-            return deliverViaHttp1(item, url, pins, clientCert, proxyUrl, tlsSni, minTlsVersion, clientCertRotation, ocsp, oauthToken);
+            return deliverViaHttp1(item, url, pins, clientCert, proxyUrl, tlsSni, minTlsVersion, clientCertRotation, ocsp, oauthToken, phaseTimeout);
           }
           throw err;
         });
       }
-      return deliverViaHttp1(item, url, pins, clientCert, proxyUrl, tlsSni, minTlsVersion, clientCertRotation, ocsp, oauthToken);
+      return deliverViaHttp1(item, url, pins, clientCert, proxyUrl, tlsSni, minTlsVersion, clientCertRotation, ocsp, oauthToken, phaseTimeout);
     };
     // WR-129: resolve the bearer value once per delivery attempt
     // (cached); a 401 forces exactly one refresh + redelivery inside the
@@ -4438,7 +4688,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   }
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, opts.awsSigV4, opts.awsSecretResolver, opts.outboundSchemas, opts.oauth2, undefined, opts.compressBrotli)
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, opts.awsSigV4, opts.awsSecretResolver, opts.outboundSchemas, opts.oauth2, undefined, opts.compressBrotli, opts.phaseTimeouts)
       : undefined;
   // WR-50: endpoints the operator may pause/resume over HTTP. The server
   // only ever delivers to these — the intake target plus every

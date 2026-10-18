@@ -35,6 +35,7 @@ import {
   type FailureClass,
 } from "./failure.ts";
 import { OcspError } from "./ocsp.ts";
+import { PhaseTimeoutError, type PhaseTimeoutPhase } from "./phase-timeouts.ts";
 import {
   AssertionFailedError,
   assertValidResponseAssertionRule,
@@ -674,6 +675,14 @@ export interface SloMissInfo {
    * and OTLP consumers distinguish "ran out of SLO" from "was slow".
    */
   deadlineBudgetExhausted?: boolean;
+  /**
+   * WR-143: the phase whose per-endpoint timeout budget fired on one of
+   * this delivery's attempts, if any (see `src/phase-timeouts.ts`).
+   * Lets an SLO miss say which phase blew the budget — the phase name
+   * only, never fabricated durations. Absent when no attempt hit a
+   * phase budget.
+   */
+  phaseTimeout?: PhaseTimeoutPhase;
 }
 
 /** {@link LatencyTrackerOptions} plus the SLO-miss hook and the SLO-risk predictor. */
@@ -2922,6 +2931,13 @@ export class RetryQueue {
   /** WR-98: resolved trace-context option; `undefined` = feature off. */
   private readonly traceContextOpts?: ResolvedTraceContextOptions;
   private readonly onSloMiss?: (info: SloMissInfo) => void;
+  /**
+   * WR-143: most recent phase-timeout phase per in-flight delivery
+   * (see `src/phase-timeouts.ts`) — set when an attempt's phase budget
+   * fires, read when a later SLO miss is attributed, cleared when the
+   * delivery settles (delivered or dead-letter).
+   */
+  private readonly phaseTimeoutByDelivery = new Map<string, PhaseTimeoutPhase>();
   /**
    * WR-71: per-tenant SLO-breach predictors, keyed by tenant (`""` =
    * default) — mirrors `latencies` above.
@@ -6143,6 +6159,10 @@ export class RetryQueue {
           this.compactDurable();
         }
         this.queue.delete(id);
+        // WR-143: the delivery settled — consume the phase-timeout
+        // attribution for the slo_missed block below, then drop it.
+        const phaseTimeout = this.phaseTimeoutByDelivery.get(id);
+        this.phaseTimeoutByDelivery.delete(id);
         // WR-113: settle the ordered line — a settled head wakes the next head.
         this.orderedSettle(entry.targetUrl, id);
         this.bumpPending(entry.tenantId, entry.targetUrl, -1);
@@ -6183,6 +6203,9 @@ export class RetryQueue {
           const phasesTracker = this.latencyPhasesFor(tenant);
           const dominantPhase =
             dominantPhaseOf(phaseBreakdown) ?? phasesTracker?.dominantPhase(target);
+          // WR-143: attribute the miss to the phase whose budget fired
+          // on this delivery's attempts, if any — the phase name only,
+          // never fabricated durations (consumed at settle above).
           this.onSloMiss?.({
             id: entry.id,
             traceId,
@@ -6192,6 +6215,7 @@ export class RetryQueue {
             sloMs: latency.sloMs,
             ...(dominantPhase === undefined ? {} : { dominantPhase }),
             ...(phaseBreakdown === undefined ? {} : { phaseBreakdown }),
+            ...(phaseTimeout === undefined ? {} : { phaseTimeout }),
           });
         }
         // WR-71: one sample landed and the backlog shrank — re-evaluate
@@ -6263,6 +6287,12 @@ export class RetryQueue {
         const classified = classifyFailure(err);
         const error = err instanceof Error ? err.message : String(err);
         const at = new Date().toISOString();
+        if (err instanceof PhaseTimeoutError) {
+          // WR-143: remember the phase whose budget fired — a later SLO
+          // miss on this delivery attributes to it ("firstByte blew the
+          // budget"). Cleared when the delivery settles.
+          this.phaseTimeoutByDelivery.set(id, err.phase);
+        }
         if (err instanceof SemanticDeliveryError) {
           // WR-37: the downstream answered 2xx but the body said no.
           // Audited as `failed` with reason `semantic_failed`; the
@@ -6495,6 +6525,11 @@ export class RetryQueue {
     // When latency tracking is not configured `onSloMiss` is undefined
     // and this degrades to a no-op.
     const dominantPhase = this.latencyPhasesFor(tenant)?.dominantPhase(target);
+    // WR-143: the phase whose budget fired on this delivery's attempts,
+    // if any — the delivery died on the deadline, but the phase that
+    // blew a budget is still the actionable signal. Read-only here;
+    // `moveToDeadLetter` below drops the entry.
+    const phaseTimeout = this.phaseTimeoutByDelivery.get(id);
     this.onSloMiss?.({
       id: entry.id,
       traceId,
@@ -6504,6 +6539,7 @@ export class RetryQueue {
       sloMs: deadlineMs,
       deadlineBudgetExhausted: true,
       ...(dominantPhase === undefined ? {} : { dominantPhase }),
+      ...(phaseTimeout === undefined ? {} : { phaseTimeout }),
     });
     // Classified "retryable": the payload was not poison — the relay
     // simply ran out of SLO — so the dead-letter record reads honestly.
@@ -6565,6 +6601,8 @@ export class RetryQueue {
       this.compactDurable();
     }
     this.queue.delete(id);
+    // WR-143: the delivery settled — drop the phase-timeout attribution.
+    this.phaseTimeoutByDelivery.delete(id);
     // WR-113: settle the ordered line — a settled head wakes the next head.
     this.orderedSettle(entry.targetUrl, id);
     this.bumpPending(entry.tenantId, entry.targetUrl, -1);

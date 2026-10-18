@@ -4209,6 +4209,60 @@ Custom (injected) senders ignore `deadlineBudgetMs` — the queue-side
 expiry still bounds the delivery, only the per-attempt cap is lost.
 Set `propagateBudget: false` to keep the exact WR-76 behavior.
 
+#### Per-endpoint phase timeout budgets (WR-143)
+
+The deadline above is one end-to-end pool; sometimes you want to budget
+*where* inside the attempt the time goes. `phaseTimeouts`
+(`src/phase-timeouts.ts`) is an opt-in per-endpoint record —
+`{ "<exact targetUrl>": { connectMs?, tlsMs?, firstByteMs?, bodyMs? } }`
+— that arms one timer per configured WR-95 phase on every delivery
+attempt:
+
+```ts
+const relay = createRelayServer({
+  // ...secret, forwardUrl, auditLog
+  phaseTimeouts: {
+    "https://slow-tls.example/hook": { tlsMs: 800, firstByteMs: 5_000 },
+  },
+});
+```
+
+The four phases: `connect` (socket-assigned → TCP established),
+`tls` (TCP established → TLS handshake complete, `https:` only),
+`firstByte` (request-issued → first response bytes), `body` (first
+response bytes → response end, 2xx only). `dns` is never budgeted —
+per-request DNS timing is not attributable (WR-95 convention). When a
+phase's budget expires before the sender observes that phase's
+completion, the attempt fails with a typed `PhaseTimeoutError{phase,
+timeoutMs}` — classified `"retryable"` by the default fallthrough, so
+it takes the normal backoff / dead-letter path, and a `connect`/`tls`
+budget firing destroys the request before a single payload byte is
+written (the pinning/OCSP zero-leak standard).
+
+Layering: the phase budgets are per-attempt allocations *inside* one
+attempt; the delivery deadline stays end-to-end — both may be
+configured, and they compose (a phase budget can fail an attempt long
+before the deadline; the deadline can expire a delivery whose attempts
+never hit a phase budget).
+
+Pooled-socket rule: `connect`/`tls` are only measurable on a fresh
+direct socket (WR-95) — on pooled reuse or behind a proxy they report
+unavailable, so their timers simply never arm there; budgets fire
+against measured phases only. The budgets apply on the HTTP/1.1 path;
+phase-timeout endpoints are kept off the opt-in HTTP/2 path
+(per-request phases don't exist on a multiplexed session — the OCSP
+precedent), and `wss:` targets are not covered.
+
+Attribution: the phase whose budget fired is recorded per delivery, so
+a later SLO miss carries `phaseTimeout` ("firstByte blew the budget")
+in the `slo_missed` audit event — the phase name only, never fabricated
+durations — alongside the usual `dominantPhase`/`phaseBreakdown`.
+
+Off by default: endpoints without an entry keep the current single
+attempt-total-timeout behavior untouched. All values are positive
+integer milliseconds with at least one phase per entry; invalid
+entries throw `RangeError` at startup.
+
 ### Shadow-target dry-run mirroring
 
 Opt-in per-endpoint dry-run mirroring for the downstream-migration /
