@@ -124,6 +124,12 @@ import {
   type ResolvedOrderedConfig,
 } from "./ordered.ts";
 import { ReplayEgressGate, type ReplayEgressOptions, DEFAULT_REPLAY_EGRESS_RPS } from "./replay-egress.ts";
+import {
+  ReplayApprovalStore,
+  ReplayApprovalError,
+  type ReplayApprovalOptions,
+  type ReplayApprovalScope,
+} from "./replay-approval.ts";
 import { RetryBudget, type RetryBudgetOptions } from "./retry-budget.ts";
 import {
   AdaptiveBackoffController,
@@ -1032,9 +1038,48 @@ export interface DeadLetterReplayFailure {
   error: string;
 }
 
+/** Call options for {@link RetryQueue.replayDeadLetter}. */
+export interface ReplayDeadLetterOpts {
+  /**
+   * WR-135: one-shot approval token, consumed by this call. Required when
+   * the queue's `replayApproval` option is set, unless `bypassApproval`.
+   * The token's scope must cover this entry (an endpoint-scoped token
+   * covers entries on its endpoint; an ids-scoped token covers exactly
+   * the named ids).
+   */
+  approvalToken?: string;
+  /**
+   * WR-135: explicit operator escape hatch — skips the two-phase approval
+   * gate. Only an explicit `true` bypasses; omitting the flag keeps the
+   * gate. For pre-authorized programmatic paths (the WR-31 auto-replayer,
+   * embedded operator tooling) — the operator HTTP layer never passes it.
+   */
+  bypassApproval?: boolean;
+}
+
+/** Call options for the executing (non-dry-run) {@link RetryQueue.replayDeadLetters}. */
+export interface DeadLetterBatchReplayOpts {
+  /**
+   * Preview only: return the would-be-replayed metadata with zero side
+   * effects. A dry run never needs replay approval.
+   */
+  dryRun?: boolean;
+  /**
+   * WR-135: one-shot approval token, consumed once for the whole batch.
+   * Required when the queue's `replayApproval` option is set, unless
+   * `bypassApproval`. The token's scope must cover the batch filter.
+   */
+  approvalToken?: string;
+  /**
+   * WR-135: explicit operator escape hatch — skips the two-phase approval
+   * gate. Only an explicit `true` bypasses; omitting the flag keeps the
+   * gate. The operator HTTP layer never passes it.
+   */
+  bypassApproval?: boolean;
+}
+
 /** Outcome of {@link RetryQueue.replayDeadLetters}. */
-export interface DeadLetterBatchReplayResult {
-  /** Ids successfully re-queued with a fresh attempt budget. */
+export interface DeadLetterBatchReplayResult {  /** Ids successfully re-queued with a fresh attempt budget. */
   replayed: string[];
   /**
    * Entries that could not be re-queued (e.g. a sealed payload that no
@@ -1869,6 +1914,21 @@ export interface RetryQueueOptions {
    * construction.
    */
   replayEgress?: ReplayEgressOptions;
+  /**
+   * WR-135: opt-in two-phase approval for dead-letter replays (see
+   * `src/replay-approval.ts`). A replay re-fires the downstream handler,
+   * so when this is set a non-dry-run `replayDeadLetters` or
+   * `replayDeadLetter` call consumes a one-shot approval token issued by
+   * `issueReplayApprovalToken` (operator: `POST
+   * /dead-letter/replay/approve-request`) — missing, expired, reused, or
+   * scope-mismatched tokens throw `ReplayApprovalError`; dry runs never
+   * need approval (zero side effects). Explicit `bypassApproval: true` on
+   * the call is the operator escape hatch for pre-authorized programmatic
+   * paths (e.g. the WR-31 auto-replayer). Disabled by default (absent =
+   * the exact pre-WR-135 behavior). Invalid values throw `RangeError` at
+   * construction.
+   */
+  replayApproval?: ReplayApprovalOptions;
   /**
    * Per-endpoint end-to-end delivery deadline (WR-76; see
    * {@link DeliveryDeadlineOptions}): exact `targetUrl` -> ms from queue
@@ -2999,6 +3059,8 @@ export class RetryQueue {
   private readonly onDeadLetterPurged?: (event: DeadLetterPurgedEvent) => void;
   /** WR-68: shared replay egress gate; undefined when not configured. */
   private readonly replayEgress?: ReplayEgressGate;
+  /** WR-135: two-phase replay approval store; undefined when not configured. */
+  private readonly replayApproval?: ReplayApprovalStore;
   /** WR-68: cumulative entries held back by the egress gate. */
   private replayEgressThrottled = 0;
   private readonly prober?: DownstreamProber;
@@ -3553,7 +3615,10 @@ export class RetryQueue {
       // always report a status; it only ticks when enabled and started.
       this.autoReplayer = new DeadLetterAutoReplayer({
         ...opts.autoReplay,
-        replayAll: () => this.replayDeadLetters(),
+        // WR-135: the auto-replay schedule is pre-authorized by
+        // configuration — the operator explicitly armed it — so rounds
+        // use the explicit escape hatch instead of per-round tokens.
+        replayAll: () => this.replayDeadLetters({}, { bypassApproval: true }),
         onAudit: opts.onAutoReplayAudit,
       });
     }
@@ -3595,6 +3660,13 @@ export class RetryQueue {
       // `POST /dead-letter/replay`, and the WR-31 auto-replayer all flow
       // through `replayDeadLetters`, so they share this one gate.
       this.replayEgress = new ReplayEgressGate(opts.replayEgress);
+    }
+    if (opts.replayApproval !== undefined) {
+      // WR-135: constructed eagerly so invalid values throw RangeError at
+      // construction, never mid-replay. The store lives on the queue so
+      // manual, operator, and programmatic replays share one token
+      // ledger; the operator HTTP layer issues tokens from it.
+      this.replayApproval = new ReplayApprovalStore(opts.replayApproval);
     }
     if (opts.probe !== undefined) {
       // A probe outcome feeds the circuit breaker exactly like a delivery
@@ -4365,8 +4437,28 @@ export class RetryQueue {
    * fails (e.g. a sealed payload that no longer decrypts) leaves the entry
    * in the dead-letter list and rethrows, so the operator can inspect and
    * retry it again after fixing the cause.
+   *
+   * WR-135: when the queue's `replayApproval` option is set, this call
+   * consumes a one-shot approval token (or takes the explicit
+   * `bypassApproval` escape hatch) — a denied token throws
+   * `ReplayApprovalError` instead of replaying.
    */
-  replayDeadLetter(id: string): boolean {
+  replayDeadLetter(id: string, opts: ReplayDeadLetterOpts = {}): boolean {
+    // WR-135: opt-in two-phase approval. The token check runs before the
+    // entry is touched: an unknown id answers the same 404 as before
+    // (the token is not consumed), while a denied token throws. Scope
+    // binds to the live entry so an endpoint-scoped token still works on
+    // a single replay of one of that endpoint's entries.
+    if (this.replayApproval !== undefined && opts.bypassApproval !== true) {
+      const entry = this.deadLetter.find((e) => e.id === id);
+      if (entry === undefined) return false;
+      const verdict = this.replayApproval.consume(opts.approvalToken, {
+        endpoint: entry.targetUrl,
+        ...(entry.tenantId !== undefined ? { tenant: entry.tenantId } : {}),
+        ids: [id],
+      });
+      if (!verdict.ok) throw new ReplayApprovalError(verdict.reason);
+    }
     // Claim the id for the whole synchronous run so the retention sweep
     // (WR-64) never purges the entry out from under an in-progress replay.
     this.claimReplay(id);
@@ -4442,12 +4534,17 @@ export class RetryQueue {
     this.compactDurable();
   }
 
-  /** Replay every dead-lettered item. Returns the number replayed. */
-  replayAllDeadLetters(): number {
+  /**
+   * Replay every dead-lettered item. Returns the number replayed.
+   * WR-135: with the `replayApproval` option set this is a programmatic
+   * replay, so it needs the explicit `bypassApproval` escape hatch — a
+   * per-entry token cannot be shared across entries (one-shot).
+   */
+  replayAllDeadLetters(opts: { bypassApproval?: boolean } = {}): number {
     const ids = this.deadLetter.map((e) => e.id);
     let replayed = 0;
     for (const id of ids) {
-      if (this.replayDeadLetter(id)) replayed += 1;
+      if (this.replayDeadLetter(id, opts)) replayed += 1;
     }
     return replayed;
   }
@@ -4566,6 +4663,26 @@ export class RetryQueue {
   }
 
   /**
+   * WR-135: the opt-in two-phase replay approval store, or `undefined`
+   * when no `replayApproval` option was configured. The operator
+   * `POST /dead-letter/replay/approve-request` endpoint issues tokens
+   * from this store.
+   */
+  getReplayApprovalStore(): ReplayApprovalStore | undefined {
+    return this.replayApproval;
+  }
+
+  /**
+   * WR-135: issue a one-shot replay approval token bound to `scope`, or
+   * `undefined` when the `replayApproval` option was not configured.
+   * The token is spent by the next non-dry-run `replayDeadLetters` /
+   * `replayDeadLetter` call whose execution fits inside `scope`.
+   */
+  issueReplayApprovalToken(scope: ReplayApprovalScope): { approvalToken: string; expiresAt: number } | undefined {
+    return this.replayApproval?.issue(scope);
+  }
+
+  /**
    * Remove a dead-letter entry for retention purging (WR-64). Journaled
    * (WR-49: the `purged` line supersedes the `dead_letter` line, so a
    * restarted process never resurrects the entry) and counted toward
@@ -4615,6 +4732,12 @@ export class RetryQueue {
    * Every entry is replayed independently: one failure cannot stop or roll
    * back the others — failures stay in the dead-letter list and are
    * reported in `failed` with their error.
+   *
+   * WR-135: when the queue's `replayApproval` option is set, a real replay
+   * consumes one one-shot approval token for the whole batch (or takes the
+   * explicit `bypassApproval` escape hatch) — a denied token throws
+   * `ReplayApprovalError` before anything is re-queued. Dry runs never
+   * need approval.
    */
   replayDeadLetters(
     filter: DeadLetterReplayFilter,
@@ -4622,11 +4745,11 @@ export class RetryQueue {
   ): DeadLetterReplayPreview[];
   replayDeadLetters(
     filter?: DeadLetterReplayFilter,
-    opts?: { dryRun?: false }
+    opts?: Omit<DeadLetterBatchReplayOpts, "dryRun"> & { dryRun?: false }
   ): DeadLetterBatchReplayResult;
   replayDeadLetters(
     filter: DeadLetterReplayFilter = {},
-    opts: { dryRun?: boolean } = {}
+    opts: DeadLetterBatchReplayOpts = {}
   ): DeadLetterReplayPreview[] | DeadLetterBatchReplayResult {
     if (opts.dryRun === true) {
       return this.matchDeadLetters(filter).map((e) => ({
@@ -4638,6 +4761,18 @@ export class RetryQueue {
         deadLetteredAt: e.deadLetteredAt,
         payloadBytes: e.payloadBytes,
       }));
+    }
+    // WR-135: one-shot approval for the whole batch, consumed before any
+    // entry is touched — a denial replays nothing. The per-entry calls
+    // below ride this same approval (they are one execution, not one
+    // token each), hence the explicit bypass on the inner calls.
+    if (this.replayApproval !== undefined && opts.bypassApproval !== true) {
+      const verdict = this.replayApproval.consume(opts.approvalToken, {
+        ...(filter.endpoint !== undefined ? { endpoint: filter.endpoint } : {}),
+        ...(filter.tenant !== undefined ? { tenant: filter.tenant } : {}),
+        ...(filter.ids !== undefined ? { ids: filter.ids } : {}),
+      });
+      if (!verdict.ok) throw new ReplayApprovalError(verdict.reason);
     }
     // WR-64: claim every matched id for the whole batch so the retention
     // sweep skips them — the sweep can never interleave inside this
@@ -4679,7 +4814,10 @@ export class RetryQueue {
             continue;
           }
           try {
-            if (this.replayDeadLetter(entry.id)) {
+            // WR-135: the batch already consumed the approval token above
+            // (or took the explicit bypass) — the per-entry calls are one
+            // execution, not one token each.
+            if (this.replayDeadLetter(entry.id, { bypassApproval: true })) {
               replayed.push(entry.id);
             } else {
               failed.push({ id: entry.id, error: "dead-letter entry no longer present" });

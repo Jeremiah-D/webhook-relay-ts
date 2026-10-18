@@ -1078,7 +1078,7 @@ reliability primitives that matter for any signed-payload pipeline.
   It carries the same operator authentication (fail-closed 404 without a
   credential) and needs only the `read` scope. For reconciliation workflows,
   `POST /dead-letter/replay` batch-replays dead letters: the JSON body takes
-  `{ endpoint?, tenant?, ids?, dryRun? }` — `endpoint` limits the replay to one
+  `{ endpoint?, tenant?, ids?, dryRun?, approvalToken? }` — `endpoint` limits the replay to one
   downstream, `tenant` to one tenant's dead letters (WR-86; omitting it keeps
   the pre-tenant behavior), `ids` to an explicit subset, and `dryRun: true`
   returns only a metadata preview (`{ dryRun: true, entries: [...] }` with
@@ -1094,6 +1094,21 @@ reliability primitives that matter for any signed-payload pipeline.
   instead of stampeding the downstream — entries held back stay
   dead-lettered (nothing dropped) and are reported in `throttled` plus the
   cumulative `throttled` counter on `GET /dead-letter/stats`. The opt-in
+  `replayApproval` server/queue option (WR-135) adds a second pair of eyes
+  for payment pipelines: a replay re-fires the downstream handler (real funds
+  movement), so a real (non-dry-run) `POST /dead-letter/replay` or
+  `POST /dead-letter/:id/replay` consumes a one-shot `approvalToken` issued
+  by `POST /dead-letter/replay/approve-request` — the token is bound to the
+  requested `endpoint`/`tenant`/`ids` scope (an empty scope approves anything),
+  expires after 5 minutes by default (configurable), and a missing, expired,
+  reused, or scope-mismatched token answers 403. Token consumption is audited
+  as `replay_approved`; executing with an expired token is audited as
+  `replay_approval_expired`. The token rides the JSON body or the
+  `x-replay-approval-token` header and is never written to the audit log.
+  Dry-run previews never need approval, and programmatic paths
+  (`RetryQueue.replayDeadLetter` / `replayDeadLetters`) keep an explicit
+  `bypassApproval: true` escape hatch (the operator HTTP layer never passes
+  it; the WR-31 auto-replayer uses it). The opt-in
   `autoReplay` server option (see *Dead-letter auto-replay* below) replays
   the whole list on a timer with identical fresh-budget semantics, controlled by
   `POST /dead-letter/auto-replay/pause|resume|trigger` and observed via

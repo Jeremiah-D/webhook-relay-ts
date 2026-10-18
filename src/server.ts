@@ -60,6 +60,7 @@ import {
   type OAuth2ClientCredentialsConfig,
 } from "./oauth-client.ts";
 import type { ReplayEgressOptions } from "./replay-egress.ts";
+import { ReplayApprovalError, type ReplayApprovalDenyReason, type ReplayApprovalOptions } from "./replay-approval.ts";
 import { HttpDeliveryError, parseRetryAfterMs } from "./failure.ts";
 import {
   DeadlineBudgetTimeoutError,
@@ -1286,6 +1287,23 @@ export interface RelayServerOptions {
    * immediately. Invalid values throw `RangeError` at startup.
    */
   replayEgress?: ReplayEgressOptions;
+  /**
+   * Two-phase approval for dead-letter replays (WR-135; see
+   * `src/replay-approval.ts` and the `replayApproval` `RetryQueue`
+   * option). Opt-in: when set, the executing side of `POST
+   * /dead-letter/replay` and `POST /dead-letter/{id}/replay`
+   * (non-dry-run) consumes a one-shot `approvalToken` issued by `POST
+   * /dead-letter/replay/approve-request` — missing, expired, reused, or
+   * scope-mismatched tokens answer 403, and dry-run previews never need
+   * approval (zero side effects). A replay re-fires the downstream
+   * handler, so for payment webhooks this is the second pair of eyes
+   * before real money moves again. Token consumption is audited as
+   * `replay_approved`; executing with an expired token is audited as
+   * `replay_approval_expired`. Off by default — replays run on the
+   * operator token alone, exactly the pre-WR-135 behavior. Invalid values
+   * throw `RangeError` at startup.
+   */
+  replayApproval?: ReplayApprovalOptions;
   /**
    * Delivery completion callbacks (WR-47; see `src/callback.ts`). Opt-in:
    * when a delivery reaches a terminal state (`delivered` or
@@ -3725,6 +3743,23 @@ export class BodyTooLargeError extends Error {
   }
 }
 
+/**
+ * WR-135: operator-facing message for a denied replay approval token.
+ * The token itself is never echoed — it is bearer material.
+ */
+function approvalDenyMessage(reason: ReplayApprovalDenyReason): string {
+  switch (reason) {
+    case "missing":
+      return "replay approval token required";
+    case "expired":
+      return "replay approval token expired";
+    case "reused":
+      return "replay approval token already used";
+    case "scope_mismatch":
+      return "replay approval token scope mismatch";
+  }
+}
+
 function readRawBody(
   req: Parameters<Parameters<typeof createServer>[0]>[0],
   maxBytes: number
@@ -4491,6 +4526,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // An explicit server-level `replayEgress` wins over the nested
     // `retry.replayEgress`; either way the queue owns the gate.
     replayEgress: opts.replayEgress ?? opts.retry?.replayEgress,
+    // WR-135: same precedence for two-phase replay approval — the queue
+    // owns the token ledger, the operator endpoints issue from it.
+    replayApproval: opts.replayApproval ?? opts.retry?.replayApproval,
     // Wrap the caller's hook so every retention purge is audited as
     // `dead_letter_purged`, not just observed.
     onDeadLetterPurged: (event) => {
@@ -5363,6 +5401,35 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   };
 
   /** Operator surface: dead-letter queue + audit-log queries + live event stream. */
+  /**
+   * WR-135: read an optional JSON object body for the replay-approval
+   * operator routes. Answers 413/400 itself and returns `undefined` on
+   * failure — the caller returns right away.
+   */
+  const readOptionalJsonBody = async (
+    req: Parameters<Parameters<typeof createServer>[0]>[0],
+    res: Parameters<Parameters<typeof createServer>[0]>[1],
+    maxBodyBytes: number
+  ): Promise<Record<string, unknown> | undefined> => {
+    let body: Record<string, unknown>;
+    try {
+      const raw = (await readRawBody(req, maxBodyBytes)).toString("utf8");
+      body = raw.trim() === "" ? {} : JSON.parse(raw);
+    } catch (err) {
+      if (err instanceof BodyTooLargeError) {
+        respondJson(res, 413, { error: "request body too large" });
+      } else {
+        respondJson(res, 400, { error: "invalid JSON body" });
+      }
+      return undefined;
+    }
+    if (typeof body !== "object" || body === null || Array.isArray(body)) {
+      respondJson(res, 400, { error: "body must be a JSON object" });
+      return undefined;
+    }
+    return body;
+  };
+
   const handleOperator = async (
     req: Parameters<Parameters<typeof createServer>[0]>[0],
     res: Parameters<Parameters<typeof createServer>[0]>[1],
@@ -5397,6 +5464,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     const isExport = pathname === "/dead-letter/export";
     const isStats = pathname === "/dead-letter/stats";
     const isBatchReplay = pathname === "/dead-letter/replay";
+    // WR-135: one-shot approval token issuance for two-phase replays.
+    const isApproveRequest = pathname === "/dead-letter/replay/approve-request";
     const isAudit = pathname === "/audit";
     const isAuditVerify = pathname === "/audit/verify";
     const isLatency = pathname === "/latency";
@@ -5478,7 +5547,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         respondJson(res, 400, { error: "body must be a JSON object" });
         return;
       }
-      const { endpoint, tenant, ids, dryRun } = body;
+      const { endpoint, tenant, ids, dryRun, approvalToken } = body;
       if (endpoint !== undefined && typeof endpoint !== "string") {
         respondJson(res, 400, { error: "endpoint must be a string" });
         return;
@@ -5498,6 +5567,10 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         respondJson(res, 400, { error: "dryRun must be a boolean" });
         return;
       }
+      if (approvalToken !== undefined && typeof approvalToken !== "string") {
+        respondJson(res, 400, { error: "approvalToken must be a string" });
+        return;
+      }
       const filter = {
         ...(endpoint !== undefined ? { endpoint } : {}),
         // WR-86: tenant-scoped replay — only this tenant's dead letters
@@ -5514,7 +5587,36 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         });
         return;
       }
-      const result = queue.replayDeadLetters(filter);
+      // WR-135: two-phase replay approval (opt-in). A replay re-fires the
+      // downstream handler, so with approval enabled the execution side
+      // consumes a one-shot token issued by
+      // `POST /dead-letter/replay/approve-request` — missing, expired,
+      // reused, or scope-mismatched tokens all answer 403. The token
+      // rides `approvalToken` or the `x-replay-approval-token` header and
+      // is never written to the audit log (bearer material). Dry runs
+      // never need approval — they returned above.
+      const headerToken = req.headers["x-replay-approval-token"];
+      const batchApprovalToken =
+        approvalToken ?? (typeof headerToken === "string" ? headerToken : undefined);
+      let result: { replayed: string[]; failed: { id: string; error: string }[]; throttled: string[] };
+      try {
+        result = queue.replayDeadLetters(filter, { approvalToken: batchApprovalToken });
+      } catch (err) {
+        if (err instanceof ReplayApprovalError) {
+          if (err.reason === "expired") {
+            opts.auditLog.append({
+              event: "replay_approval_expired",
+              keyId: operatorKeyId,
+              reason: "approval_token_expired",
+              ...(endpoint !== undefined ? { endpoint } : {}),
+              ...(tenant !== undefined ? { tenant } : {}),
+            });
+          }
+          respondJson(res, 403, { error: approvalDenyMessage(err.reason) });
+          return;
+        }
+        throw err;
+      }
       opts.auditLog.append({
         event: "dead_letter_batch_replayed",
         keyId: operatorKeyId,
@@ -5523,7 +5625,61 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         ...(endpoint !== undefined ? { endpoint } : {}),
         ...(tenant !== undefined ? { tenant } : {}),
       });
+      // WR-135: the token that paid for this execution. Only audited when
+      // the gate is on — without approval there is no token to report.
+      if (queue.getReplayApprovalStore() !== undefined) {
+        opts.auditLog.append({
+          event: "replay_approved",
+          keyId: operatorKeyId,
+          replayed: result.replayed,
+          ...(endpoint !== undefined ? { endpoint } : {}),
+          ...(tenant !== undefined ? { tenant } : {}),
+        });
+      }
       respondJson(res, 200, { replayed: result.replayed, failed: result.failed });
+      return;
+    }
+    if (isApproveRequest) {
+      // WR-135: issue a one-shot replay approval token scoped to the
+      // requested filter. 404 when two-phase approval is not configured —
+      // there is no token ledger to issue from.
+      if (queue.getReplayApprovalStore() === undefined) {
+        respondJson(res, 404, { error: "replay approval is not configured" });
+        return;
+      }
+      const approveBody = await readOptionalJsonBody(req, res, maxBodyBytes);
+      if (approveBody === undefined) return;
+      const { endpoint, tenant, ids } = approveBody;
+      if (endpoint !== undefined && typeof endpoint !== "string") {
+        respondJson(res, 400, { error: "endpoint must be a string" });
+        return;
+      }
+      if (tenant !== undefined && typeof tenant !== "string") {
+        respondJson(res, 400, { error: "tenant must be a string" });
+        return;
+      }
+      if (
+        ids !== undefined &&
+        (!Array.isArray(ids) || ids.some((i) => typeof i !== "string"))
+      ) {
+        respondJson(res, 400, { error: "ids must be an array of strings" });
+        return;
+      }
+      const issued = queue.issueReplayApprovalToken({
+        ...(endpoint !== undefined ? { endpoint } : {}),
+        ...(tenant !== undefined ? { tenant } : {}),
+        ...(ids !== undefined ? { ids: ids as string[] } : {}),
+      });
+      // The store existed (checked above); this is only unreachable when a
+      // concurrent reconfiguration removed it mid-request.
+      if (issued === undefined) {
+        respondJson(res, 404, { error: "replay approval is not configured" });
+        return;
+      }
+      respondJson(res, 200, {
+        approvalToken: issued.approvalToken,
+        expiresAt: issued.expiresAt,
+      });
       return;
     }
     if (isMetrics) {
@@ -6497,8 +6653,49 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       return;
     }
     const id = decodeURIComponent(replayMatch![1]);
-    if (queue.replayDeadLetter(id)) {
+    // WR-135: the single replay honors the two-phase gate when enabled —
+    // same 403 semantics as the batch endpoint. The approval token may
+    // ride the (optional) JSON body or the `x-replay-approval-token`
+    // header; with the feature off the body is never read, keeping the
+    // legacy path byte-identical.
+    let singleApprovalToken: string | undefined;
+    if (queue.getReplayApprovalStore() !== undefined) {
+      const singleBody = await readOptionalJsonBody(req, res, maxBodyBytes);
+      if (singleBody === undefined) return;
+      const bodyToken = singleBody.approvalToken;
+      if (bodyToken !== undefined && typeof bodyToken !== "string") {
+        respondJson(res, 400, { error: "approvalToken must be a string" });
+        return;
+      }
+      const headerToken = req.headers["x-replay-approval-token"];
+      singleApprovalToken =
+        bodyToken ?? (typeof headerToken === "string" ? headerToken : undefined);
+    }
+    let singleReplayed: boolean;
+    try {
+      singleReplayed = queue.replayDeadLetter(id, { approvalToken: singleApprovalToken });
+    } catch (err) {
+      if (err instanceof ReplayApprovalError) {
+        if (err.reason === "expired") {
+          opts.auditLog.append({
+            event: "replay_approval_expired",
+            keyId: operatorKeyId,
+            id,
+            reason: "approval_token_expired",
+          });
+        }
+        respondJson(res, 403, { error: approvalDenyMessage(err.reason) });
+        return;
+      }
+      throw err;
+    }
+    if (singleReplayed) {
       opts.auditLog.append({ event: "dead_letter_replayed", keyId: operatorKeyId, id });
+      // WR-135: the token that paid for this execution — only when the
+      // gate is on; without approval there is no token to report.
+      if (queue.getReplayApprovalStore() !== undefined) {
+        opts.auditLog.append({ event: "replay_approved", keyId: operatorKeyId, id });
+      }
       respondJson(res, 200, { id, replayed: true });
     } else {
       respondJson(res, 404, { error: "unknown dead-letter id" });

@@ -162,7 +162,7 @@ export const OPERATOR_ROUTES: readonly OperatorRoute[] = [
     methods: ["POST"],
     summary: "Batch-replay dead letters",
     description:
-      "WR-23: replay dead letters back into the delivery queue with a fresh retry budget, grouped per endpoint. `dryRun: true` returns the would-be-replayed metadata with zero side effects (nothing re-queued, nothing audited, payloads never touched).",
+      "WR-23: replay dead letters back into the delivery queue with a fresh retry budget, grouped per endpoint. `dryRun: true` returns the would-be-replayed metadata with zero side effects (nothing re-queued, nothing audited, payloads never touched). WR-135: when two-phase replay approval is enabled, a real (non-dry-run) replay consumes a one-shot `approvalToken` issued by `POST /dead-letter/replay/approve-request` — pass it in the body or the `x-replay-approval-token` header; missing, expired, reused, or scope-mismatched tokens answer 403.",
     okDescription:
       "`{ replayed, failed }`, or `{ dryRun: true, entries: [...] }` for a dry run.",
     requestBody: {
@@ -177,6 +177,33 @@ export const OPERATOR_ROUTES: readonly OperatorRoute[] = [
           description: "Only replay these dead-letter ids; unknown ids are an explicit error.",
         },
         dryRun: { type: "boolean", description: "Preview only: return metadata, change nothing." },
+        approvalToken: {
+          type: "string",
+          description:
+            "WR-135: one-shot approval token (see POST /dead-letter/replay/approve-request); required for a real replay when two-phase approval is enabled, never for a dry run. The x-replay-approval-token header is an alternative carrier.",
+        },
+      },
+    },
+  },
+  {
+    path: "/dead-letter/replay/approve-request",
+    pattern: exact("/dead-letter/replay/approve-request"),
+    methods: ["POST"],
+    summary: "Issue a one-shot replay approval token",
+    description:
+      "WR-135: two-phase approval for dead-letter replays (opt-in via `replayApproval`). Issues a one-shot `approvalToken` (default TTL 5 minutes, configurable) scoped to the requested filter — `endpoint` / `tenant` / `ids`; an empty scope approves any replay. A real (non-dry-run) `POST /dead-letter/replay` or `POST /dead-letter/{id}/replay` consumes the token; missing, expired, reused, or scope-mismatched tokens answer 403, and dry-run previews never need approval. Token consumption is audited as `replay_approved`; executing with an expired token is audited as `replay_approval_expired`. 404 when replay approval is not configured.",
+    okDescription: "`{ approvalToken, expiresAt }` — the token and its expiry as a unix-ms timestamp.",
+    requestBody: {
+      description: "Approval scope; all fields optional.",
+      required: [],
+      properties: {
+        endpoint: { type: "string", description: "Restrict the token to this target URL." },
+        tenant: { type: "string", description: "Restrict the token to this tenant's entries." },
+        ids: {
+          type: "array",
+          items: { type: "string" },
+          description: "Restrict the token to these dead-letter ids.",
+        },
       },
     },
   },
@@ -186,7 +213,7 @@ export const OPERATOR_ROUTES: readonly OperatorRoute[] = [
     methods: ["POST"],
     summary: "Replay one dead letter",
     description:
-      "Re-queue a single dead-letter entry with a fresh retry budget. Audited as `dead_letter_replayed`.",
+      "Re-queue a single dead-letter entry with a fresh retry budget. Audited as `dead_letter_replayed`. WR-135: when two-phase replay approval is enabled, the replay consumes a one-shot `approvalToken` (body or `x-replay-approval-token` header); missing, expired, reused, or scope-mismatched tokens answer 403.",
     okDescription: "`{ id, replayed: true }`, or 404 for an unknown id.",
     pathParams: [{ name: "id", description: "The dead-letter entry id." }],
   },
