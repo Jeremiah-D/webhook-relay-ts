@@ -115,6 +115,17 @@ export type {
 };
 import { EndpointQuota, type QuotaOptions, type QuotaStats } from "./quota.ts";
 import {
+  assertValidDeliveryDryRunOptions,
+  assertValidEndpointDryRunConfig,
+  classifyDryRunStatus,
+  normalizeEndpointDryRunConfig,
+  type DeliveryDryRunOptions,
+  type DryRunDeliveryEvent,
+  type DryRunOutcome,
+  type EndpointDryRunConfig,
+  type NormalizedDryRunConfig,
+} from "./delivery-dryrun.ts";
+import {
   TenantBudgetEnforcer,
   type TenantBudgetAuditEvent,
   type TenantBudgetConfig,
@@ -257,6 +268,7 @@ import {
   type ShadowMetricsInput,
   type SloRiskMetricsInput,
   type StarvationGuardMetricsInput,
+  type DryRunMetricsInput,
   type WeightedMetricsInput,
   type DeadLetterEscalationMetricsInput,
   type StalePauseMetricsInput,
@@ -1635,6 +1647,23 @@ export interface RetryQueueOptions {
    * retrying go through `onDeadLetter`, not here.
    */
   onAttemptFailed?: (info: AttemptFailedInfo) => void;
+  /**
+   * Per-endpoint delivery dry-run drill mode (WR-145; see
+   * `src/delivery-dryrun.ts`): exact `targetUrl` → drill config. A
+   * drill dispatch walks the intake-to-dispatch pipeline but answers
+   * with a configurable canned response instead of a physical outbound
+   * request — and never writes the circuit breaker, the dead-letter
+   * queue, the retry budget, or quotas. Disabled by default: endpoints
+   * without an entry behave exactly as before.
+   */
+  deliveryDryRun?: DeliveryDryRunOptions;
+  /**
+   * Called once per drill attempt outcome (WR-145). The server audits
+   * these with `dry_run: true` (`delivered` / `retrying` /
+   * `dry_run_exhausted` / `failed`), keeping drill traffic isolated
+   * from real-traffic audit queries.
+   */
+  onDryRunDelivery?: (event: DryRunDeliveryEvent) => void;
   /**
    * Called every time a batch is flushed — i.e. a group of buffered events
    * became one merged delivery item. The server audits this as
@@ -3066,6 +3095,21 @@ export class RetryQueue {
   private readonly latencyPhaseTrackers = new Map<string, LatencyPhasesTracker>();
   private readonly onRetryBudgetDepleted?: (info: RetryBudgetDepletedInfo) => void;
   private readonly onAttemptFailed?: (info: AttemptFailedInfo) => void;
+  /**
+   * WR-145: per-endpoint drill configs, keyed by exact `targetUrl` (the
+   * logical endpoint, stable across WR-39 failover). Empty when the
+   * feature is off — endpoints without an entry keep byte-exact current
+   * behavior.
+   */
+  private readonly dryRunConfigs = new Map<string, NormalizedDryRunConfig>();
+  private readonly onDryRunDelivery?: (event: DryRunDeliveryEvent) => void;
+  /**
+   * WR-145: drill outcome counters — tenant key ("" = default) →
+   * endpoint → outcome → count. Only endpoints that actually drilled
+   * appear, so exposition is byte-identical to the pre-WR-145 shape
+   * until the first drill.
+   */
+  private readonly dryRunCounters = new Map<string, Map<string, Map<DryRunOutcome, number>>>();
   /** Retries parked because the global retry budget was exhausted. */
   private retryBudgetDepleted = 0;
   private readonly batcher?: BatchCollector;
@@ -3694,6 +3738,16 @@ export class RetryQueue {
     }
     this.onAttemptFailed = opts.onAttemptFailed;
     this.onBatch = opts.onBatch;
+    // WR-145: drill configs are validated before any is installed — an
+    // illegal config throws RangeError at construction with zero partial
+    // application (a bad drill never silently disables the good ones).
+    if (opts.deliveryDryRun !== undefined) {
+      assertValidDeliveryDryRunOptions(opts.deliveryDryRun);
+      for (const [endpoint, config] of Object.entries(opts.deliveryDryRun)) {
+        this.dryRunConfigs.set(endpoint, normalizeEndpointDryRunConfig(config));
+      }
+    }
+    this.onDryRunDelivery = opts.onDryRunDelivery;
     const histBuckets = opts.metrics?.histogramBucketsMs ?? [50, 100, 250, 500, 1000, 2500, 5000, 10000];
     if (
       histBuckets.length === 0 ||
@@ -5669,6 +5723,140 @@ export class RetryQueue {
   }
 
   /**
+   * WR-145: one drill dispatch. Answers with the canned response after
+   * the canned delay — no socket is ever opened. Outcomes follow the
+   * WR-30 taxonomy (see `src/delivery-dryrun.ts`): canned 2xx delivers,
+   * canned retryable failures ride the normal backoff lane (without
+   * touching the retry budget), exhaustion and canned 4xx settle
+   * terminally WITHOUT the dead-letter queue. Every outcome is counted
+   * in the isolated dry-run metrics dimension and reported through
+   * `onDryRunDelivery`; nothing else in the control plane is written.
+   */
+  private async deliverDryRun(
+    id: string,
+    entry: RetryItem,
+    traceId: string,
+    tenant: string | undefined,
+    logicalEndpoint: string,
+    target: string,
+    cfg: NormalizedDryRunConfig,
+    force: boolean
+  ): Promise<void> {
+    entry.attempt += 1;
+    const attempt = entry.attempt;
+    const startedAt = Date.now();
+    if (cfg.canned.delayMs > 0) {
+      // The queue's injectable timer (manual in tests) — the drill
+      // "network" latency is as deterministic as the rest of the queue.
+      await new Promise<void>((resolve) => {
+        this.setTimer(() => resolve(), cfg.canned.delayMs);
+      });
+    }
+    // The queue may have stopped, or the item may have been settled,
+    // while the drill slept — bail out; the item stays queued for the
+    // normal lifecycle (or the shutdown drain drops it).
+    if ((!this.running && !force) || !this.queue.has(id)) return;
+    const status = cfg.canned.status;
+    const latencyMs = Date.now() - startedAt;
+    const report = (outcome: DryRunOutcome, extra: { error?: string; nextDelayMs?: number }): void => {
+      this.recordDryRun(tenant, logicalEndpoint, outcome);
+      this.onDryRunDelivery?.({
+        id: entry.id,
+        traceId,
+        ...(tenant === undefined ? {} : { tenant }),
+        endpoint: logicalEndpoint,
+        targetUrl: target,
+        attempts: attempt,
+        outcome,
+        statusCode: status,
+        latencyMs,
+        ...extra,
+      });
+    };
+    const classified = classifyDryRunStatus(status);
+    if (classified === "delivered") {
+      this.settleDryRun(id, entry);
+      report("delivered", {});
+      return;
+    }
+    const error = `dry-run canned response ${status}`;
+    if (classified === "failed") {
+      // Poison canned answer (e.g. a canned 400): retrying can never
+      // succeed, so settle terminally — audited as `failed`, never
+      // dead-lettered. The endpoint is not sick (it "answered"), so no
+      // breaker verdict is recorded — same neutrality as the real
+      // path's non_retryable branch, minus the dead letter.
+      this.settleDryRun(id, entry);
+      report("failed", { error });
+      return;
+    }
+    if (attempt >= this.maxAttempts) {
+      // Retries exhausted: settle terminally and audit
+      // `dry_run_exhausted`. A drill must never enter the dead-letter
+      // queue — the operator views stay clean for real dead letters.
+      this.settleDryRun(id, entry);
+      report("exhausted", { error });
+      return;
+    }
+    const retryDelayMs = this.delayForAttempt(attempt, logicalEndpoint, tenant);
+    report("retrying", {
+      error,
+      nextDelayMs: Math.max(0, Math.round(retryDelayMs)),
+    });
+    // WR-38: deliberately NO retry-budget gate here — a drill retry is
+    // not real load and must never consume the budget (or be parked by
+    // it). `schedule()` itself parks for paused endpoints, which is an
+    // operational hold, not control-plane accounting.
+    this.schedule(id, retryDelayMs);
+  }
+
+  /**
+   * WR-145: terminal drill settle. Mirrors the real delivered settle's
+   * *queue bookkeeping* (durable journal, queue removal, ordered-line
+   * settle, pending count) WITHOUT any control-plane writes: no
+   * breaker verdict, no quota/budget consumption, no real latency
+   * samples, no completion receipts, no SSE events, no endpoint-idle
+   * clock restart. A drilled delivery never happened — but the item is
+   * still gone, exactly once.
+   */
+  private settleDryRun(id: string, entry: RetryItem): void {
+    // WR-49: journal before the in-memory delete — a crash between the
+    // two redelivers (at-least-once), never loses.
+    if (this.durable !== undefined) {
+      this.durable.appendDelivered(id);
+      this.durablePendingRetry.delete(id);
+      this.compactDurable();
+    }
+    this.queue.delete(id);
+    // WR-143: the delivery settled — drop any phase-timeout attribution.
+    this.phaseTimeoutByDelivery.delete(id);
+    // WR-113: settle the ordered line — a settled head wakes the next head.
+    this.orderedSettle(entry.targetUrl, id);
+    this.bumpPending(entry.tenantId, entry.targetUrl, -1);
+    this.armedNextAt.delete(id);
+  }
+
+  /** WR-145: count one drill outcome in the isolated metrics dimension. */
+  private recordDryRun(
+    tenant: string | undefined,
+    endpoint: string,
+    outcome: DryRunOutcome
+  ): void {
+    const tenantKey = tenant ?? "";
+    let inner = this.dryRunCounters.get(tenantKey);
+    if (inner === undefined) {
+      inner = new Map();
+      this.dryRunCounters.set(tenantKey, inner);
+    }
+    let counts = inner.get(endpoint);
+    if (counts === undefined) {
+      counts = new Map();
+      inner.set(endpoint, counts);
+    }
+    counts.set(outcome, (counts.get(outcome) ?? 0) + 1);
+  }
+
+  /**
    * @param force bypass the `running` checks: used by `shutdown()` for the
    * one immediate attempt it grants flushed batches. A forced delivery that
    * needs to reschedule (retry, quota/circuit park) stays queued instead —
@@ -5798,6 +5986,20 @@ export class RetryQueue {
         });
       }
       this.schedule(id, budgetVerdict.retryAfterMs + this.random() * 50);
+      return;
+    }
+    // WR-145: per-endpoint delivery dry-run drill mode. The drill
+    // dispatches *here* — after every parking gate (ordered, deadline,
+    // pause, window, maintenance, tenant budget) but before the quota
+    // gate and everything control-plane below it. The drill answers
+    // with a canned response instead of a physical outbound request and
+    // never writes the breaker, the dead-letter queue, the retry
+    // budget, quotas, or the urgent lane (control plane: read zero,
+    // write zero). Operational parking above still applies: a drill for
+    // a paused endpoint parks like a real delivery.
+    const dryRunCfg = this.dryRunConfigs.get(logicalEndpoint);
+    if (dryRunCfg !== undefined && dryRunCfg.enabled) {
+      await this.deliverDryRun(id, entry, traceId, tenant, logicalEndpoint, target, dryRunCfg, force);
       return;
     }
     // Per-endpoint quota first: an exhausted budget delays the attempt
@@ -7072,6 +7274,23 @@ export class RetryQueue {
         });
       }
     }
+    // WR-145: activity-gated — drill series stay absent until a drill
+    // outcome has actually been recorded, so a relay that never drills
+    // renders byte-identical exposition to the pre-WR-145 shape.
+    const dryRun: DryRunMetricsInput[] = [];
+    for (const [tenantKey, inner] of this.dryRunCounters) {
+      const tenant = tenantKey === "" ? undefined : tenantKey;
+      for (const [endpoint, counts] of inner) {
+        for (const [outcome, count] of counts) {
+          dryRun.push({
+            endpoint,
+            ...(tenant === undefined ? {} : { tenant }),
+            outcome,
+            count,
+          });
+        }
+      }
+    }
     return renderPrometheus({
       deliveries,
       circuits,
@@ -7081,6 +7300,7 @@ export class RetryQueue {
       latencyHistograms,
       probes,
       starvationGuard,
+      ...(dryRun.length > 0 ? { dryRun } : {}),
       failover,
       // WR-66: activity-gated (see above) — weighted mode's series stay
       // absent until a dispatch has actually been weighted.
@@ -7473,6 +7693,73 @@ export class RetryQueue {
   /** True when `endpoint` is currently paused (WR-50). */
   isEndpointPaused(endpoint: string): boolean {
     return this.pausedEndpoints.has(endpoint);
+  }
+
+  /**
+   * WR-145: install or replace one endpoint's drill config at runtime
+   * (the WR-32 convention — immediate effect, no restart). `undefined`
+   * removes the config (drill off). Validates before applying — an
+   * illegal config throws `RangeError` and the live config is left
+   * intact. Returns the normalized config, or `undefined` when removed.
+   */
+  setEndpointDryRun(
+    endpoint: string,
+    config: EndpointDryRunConfig | undefined
+  ): NormalizedDryRunConfig | undefined {
+    if (typeof endpoint !== "string" || endpoint.length === 0) {
+      throw new RangeError("setEndpointDryRun: endpoint must be a non-empty string");
+    }
+    if (config === undefined) {
+      this.dryRunConfigs.delete(endpoint);
+      return undefined;
+    }
+    assertValidEndpointDryRunConfig(endpoint, config);
+    const normalized = normalizeEndpointDryRunConfig(config);
+    this.dryRunConfigs.set(endpoint, normalized);
+    return normalized;
+  }
+
+  /** The drill config for `endpoint`, or `undefined` when drills are off. */
+  getEndpointDryRun(endpoint: string): NormalizedDryRunConfig | undefined {
+    return this.dryRunConfigs.get(endpoint);
+  }
+
+  /** Every endpoint with a drill config installed. */
+  dryRunEndpoints(): string[] {
+    return [...this.dryRunConfigs.keys()];
+  }
+
+  /** Drill outcome counters per endpoint (operator introspection). */
+  getDryRunStats(): Array<{
+    endpoint: string;
+    tenant?: string;
+    delivered: number;
+    retried: number;
+    exhausted: number;
+    failed: number;
+  }> {
+    const rows: Array<{
+      endpoint: string;
+      tenant?: string;
+      delivered: number;
+      retried: number;
+      exhausted: number;
+      failed: number;
+    }> = [];
+    for (const [tenantKey, inner] of this.dryRunCounters) {
+      const tenant = tenantKey === "" ? undefined : tenantKey;
+      for (const [endpoint, counts] of inner) {
+        rows.push({
+          endpoint,
+          ...(tenant === undefined ? {} : { tenant }),
+          delivered: counts.get("delivered") ?? 0,
+          retried: counts.get("retrying") ?? 0,
+          exhausted: counts.get("exhausted") ?? 0,
+          failed: counts.get("failed") ?? 0,
+        });
+      }
+    }
+    return rows;
   }
 
   /**

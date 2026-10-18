@@ -55,6 +55,7 @@ const INVENTORY: Array<[string, Array<"GET" | "POST" | "PUT" | "DELETE">]> = [
   ["/endpoints/pause", ["POST"]],
   ["/endpoints/resume", ["POST"]],
   ["/endpoints", ["GET", "POST"]],
+  ["/endpoints/dry-run", ["POST"]],
   ["/endpoints/{id}", ["PUT", "DELETE"]],
   ["/scheduled", ["GET"]],
   ["/scheduled/{id}/{action}", ["POST"]],

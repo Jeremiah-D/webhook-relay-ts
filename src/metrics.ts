@@ -306,6 +306,12 @@ export interface MetricsInput {
   probes?: ProbeMetricsInput[];
   /** Present only for endpoints where the starvation guard activated. */
   starvationGuard?: StarvationGuardMetricsInput[];
+  /**
+   * WR-145: present only for endpoints that actually ran drills; one
+   * series per (endpoint, outcome) — activity-gated, so exposition is
+   * byte-identical to the pre-WR-145 shape until the first drill.
+   */
+  dryRun?: DryRunMetricsInput[];
   /** Present only for (endpoint, from, to) triples that actually switched. */
   failover?: FailoverMetricsInput[];
   /**
@@ -449,6 +455,15 @@ export interface MetricsInput {
 export interface StarvationGuardMetricsInput {
   endpoint: string;
   activations: number;
+}
+
+/** One endpoint's drill outcome counts, in Prometheus label order (WR-145). */
+export interface DryRunMetricsInput {
+  endpoint: string;
+  tenant?: string;
+  /** One of `delivered` / `retrying` / `exhausted` / `failed`. */
+  outcome: string;
+  count: number;
 }
 
 /** One failover switch count, in Prometheus label order. */
@@ -968,6 +983,18 @@ export function renderPrometheus(input: MetricsInput): string {
     for (const s of input.starvationGuard) {
       lines.push(
         `relay_starvation_guard_activations{endpoint="${escapeLabelValue(s.endpoint)}"} ${s.activations}`
+      );
+    }
+  }
+  if (input.dryRun !== undefined && input.dryRun.length > 0) {
+    lines.push(
+      "# HELP relay_dry_run_deliveries_total Drill (dry-run) delivery outcomes by endpoint. Drill traffic is fully isolated from real-traffic counters."
+    );
+    lines.push("# TYPE relay_dry_run_deliveries_total counter");
+    for (const d of input.dryRun) {
+      const tenantLabel = d.tenant === undefined ? "" : `,tenant="${escapeLabelValue(d.tenant)}"`;
+      lines.push(
+        `relay_dry_run_deliveries_total{endpoint="${escapeLabelValue(d.endpoint)}"${tenantLabel},outcome="${escapeLabelValue(d.outcome)}"} ${d.count}`
       );
     }
   }

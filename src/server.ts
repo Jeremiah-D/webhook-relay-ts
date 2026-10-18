@@ -27,6 +27,11 @@ import { RetryQueue, type DeliveryEvent, type DeliveryPriority, type DownstreamR
 import { parseDeliverAtHeader, DELIVER_AT_HEADER } from "./retry.ts";
 import type { ShadowDeliveredInfo, ShadowFailedInfo, ShadowTargetConfig, ShadowTargetsConfig } from "./retry.ts";
 import type {
+  DeliveryDryRunOptions,
+  DryRunDeliveryEvent,
+  EndpointDryRunConfig,
+} from "./delivery-dryrun.ts";
+import type {
   QuorumAcknowledgedInfo,
   QuorumConfig,
   QuorumDispatchedInfo,
@@ -1348,6 +1353,23 @@ export interface RelayServerOptions {
    * is the only behavior unless the operator opts in.
    */
   autoReplay?: AutoReplayOptions;
+  /**
+   * Per-endpoint delivery dry-run drill mode (WR-145; see
+   * `src/delivery-dryrun.ts`): exact `targetUrl` → drill config. A
+   * drill dispatch walks the intake-to-dispatch pipeline but answers
+   * with a configurable canned response (`status`/`body`/`delayMs`)
+   * instead of a physical outbound request — and never writes the
+   * circuit breaker, the dead-letter queue, the retry budget, quotas,
+   * or the urgent lane (control plane: read zero, write zero). Drill
+   * outcomes are audited with `dry_run: true` and counted in the
+   * isolated `relay_dry_run_deliveries_total{endpoint,outcome}`
+   * dimension. Toggle at runtime via `POST /endpoints/dry-run`
+   * (operator, admin scope; audited as
+   * `endpoint_dry_run_enabled`/`endpoint_dry_run_disabled`). Off by
+   * default — wins over the nested `retry.deliveryDryRun` when both
+   * are set.
+   */
+  deliveryDryRun?: DeliveryDryRunOptions;
   /**
    * Dead-letter retention TTL (WR-64; see `src/deadletter-retention.ts`
    * and the `deadLetterRetention` `RetryQueue` option): per-endpoint
@@ -4901,6 +4923,73 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // An explicit server-level `autoReplay` wins over the nested
     // `retry.autoReplay`; either way the queue owns the scheduler.
     autoReplay: opts.autoReplay ?? opts.retry?.autoReplay,
+    // WR-145: an explicit server-level `deliveryDryRun` wins over the
+    // nested `retry.deliveryDryRun`; either way the queue owns the
+    // drill configs. Wrap the caller's hook so every drill outcome is
+    // audited with `dry_run: true`, not just observed.
+    deliveryDryRun: opts.deliveryDryRun ?? opts.retry?.deliveryDryRun,
+    onDryRunDelivery: (event: DryRunDeliveryEvent) => {
+      const dryRunLabel = { dry_run: true } as const;
+      if (event.outcome === "delivered") {
+        opts.auditLog.append({
+          event: "delivered",
+          id: event.id,
+          traceId: event.traceId,
+          ...(event.tenant !== undefined ? { tenant: event.tenant } : {}),
+          endpoint: event.endpoint,
+          targetUrl: event.targetUrl,
+          attempts: event.attempts,
+          statusCode: event.statusCode,
+          latencyMs: event.latencyMs,
+          ...dryRunLabel,
+        });
+      } else if (event.outcome === "retrying") {
+        opts.auditLog.append({
+          event: "retrying",
+          id: event.id,
+          traceId: event.traceId,
+          ...(event.tenant !== undefined ? { tenant: event.tenant } : {}),
+          endpoint: event.endpoint,
+          targetUrl: event.targetUrl,
+          attempts: event.attempts,
+          statusCode: event.statusCode,
+          error: event.error,
+          nextDelayMs: event.nextDelayMs,
+          ...dryRunLabel,
+        });
+      } else if (event.outcome === "exhausted") {
+        // A drill must never enter the dead-letter queue, so exhaustion
+        // gets its own audit event name instead of `dead_letter` —
+        // operator dead-letter views stay clean for real dead letters.
+        opts.auditLog.append({
+          event: "dry_run_exhausted",
+          id: event.id,
+          traceId: event.traceId,
+          ...(event.tenant !== undefined ? { tenant: event.tenant } : {}),
+          endpoint: event.endpoint,
+          targetUrl: event.targetUrl,
+          attempts: event.attempts,
+          statusCode: event.statusCode,
+          error: event.error,
+          ...dryRunLabel,
+        });
+      } else {
+        opts.auditLog.append({
+          event: "failed",
+          id: event.id,
+          traceId: event.traceId,
+          ...(event.tenant !== undefined ? { tenant: event.tenant } : {}),
+          endpoint: event.endpoint,
+          targetUrl: event.targetUrl,
+          attempts: event.attempts,
+          statusCode: event.statusCode,
+          reason: "dry_run_failed",
+          error: event.error,
+          ...dryRunLabel,
+        });
+      }
+      opts.retry?.onDryRunDelivery?.(event);
+    },
     // Wrap the caller's hook so every cron occurrence is audited as
     // `scheduled_fired`, not just observed.
     onScheduledFired: (event) => {
@@ -5911,6 +6000,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     const isRoutingRules = pathname === "/routing/rules";
     const isEndpointsPause = pathname === "/endpoints/pause";
     const isEndpointsResume = pathname === "/endpoints/resume";
+    // WR-145: per-endpoint drill-mode toggle.
+    const isEndpointsDryRun = pathname === "/endpoints/dry-run";
     // WR-114: dynamic endpoint registry. The negative lookahead keeps
     // `/endpoints/pause` and `/endpoints/resume` on their exact routes
     // (mirrors the registry pattern in `src/operator-routes.ts`).
@@ -6933,6 +7024,72 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       } else {
         runAsOperator(operatorKeyId, () => queue.resumeEndpoint(endpoint));
         respondJson(res, 200, { endpoint, paused: false });
+      }
+      return;
+    }
+    if (isEndpointsDryRun) {
+      // WR-145: per-endpoint drill-mode toggle (operator, admin scope).
+      // Body `{ endpoint, enabled, canned? }`: `enabled: true` installs
+      // (or replaces) the drill config, `false` removes it. Unlike
+      // pause/resume, any endpoint string is accepted — a drill config
+      // applies the first time a delivery to it dispatches. Audited as
+      // `endpoint_dry_run_enabled` / `endpoint_dry_run_disabled` with
+      // the operator's `keyId`. A RangeError from `setEndpointDryRun`
+      // (illegal canned response) surfaces as a 400 and means
+      // "nothing changed".
+      let body: Record<string, unknown>;
+      try {
+        const raw = (await readRawBody(req, maxBodyBytes)).toString("utf8");
+        body = raw.trim() === "" ? {} : JSON.parse(raw);
+      } catch (err) {
+        if (err instanceof BodyTooLargeError) {
+          respondJson(res, 413, { error: "request body too large" });
+          return;
+        }
+        respondJson(res, 400, { error: "invalid JSON body" });
+        return;
+      }
+      if (typeof body !== "object" || body === null || Array.isArray(body)) {
+        respondJson(res, 400, { error: "body must be a JSON object" });
+        return;
+      }
+      const { endpoint, enabled, canned } = body;
+      if (typeof endpoint !== "string" || endpoint.length === 0) {
+        respondJson(res, 400, { error: "endpoint must be a non-empty string" });
+        return;
+      }
+      if (typeof enabled !== "boolean") {
+        respondJson(res, 400, { error: "enabled must be a boolean" });
+        return;
+      }
+      try {
+        const applied = queue.setEndpointDryRun(
+          endpoint,
+          enabled
+            ? { enabled: true, canned: canned as EndpointDryRunConfig["canned"] }
+            : undefined
+        );
+        opts.auditLog.append({
+          event: enabled ? "endpoint_dry_run_enabled" : "endpoint_dry_run_disabled",
+          endpoint,
+          // The canned body is operator test data — the audit carries
+          // only the classification-relevant fields, never the body.
+          ...(applied !== undefined
+            ? { canned: { status: applied.canned.status, delayMs: applied.canned.delayMs } }
+            : {}),
+          ...(operatorKeyId !== undefined ? { keyId: operatorKeyId } : {}),
+        });
+        respondJson(res, 200, {
+          endpoint,
+          dryRun: enabled,
+          ...(applied !== undefined ? { canned: applied.canned } : {}),
+        });
+      } catch (err) {
+        if (err instanceof RangeError) {
+          respondJson(res, 400, { error: err.message });
+          return;
+        }
+        throw err;
       }
       return;
     }

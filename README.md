@@ -1466,6 +1466,58 @@ curl -X POST http://127.0.0.1:PORT/endpoints/pause \
   (attempt counts survive through the durable queue; the remaining
   backoff does not).
 
+## Delivery dry-run drill mode (opt-in)
+
+Rehearse the whole delivery pipeline against a downstream without
+touching it: per-endpoint opt-in drill mode dispatches through the
+normal intake-to-dispatch path, but instead of a physical outbound
+request the queue answers with a configurable canned response
+(`status`/`body`/`delayMs`). Useful before a new downstream contract
+goes live, or to verify retry/backoff wiring after an incident.
+
+```ts
+createRelayServer({
+  deliveryDryRun: {
+    "https://downstream/hook": { canned: { status: 200 } },          // the happy path
+    "https://flaky/hook": { canned: { status: 503, delayMs: 150 } },  // drill the backoff lane
+  },
+});
+```
+
+```sh
+curl -X POST http://127.0.0.1:PORT/endpoints/dry-run \
+  -H "Authorization: Bearer $OPERATOR_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"endpoint":"https://downstream/hook","enabled":true,"canned":{"status":200}}'
+# → 200 { endpoint, dryRun: true, canned } · `enabled: false` removes the drill ·
+# 400 on an illegal canned response (a 400 always means "nothing changed")
+```
+
+- **Control-plane isolation** — a drill never writes the circuit
+  breaker, the dead-letter queue, the retry budget, quotas, or the
+  urgent lane (control plane: read zero, write zero). A canned 2xx
+  audits `delivered`, canned 408/429/5xx ride the normal backoff lane
+  (audited `retrying`) without consuming retry budget, exhaustion
+  audits `dry_run_exhausted` — never the dead-letter queue — and other
+  canned 4xx audit `failed` with reason `dry_run_failed`. Every drill
+  audit event carries `dry_run: true`, and drill outcomes count in the
+  isolated `relay_dry_run_deliveries_total{endpoint,outcome}` dimension
+  instead of the real-traffic counters.
+- **Operational parking still applies** — endpoint pause, delivery
+  windows, maintenance windows, and the delivery deadline gate a drill
+  exactly like a real delivery; only the physical request and the
+  control-plane writes are skipped.
+- **Runtime toggle and audit** — `POST /endpoints/dry-run` (operator,
+  admin scope) installs or removes a drill config with immediate
+  effect; transitions audit `endpoint_dry_run_enabled` /
+  `endpoint_dry_run_disabled` with the operator's `keyId`.
+  `queue.setEndpointDryRun` / `getEndpointDryRun` /
+  `dryRunEndpoints` / `getDryRunStats` are the library-level API.
+- **Honest drill semantics** — the canned delay holds the delivery
+  in-flight (keep it small); a drill never emits completion receipts
+  (WR-47), never feeds the fan-out quorum (WR-106), and never samples
+  the real latency trackers — a rehearsal is not a delivery.
+
 ## Dynamic endpoint registry (opt-in)
 
 Manage the *set* of downstream endpoints without restarting the relay:

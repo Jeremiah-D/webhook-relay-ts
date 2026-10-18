@@ -525,7 +525,7 @@ export const OPERATOR_ROUTES: readonly OperatorRoute[] = [
       description: "The endpoint config to register. `targetUrl` is required; `id` defaults to it.",
       required: ["targetUrl"],
       properties: {
-        id: { type: "string", description: "Registry id; defaults to targetUrl. `pause`/`resume` are reserved." },
+        id: { type: "string", description: "Registry id; defaults to targetUrl. `pause`/`resume`/`dry-run` are reserved." },
         targetUrl: { type: "string", description: "Downstream URL (http:/https:/ws:/wss:)." },
         verifier: { type: "object", description: "Per-endpoint outbound signing override ({ secret, keyId? })." },
         circuitBreaker: { type: "object", description: "Per-endpoint circuit-breaker thresholds (requires the breaker enabled)." },
@@ -538,8 +538,26 @@ export const OPERATOR_ROUTES: readonly OperatorRoute[] = [
     },
   },
   {
+    path: "/endpoints/dry-run",
+    pattern: exact("/endpoints/dry-run"),
+    methods: ["POST"],
+    summary: "Toggle per-endpoint delivery dry-run drill mode",
+    description:
+      "WR-145: install or remove one endpoint's drill config (`{ endpoint, enabled, canned? }`, admin scope). A drill dispatch walks the intake-to-dispatch pipeline but answers with a canned response (`status`/`body`/`delayMs`) instead of a physical outbound request — and never writes the circuit breaker, the dead-letter queue, the retry budget, or quotas. Audited as `endpoint_dry_run_enabled` / `endpoint_dry_run_disabled`. A 400 always means “nothing changed”.",
+    okDescription: "`{ endpoint, dryRun, canned? }`.",
+    requestBody: {
+      description: "`enabled: true` installs/replaces the drill config; `false` removes it.",
+      required: ["endpoint", "enabled"],
+      properties: {
+        endpoint: { type: "string", description: "Target URL of the endpoint to drill." },
+        enabled: { type: "boolean", description: "Install (true) or remove (false) the drill config." },
+        canned: { type: "object", description: "Canned response `{ status, body?, delayMs? }`; defaults to `{ status: 200 }`." },
+      },
+    },
+  },
+  {
     path: "/endpoints/{id}",
-    pattern: /^\/endpoints\/(?!pause$|resume$)(.+)$/,
+    pattern: /^\/endpoints\/(?!pause$|resume$|dry-run$)(.+)$/,
     methods: ["PUT", "DELETE"],
     summary: "Endpoint registry: update / delete one endpoint",
     description:
