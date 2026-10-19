@@ -1,5 +1,11 @@
 import { createHash } from "node:crypto";
 import { encodeWsFrame } from "./websocket.ts";
+import {
+  maybeCompressMessage,
+  resolvePerMessageDeflate,
+  type PerMessageDeflateOptions,
+  type ResolvedPerMessageDeflate,
+} from "./deflate.ts";
 
 /**
  * Inbound WebSocket event intake (WR-130): RFC 6455 *server-side*
@@ -13,8 +19,12 @@ import { encodeWsFrame } from "./websocket.ts";
  * - the server never masks outbound frames; clients MUST mask inbound
  *   ones (RFC 6455 §5.1) — an unmasked client frame is a protocol error
  *   (close 1002), where the outbound client merely tolerates it;
- * - no extensions are negotiated, so any RSV bit set is a protocol
- *   error (the outbound client speaks permessage-deflate);
+ * - extensions: none by default, so any RSV bit set is a protocol error;
+ *   opt in to RFC 7692 permessage-deflate (WR-152) via
+ *   `InboundWsOptions.permessageDeflate` and the client negotiates it in
+ *   the upgrade handshake — RSV1 then marks compressed data frames and
+ *   the server inflates them with the `src/deflate.ts` primitives (the
+ *   outbound client speaks permessage-deflate the same strict way);
  * - fragmented messages are reassembled with a byte cap — oversize
  *   reassembly fails with close 1009 (message too big).
  *
@@ -28,6 +38,16 @@ import { encodeWsFrame } from "./websocket.ts";
  * - server → client: one text frame per event,
  *   `{ "type": "event-ack", "status": "accepted" | "rejected", … }`,
  *   mirroring the HTTP intake's 202 / 4xx semantics.
+ *
+ * Opt-in compression (WR-152): when `InboundWsOptions.permessageDeflate`
+ * is enabled, the client may offer `permessage-deflate` in the upgrade's
+ * `Sec-WebSocket-Extensions` header — strictly, with both
+ * `client_no_context_takeover` and `server_no_context_takeover`, or the
+ * upgrade is rejected. Accepted offers get
+ * `Sec-WebSocket-Extensions: permessage-deflate;
+ * client_no_context_takeover; server_no_context_takeover` on the 101;
+ * the client then sets RSV1 on compressed data frames (first frame only)
+ * and the server answers large acks compressed the same way.
  */
 
 /** The RFC 6455 §1.3 magic GUID, spelled exactly as the spec has it. */
@@ -84,29 +104,121 @@ export class WsProtocolError extends Error {
 
 /** One fully reassembled inbound message. */
 export type InboundWsMessage =
-  | { kind: "text"; data: Buffer }
-  | { kind: "binary"; data: Buffer }
+  | { kind: "text"; data: Buffer; compressed: boolean }
+  | { kind: "binary"; data: Buffer; compressed: boolean }
   | { kind: "ping"; data: Buffer }
   | { kind: "pong"; data: Buffer }
   | { kind: "close"; code: number; reason: string };
 
 /**
+ * Parameters negotiated for inbound permessage-deflate (RFC 7692,
+ * server side — WR-152).
+ */
+export interface NegotiatedInboundDeflate {
+  /**
+   * LZ77 window bits the peer's compressor used (from the client's
+   * `client_max_window_bits`, default 15). We always inflate with a
+   * 15-bit window: a stream produced with a smaller window inflates
+   * fine under a larger one.
+   */
+  clientWindowBits: number;
+}
+
+/** The `Sec-WebSocket-Extensions` value sent back on an accepted offer. */
+export const INBOUND_DEFLATE_ACCEPT =
+  "permessage-deflate; client_no_context_takeover; server_no_context_takeover";
+
+/**
+ * Parse the client's `Sec-WebSocket-Extensions` request header for a
+ * permessage-deflate offer (RFC 7692 server side).
+ *
+ * Returns `null` when the client did not offer permessage-deflate — the
+ * connection then works uncompressed. Returns the negotiated parameters
+ * when it did. Throws a plain `Error` when the client offered
+ * permessage-deflate but violated the strict negotiation: missing
+ * either required no-context-takeover parameter, an out-of-range
+ * `client_max_window_bits`, or an unknown parameter. The caller must
+ * fail the upgrade (400) rather than run on parameters we cannot
+ * honor — symmetric with the WR-46 outbound convention, where the
+ * relay *requires* both no-context-takeover parameters.
+ */
+export function negotiateInboundPerMessageDeflate(
+  requestHeader: string | undefined
+): NegotiatedInboundDeflate | null {
+  if (requestHeader === undefined || requestHeader.trim() === "") return null;
+  // Split extensions on commas; parameter values here are simple tokens
+  // or quoted strings without commas, so a plain split is sound.
+  for (const ext of requestHeader.split(",")) {
+    const tokens = ext.split(";").map((t) => t.trim());
+    if (tokens[0].toLowerCase() !== "permessage-deflate") continue;
+    let clientNoTakeover = false;
+    let serverNoTakeover = false;
+    let clientWindowBits = 15;
+    for (const token of tokens.slice(1)) {
+      const eq = token.indexOf("=");
+      const name = (eq < 0 ? token : token.slice(0, eq)).trim().toLowerCase();
+      const rawValue = eq < 0 ? "" : token.slice(eq + 1).trim();
+      // Strip one layer of DQUOTE, per RFC 6455 quoted-string values.
+      const value =
+        rawValue.length >= 2 && rawValue.startsWith('"') && rawValue.endsWith('"')
+          ? rawValue.slice(1, -1)
+          : rawValue;
+      if (name === "client_no_context_takeover") {
+        clientNoTakeover = true;
+      } else if (name === "server_no_context_takeover") {
+        serverNoTakeover = true;
+      } else if (name === "client_max_window_bits") {
+        const bits = Number(value);
+        if (!Number.isInteger(bits) || bits < 8 || bits > 15) {
+          throw new Error(
+            `inbound-ws: bad permessage-deflate client_max_window_bits ${JSON.stringify(value)}`
+          );
+        }
+        clientWindowBits = bits;
+      } else if (name === "server_max_window_bits") {
+        // Accepted and ignored: a stream produced with a smaller window
+        // always inflates under our 15-bit window.
+      } else {
+        throw new Error(
+          `inbound-ws: unsupported permessage-deflate parameter ${JSON.stringify(name)}`
+        );
+      }
+    }
+    if (!clientNoTakeover || !serverNoTakeover) {
+      throw new Error(
+        "inbound-ws: permessage-deflate offer lacks a required no_context_takeover parameter"
+      );
+    }
+    return { clientWindowBits };
+  }
+  return null;
+}
+
+/**
  * Incremental server-side frame parser: feed socket chunks, pull out
  * complete messages. Enforces masking (1002 on violation), control-frame
- * rules, and the reassembly byte cap (1009 past it).
+ * rules, and the reassembly byte cap (1009 past it). When
+ * `permessageDeflate` is negotiated (WR-152), RSV1 marks compressed data
+ * frames — per RFC 7692 only on the first frame of a message — and the
+ * reassembled message comes back with `compressed: true` (the caller
+ * inflates it with `decompressMessage`; the parser itself stays
+ * synchronous).
  */
 export class InboundWsParser {
   private buf = Buffer.alloc(0);
   private fragOpcode: 0x1 | 0x2 | null = null;
   private fragParts: Buffer[] = [];
   private fragLen = 0;
+  private fragCompressed = false;
   private readonly maxMessageBytes: number;
+  private readonly permessageDeflate: boolean;
 
-  constructor(maxMessageBytes: number) {
+  constructor(maxMessageBytes: number, permessageDeflate = false) {
     if (!Number.isInteger(maxMessageBytes) || maxMessageBytes <= 0) {
       throw new RangeError("InboundWsParser: maxMessageBytes must be a positive integer");
     }
     this.maxMessageBytes = maxMessageBytes;
+    this.permessageDeflate = permessageDeflate;
   }
 
   push(chunk: Buffer): InboundWsMessage[] {
@@ -123,7 +235,6 @@ export class InboundWsParser {
     const b = this.buf;
     if (b.length < 2) return undefined;
     const fin = (b[0] & 0x80) !== 0;
-    const rsv = b[0] & 0x70;
     const opcode = b[0] & 0x0f;
     const masked = (b[1] & 0x80) !== 0;
     let len = b[1] & 0x7f;
@@ -144,8 +255,13 @@ export class InboundWsParser {
     }
     // RFC 6455 §5.1: a server MUST close when a client sends unmasked data.
     if (!masked) throw new WsProtocolError(1002, "client frames must be masked");
-    // No extensions are negotiated on this endpoint.
-    if (rsv !== 0) throw new WsProtocolError(1002, "RSV bits set without a negotiated extension");
+    // RSV1 is meaningful only with a negotiated permessage-deflate
+    // (WR-152); RSV2/RSV3 are never negotiated.
+    const rsv1 = (b[0] & 0x40) !== 0;
+    if ((b[0] & 0x30) !== 0) throw new WsProtocolError(1002, "RSV2/RSV3 bits set");
+    if (rsv1 && !this.permessageDeflate) {
+      throw new WsProtocolError(1002, "RSV bits set without a negotiated extension");
+    }
     if (b.length < off + 4 + len) return undefined;
     const mask = b.subarray(off, off + 4);
     const enc = b.subarray(off + 4, off + 4 + len);
@@ -155,6 +271,9 @@ export class InboundWsParser {
 
     if (opcode >= 0x8) {
       if (!fin) throw new WsProtocolError(1002, "fragmented control frame");
+      // RFC 7692: RSV1 is reserved for compressed *data* frames — never
+      // on a control frame, even when permessage-deflate is negotiated.
+      if (rsv1) throw new WsProtocolError(1002, "RSV1 set on a control frame");
       if (len > 125) throw new WsProtocolError(1002, "control frame payload exceeds 125 bytes");
       if (opcode === 0x9) return { kind: "ping", data: payload };
       if (opcode === 0xa) return { kind: "pong", data: payload };
@@ -170,6 +289,9 @@ export class InboundWsParser {
 
     if (this.fragOpcode !== null) {
       if (opcode !== 0x0) throw new WsProtocolError(1002, "expected a continuation frame");
+      // RFC 7692 §7.2.1: RSV1 appears only on the first frame of a
+      // compressed message — a continuation with RSV1 is a violation.
+      if (rsv1) throw new WsProtocolError(1002, "RSV1 set on a continuation frame");
     } else if (opcode !== 0x1 && opcode !== 0x2) {
       throw new WsProtocolError(1002, `unexpected data opcode ${opcode}`);
     }
@@ -177,6 +299,9 @@ export class InboundWsParser {
       this.fragOpcode = opcode;
       this.fragParts = [];
       this.fragLen = 0;
+      // The first frame decides: its RSV1 marks the whole reassembled
+      // message as compressed.
+      this.fragCompressed = rsv1;
     }
     this.fragLen += payload.length;
     if (this.fragLen > this.maxMessageBytes) {
@@ -186,10 +311,12 @@ export class InboundWsParser {
     if (!fin) return undefined;
     const data = Buffer.concat(this.fragParts, this.fragLen);
     const kind = this.fragOpcode === 0x1 ? "text" : "binary";
+    const compressed = this.fragCompressed;
     this.fragOpcode = null;
     this.fragParts = [];
     this.fragLen = 0;
-    return { kind, data };
+    this.fragCompressed = false;
+    return { kind, data, compressed };
   }
 }
 
@@ -243,6 +370,18 @@ export interface InboundWsOptions {
    * 1048576. Must be a positive integer.
    */
   maxMessageBytes?: number;
+  /**
+   * Opt in to RFC 7692 permessage-deflate for the inbound intake
+   * (WR-152): `true` for defaults, `{ thresholdBytes? }` to tune the
+   * payload size at which *outbound* acks compress (default 1024).
+   * Default: off — the endpoint stays plain RFC 6455 unless the client
+   * offers permessage-deflate *and* this is enabled. Invalid values
+   * throw `RangeError` at startup. When enabled, the server side of the
+   * negotiation is strict, mirroring the WR-46 outbound convention: the
+   * client's offer must carry both `client_no_context_takeover` and
+   * `server_no_context_takeover`, or the upgrade fails with 400.
+   */
+  permessageDeflate?: boolean | PerMessageDeflateOptions;
 }
 
 /** Validated {@link InboundWsOptions} with defaults applied. */
@@ -251,6 +390,7 @@ export interface ResolvedInboundWsOptions {
   pingIntervalMs: number;
   idleTimeoutMs: number;
   maxMessageBytes: number;
+  permessageDeflate: ResolvedPerMessageDeflate | undefined;
 }
 
 export const DEFAULT_INBOUND_WS_PATH = "/ingest/ws";
@@ -278,5 +418,30 @@ export function resolveInboundWsOptions(opts: InboundWsOptions = {}): ResolvedIn
   if (!Number.isInteger(maxMessageBytes) || maxMessageBytes <= 0) {
     throw new RangeError("inboundWs: `maxMessageBytes` must be a positive integer");
   }
-  return { path, pingIntervalMs, idleTimeoutMs, maxMessageBytes };
+  let permessageDeflate: ResolvedPerMessageDeflate | undefined;
+  try {
+    permessageDeflate = resolvePerMessageDeflate(opts.permessageDeflate);
+  } catch (err) {
+    throw new RangeError(`inboundWs: invalid permessageDeflate: ${(err as Error).message}`);
+  }
+  return { path, pingIntervalMs, idleTimeoutMs, maxMessageBytes, permessageDeflate };
+}
+
+/**
+ * One server→client text frame, opportunistically permessage-deflated
+ * (WR-152). When `deflate` is `undefined` (extension off or not
+ * negotiated) the frame goes out plain. Otherwise `maybeCompressMessage`
+ * decides: payloads under `thresholdBytes` — or ones that would not
+ * shrink — ride untouched; only a genuinely smaller payload sets RSV1.
+ * Servers never mask (RFC 6455 §5.3).
+ */
+export function wsDeflatedTextFrame(
+  text: string,
+  deflate: ResolvedPerMessageDeflate | undefined
+): Promise<Buffer> {
+  const payload = Buffer.from(text, "utf8");
+  if (deflate === undefined) return Promise.resolve(encodeWsFrame(0x1, payload, false));
+  return maybeCompressMessage(payload, deflate.thresholdBytes).then(({ bytes, compressed }) =>
+    encodeWsFrame(0x1, bytes, false, compressed)
+  );
 }

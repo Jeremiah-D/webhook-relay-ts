@@ -994,6 +994,20 @@ reliability primitives that matter for any signed-payload pipeline.
   the intake plane only. Invalid option values throw `RangeError` at
   startup; connect/disconnect and every admission decision are audited
   (`ws_connected` / `ws_disconnected` / `rejected` / `accepted`).
+  Opt-in permessage-deflate (WR-152, RFC 7692, real-time systems): set
+  `inboundWs.permessageDeflate` (`true` for defaults, `{ thresholdBytes? }`
+  to tune when *outbound* acks compress, default 1024) and the endpoint
+  negotiates compression in the upgrade handshake — strictly, like the
+  WR-46 outbound convention: the client's offer must carry both
+  `client_no_context_takeover` and `server_no_context_takeover`, or the
+  upgrade fails with 400; accepted offers get
+  `Sec-WebSocket-Extensions: permessage-deflate;
+  client_no_context_takeover; server_no_context_takeover` on the 101.
+  RSV1 then marks compressed data frames (first frame only, never on
+  control frames); the server inflates them with the `src/deflate.ts`
+  primitives and answers large acks compressed the same way —
+  opportunistic per message, never expanding the wire. Covered by
+  `test/inbound-ws-deflate.test.ts` against raw sockets.
 - `src/deflate.ts` — WebSocket permessage-deflate (RFC 7692, WR-46),
   opt-in per pool via the `permessageDeflate` WebSocket option (`true` for
   defaults, `{ thresholdBytes? }` to tune the payload size at which

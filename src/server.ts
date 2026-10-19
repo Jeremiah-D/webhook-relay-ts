@@ -200,18 +200,22 @@ import type { TLSSocket, Server as TlsServer } from "node:tls";
 import type { Socket } from "node:net";
 import {
   checkInboundWsHandshake,
+  INBOUND_DEFLATE_ACCEPT,
   inboundWsAcceptKey,
   InboundWsParser,
+  negotiateInboundPerMessageDeflate,
   resolveInboundWsOptions,
   wsCloseFrame,
+  wsDeflatedTextFrame,
   wsPingFrame,
   wsPongFrame,
-  wsTextFrame,
   WsProtocolError,
   type InboundWsMessage,
   type InboundWsOptions,
+  type NegotiatedInboundDeflate,
   type ResolvedInboundWsOptions,
 } from "./inbound-ws.ts";
+import { decompressMessage } from "./deflate.ts";
 import { assertValidPins, normalizePin, spkiFingerprint, TlsPinMismatchError } from "./pinning.ts";
 import {
   assertValidClientCert,
@@ -1721,6 +1725,12 @@ export interface RelayServerOptions {
    * listener terminates TLS the same listener serves `wss://` — no
    * second port. Disabled by default; invalid config throws `RangeError`
    * at startup.
+   *
+   * Opt-in permessage-deflate (WR-152): set
+   * `inboundWs.permessageDeflate` (`true` or `{ thresholdBytes? }`) and
+   * the endpoint negotiates RFC 7692 compression in the upgrade
+   * handshake — strictly, the client's offer must carry both
+   * no-context-takeover parameters or the upgrade fails with 400.
    */
   inboundWs?: InboundWsOptions;
   /**
@@ -9851,6 +9861,32 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // connection — the transport layer, orthogonal to schema validation.
     const bodyBudget = selectEndpointBodyLimit(wsOpts.path, opts.endpointBodyLimits) ?? maxBodyBytes;
 
+    // WR-152: inbound permessage-deflate negotiation — only when opted
+    // in, and only when the client offers it. The offer must carry both
+    // no-context-takeover parameters (strict, like the WR-46 outbound
+    // convention); a violating offer fails the upgrade with 400, like any
+    // other handshake violation — never silently mis-negotiated.
+    let inboundDeflate: NegotiatedInboundDeflate | null = null;
+    if (wsOpts.permessageDeflate !== undefined) {
+      const extRaw = req.headers["sec-websocket-extensions"];
+      const extHeader = Array.isArray(extRaw) ? extRaw[0] : extRaw;
+      try {
+        inboundDeflate = negotiateInboundPerMessageDeflate(extHeader);
+      } catch (err) {
+        const detail = (err as Error).message;
+        opts.auditLog.append({
+          event: "rejected",
+          id: connId,
+          traceId: connTraceId,
+          reason: "ws_deflate_negotiation_failed",
+          detail,
+          path: wsOpts.path,
+        });
+        rejectUpgradeHttp(400, "Bad Request", `permessage-deflate negotiation failed: ${detail}`);
+        return;
+      }
+    }
+
     const keyRaw = req.headers["sec-websocket-key"];
     const clientKey = (Array.isArray(keyRaw) ? keyRaw[0] : keyRaw) ?? "";
     socket.write(
@@ -9858,6 +9894,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         "Upgrade: websocket\r\n" +
         "Connection: Upgrade\r\n" +
         `Sec-WebSocket-Accept: ${inboundWsAcceptKey(clientKey)}\r\n` +
+        (inboundDeflate === null ? "" : `Sec-WebSocket-Extensions: ${INBOUND_DEFLATE_ACCEPT}\r\n`) +
         "\r\n"
     );
     socket.setNoDelay(true);
@@ -9879,10 +9916,17 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
           }),
     });
 
-    const parser = new InboundWsParser(wsOpts.maxMessageBytes);
+    // WR-152: the parser knows whether permessage-deflate was negotiated —
+    // RSV1 on a data frame then marks a compressed message.
+    const parser = new InboundWsParser(wsOpts.maxMessageBytes, inboundDeflate !== null);
     let lastActivity = Date.now();
     let tornDown = false;
     let timer: ReturnType<typeof setInterval> | undefined;
+    // WR-152: ordered outbound frame queue — ack compression is async, so
+    // every outbound data frame *and* the close frame ride one chain and
+    // keep call order on the wire (a 413 ack is never overtaken by the
+    // close that follows it).
+    let sendQueue: Promise<void> = Promise.resolve();
 
     const tearDown = (auditReason: string, code: number, reasonText: string): void => {
       if (tornDown) return;
@@ -9896,7 +9940,10 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         reason: auditReason,
         path: wsOpts.path,
       });
-      if (!socket.destroyed) {
+      // Drain through the frame queue so pending acks land before the
+      // close frame, preserving call order across async compression.
+      sendQueue = sendQueue.then(() => {
+        if (socket.destroyed) return;
         try {
           socket.write(wsCloseFrame(code, reasonText), () => socket.destroy());
           // If the peer never drains, don't linger: the audit is written.
@@ -9905,7 +9952,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         } catch {
           socket.destroy();
         }
-      }
+      });
     };
     const handle: InboundWsHandle = { tearDown };
     inboundWsHandles.add(handle);
@@ -9919,7 +9966,25 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         return false;
       }
       if (tornDown || socket.destroyed) return false;
-      socket.write(wsTextFrame(JSON.stringify(obj)));
+      // WR-152: opportunistically deflate the ack when permessage-deflate
+      // was negotiated — small acks ride untouched, large ones compress;
+      // deflate never expands the wire.
+      const frame = wsDeflatedTextFrame(
+        JSON.stringify(obj),
+        inboundDeflate === null ? undefined : wsOpts.permessageDeflate
+      );
+      sendQueue = sendQueue.then(async () => {
+        try {
+          // No tornDown check here: a frame queued before tearDown (e.g.
+          // the 413 ack ahead of its 1009 close) must still go out — the
+          // queue order is the correctness mechanism, and a dead socket
+          // is covered by the destroyed check below.
+          if (socket.destroyed) return;
+          socket.write(await frame);
+        } catch {
+          // Best-effort: one failed ack must not stall later frames.
+        }
+      });
       return true;
     };
 
@@ -10130,6 +10195,53 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       }
     };
 
+    // WR-152: ordered message delivery — decompression is async, so
+    // compressed messages inflate on this chain and keep their arrival
+    // order against later uncompressed ones. A corrupt or truncated
+    // compressed frame fails the connection on the WR-130 protocol-error
+    // channel (1002); an inflated message past the reassembly cap fails
+    // with 1009 (decompression-bomb guard).
+    let processQueue: Promise<void> = Promise.resolve();
+    const deliverMessage = (msg: InboundWsMessage): void => {
+      const run = async (): Promise<void> => {
+        if (tornDown) return;
+        if ((msg.kind === "text" || msg.kind === "binary") && msg.compressed) {
+          let data: Buffer;
+          try {
+            data = await decompressMessage(msg.data);
+          } catch {
+            opts.auditLog.append({
+              event: "rejected",
+              id: randomUUID(),
+              traceId: connTraceId,
+              reason: "ws_protocol_error",
+              detail: "permessage-deflate decompression failed",
+              path: wsOpts.path,
+            });
+            tearDown("protocol_error", 1002, "permessage-deflate decompression failed");
+            return;
+          }
+          if (data.length > wsOpts.maxMessageBytes) {
+            opts.auditLog.append({
+              event: "rejected",
+              id: randomUUID(),
+              traceId: connTraceId,
+              reason: "ws_protocol_error",
+              detail: "decompressed message exceeds the cap",
+              path: wsOpts.path,
+            });
+            tearDown("protocol_error", 1009, "decompressed message exceeds the cap");
+            return;
+          }
+          msg = { ...msg, data, compressed: false };
+        }
+        onMessage(msg);
+      };
+      // Keep the chain alive even if one link throws — no unhandled
+      // rejections, no stalled delivery.
+      processQueue = processQueue.then(run, run).then(undefined, () => undefined);
+    };
+
     socket.on("data", (chunk: Buffer) => {
       if (tornDown) return;
       let messages: InboundWsMessage[];
@@ -10153,7 +10265,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       }
       for (const msg of messages) {
         if (tornDown) break;
-        onMessage(msg);
+        deliverMessage(msg);
       }
     });
     socket.on("close", () => tearDown("transport_close", 1000, ""));
