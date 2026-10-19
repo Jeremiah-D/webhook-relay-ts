@@ -60,8 +60,11 @@ import { AssertionFailedError } from "./response-assertions.ts";
  *   declarative assertions. Retryable — follows the normal backoff lane,
  *   counts as a failure for the WR-10 breaker, and honors the retry
  *   budget.
+ * - `"endpoint_disabled"`: the endpoint is auto-disabled (WR-150) — the
+ *   delivery was dead-lettered *without an attempt*. Never a downstream
+ *   verdict; only an operator re-enable clears the gate.
  */
-export type FailureClass = "retryable" | "non_retryable" | "head_of_line_timeout" | "assertion_failed";
+export type FailureClass = "retryable" | "non_retryable" | "head_of_line_timeout" | "assertion_failed" | "endpoint_disabled";
 
 /**
  * Structured delivery failure for a non-2xx downstream HTTP response.
@@ -131,10 +134,13 @@ export interface ClassifiedFailure {
    * scheduled, including `"assertion_failed"` assertion failures),
    * `"non_retryable"` (the payload is poison — dead-letter immediately),
    * `"head_of_line_timeout"` (WR-113 line parking — dead-letter, never
-   * silently dropped), or `"assertion_failed"` (WR-118: the downstream
+   * silently dropped), `"assertion_failed"` (WR-118: the downstream
    * answered inside the status whitelist but the body failed the
    * endpoint's declarative assertions; handled exactly like
-   * `"retryable"` — normal backoff lane, breaker, budget).
+   * `"retryable"` — normal backoff lane, breaker, budget), or
+   * `"endpoint_disabled"` (WR-150: the endpoint is auto-disabled, so the
+   * delivery was dead-lettered without an attempt — never a downstream
+   * verdict).
    */
   failureClass: FailureClass;
   /** Downstream HTTP status, when the failure was an HTTP response. */

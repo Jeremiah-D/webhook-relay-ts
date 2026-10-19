@@ -152,8 +152,9 @@ function describeValue(value: unknown): string {
 /**
  * Validate a registry id: a non-empty string. Slashes are allowed (the
  * default id *is* the `targetUrl`, which contains them); the ids
- * `pause` and `resume` are reserved by the `/endpoints/pause` and
- * `/endpoints/resume` operator routes and can never address a record.
+ * `pause`, `resume`, and `enable` are reserved by the
+ * `/endpoints/pause`, `/endpoints/resume`, and `/endpoints/enable`
+ * operator routes and can never address a record.
  */
 export function assertValidEndpointId(id: unknown): asserts id is string {
   if (typeof id !== "string" || id.length === 0) {
@@ -161,7 +162,7 @@ export function assertValidEndpointId(id: unknown): asserts id is string {
       `endpoint registry: \`id\` must be a non-empty string, got ${describeValue(id)}`
     );
   }
-  if (id === "pause" || id === "resume") {
+  if (id === "pause" || id === "resume" || id === "enable") {
     throw new RangeError(
       `endpoint registry: \`id\` ${JSON.stringify(id)} is reserved by the operator API`
     );

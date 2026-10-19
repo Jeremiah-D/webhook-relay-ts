@@ -19,6 +19,12 @@ import {
   type StalePauseSweepResult,
 } from "./stale-pause.ts";
 import { EndpointCircuitBreaker, type CircuitBreakerOptions, type CircuitState, type CircuitStats } from "./circuit.ts";
+import {
+  EndpointAutoDisable,
+  type DisableFailureOutcome,
+  type EndpointAutoDisableOptions,
+  type EndpointDisableStatsRow,
+} from "./endpoint-disable.ts";
 import { SlowStartController, type SlowStartOptions, type SlowStartEndpointStats } from "./slowstart.ts";
 import {
   ReplayIdempotencyGuard,
@@ -287,6 +293,7 @@ import {
   type WeightedMetricsInput,
   type DeadLetterEscalationMetricsInput,
   type StalePauseMetricsInput,
+  type EndpointDisableMetricsInput,
   type OcspMetricsInput,
   type OrderedMetricsInput,
   type AssertionFailureMetricsInput,
@@ -321,6 +328,7 @@ export { TENANT_ID_HEADER, assertValidTenantId, tenantScopeKey, splitTenantScope
 export type { DeliveryCountersInput, CircuitStateInput, LatencyHistogramInput, StarvationGuardMetricsInput, SloRiskMetricsInput, CertExpiryMetricsInput };
 export type { DeadLetterEscalationMetricsInput };
 export type { StalePauseMetricsInput };
+export type { EndpointDisableMetricsInput };
 export type { OrderedMetricsInput };
 export {
   OrderedTracker,
@@ -464,6 +472,12 @@ export type {
   StalePauseOptions,
   StaleEndpointPausedEvent,
   StalePauseSweepResult,
+};
+export { EndpointAutoDisable };
+export type {
+  EndpointAutoDisableOptions,
+  EndpointDisableStatsRow,
+  DisableFailureOutcome,
 };
 export type { OtlpExporterOptions, OtlpStats } from "./otlp.ts";
 export { OutboundCoalescer, coalesceKey } from "./coalesce.ts";
@@ -2047,6 +2061,21 @@ export interface RetryQueueOptions {
    */
   onEndpointResumed?: (info: EndpointPauseInfo) => void;
   /**
+   * Called once per endpoint auto-disable transition (see
+   * {@link EndpointAutoDisable}). Edge-triggered: one event per
+   * transition. The server audits these as `endpoint_auto_disabled` —
+   * endpoint/consecutiveFailures/failureThreshold — which is the
+   * operator alert channel for this feature; library users get the
+   * hook directly.
+   */
+  onEndpointAutoDisabled?: (info: EndpointAutoDisabledInfo) => void;
+  /**
+   * Called once per operator re-enable of an auto-disabled endpoint
+   * (see {@link RetryQueue.enableEndpoint}). Edge-triggered. The
+   * server audits these as `endpoint_enabled`.
+   */
+  onEndpointEnabled?: (info: EndpointEnabledInfo) => void;
+  /**
    * Relay-level cap on concurrent in-flight deliveries *across all
    * endpoints* (see {@link GlobalConcurrencyGate}). Orthogonal to
    * `maxConcurrentPerEndpoint` (WR-06, per endpoint): both gates compose
@@ -2151,6 +2180,22 @@ export interface RetryQueueOptions {
    * the `relay_endpoint_auto_pauses_total` Prometheus counter.
    */
   stalePause?: StalePauseOptions;
+  /**
+   * Endpoint auto-disable (WR-150): `failureThreshold` consecutive
+   * delivery failures auto-disable the endpoint — new deliveries
+   * dead-letter immediately with `failureClass: "endpoint_disabled"`
+   * (no attempt, no retry budget, no backoff) until an operator
+   * re-enables it (`enableEndpoint` / `POST /endpoints/enable`). This
+   * is the human-intervention gate above the WR-10 circuit breaker:
+   * the breaker sheds load transiently and probes back; a disable
+   * holds until a human looks. Both keep separate streaks and are
+   * orthogonal. Disabled by default (absent = zero behavior change).
+   * Invalid values throw `RangeError` at construction. Stats via
+   * `getEndpointDisableStats()` and the
+   * `relay_endpoint_auto_disables_total` / `relay_endpoint_disabled`
+   * Prometheus series.
+   */
+  endpointAutoDisable?: EndpointAutoDisableOptions;
   /**
    * Called once per dead-letter entry auto-purged by the retention
    * sweep. The server audits these as `dead_letter_purged`; library
@@ -2364,6 +2409,28 @@ export interface RetryQueueOptions {
  * `endpoint_auto_paused`).
  */
 export type EndpointPauseCause = "manual" | "auto";
+
+/**
+ * Fired on an endpoint auto-disable transition (WR-150). The endpoint is
+ * the physical `targetUrl` that earned the consecutive-failure verdicts
+ * (the same key the WR-10 breaker records on).
+ */
+export interface EndpointAutoDisabledInfo {
+  /** The auto-disabled endpoint (physical `targetUrl`). */
+  endpoint: string;
+  /** Consecutive failures that tripped the gate. */
+  consecutiveFailures: number;
+  /** Effective failure threshold. */
+  failureThreshold: number;
+}
+
+/**
+ * Fired on an operator re-enable of an auto-disabled endpoint (WR-150).
+ */
+export interface EndpointEnabledInfo {
+  /** The re-enabled endpoint. */
+  endpoint: string;
+}
 
 /**
  * One row of the WR-100 stale-endpoint observability snapshot (see
@@ -3100,6 +3167,16 @@ export class RetryQueue {
   /** WR-50: operator pause/resume transition hooks (audited by the server). */
   private readonly onEndpointPaused?: (info: EndpointPauseInfo) => void;
   private readonly onEndpointResumed?: (info: EndpointPauseInfo) => void;
+  /** WR-150: auto-disable transition hooks (audited by the server). */
+  private readonly onEndpointAutoDisabled?: (info: EndpointAutoDisabledInfo) => void;
+  private readonly onEndpointEnabled?: (info: EndpointEnabledInfo) => void;
+  /**
+   * WR-150: per-endpoint consecutive-failure tracker with the disable
+   * gate. `undefined` when the `endpointAutoDisable` option is absent —
+   * the gate, the streaks, and the series are all compiled out of the
+   * delivery path then.
+   */
+  private readonly autoDisable?: EndpointAutoDisable;
   /**
    * WR-50: operator pause set, keyed by logical endpoint (`targetUrl` as
    * enqueued). A paused endpoint's deliveries are parked: they stay
@@ -3547,6 +3624,14 @@ export class RetryQueue {
     this.onConfigChange = opts.onConfigChange;
     this.onEndpointPaused = opts.onEndpointPaused;
     this.onEndpointResumed = opts.onEndpointResumed;
+    this.onEndpointAutoDisabled = opts.onEndpointAutoDisabled;
+    this.onEndpointEnabled = opts.onEndpointEnabled;
+    // WR-150: the tracker validates eagerly — an illegal threshold or
+    // window throws RangeError here, at construction, never mid-delivery.
+    this.autoDisable =
+      opts.endpointAutoDisable !== undefined
+        ? new EndpointAutoDisable(opts.endpointAutoDisable)
+        : undefined;
     // WR-48: the limiter is per-tenant now; instances are created lazily
     // by `limiterFor()` so tenants that never appear cost nothing. The
     // limit itself is still validated eagerly, at construction.
@@ -6344,6 +6429,11 @@ export class RetryQueue {
       this.park(id, 0);
       return;
     }
+    // WR-150: the auto-disable gate sits next to the pause — an explicit
+    // operator hold (pause) still wins over the automatic health gate,
+    // but a merely disabled endpoint never consumes a gate, a token, or
+    // an attempt: the delivery dead-letters immediately.
+    if (this.deadLetterIfEndpointDisabled(entry, id, traceId, target)) return;
     // WR-52: delivery time window ("quiet hours") — second only to the
     // manual pause. Outside a configured window the delivery is parked
     // until the window opens: it stays queued with its attempt count
@@ -6547,6 +6637,9 @@ export class RetryQueue {
         this.park(id, 0);
         return;
       }
+      // WR-150: a disable that landed before the global gate dead-letters
+      // the delivery instead of dispatching it — terminal, not parked.
+      if (this.deadLetterIfEndpointDisabled(entry, id, traceId, target, probe, breaker)) return;
       // WR-51: relay-level global dispatch gate — the outermost of the
       // three dispatch gates, so quota/circuit/budget verdicts and lane
       // ordering are all settled before a global slot is taken, and a
@@ -6568,6 +6661,10 @@ export class RetryQueue {
         this.park(id, 0);
         return;
       }
+      // WR-150: a disable that landed while waiting for the global slot
+      // dead-letters instead of dispatching — the slot is released by
+      // the finally below, exactly once.
+      if (this.deadLetterIfEndpointDisabled(entry, id, traceId, target, probe, breaker)) return;
       // WR-140: per-tenant dispatch gate — inside the global gate,
       // outside the per-endpoint limiter: the last tenant-granularity
       // gate before the sender. Tenant-less deliveries skip it entirely
@@ -6587,6 +6684,9 @@ export class RetryQueue {
           this.park(id, 0);
           return;
         }
+        // WR-150: a disable that landed while waiting for the tenant
+        // slot dead-letters instead of dispatching.
+        if (this.deadLetterIfEndpointDisabled(entry, id, traceId, target, probe, breaker)) return;
       }
       // WR-06: per-endpoint concurrency limiter — the innermost gate
       // since WR-140 moved it inside the tenant gate. The fast lane
@@ -6605,6 +6705,9 @@ export class RetryQueue {
         this.park(id, 0);
         return;
       }
+      // WR-150: a disable that landed while queued for the per-endpoint
+      // limiter dead-letters instead of dispatching.
+      if (this.deadLetterIfEndpointDisabled(entry, id, traceId, target, probe, breaker)) return;
       // A normal dispatch earns the urgent lane its proportional deficit
       // (only while urgent demand is backlogged) — the DRR earning event.
       // Runs after the innermost gate granted (the per-endpoint limiter
@@ -6751,6 +6854,11 @@ export class RetryQueue {
         // keep their own audit/counters/latency below, untouched.
         if (attemptLeads) {
           breaker?.recordSuccess(target);
+          // WR-150: a delivered attempt resets the auto-disable streak —
+          // same verdict rule as the breaker (one physical attempt, one
+          // verdict), kept in a separate streak so the two gates stay
+          // orthogonal.
+          this.autoDisable?.recordSuccess(target);
           // WR-59: a delivered attempt cools the endpoint's adaptive base
           // toward the floor.
           this.adaptiveBackoffFor(tenant)?.recordOutcome(target, true);
@@ -6951,6 +7059,9 @@ export class RetryQueue {
           // a second physical observation of the endpoint.
           if (attemptLeads && reachedDownstream) {
             breaker?.recordSuccess(target);
+            // WR-150: the downstream answered (poison payload, not a sick
+            // endpoint) — resets the auto-disable streak like any success.
+            this.autoDisable?.recordSuccess(target);
             // WR-59: the downstream answered (poison payload, not a sick
             // endpoint) — cools the adaptive base like any success.
             this.adaptiveBackoffFor(tenant)?.recordOutcome(target, true);
@@ -6979,6 +7090,22 @@ export class RetryQueue {
           // (OcspRevokedError, a different class) is a real endpoint
           // failure and counts normally.
           if (!(err instanceof OcspError)) breaker?.recordFailure(target);
+          // WR-150: feed the auto-disable tracker the same leader-only
+          // verdict the breaker gets — one physical failure, one streak
+          // event. The WR-101 OCSP rule applies here too: a local
+          // telemetry outage is not a sick endpoint, a revoked
+          // certificate is. Edge-triggered: the first failure to reach
+          // the threshold fires the transition hook exactly once.
+          if (!(err instanceof OcspError)) {
+            const outcome = this.autoDisable?.recordFailure(target);
+            if (outcome?.disabled === true) {
+              this.onEndpointAutoDisabled?.({
+                endpoint: target,
+                consecutiveFailures: outcome.consecutiveFailures,
+                failureThreshold: outcome.failureThreshold,
+              });
+            }
+          }
           // WR-59: a retryable failure heats the endpoint's adaptive base
           // toward the ceiling.
           this.adaptiveBackoffFor(tenant)?.recordOutcome(target, false);
@@ -7174,6 +7301,45 @@ export class RetryQueue {
     // Classified "retryable": the payload was not poison — the relay
     // simply ran out of SLO — so the dead-letter record reads honestly.
     this.moveToDeadLetter(entry, id, err, { failureClass: "retryable" }, at, traceId, target);
+  }
+
+  /**
+   * WR-150: dead-letter a delivery whose physical target is auto-disabled.
+   * Returns `true` when the delivery was settled — the caller must return
+   * immediately (the item is out of the queue; nothing else may run).
+   *
+   * The delivery is terminal, not parked: no attempt is made, no retry
+   * budget is burned, no backoff is scheduled, and no breaker/adaptive
+   * verdict is recorded (a gate refusal is not a downstream observation —
+   * the same neutrality as the WR-76 "never attempted" path). A half-open
+   * probe on a just-disabled endpoint is cancelled: the disable gate
+   * supersedes the breaker's recovery probing.
+   */
+  private deadLetterIfEndpointDisabled(
+    entry: RetryItem & { attempt: number },
+    id: string,
+    traceId: string,
+    target: string,
+    probe?: boolean,
+    breaker?: EndpointCircuitBreaker
+  ): boolean {
+    const tracker = this.autoDisable;
+    if (tracker === undefined || !tracker.isDisabled(target)) return false;
+    if (probe === true) breaker?.cancelProbe(target);
+    const consecutiveFailures = tracker.consecutiveFailures(target);
+    this.moveToDeadLetter(
+      entry,
+      id,
+      new Error(
+        `endpoint ${target} is auto-disabled after ${consecutiveFailures} consecutive delivery failures; ` +
+          "delivery dead-lettered without an attempt (operator re-enable required)"
+      ),
+      { failureClass: "endpoint_disabled" },
+      new Date().toISOString(),
+      traceId,
+      target
+    );
+    return true;
   }
 
   /**
@@ -7676,6 +7842,18 @@ export class RetryQueue {
     const stalePause: StalePauseMetricsInput[] = [...this.autoPauseCounts]
       .filter(([, pauses]) => pauses > 0)
       .map(([endpoint, pauses]) => ({ endpoint, pauses }));
+    // WR-150: one counter row per endpoint that has actually been
+    // auto-disabled, plus the currently-disabled set for the gauge —
+    // all activity-gated, so a relay with the feature off (or never
+    // triggered) exposes no `relay_endpoint_auto_disable*` series at
+    // all. The tracker's cumulative counts are the source.
+    const disableStats = this.autoDisable?.getStats() ?? [];
+    const endpointDisable: EndpointDisableMetricsInput[] = disableStats
+      .filter((s) => s.autoDisables > 0)
+      .map((s) => ({ endpoint: s.endpoint, disables: s.autoDisables }));
+    const endpointDisabledNow: string[] = disableStats
+      .filter((s) => s.disabled)
+      .map((s) => s.endpoint);
     // WR-113: one counter row per ordered endpoint with recorded
     // activity — activity-gated, so a relay with the feature off (or
     // never exercised) exposes no `relay_ordered_*` series at all.
@@ -7791,6 +7969,11 @@ export class RetryQueue {
       ...(escalation.length > 0 ? { escalation } : {}),
       // WR-100: activity-gated (see above).
       ...(stalePause.length > 0 ? { stalePause } : {}),
+      // WR-150: activity-gated (see above) — the counter appears once an
+      // endpoint has actually been auto-disabled, and the gauge only
+      // while at least one endpoint is disabled.
+      ...(endpointDisable.length > 0 ? { endpointDisable } : {}),
+      ...(endpointDisabledNow.length > 0 ? { endpointDisabledNow } : {}),
       // WR-94: activity-gated — the gauge appears only once an adaptive
       // outcome has been recorded for an endpoint. Non-finite limits are
       // skipped: a Prometheus gauge cannot hold Infinity.
@@ -8121,6 +8304,41 @@ export class RetryQueue {
   /** True when `endpoint` is currently paused (WR-50). */
   isEndpointPaused(endpoint: string): boolean {
     return this.pausedEndpoints.has(endpoint);
+  }
+
+  /**
+   * WR-150: operator re-enable for an auto-disabled endpoint. Clears the
+   * disable gate and resets the endpoint's failure streak (the operator's
+   * attention is a fresh start — like the WR-100 resume restarting the
+   * idle clock). Queued deliveries dispatch normally again; the next
+   * failure starts a new streak.
+   *
+   * Orthogonal to pause/resume: re-enabling does not touch the pause
+   * set, and resuming a pause does not clear a disable. Idempotent:
+   * enabling a non-disabled endpoint is a no-op returning `false`.
+   * Returns `true` on a real transition. An empty/non-string endpoint
+   * throws `RangeError`.
+   */
+  enableEndpoint(endpoint: string): boolean {
+    assertValidPauseEndpoint(endpoint, "enableEndpoint");
+    const tracker = this.autoDisable;
+    if (tracker === undefined || !tracker.enable(endpoint)) return false;
+    this.onEndpointEnabled?.({ endpoint });
+    return true;
+  }
+
+  /** True when `endpoint` is currently auto-disabled (WR-150). */
+  isEndpointDisabled(endpoint: string): boolean {
+    return this.autoDisable?.isDisabled(endpoint) ?? false;
+  }
+
+  /**
+   * WR-150: per-endpoint auto-disable observability snapshot (operator
+   * metadata only — no payloads). Empty when the `endpointAutoDisable`
+   * option was never configured.
+   */
+  getEndpointDisableStats(): EndpointDisableStatsRow[] {
+    return this.autoDisable?.getStats() ?? [];
   }
 
   /**

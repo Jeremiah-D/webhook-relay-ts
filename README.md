@@ -599,6 +599,23 @@ reliability primitives that matter for any signed-payload pipeline.
   maintained in both modes, so a switch trips on live history instead of
   a cold start. `relay_endpoint_circuit_error_rate{endpoint}` exposes the
   rolling-window rate per error-rate-mode endpoint.
+- `src/endpoint-disable.ts` — per-endpoint auto-disable gate
+  (`EndpointAutoDisable`): `failureThreshold` (default 5) consecutive
+  delivery failures auto-disable the endpoint — new deliveries
+  dead-letter immediately with `failureClass: "endpoint_disabled"` (no
+  attempt, no retry budget, no backoff) until an operator re-enables it
+  via `queue.enableEndpoint` / `POST /endpoints/enable`. An optional
+  `windowMs` prunes failures older than the window, so a slow drip can
+  never trip the gate. Keeps a separate streak from the circuit breaker
+  (orthogonal gates, same leader-only verdicts); an answering downstream
+  (including `non_retryable` rejections) resets the streak. Wired into
+  `RetryQueue` via `retry: { endpointAutoDisable: {...} }` (off by
+  default); `getEndpointDisableStats()` reports per-endpoint `disabled` /
+  `consecutiveFailures` / `disabledAtMs` / `autoDisables`, transitions
+  are audited as `endpoint_auto_disabled` / `endpoint_enabled`, and
+  `relay_endpoint_auto_disables_total{endpoint}` /
+  `relay_endpoint_disabled{endpoint}` expose it to Prometheus.
+  Injectable clock for deterministic tests.
 - `src/downstream-probe.ts` — opt-in *active* downstream health probing
   (`DownstreamProber`), wired into `RetryQueue` via `retry: { probe: {
   endpoints, intervalMs, method, timeoutMs } }` (off by default). Each
@@ -1465,6 +1482,65 @@ curl -X POST http://127.0.0.1:PORT/endpoints/pause \
 - **Parked timing is in-memory** — a restart resumes parked items promptly
   (attempt counts survive through the durable queue; the remaining
   backoff does not).
+
+## Endpoint auto-disable (opt-in)
+
+The human-intervention gate above the circuit breaker. The breaker is
+transient fault handling — it sheds load for a cooldown, then probes
+back. Auto-disable concludes the downstream is not coming back on its
+own: after `failureThreshold` consecutive delivery failures, the relay
+*disables* the endpoint. New deliveries to a disabled endpoint
+dead-letter immediately with `failureClass: "endpoint_disabled"` — no
+attempt is made, no retry budget is burned, no backoff is scheduled.
+They are terminal, not parked (compare the pause above, which holds
+deliveries for a later resume). The endpoint stays disabled until an
+operator re-enables it; successes cannot clear it, because a disabled
+endpoint is never attempted.
+
+```ts
+const queue = new RetryQueue({
+  endpointAutoDisable: { failureThreshold: 5, windowMs: 10 * 60_000 }, // 5 straight failures within 10 min
+  // ...
+});
+queue.enableEndpoint("https://downstream/hook"); // operator re-enable: clears the gate, resets the streak
+queue.isEndpointDisabled("https://downstream/hook");
+queue.getEndpointDisableStats();                 // per-endpoint rows: disabled, streak, disabledAtMs, autoDisables
+```
+
+```sh
+curl -X POST http://127.0.0.1:PORT/endpoints/enable \
+  -H "Authorization: Bearer $OPERATOR_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"endpoint":"https://downstream/hook"}'
+# → 200 { endpoint, disabled: false, wasDisabled: true } · 404 for an
+# unknown endpoint · 403 without the token
+```
+
+- **Orthogonal to the circuit breaker** — the breaker keeps its own
+  consecutive-failure streak and trips on its own thresholds; this gate
+  keeps a separate streak fed from the same leader-only verdicts. A
+  breaker opening and closing never touches the disable streak, and a
+  disable never opens the breaker. Both are off unless configured.
+- **Same verdict rule as the breaker** — a delivered attempt (or an
+  answering downstream, e.g. a 400 `non_retryable` rejection) resets the
+  streak; a retryable failure grows it; our own SLO cutoffs
+  (deadline-budget expiry) and local telemetry outages (OCSP query
+  failures) record no verdict at all. Follower verdicts in coalesced
+  fan-out never double-count.
+- **Keyed by the physical target** — the streak is recorded on the URL
+  that actually failed (the same key the breaker uses), so a sick
+  failover standby is gated without touching the healthy primary.
+- **The pause still wins** — an explicit operator hold parks deliveries
+  even for a disabled endpoint; when resumed, they dead-letter through
+  the gate instead of dispatching.
+- **Audited and metered** — transitions are written as
+  `endpoint_auto_disabled` (endpoint, consecutiveFailures,
+  failureThreshold) and `endpoint_enabled`; Prometheus exposes
+  `relay_endpoint_auto_disables_total{endpoint}` and the
+  `relay_endpoint_disabled{endpoint}` gauge (both activity-gated —
+  absent when the feature is off).
+- **Off by default** — without the option the tracker is never
+  constructed: zero behavior change, zero hot-path cost.
 
 ## Delivery dry-run drill mode (opt-in)
 

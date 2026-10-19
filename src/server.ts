@@ -5667,6 +5667,28 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       });
       opts.retry?.onEndpointResumed?.({ endpoint });
     },
+    // WR-150: audit the auto-disable transition and operator re-enables.
+    // Edge-triggered in the queue — each transition audits exactly one
+    // event. The disable carries the streak that tripped it so the
+    // operator sees *why* the gate fired.
+    onEndpointAutoDisabled: ({ endpoint, consecutiveFailures, failureThreshold }) => {
+      opts.auditLog.append({
+        event: "endpoint_auto_disabled",
+        endpoint,
+        consecutiveFailures,
+        failureThreshold,
+        ...(activeOperatorKeyId !== undefined ? { keyId: activeOperatorKeyId } : {}),
+      });
+      opts.retry?.onEndpointAutoDisabled?.({ endpoint, consecutiveFailures, failureThreshold });
+    },
+    onEndpointEnabled: ({ endpoint }) => {
+      opts.auditLog.append({
+        event: "endpoint_enabled",
+        endpoint,
+        ...(activeOperatorKeyId !== undefined ? { keyId: activeOperatorKeyId } : {}),
+      });
+      opts.retry?.onEndpointEnabled?.({ endpoint });
+    },
     // Wrap the caller's onBatch so every flushed batch is audited, not just observed.
     onBatch: (info) => {
       opts.auditLog.append({
@@ -6150,13 +6172,16 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     const isRoutingRules = pathname === "/routing/rules";
     const isEndpointsPause = pathname === "/endpoints/pause";
     const isEndpointsResume = pathname === "/endpoints/resume";
+    // WR-150: operator re-enable for an auto-disabled endpoint.
+    const isEndpointsEnable = pathname === "/endpoints/enable";
     // WR-145: per-endpoint drill-mode toggle.
     const isEndpointsDryRun = pathname === "/endpoints/dry-run";
     // WR-114: dynamic endpoint registry. The negative lookahead keeps
-    // `/endpoints/pause` and `/endpoints/resume` on their exact routes
-    // (mirrors the registry pattern in `src/operator-routes.ts`).
+    // `/endpoints/pause`, `/endpoints/resume`, and `/endpoints/enable`
+    // on their exact routes (mirrors the registry pattern in
+    // `src/operator-routes.ts`).
     const isEndpointsRegistry = pathname === "/endpoints";
-    const endpointIdMatch = /^\/endpoints\/(?!pause$|resume$)(.+)$/.exec(pathname);
+    const endpointIdMatch = /^\/endpoints\/(?!pause$|resume$|enable$)(.+)$/.exec(pathname);
     const isScheduledList = pathname === "/scheduled";
     const scheduleActionMatch = /^\/scheduled\/([^/]+)\/(pause|resume)$/.exec(pathname);
     const deliveryMatch = /^\/deliveries\/([^/]+)$/.exec(pathname);
@@ -7180,6 +7205,45 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         runAsOperator(operatorKeyId, () => queue.resumeEndpoint(endpoint));
         respondJson(res, 200, { endpoint, paused: false });
       }
+      return;
+    }
+    if (isEndpointsEnable) {
+      // WR-150: operator re-enable for an auto-disabled endpoint. Body
+      // is `{ endpoint }`. Re-enabling clears the disable gate and
+      // resets the endpoint's failure streak — queued deliveries dispatch
+      // normally again and the next failure starts a new streak. It does
+      // not touch the pause set (orthogonal states). Transitions are
+      // audited as `endpoint_enabled` by the queue hook. Unknown
+      // endpoints are a fail-closed 404, like pause/resume. Enabling a
+      // non-disabled endpoint is a no-op 200 (idempotent).
+      let body: Record<string, unknown>;
+      try {
+        const raw = (await readRawBody(req, maxBodyBytes)).toString("utf8");
+        body = raw.trim() === "" ? {} : JSON.parse(raw);
+      } catch (err) {
+        if (err instanceof BodyTooLargeError) {
+          respondJson(res, 413, { error: "request body too large" });
+          return;
+        }
+        respondJson(res, 400, { error: "invalid JSON body" });
+        return;
+      }
+      if (typeof body !== "object" || body === null || Array.isArray(body)) {
+        respondJson(res, 400, { error: "body must be a JSON object" });
+        return;
+      }
+      const { endpoint } = body;
+      if (typeof endpoint !== "string" || endpoint.length === 0) {
+        respondJson(res, 400, { error: "endpoint must be a non-empty string" });
+        return;
+      }
+      if (!knownEndpoints.has(endpoint)) {
+        respondJson(res, 404, { error: "unknown endpoint" });
+        return;
+      }
+      const wasDisabled = queue.isEndpointDisabled(endpoint);
+      runAsOperator(operatorKeyId, () => queue.enableEndpoint(endpoint));
+      respondJson(res, 200, { endpoint, disabled: false, wasDisabled });
       return;
     }
     if (isEndpointsDryRun) {

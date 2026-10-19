@@ -279,6 +279,7 @@ describe("EndpointRegistry (unit)", () => {
       { targetUrl: "gopher://a.example/" },
       { id: "", targetUrl: "https://a.example/" },
       { id: "pause", targetUrl: "https://a.example/" },
+      { id: "enable", targetUrl: "https://a.example/" },
       { targetUrl: "https://a.example/", verifier: { secret: "" } },
       { targetUrl: "https://a.example/", maxConcurrentPerEndpoint: 1.5 },
       { targetUrl: "https://a.example/", circuitBreaker: { failureThreshold: 0 } },

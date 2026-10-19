@@ -255,6 +255,14 @@ export interface StalePauseMetricsInput {
   pauses: number;
 }
 
+/** One endpoint's auto-disable count (WR-150). */
+export interface EndpointDisableMetricsInput {
+  /** Auto-disabled endpoint (physical `targetUrl`). */
+  endpoint: string;
+  /** Cumulative auto-disables for this endpoint. */
+  disables: number;
+}
+
 /**
  * One endpoint's adaptive concurrency limit (WR-94), in Prometheus label
  * order. Only finite limits are rendered — a gauge cannot hold Infinity.
@@ -371,6 +379,18 @@ export interface MetricsInput {
    * is off — the same activity-gated convention as the probe series.
    */
   stalePause?: StalePauseMetricsInput[];
+  /**
+   * Present only for endpoints that have actually been auto-disabled
+   * (WR-150); absent entirely when the feature is off — the same
+   * activity-gated convention as the stale-pause series.
+   */
+  endpointDisable?: EndpointDisableMetricsInput[];
+  /**
+   * Present only while at least one endpoint is currently auto-disabled
+   * (WR-150); absent entirely otherwise — the same activity-gated
+   * convention as the stale-pause series.
+   */
+  endpointDisabledNow?: string[];
   /**
    * Present only for endpoints where an OCSP revocation check (WR-101)
    * actually ran; absent entirely when the feature is off — the same
@@ -1145,6 +1165,29 @@ export function renderPrometheus(input: MetricsInput): string {
     lines.push("# TYPE relay_endpoint_auto_pauses_total counter");
     for (const s of input.stalePause) {
       lines.push(`relay_endpoint_auto_pauses_total{endpoint="${escapeLabelValue(s.endpoint)}"} ${s.pauses}`);
+    }
+  }
+  // WR-150: activity-gated like the stale-pause series — the counter
+  // appears only for endpoints that have actually been auto-disabled,
+  // and the gauge only while at least one endpoint is disabled, so a
+  // relay with the feature off exposes no
+  // `relay_endpoint_auto_disable*` series at all.
+  if (input.endpointDisable !== undefined && input.endpointDisable.length > 0) {
+    lines.push(
+      "# HELP relay_endpoint_auto_disables_total Endpoint auto-disables (WR-150) per endpoint."
+    );
+    lines.push("# TYPE relay_endpoint_auto_disables_total counter");
+    for (const s of input.endpointDisable) {
+      lines.push(`relay_endpoint_auto_disables_total{endpoint="${escapeLabelValue(s.endpoint)}"} ${s.disables}`);
+    }
+  }
+  if (input.endpointDisabledNow !== undefined && input.endpointDisabledNow.length > 0) {
+    lines.push(
+      "# HELP relay_endpoint_disabled Whether the endpoint is currently auto-disabled (WR-150)."
+    );
+    lines.push("# TYPE relay_endpoint_disabled gauge");
+    for (const endpoint of input.endpointDisabledNow) {
+      lines.push(`relay_endpoint_disabled{endpoint="${escapeLabelValue(endpoint)}"} 1`);
     }
   }
   // WR-101: activity-gated like the probe series — the OCSP series

@@ -21,10 +21,10 @@
  * - WR-82 scopes: GET routes need the `read` scope, mutating routes
  *   (POST/PUT/DELETE) need `admin`. The spec records this as the
  *   `x-required-scope` vendor extension on each operation.
- * - Declaration order matters where patterns overlap: `/endpoints/pause`
- *   and `/endpoints/resume` are declared before `/endpoints/{id}`, whose
- *   pattern excludes them with a negative lookahead anyway, so no
- *   pathname matches two routes.
+ * - Declaration order matters where patterns overlap: `/endpoints/pause`,
+ *   `/endpoints/resume`, and `/endpoints/enable` are declared before
+ *   `/endpoints/{id}`, whose pattern excludes them with a negative
+ *   lookahead anyway, so no pathname matches two routes.
  *
  * Zero dependencies (pure data + string building).
  */
@@ -534,6 +534,22 @@ export const OPERATOR_ROUTES: readonly OperatorRoute[] = [
     },
   },
   {
+    path: "/endpoints/enable",
+    pattern: exact("/endpoints/enable"),
+    methods: ["POST"],
+    summary: "Re-enable an auto-disabled endpoint",
+    description:
+      "WR-150: clear an endpoint's auto-disable gate and reset its failure streak — queued deliveries dispatch normally again. Does not touch the pause set (orthogonal states). Unknown endpoints are a fail-closed 404. Audited as `endpoint_enabled`.",
+    okDescription: "`{ endpoint, disabled: false, wasDisabled }`.",
+    requestBody: {
+      description: "Names the endpoint to re-enable.",
+      required: ["endpoint"],
+      properties: {
+        endpoint: { type: "string", description: "Target URL of the endpoint to re-enable." },
+      },
+    },
+  },
+  {
     path: "/endpoints",
     pattern: exact("/endpoints"),
     methods: ["GET", "POST"],
@@ -578,7 +594,7 @@ export const OPERATOR_ROUTES: readonly OperatorRoute[] = [
   },
   {
     path: "/endpoints/{id}",
-    pattern: /^\/endpoints\/(?!pause$|resume$|dry-run$)(.+)$/,
+    pattern: /^\/endpoints\/(?!pause$|resume$|enable$|dry-run$)(.+)$/,
     methods: ["PUT", "DELETE"],
     summary: "Endpoint registry: update / delete one endpoint",
     description:
