@@ -23,7 +23,7 @@ import {
   selectSignatureAlgorithmVerifier,
   type SignatureAlgorithmRule,
 } from "./signature-alg.ts";
-import { RetryQueue, type DeliveryEvent, type DeliveryPriority, type DownstreamResponse, type RetryItem, type Sender, type MaintenanceWindowTransition } from "./retry.ts";
+import { RetryQueue, type DeliveryEvent, type DeliveryPriority, type DownstreamResponse, type RetryItem, type Sender, type SenderCallOptions, type MaintenanceWindowTransition } from "./retry.ts";
 import { parseDeliverAtHeader, DELIVER_AT_HEADER } from "./retry.ts";
 import type { ShadowDeliveredInfo, ShadowFailedInfo, ShadowTargetConfig, ShadowTargetsConfig } from "./retry.ts";
 import type {
@@ -85,6 +85,14 @@ import {
   type PhaseTimeoutBudgets,
   type PhaseTimeoutPhase,
 } from "./phase-timeouts.ts";
+import {
+  createHedgedSender,
+  HedgeCancelledError,
+  HedgeMetrics,
+  assertValidHedgedSenderOptions,
+  type HedgeAuditEvent,
+  type HedgedSender,
+} from "./hedged.ts";
 import { installGracefulShutdown } from "./shutdown.ts";
 import { SourceBaselineDetector, type SourceBaselineOptions } from "./source-baseline.ts";
 import type { PayloadEncryptor } from "./encrypt.ts";
@@ -118,6 +126,13 @@ export {
   signAwsSigV4,
 };
 export type { AwsSigV4EndpointConfig, SecretResolver };
+export {
+  createHedgedSender,
+  HedgeCancelledError,
+  HedgeMetrics,
+  assertValidHedgedSenderOptions,
+};
+export type { HedgeAuditEvent, HedgedSender, HedgedSenderOptions } from "./hedged.ts";
 import type { ReplayGuard } from "./replay.ts";
 import { DeliveryDeduplicator, type DedupOptions } from "./dedup.ts";
 import {
@@ -919,6 +934,37 @@ export interface RelayServerOptions {
    * entry; invalid entries throw `RangeError` at startup.
    */
   phaseTimeouts?: Record<string, PhaseTimeoutBudgets>;
+  /**
+   * Outbound tail-latency hedging (WR-146, see `src/hedged.ts`): when a
+   * delivery attempt to a hedgeable endpoint has not returned within
+   * `hedgeDelayMs`, a second identical attempt is issued in parallel —
+   * first to settle wins, the loser is cancelled. Opt-in (off by
+   * default). Hedging duplicates a downstream hit on slow endpoints, so
+   * only endpoints listed in `hedgeableEndpoints` (exact `targetUrl`
+   * match) are ever hedged — conservative by construction; omit the
+   * list (or the whole block) and nothing hedges. A `hedgeable(item)`
+   * predicate may override the list for library-style dynamic routing.
+   * A returned 429/5xx settles the attempt, so it never triggers a
+   * hedge — it takes the normal classify → backoff path. Each hedge
+   * attempt is an independent full attempt (own keep-alive checkout,
+   * own WR-99 deadline budget, own WR-143 phase budgets). The losing
+   * attempt is cancelled via `AbortSignal` on the HTTP/1.1 path
+   * (`HedgeCancelledError`, swallowed by the wrapper); H2/WS attempts
+   * ignore the signal (best effort). `hedgeDelayMs` must be a positive
+   * integer; invalid configs throw `RangeError` at startup. Wraps
+   * `opts.sender` when one is injected (a custom sender that ignores
+   * the signal gets abandon-the-loser semantics).
+   */
+  hedgedRequests?: {
+    /** Master switch; absent/`false` disables hedging entirely. */
+    enabled?: boolean;
+    /** Ms after issue with no response before the hedge fires. */
+    hedgeDelayMs: number;
+    /** Exact targetUrls eligible for hedging (default: none). */
+    hedgeableEndpoints?: string[];
+    /** Dynamic predicate override (wins over `hedgeableEndpoints`). */
+    hedgeable?: (item: RetryItem) => boolean;
+  };
   /**
    * Downstream + own TLS certificate expiry warning (WR-73, see
    * `src/cert-expiry.ts`): `{ enabled: true, thresholdSeconds? }`. When
@@ -2954,7 +3000,13 @@ export function createDefaultSender(
      * Enforced on the HTTP/1.1 path only — see the arming block in
      * `runWithClientCert` below.
      */
-    phaseTimeout?: PhaseTimeoutBudgets
+    phaseTimeout?: PhaseTimeoutBudgets,
+    /**
+     * WR-146: hedge-loser cancellation — forwarded to
+     * `runWithClientCert`, which destroys the in-flight request when
+     * the signal fires. H2/WS paths ignore it (best effort).
+     */
+    signal?: AbortSignal
   ): Promise<DownstreamResponse | void> => {
     // WR-75: the guarded 415→plaintext fallback needs the compression
     // decision outside the attempt promise. The decision is deterministic
@@ -2994,7 +3046,15 @@ export function createDefaultSender(
       certToUse: TlsClientCert | undefined,
       kid: string | undefined,
       state: { responseReceived: boolean; handshakeCompleted: boolean },
-      forcePlaintext: boolean
+      forcePlaintext: boolean,
+      /**
+       * WR-146: hedge-loser cancellation. When the signal fires, the
+       * in-flight request is destroyed with a typed
+       * `HedgeCancelledError` (surfaces through `req.on("error",
+       * reject)`; the hedged wrapper swallows the loser's rejection).
+       * H2/WS paths do not take this parameter — best effort there.
+       */
+      signal?: AbortSignal
     ): Promise<DownstreamResponse | void> =>
       new Promise((resolve, reject) => {
         // The wire request is built once per attempt: the guarded decision
@@ -3241,6 +3301,23 @@ export function createDefaultSender(
                 onResponse
               );
         req.on("error", reject);
+
+        // WR-146: hedge-loser cancellation — destroy the in-flight
+        // request when the hedged sender fires the loser's controller.
+        // The typed error surfaces through `req.on("error", reject)`
+        // above; the hedged wrapper swallows the loser's rejection so
+        // the queue never classifies it as a delivery failure. The
+        // listener is removed on request close so settled attempts
+        // leave no dangling subscription.
+        if (signal !== undefined) {
+          if (signal.aborted) {
+            req.destroy(new HedgeCancelledError(item.targetUrl));
+          } else {
+            const onAbort = () => req.destroy(new HedgeCancelledError(item.targetUrl));
+            signal.addEventListener("abort", onAbort, { once: true });
+            req.on("close", () => signal.removeEventListener("abort", onAbort));
+          }
+        }
 
         // WR-99: enforce the propagated deadline budget on this attempt.
         // The HTTP/1.1 path has no other per-attempt timeout, so without
@@ -3691,7 +3768,7 @@ export function createDefaultSender(
           }
           const state = { responseReceived: false, handshakeCompleted: false };
           try {
-            const response = await runWithClientCert(candidate.cert, candidate.kid, state, forcePlaintext);
+            const response = await runWithClientCert(candidate.cert, candidate.kid, state, forcePlaintext, signal);
             if (candidate.kid !== undefined) establishedKid = candidate.kid;
             return response;
           } catch (err) {
@@ -3904,7 +3981,7 @@ export function createDefaultSender(
     return wsPool.deliver(url, body, relayHeaders, pins, item.targetUrl);
   };
 
-  const sender = function defaultSender(item: RetryItem): Promise<DownstreamResponse | void> {
+  const sender = function defaultSender(item: RetryItem, callOpts?: SenderCallOptions): Promise<DownstreamResponse | void> {
     const url = new URL(item.targetUrl);
     // Pinning is per endpoint (exact targetUrl match). When pins are
     // configured for the endpoint, the whitelist is the trust anchor: it
@@ -4034,12 +4111,12 @@ export function createDefaultSender(
         return deliverViaHttp2(item, url, pins, clientCert, tlsSni, minTlsVersion, clientCertRotation, oauthToken).catch((err) => {
           if (err instanceof Http2UnavailableError) {
             h2pool!.noteFallback();
-            return deliverViaHttp1(item, url, pins, clientCert, proxyUrl, tlsSni, minTlsVersion, clientCertRotation, ocsp, oauthToken, phaseTimeout);
+            return deliverViaHttp1(item, url, pins, clientCert, proxyUrl, tlsSni, minTlsVersion, clientCertRotation, ocsp, oauthToken, phaseTimeout, callOpts?.signal);
           }
           throw err;
         });
       }
-      return deliverViaHttp1(item, url, pins, clientCert, proxyUrl, tlsSni, minTlsVersion, clientCertRotation, ocsp, oauthToken, phaseTimeout);
+      return deliverViaHttp1(item, url, pins, clientCert, proxyUrl, tlsSni, minTlsVersion, clientCertRotation, ocsp, oauthToken, phaseTimeout, callOpts?.signal);
     };
     // WR-129: resolve the bearer value once per delivery attempt
     // (cached); a 401 forces exactly one refresh + redelivery inside the
@@ -4723,6 +4800,44 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     opts.sender === undefined
       ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, opts.awsSigV4, opts.awsSecretResolver, opts.outboundSchemas, opts.oauth2, undefined, opts.compressBrotli, opts.phaseTimeouts)
       : undefined;
+  // WR-146: tail-latency hedging for outbound attempts (opt-in). The
+  // wrapper sits around whichever sender the queue uses — the default
+  // sender or an injected custom one — and is a pure pass-through when
+  // disabled or when no endpoint is hedgeable. The server's own
+  // `defaultSender` handle keeps its PooledSender properties (pool,
+  // destroy, ...) untouched, exactly like the WR-85 coalescing wrap.
+  const hedgeMetrics = new HedgeMetrics();
+  const hedgedCfg = opts.hedgedRequests;
+  if (hedgedCfg !== undefined && hedgedCfg.enabled === true) {
+    if (hedgedCfg.hedgeable !== undefined && typeof hedgedCfg.hedgeable !== "function") {
+      throw new RangeError("createRelayServer: hedgedRequests.hedgeable must be a function");
+    }
+  }
+  const hedgeableEndpoints = hedgedCfg?.hedgeableEndpoints;
+  const hedgedSender = (
+    hedgedCfg !== undefined && hedgedCfg.enabled === true
+      ? createHedgedSender(opts.sender ?? defaultSender!, {
+          enabled: true,
+          hedgeDelayMs: hedgedCfg.hedgeDelayMs,
+          hedgeable:
+            hedgedCfg.hedgeable ??
+            (hedgeableEndpoints === undefined
+              ? () => false
+              : (item) => hedgeableEndpoints.includes(item.targetUrl)),
+          metrics: hedgeMetrics,
+          onHedge: (event: HedgeAuditEvent) => {
+            opts.auditLog.append({
+              event: event.event,
+              id: event.id,
+              ...(event.traceId !== undefined ? { traceId: event.traceId } : {}),
+              targetUrl: event.endpoint,
+              hedgeDelayMs: event.hedgeDelayMs,
+            });
+          },
+        })
+      : // Hedging off: the queue talks to the sender directly, byte-identical.
+        (opts.sender ?? defaultSender!)
+  ) as HedgedSender;
   // WR-50: endpoints the operator may pause/resume over HTTP. The server
   // only ever delivers to these — the intake target plus every
   // per-endpoint-configured target — so anything else is a typo or a
@@ -4858,7 +4973,10 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         )
       : opts.retry?.shadowTargets;
   const queue = new RetryQueue({
-    sender: opts.sender ?? defaultSender,
+    // WR-146: the queue talks to the hedged wrapper (a pure pass-through
+    // when hedging is off) so the server's `defaultSender` handle keeps
+    // its PooledSender properties for pool management.
+    sender: hedgedSender,
     ...(opts.retry ?? {}),
     // WR-127: one-shot per-endpoint maintenance windows (see
     // `src/maintenance-window.ts`). Wrap the caller's `onTransition` so
@@ -5326,6 +5444,10 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       // delivery — absent for WR-36 single-identity and non-mTLS
       // endpoints (legacy audit shape).
       const clientCertId = defaultSender?.takeRotationClientCertId?.(item.id);
+      // WR-146: a delivery that launched a hedge attempt carries the
+      // marker (take-and-clear — the flag is consumed here, exactly
+      // once, like the rotation certificate id above).
+      const hedged = hedgedSender.takeHedgedFlag?.(item.id) === true;
       opts.auditLog.append({
         event: "delivered",
         id: item.id,
@@ -5333,6 +5455,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         ...(item.tenantId !== undefined ? { tenant: item.tenantId } : {}),
         targetUrl: item.targetUrl,
         attempts,
+        ...(hedged ? { hedged: true } : {}),
         // WR-107: the mesh hop count the event arrived with — the audit
         // trail shows how deep into the mesh the delivery traveled.
         ...(item.meshHops !== undefined ? { meshHops: item.meshHops } : {}),
@@ -6206,7 +6329,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       // new series. Absent entirely with a custom sender (no pool).
       res
         .writeHead(200, { "content-type": "text/plain; version=0.0.4" })
-        .end(queue.renderMetrics() + versionMetrics.render() + schemaMetrics.render() + (schemaRegistry?.renderMetrics() ?? "") + ipAclMetrics.render() + inboundTenantRateLimitMetrics.render() + certExpiryMonitor.render() + tlsVersionMonitor.render() + (ocspMonitor?.render() ?? "") + (usageMeter?.render() ?? "") + (defaultSender?.compressionStats.render() ?? "") + (defaultSender?.dnsCache?.render() ?? "") + (defaultSender?.wsPool.renderMetrics() ?? "") + meshMetrics.render() + (defaultSender?.outboundSchemaMetrics?.render() ?? "") + (reputation?.renderMetrics() ?? ""));
+        .end(queue.renderMetrics() + versionMetrics.render() + schemaMetrics.render() + (schemaRegistry?.renderMetrics() ?? "") + ipAclMetrics.render() + inboundTenantRateLimitMetrics.render() + certExpiryMonitor.render() + tlsVersionMonitor.render() + (ocspMonitor?.render() ?? "") + (usageMeter?.render() ?? "") + (defaultSender?.compressionStats.render() ?? "") + (defaultSender?.dnsCache?.render() ?? "") + (defaultSender?.wsPool.renderMetrics() ?? "") + meshMetrics.render() + (defaultSender?.outboundSchemaMetrics?.render() ?? "") + (reputation?.renderMetrics() ?? "") + hedgeMetrics.render());
       return;
     }
     if (isEvents) {

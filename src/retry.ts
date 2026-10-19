@@ -788,6 +788,13 @@ export interface DeliveryEvent {
    * events. Absent when no archive is configured.
    */
   eventSeq?: number;
+  /**
+   * WR-146: `true` on `delivered` events whose delivery launched a hedge
+   * attempt (the hedged sender marks the winning response; the queue
+   * copies it here). Absent = the delivery ran a single attempt — the
+   * pre-WR-146 event shape.
+   */
+  hedged?: boolean;
 }
 
 /** Fired every time a batch is flushed (one merged item enqueued). */
@@ -804,7 +811,20 @@ export interface BatchInfo {
   traceIds: string[];
 }
 
-export type Sender = (item: RetryItem) => Promise<DownstreamResponse | void>;
+/**
+ * WR-146: per-call options a `Sender` may receive. `signal` cancels the
+ * in-flight attempt (the hedged sender fires the losing attempt's
+ * controller; the relay also forwards its own attempt cancellation).
+ * Senders that cannot cancel simply ignore it — the contract stays
+ * backwards compatible: existing `(item) => ...` senders typecheck
+ * unchanged.
+ */
+export interface SenderCallOptions {
+  /** Abort the in-flight attempt; senders without cancellation support ignore it. */
+  signal?: AbortSignal;
+}
+
+export type Sender = (item: RetryItem, opts?: SenderCallOptions) => Promise<DownstreamResponse | void>;
 
 /**
  * A downstream HTTP response, as observed by the sender. A sender that can
@@ -852,6 +872,13 @@ export interface DownstreamResponse {
    * `clientCertId` on the `delivered` / `dead_letter` audit events.
    */
   clientCertId?: string;
+  /**
+   * WR-146: set by the hedged sender when this delivery launched a hedge
+   * attempt — the response is the winner of the primary/hedge race. The
+   * queue stamps `hedged: true` on the `delivered` delivery event (and the
+   * server on the `delivered` audit line) from it. Absent = no hedge.
+   */
+  hedged?: boolean;
   /**
    * WR-95: per-phase delivery timing measured by the sender
    * (dns/connect/tls/firstByte/body, in ms). A phase the sender could not
@@ -6442,6 +6469,9 @@ export class RetryQueue {
           attempts: entry.attempt + 1,
           bytesOut: entry.payload.length,
           at: new Date().toISOString(),
+          // WR-146: a hedged delivery carries the marker the winning
+          // response brought back.
+          ...(response !== undefined && response.hedged === true ? { hedged: true as const } : {}),
           ...(deliveredTraceSpan === undefined ? {} : { traceSpan: deliveredTraceSpan }),
         });
         // WR-47: terminal state — fire the completion receipt (opt-in).

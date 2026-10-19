@@ -1518,6 +1518,51 @@ curl -X POST http://127.0.0.1:PORT/endpoints/dry-run \
   (WR-47), never feeds the fan-out quorum (WR-106), and never samples
   the real latency trackers — a rehearsal is not a delivery.
 
+## Outbound hedged requests (opt-in)
+
+Cut tail latency without waiting for retries: when a delivery attempt
+to a hedgeable endpoint has not returned within `hedgeDelayMs`, the
+relay issues a second identical attempt in parallel — first to settle
+wins, the loser is cancelled (`AbortController`; the HTTP/1.1 path
+destroys the losing request, H2/WS attempts are abandoned best-effort).
+
+```ts
+createRelayServer({
+  hedgedRequests: {
+    enabled: true,
+    hedgeDelayMs: 250,
+    hedgeableEndpoints: ["https://payments/hook"], // exact targetUrl match
+  },
+});
+```
+
+- **Hedgeable only** — hedging duplicates a downstream hit on slow
+  endpoints, so it only ever fires for idempotent-safe endpoints you
+  list explicitly (or a `hedgeable(item)` predicate you supply).
+  Nothing hedges by default: omit the list and the wrapper is a pure
+  pass-through.
+- **Latency-gated, never error-gated** — a returned 429/5xx settles the
+  attempt, so it never triggers a hedge; it rides the normal
+  classify → backoff path. A fast transport failure (connection
+  refused) settles the attempt the same way. Only "no response within
+  `hedgeDelayMs`" launches the hedge.
+- **Orthogonal composition** — each hedge attempt is an independent
+  full attempt: its own keep-alive checkout (WR-24), its own WR-76
+  delivery deadline, its own WR-99 deadline-budget race, and its own
+  WR-143 phase budgets. The winner is whoever settles first; the loser
+  is cancelled immediately so it never holds a pool slot or delivers a
+  late duplicate.
+- **Observability** — every launched hedge audits `hedged`
+  (`targetUrl`, `hedgeDelayMs`); `relay_hedged_total{endpoint}`
+  counts hedges (activity-gated, absent when the feature never fires);
+  a delivery that hedged carries `hedged: true` on its `delivered`
+  delivery event and audit line.
+- **Also a library primitive** — `createHedgedSender(inner, opts)`
+  wraps any `Sender` (the default sender or a custom one); custom
+  senders that ignore the `signal` option degrade to abandon-the-loser
+  semantics, documented in `src/hedged.ts`. Invalid `hedgeDelayMs`
+  throws `RangeError` at startup.
+
 ## Dynamic endpoint registry (opt-in)
 
 Manage the *set* of downstream endpoints without restarting the relay:
