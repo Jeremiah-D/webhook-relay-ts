@@ -3359,6 +3359,54 @@ const server = createRelayServer({
   adds `relay_otlp_exports_total{event_type,status}` and
   `relay_otlp_buffered` only when OTLP export is enabled.
 
+## OpenTelemetry span export (opt-in)
+
+While the OTLP event export above ships *logs*, this ships *traces*:
+each delivery gets one OTel trace with the intake → dispatch → delivery
+span chain, exported as OTLP/HTTP JSON to a configurable collector —
+for operators who want the delivery lifecycle in Jaeger/Tempo, not just
+the event log.
+
+```ts
+const queue = new RetryQueue({
+  otelTracing: {
+    endpoint: "http://collector:4318", // base URL; spans POST to <endpoint>/v1/traces
+    sampleRate: 0.1,                   // head-based; default 1.0 = trace everything
+    serviceName: "webhook-relay-ts",   // service.name resource attribute
+    headers: { authorization: "Bearer ..." }, // optional export auth
+  },
+});
+```
+
+- **The span chain** — `relay.intake` (root: `enqueue()` → first
+  dispatch, measuring admission/queueing delay; runs to the terminal
+  state when the delivery never attempts, e.g. the auto-disable gate),
+  `relay.dispatch` (first attempt → terminal, grouping the attempts),
+  and one `relay.delivery` per attempt. Span attributes carry
+  `relay.endpoint`, `relay.tenant` (multi-tenant only), `relay.event_id`,
+  `relay.attempt` / `relay.attempts`, `relay.status` (`ok`/`error`), and
+  `relay.error` (failures); durations come from the span timestamps.
+- **W3C trace-context reuse** — the trace id is the delivery's
+  caller-propagated W3C trace id when one was received (the durable
+  queue carries it across restarts), else the relay's own trace id
+  mapped to 32-hex (the same mapping the log export uses). Each
+  `relay.delivery` span id is the exact parent-id the relay stamps on
+  that attempt's outbound `traceparent` — the OTel span and the
+  downstream trace's span correlate with zero extra plumbing.
+- **Head-based sampling** — the sample decision is made once at intake,
+  so an exported trace is always whole; unsampled deliveries cost one
+  random draw and nothing else.
+- **Never disturbs delivery** — off by default (every hook is a single
+  `undefined` check when unset); when enabled, span bookkeeping is
+  synchronous and never throws, the export flush runs on an unref'd
+  background timer, and a hung collector cannot pin shutdown
+  (best-effort flush races a 1s timeout). Failed exports stay buffered
+  (drop-oldest past `maxBuffered`) with capped exponential backoff.
+- **Fail-fast** — a bad endpoint URL, a `sampleRate` outside [0, 1], or a
+  `maxBuffered`/`maxTraces` below 1 throws `RangeError` at construction.
+- **Observability** — `queue.getOtelTracingStats()` returns
+  `{ enabled, liveTraces, buffered, dropped, exportedSpans, lastError? }`.
+
 ## Audit event webhook sink (opt-in)
 
 The audit log can stream itself to an external webhook as signed JSON

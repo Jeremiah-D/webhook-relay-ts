@@ -25,6 +25,7 @@ import {
   type EndpointAutoDisableOptions,
   type EndpointDisableStatsRow,
 } from "./endpoint-disable.ts";
+import { OtelTracer, type OtelTracingOptions, type OtelTracingStats } from "./otel-tracing.ts";
 import { SlowStartController, type SlowStartOptions, type SlowStartEndpointStats } from "./slowstart.ts";
 import {
   ReplayIdempotencyGuard,
@@ -479,6 +480,8 @@ export type {
   EndpointDisableStatsRow,
   DisableFailureOutcome,
 };
+export { OtelTracer };
+export type { OtelTracingOptions, OtelTracingStats, OtelTerminalOutcome };
 export type { OtlpExporterOptions, OtlpStats } from "./otlp.ts";
 export { OutboundCoalescer, coalesceKey } from "./coalesce.ts";
 export type { CoalesceStats, CoalescingOptions } from "./coalesce.ts";
@@ -2197,6 +2200,20 @@ export interface RetryQueueOptions {
    */
   endpointAutoDisable?: EndpointAutoDisableOptions;
   /**
+   * OpenTelemetry span export (WR-151): opt-in OTel traces for the
+   * delivery lifecycle — one trace per delivery with the intake →
+   * dispatch → delivery span chain — exported as OTLP/HTTP JSON to a
+   * configurable collector (`<endpoint>/v1/traces`). Sampling is
+   * head-based (`sampleRate`, default 1.0). The trace id reuses the
+   * delivery's W3C trace context (WR-98) when present, and each
+   * `relay.delivery` attempt span id is the exact parent-id the relay
+   * stamps on that attempt's outbound `traceparent`, so the OTel trace
+   * joins the downstream trace. Disabled by default (absent = zero
+   * behavior change). Invalid values throw `RangeError` at
+   * construction. Stats via `getOtelTracingStats()`.
+   */
+  otelTracing?: OtelTracingOptions;
+  /**
    * Called once per dead-letter entry auto-purged by the retention
    * sweep. The server audits these as `dead_letter_purged`; library
    * users get the hook directly.
@@ -3178,6 +3195,12 @@ export class RetryQueue {
    */
   private readonly autoDisable?: EndpointAutoDisable;
   /**
+   * WR-151: per-delivery OTel trace lifecycle. `undefined` when the
+   * `otelTracing` option is absent — every hook is then a single
+   * `undefined` check on the delivery path.
+   */
+  private readonly otelTracer?: OtelTracer;
+  /**
    * WR-50: operator pause set, keyed by logical endpoint (`targetUrl` as
    * enqueued). A paused endpoint's deliveries are parked: they stay
    * queued with their attempt counts intact, no delivery attempt is
@@ -3632,6 +3655,10 @@ export class RetryQueue {
       opts.endpointAutoDisable !== undefined
         ? new EndpointAutoDisable(opts.endpointAutoDisable)
         : undefined;
+    // WR-151: the tracer validates eagerly — an illegal endpoint or
+    // sample rate throws RangeError here, at construction, never
+    // mid-delivery.
+    this.otelTracer = opts.otelTracing !== undefined ? new OtelTracer(opts.otelTracing) : undefined;
     // WR-48: the limiter is per-tenant now; instances are created lazily
     // by `limiterFor()` so tenants that never appear cost nothing. The
     // limit itself is still validated eagerly, at construction.
@@ -5155,6 +5182,9 @@ export class RetryQueue {
     // WR-48: the replay keeps the dead letter's tenant, so the clock
     // restarts on the same tenant's tracker.
     this.latencyFor(item.tenantId)?.recordAccepted(item.id);
+    // WR-151: a replay is a fresh delivery cycle — start a new OTel trace
+    // for it (the original trace already terminated at dead_letter).
+    this.otelTracer?.intake(requeued);
     if (this.running) {
       this.schedule(item.id, 0);
     }
@@ -5719,6 +5749,13 @@ export class RetryQueue {
     // WR-100: first-sighting stamp for the stale-endpoint sweep.
     this.recordEndpointSeen(stored.targetUrl);
     this.evaluateSloRisk(item.tenantId, stored.targetUrl);
+    // WR-151: start the delivery's OTel trace here — when the item
+    // becomes a live delivery — not in `enqueue()`. Batch-window and
+    // deliver_at parking end here (like the latency clock: the hold is
+    // by design, not lateness), and flushed batches arrive as their own
+    // item. Head-based sampling happens inside; a no-op when the option
+    // is unset or the delivery is unsampled.
+    this.otelTracer?.intake(stored);
     if (this.running) {
       this.schedule(item.id, 0);
     }
@@ -5753,6 +5790,8 @@ export class RetryQueue {
     // WR-83: opt-in only — re-arm a pending OTLP export retry timer
     // (cleared by `stop()`) when records are still buffered.
     this.otlpExporter?.resume();
+    // WR-151: opt-in only — same for the trace export retry timer.
+    this.otelTracer?.resume();
     // WR-57: arm the deliver_at delay queue — parked items whose instant
     // already passed while stopped fire immediately (past-due semantics).
     this.scheduler.arm();
@@ -5770,6 +5809,8 @@ export class RetryQueue {
     // WR-83: opt-in only — clear the export retry timer and kick off one
     // best-effort flush (fire-and-forget; `stop()` is synchronous).
     this.otlpExporter?.stop();
+    // WR-151: opt-in only — clear the trace export timer.
+    this.otelTracer?.stop();
     // WR-57: disarm the delay-queue timer but keep the heap — parked items
     // stay parked with their absolute deliver_at; the next start() re-arms.
     this.scheduler.disarm();
@@ -5870,6 +5911,8 @@ export class RetryQueue {
     // timers. Buffered records that don't make it are dropped with the
     // process, exactly like backoff-waiting items.
     await this.otlpExporter?.shutdown(1000);
+    // WR-151: opt-in only — best-effort final trace export flush.
+    await this.otelTracer?.shutdown(1000);
     // WR-49: leave the journal compact — a shutdown is the natural
     // checkpoint; the next boot recovers from live state only.
     this.compactDurable(true);
@@ -6751,6 +6794,14 @@ export class RetryQueue {
       // reads this flag, so it must be hoisted (same reason as
       // `releaseGlobalSlot` above).
       let attemptLeads = true;
+      // WR-151: start the per-attempt `relay.delivery` span (and the
+      // `relay.dispatch` span on the first attempt). Declared outside the
+      // try for the same V8 scope reason as `attemptLeads` above — the
+      // finally below must see it. A no-op returning `undefined` when
+      // tracing is off or the delivery is unsampled.
+      const otelAttempt = this.otelTracer?.startAttempt(entry, entry.attempt + 1);
+      let otelAttemptOk = false;
+      let otelAttemptError: string | undefined;
       try {
         // Pinned copy: the sender sees the physical target chosen above,
         // so a failover switch mid-flight cannot reroute this attempt.
@@ -6901,6 +6952,9 @@ export class RetryQueue {
         this.recordEndpointSuccess(entry.targetUrl);
         this.armedNextAt.delete(id);
         this.recordDelivery(tenant, target, "delivered");
+        // WR-151: the attempt succeeded — the span ends `ok` in the
+        // finally below.
+        otelAttemptOk = true;
         // WR-137: count the terminal delivery against the tenant's
         // monthly budget (the WR-78 billing vocabulary — retries and
         // dead letters never count).
@@ -6959,6 +7013,10 @@ export class RetryQueue {
           ...(tenant === undefined ? {} : { tenant }),
         });
         const deliveredTraceSpan = this.traceSpanFor(entry, entry.attempt + 1);
+        // WR-151: terminal — end the delivery's OTel trace (ending the
+        // just-completed attempt span as ok) and hand it to the exporter.
+        // A no-op when tracing is off or the delivery was unsampled.
+        this.otelTracer?.terminal(entry, "delivered");
         this.emitDeliveryEvent({
           type: "delivered",
           id: entry.id,
@@ -7017,6 +7075,9 @@ export class RetryQueue {
         }
         const classified = classifyFailure(err);
         const error = err instanceof Error ? err.message : String(err);
+        // WR-151: the attempt failed — the span ends `error` in the
+        // finally below, carrying the failure message.
+        otelAttemptError = error;
         const at = new Date().toISOString();
         if (err instanceof PhaseTimeoutError) {
           // WR-143: remember the phase whose budget fired — a later SLO
@@ -7215,6 +7276,13 @@ export class RetryQueue {
           });
           this.schedule(id, scheduledDelayMs);
         }
+      } finally {
+        // WR-151: the attempt settled — end the per-attempt
+        // `relay.delivery` span. When the delivery just reached a
+        // terminal state, `terminal()` already ended and exported it,
+        // so this is a no-op there; otherwise it closes this attempt's
+        // span and the trace stays live for the next attempt.
+        this.otelTracer?.endAttempt(entry, otelAttempt, otelAttemptOk, otelAttemptError);
       }
     } finally {
       // Released in reverse acquisition order: the limiter slot first
@@ -7443,6 +7511,10 @@ export class RetryQueue {
     // letter; the escalator decides whether the scope crossed its
     // threshold. Aggregate storm alert, not a per-delivery receipt.
     this.escalation?.recordDeadLetter({ tenant: entry.tenantId, endpoint: target });
+    // WR-151: terminal — end the delivery's OTel trace (ending any still-
+    // open attempt span with this failure) and hand it to the exporter.
+    // A no-op when tracing is off or the delivery was unsampled.
+    this.otelTracer?.terminal(entry, "dead_letter", error);
   }
 
   /** Per-(tenant, endpoint) concurrency snapshot: in-flight and queued deliveries. Rows carry `tenant` only when set. */
@@ -8339,6 +8411,22 @@ export class RetryQueue {
    */
   getEndpointDisableStats(): EndpointDisableStatsRow[] {
     return this.autoDisable?.getStats() ?? [];
+  }
+
+  /**
+   * WR-151: OTel tracing stats. `{ enabled: false, ... }` when the
+   * `otelTracing` option was never configured.
+   */
+  getOtelTracingStats(): OtelTracingStats {
+    return (
+      this.otelTracer?.stats() ?? {
+        enabled: false,
+        liveTraces: 0,
+        buffered: 0,
+        dropped: 0,
+        exportedSpans: 0,
+      }
+    );
   }
 
   /**
