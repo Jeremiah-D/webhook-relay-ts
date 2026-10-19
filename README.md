@@ -3625,6 +3625,64 @@ Do not point the sink at this relay's own intake: forwarded events
 carry no valid webhook signature, each rejection audits a new line, and
 the sink would chase its own tail.
 
+## Audit event syslog sink (opt-in)
+
+The audit log can also stream itself to a syslog collector (SIEM) over
+UDP or TCP, in RFC 5424 or CEF format (`src/syslog-sink.ts`) — for
+shops whose SIEM speaks syslog rather than webhooks:
+
+```ts
+const server = createRelayServer({
+  secret, forwardUrl, auditLog,
+  syslogSink: {
+    host: "siem.example.com", // required; port defaults to 514
+    transport: "tcp",         // "udp" (default) or "tcp" (RFC 5425 octet counting)
+    facility: "local0",       // default; number 0-23 or name also accepted
+    format: "cef",            // "rfc5424" (default) or "cef"
+    appName: "webhook-relay", // APP-NAME in the envelope
+    maxAttempts: 10,          // default 10; backoff 1s doubling to 60s
+    pollIntervalMs: 1000,     // default 1000
+    sendTimeoutMs: 10000,     // default 10000; connectTimeoutMs default 5000
+  },
+});
+```
+
+- **Same outbox contract as the webhook sink** — background tail
+  worker, byte-offset cursor file (atomic tmp+rename, survives
+  restarts), at-least-once in order, first start begins at the log
+  tail (no backfill), dead-letter after `maxAttempts` recorded as
+  `audit_sink_dead_letter` (with `sink: "syslog"`), never touches the
+  delivery path, stops with the server. `sink.stats()` returns
+  `{ sent, failedAttempts, deadLetters }`.
+- **Envelope** — `<PRI>1 <ts> <host> <app> <pid> <event> - <msg>`.
+  PRI = facility×8 + severity; MSGID is the audit event name; the
+  timestamp is RFC 5424 with the local offset.
+- **Formats** — `rfc5424` puts the exact audit JSONL line in the MSG
+  (hash-chain fields included, sealed payloads stay sealed);
+  `cef` puts a CEF record in the MSG:
+  `CEF:0|Jeremiah-D|webhook-relay|<version>|<event>|<event>|<sev>|<ext>`
+  with mapped extensions (`tenant`→`cs1`, `traceId`→`cs2`,
+  `keyId`→`cs3`, `reason`→`reason`, endpoint/url→`request`,
+  attempt→`cnt`). Pick `rfc5424` when the SIEM needs the full record.
+- **Severity tiers** — audit events map to syslog severities by tier
+  (`ocsp_revoked`→critical, dead letters→error, `rejected`→warning,
+  key revocations→notice, everything else→informational; unknown
+  event names are informational). CEF severity derives from the same
+  tier. `syslogSeverity()` and `resolveSyslogFacility()` are exported
+  for embedders.
+- **UDP vs TCP, stated honestly** — UDP is at-most-once per datagram:
+  the retry loop re-sends on send errors/timeouts, but a silently
+  dropped datagram is never detected, and oversized frames are
+  truncated to fit one datagram (65479 bytes). Use TCP when the SIEM
+  must see every event. A TCP write completing means the kernel
+  accepted the frame, not that the SIEM processed it. Any TCP send
+  failure drops the connection before retrying, so a partial write can
+  never desynchronize the octet-counted stream.
+- **Fail-fast** — empty host, bad port, unknown transport/facility/
+  format, or `maxAttempts < 1` throws `RangeError` at construction.
+  `buildSyslogFrame()` / `cefLine()` are exported pure functions, so
+  the exact bytes are unit-testable without a collector.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same

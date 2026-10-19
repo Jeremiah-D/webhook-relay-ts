@@ -275,6 +275,7 @@ import { OutboundConnectionPool, type KeepAlivePoolOptions } from "./keepalive.t
 import { DnsCache, type DnsCacheOptions } from "./dns-cache.ts";
 import { warmupOutboundPool, resolveWarmupOptions } from "./warmup.ts";
 import { AuditSink, type AuditSinkOptions } from "./audit-sink.ts";
+import { SyslogAuditSink, type SyslogAuditSinkOptions } from "./syslog-sink.ts";
 import {
   assertValidProxyUrl,
   createProxiedAgent,
@@ -1880,6 +1881,18 @@ export interface RelayServerOptions {
    * behavior.
    */
   auditSink?: AuditSinkOptions;
+  /**
+   * Opt-in audit-event syslog sink (WR-157): forwards audit events to
+   * a syslog collector (SIEM) over UDP or TCP, in RFC 5424 or CEF
+   * format (`src/syslog-sink.ts`). Same outbox contract as
+   * `auditSink` — background tail worker, cursor file, at-least-once
+   * in order, dead-letter after `maxAttempts` — and the same
+   * isolation: the worker never touches the delivery path, and stops
+   * with the server. Unset by default: no forwarding, byte-identical
+   * behavior. Note the UDP caveat: a silently dropped datagram is
+   * never detected — use TCP when the SIEM must see every event.
+   */
+  syslogSink?: SyslogAuditSinkOptions;
 }
 
 /**
@@ -10490,6 +10503,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // in-flight POSTs abandoned (the cursor does not advance, so the
     // next start redelivers them).
     auditSink?.stop();
+    // WR-157: same for the syslog sink — in-flight sends abandoned,
+    // sockets destroyed, the cursor left for the next start.
+    syslogSink?.stop();
     // Pooled outbound connections must not outlive the server: close them
     // (and stop the idle reaper) on the same close path that stops the
     // queue — this covers stop() and the graceful-shutdown drain alike.
@@ -10631,6 +10647,16 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   if (opts.auditSink !== undefined) {
     auditSink = new AuditSink(opts.auditLog, opts.auditSink);
     auditSink.start();
+  }
+
+  // WR-157: opt-in audit-event syslog sink (SIEM). Same construction
+  // contract as the webhook sink above: built and started only when
+  // configured, invalid options throw RangeError here, stopped on the
+  // same close path as the queue.
+  let syslogSink: SyslogAuditSink | undefined;
+  if (opts.syslogSink !== undefined) {
+    syslogSink = new SyslogAuditSink(opts.auditLog, opts.syslogSink);
+    syslogSink.start();
   }
 
   // WR-103: inbound mTLS hot-reload. The request-time policy

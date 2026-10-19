@@ -262,7 +262,8 @@ function resolveConfig(opts: AuditSinkOptions, auditLogPath: string): ResolvedAu
   };
 }
 
-function fileSize(path: string): number {
+/** Byte size of a file, or 0 when it cannot be stat'ed. Shared with the syslog sink (WR-157). */
+export function fileSize(path: string): number {
   try {
     return statSync(path).size;
   } catch {
@@ -273,9 +274,10 @@ function fileSize(path: string): number {
 /**
  * Load the persisted cursor: a byte offset, or null when the file is
  * absent (first start). A corrupt cursor fails the start loudly rather
- * than silently replaying or skipping the stream.
+ * than silently replaying or skipping the stream. Shared with the
+ * syslog sink (WR-157).
  */
-function readCursorFile(path: string): number | null {
+export function readCursorFile(path: string): number | null {
   let raw: string;
   try {
     raw = readFileSync(path, "utf8");
@@ -293,9 +295,10 @@ function readCursorFile(path: string): number | null {
 /**
  * Persist the cursor with an atomic tmp+rename, so a crash can never
  * leave a torn cursor behind. (A lost cursor only costs redelivery —
- * the sink is at-least-once either way.)
+ * the sink is at-least-once either way.) Shared with the syslog sink
+ * (WR-157).
  */
-function writeCursorFile(path: string, offset: number): void {
+export function writeCursorFile(path: string, offset: number): void {
   const tmp = `${path}.tmp`;
   writeFileSync(tmp, `${offset}\n`, "utf8");
   renameSync(tmp, path);
