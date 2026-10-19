@@ -21,6 +21,11 @@ import {
 import { EndpointCircuitBreaker, type CircuitBreakerOptions, type CircuitState, type CircuitStats } from "./circuit.ts";
 import { SlowStartController, type SlowStartOptions, type SlowStartEndpointStats } from "./slowstart.ts";
 import {
+  ReplayIdempotencyGuard,
+  type ReplayIdempotencyOptions,
+  type ReplayIdempotencyStats,
+} from "./replay-idempotency.ts";
+import {
   DownstreamProber,
   type ProbeAuditEvent,
   type ProbeEndpointStats,
@@ -378,6 +383,7 @@ export type {
 
 export type { CircuitBreakerOptions, CircuitState, CircuitStats };
 export type { SlowStartOptions, SlowStartEndpointStats };
+export type { ReplayIdempotencyOptions, ReplayIdempotencyStats };
 export type {
   BurnRateAlertInfo,
   ErrorBudgetBurnAuditEvent,
@@ -1116,6 +1122,14 @@ export interface DeadLetterReplayPreview {
   lastError: string;
   deadLetteredAt: string;
   payloadBytes: number;
+  /**
+   * WR-149: present and `true` when the replay-idempotency guard would
+   * suppress replaying this entry (a newer delivered copy of the same
+   * (endpoint, payload) exists). Absent when the entry would replay —
+   * and always absent when the guard is not configured, keeping the
+   * pre-WR-149 preview shape byte-identical.
+   */
+  will_skip?: boolean;
 }
 
 /** A dead-letter entry that could not be re-queued. */
@@ -1141,6 +1155,49 @@ export interface ReplayDeadLetterOpts {
    * embedded operator tooling) — the operator HTTP layer never passes it.
    */
   bypassApproval?: boolean;
+  /**
+   * WR-149: override the replay-idempotency guard — replay even when the
+   * same (endpoint, payload) was delivered after this entry was
+   * dead-lettered. Audited as `replay_forced` via `onReplayForced` (only
+   * when the guard is enabled and a newer delivered copy actually
+   * exists). Only an explicit `true` forces; omitting the flag keeps the
+   * guard.
+   */
+  force?: boolean;
+}
+
+/**
+ * Info for {@link RetryQueueOptions.onReplaySkipped}: the WR-149 guard
+ * suppressed replaying a dead letter because the downstream already
+ * holds a newer delivered copy of the same (endpoint, payload).
+ */
+export interface ReplaySkippedInfo {
+  /** The dead-letter entry id that was not replayed. */
+  id: string;
+  /** The entry's endpoint (physical target the final attempt went to). */
+  endpoint: string;
+  /** Tenant id (WR-48); absent for the default tenant. */
+  tenant?: string;
+  /** ISO-8601 timestamp when the entry was dead-lettered. */
+  deadLetteredAt: string;
+  /** ISO-8601 timestamp of the newer delivered record that suppressed it. */
+  deliveredAt: string;
+}
+
+/**
+ * Info for {@link RetryQueueOptions.onReplayForced}: the operator
+ * overrode the WR-149 guard and replayed a dead letter despite a newer
+ * delivered copy existing.
+ */
+export interface ReplayForcedInfo {
+  /** The dead-letter entry id that was replayed. */
+  id: string;
+  /** The entry's endpoint (physical target the final attempt went to). */
+  endpoint: string;
+  /** Tenant id (WR-48); absent for the default tenant. */
+  tenant?: string;
+  /** ISO-8601 timestamp of the newer delivered record that was overridden. */
+  deliveredAt: string;
 }
 
 /** Call options for the executing (non-dry-run) {@link RetryQueue.replayDeadLetters}. */
@@ -1162,6 +1219,14 @@ export interface DeadLetterBatchReplayOpts {
    * gate. The operator HTTP layer never passes it.
    */
   bypassApproval?: boolean;
+  /**
+   * WR-149: override the replay-idempotency guard for the whole batch —
+   * replay entries even when a newer delivered copy of the same
+   * (endpoint, payload) exists. Audited per entry as `replay_forced`
+   * via `onReplayForced`. Only an explicit `true` forces; omitting the
+   * flag keeps the guard.
+   */
+  force?: boolean;
 }
 
 /** Outcome of {@link RetryQueue.replayDeadLetters}. */
@@ -1180,6 +1245,16 @@ export interface DeadLetterBatchReplayResult {  /** Ids successfully re-queued w
    * gate is not configured.
    */
   throttled: string[];
+  /**
+   * WR-149: ids suppressed by the replay-idempotency guard — the same
+   * (endpoint, payload) was delivered *after* the entry was
+   * dead-lettered, so the downstream already holds a newer copy and
+   * replaying would repeat the business action. They stay in the
+   * dead-letter list — nothing is dropped — for operator review, and a
+   * later call with `force: true` replays them. Empty when the guard is
+   * not configured.
+   */
+  skipped: string[];
 }
 
 /** Dead-letter observability snapshot (see {@link RetryQueue.getDeadLetterStats}). */
@@ -1498,6 +1573,34 @@ export interface RetryQueueOptions {
    * the option alone changes nothing.
    */
   slowStart?: SlowStartOptions;
+  /**
+   * WR-149: dead-letter replay idempotency guard (see
+   * `src/replay-idempotency.ts`). When set, `replayDeadLetter(s)` checks
+   * whether the same (endpoint, payload) was *delivered after* the entry
+   * was dead-lettered — the downstream already holds a newer copy, so
+   * the replay is suppressed (the entry stays dead-lettered) instead of
+   * repeating the business action (the classic lost-response payment
+   * callback). An explicit `force` replays anyway. The index is
+   * in-memory and bounded (`maxEntries` / `windowMs`); a restart clears
+   * it, so the guard degrades to plain replay after a crash. Disabled
+   * by default.
+   */
+  replayIdempotency?: ReplayIdempotencyOptions;
+  /**
+   * WR-149: called when the replay-idempotency guard suppresses
+   * replaying a dead letter (the downstream holds a newer delivered
+   * copy). The server routes this into the audit log as
+   * `replay_skipped_delivered`; library users get the hook directly.
+   */
+  onReplaySkipped?: (info: ReplaySkippedInfo) => void;
+  /**
+   * WR-149: called when an operator `force` overrides the
+   * replay-idempotency guard (only when the guard is enabled and a
+   * newer delivered copy actually exists). The server routes this into
+   * the audit log as `replay_forced`; library users get the hook
+   * directly.
+   */
+  onReplayForced?: (info: ReplayForcedInfo) => void;
   /**
    * Opt-in active health probing of downstream endpoints (see
    * `src/downstream-probe.ts`). When set, each listed endpoint gets a timed HEAD (or
@@ -2974,6 +3077,14 @@ export class RetryQueue {
   private readonly slowStartOpts?: SlowStartOptions;
   private readonly slowStarts = new Map<string, SlowStartController>();
   /**
+   * WR-149: per-tenant replay-idempotency guards, keyed by tenant
+   * instance key; `undefined` options mean the feature is off.
+   */
+  private readonly replayIdempotencyOpts?: ReplayIdempotencyOptions;
+  private readonly replayIdempotencyGuards = new Map<string, ReplayIdempotencyGuard>();
+  private readonly onReplaySkipped?: (info: ReplaySkippedInfo) => void;
+  private readonly onReplayForced?: (info: ReplayForcedInfo) => void;
+  /**
    * WR-147: the per-endpoint error-budget burn-rate monitor. `undefined`
    * when the feature is off — the hot path then has one extra branch,
    * nothing more.
@@ -3545,6 +3656,16 @@ export class RetryQueue {
     if (opts.slowStart !== undefined) {
       this.slowStartFor(undefined);
     }
+    // WR-149: opt-in dead-letter replay idempotency guard. The default
+    // tenant's guard is created eagerly so invalid options throw at
+    // construction, never mid-replay; other tenants' guards stay lazy
+    // (WR-48).
+    this.replayIdempotencyOpts = opts.replayIdempotency;
+    if (opts.replayIdempotency !== undefined) {
+      this.replayIdempotencyFor(undefined);
+    }
+    this.onReplaySkipped = opts.onReplaySkipped;
+    this.onReplayForced = opts.onReplayForced;
     this.circuitBreakerOnStateChange = opts.onCircuitStateChange ?? opts.circuitBreaker?.onStateChange;
     // WR-147: build the error-budget monitor eagerly so an invalid
     // config throws at construction, never mid-delivery. `enabled:
@@ -4257,6 +4378,57 @@ export class RetryQueue {
   }
 
   /**
+   * WR-149: the calling tenant's replay-idempotency guard; `undefined`
+   * when the guard is disabled. Outcomes are keyed by the physical
+   * target — the same key the dead-letter entries carry in `targetUrl`
+   * — so a replayed entry is compared against the downstream that
+   * actually delivered the newer copy.
+   */
+  private replayIdempotencyFor(tenant: string | undefined): ReplayIdempotencyGuard | undefined {
+    if (this.replayIdempotencyOpts === undefined) return undefined;
+    const key = tenantInstanceKey(tenant);
+    let g = this.replayIdempotencyGuards.get(key);
+    if (g === undefined) {
+      g = new ReplayIdempotencyGuard(this.replayIdempotencyOpts);
+      this.replayIdempotencyGuards.set(key, g);
+    }
+    return g;
+  }
+
+  /**
+   * WR-149: plaintext payload bytes of a dead-letter entry for hashing —
+   * decrypts sealed entries with the queue's `payloadEncryptor`. Throws
+   * on undecryptable envelopes (callers treat that like any failed
+   * replay: the entry stays dead-lettered).
+   */
+  private replayPayloadBytes(entry: DeadLetterEntry): Buffer {
+    if (entry.encryptedPayload !== undefined) {
+      if (!this.payloadEncryptor) {
+        throw new Error("replayDeadLetter: entry payload is encrypted but no payloadEncryptor is configured");
+      }
+      return this.payloadEncryptor.decrypt(entry.encryptedPayload);
+    }
+    return entry.payload;
+  }
+
+  /**
+   * WR-149: the delivery timestamp (ms epoch) that suppresses replaying
+   * `entry`, or `undefined` when the guard allows the replay. A replay
+   * is suppressed only when the guard is enabled *and* the same
+   * (endpoint, payload) was delivered strictly *after* the entry was
+   * dead-lettered — the downstream already holds a newer copy. Pure
+   * read: safe to call from the single, batch, and dry-run paths.
+   */
+  private replayGuardDeliveredAfterMs(entry: DeadLetterEntry): number | undefined {
+    const guard = this.replayIdempotencyFor(entry.tenantId);
+    if (guard === undefined) return undefined;
+    const deliveredAtMs = guard.deliveredAtMs(entry.targetUrl, this.replayPayloadBytes(entry));
+    if (deliveredAtMs === undefined) return undefined;
+    const deadLetteredAtMs = Date.parse(entry.deadLetteredAt);
+    return deliveredAtMs > deadLetteredAtMs ? deliveredAtMs : undefined;
+  }
+
+  /**
    * WR-95: the calling tenant's latency phase tracker; `undefined` when
    * phase tracking is off.
    */
@@ -4787,8 +4959,37 @@ export class RetryQueue {
    * consumes a one-shot approval token (or takes the explicit
    * `bypassApproval` escape hatch) — a denied token throws
    * `ReplayApprovalError` instead of replaying.
+   *
+   * WR-149: also returns false (entry stays dead-lettered) when the
+   * replay-idempotency guard suppresses the replay — the same (endpoint,
+   * payload) was delivered after the entry was dead-lettered. Pass
+   * `force: true` to replay anyway.
    */
   replayDeadLetter(id: string, opts: ReplayDeadLetterOpts = {}): boolean {
+    // WR-149: replay-idempotency guard, checked before the approval
+    // gate — a suppressed replay consumes no approval token and leaves
+    // the entry dead-lettered for operator review. Returns false (the
+    // entry stays in the list); an explicit `force` replays anyway and
+    // fires `onReplayForced`.
+    const guarded = this.deadLetter.find((e) => e.id === id);
+    if (guarded !== undefined) {
+      const deliveredAtMs = this.replayGuardDeliveredAfterMs(guarded);
+      if (deliveredAtMs !== undefined) {
+        const info = {
+          id,
+          endpoint: guarded.targetUrl,
+          ...(guarded.tenantId !== undefined ? { tenant: guarded.tenantId } : {}),
+          deadLetteredAt: guarded.deadLetteredAt,
+          deliveredAt: new Date(deliveredAtMs).toISOString(),
+        };
+        if (opts.force === true) {
+          this.onReplayForced?.(info);
+        } else {
+          this.onReplaySkipped?.(info);
+          return false;
+        }
+      }
+    }
     // WR-135: opt-in two-phase approval. The token check runs before the
     // entry is touched: an unknown id answers the same 404 as before
     // (the token is not consumed), while a denied token throws. Scope
@@ -4835,7 +5036,7 @@ export class RetryQueue {
       attempts: _attempts,
       lastError: _lastError,
       deadLetteredAt: _ts,
-      encryptedPayload,
+      encryptedPayload: _encryptedPayload,
       payloadBytes: _payloadBytes,
       failoverEndpoint,
       // WR-76: a replay starts a fresh delivery cycle — drop the original
@@ -4844,13 +5045,9 @@ export class RetryQueue {
       enqueuedAt: _enqueuedAt,
       ...item
     } = entry;
-    let payload = item.payload;
-    if (encryptedPayload) {
-      if (!this.payloadEncryptor) {
-        throw new Error("replayDeadLetter: entry payload is encrypted but no payloadEncryptor is configured");
-      }
-      payload = this.payloadEncryptor.decrypt(encryptedPayload);
-    }
+    // WR-149: shared helper resolves the plaintext payload, decrypting
+    // sealed entries (throws on undecryptable envelopes, like before).
+    const payload = this.replayPayloadBytes(entry);
     // WR-39: replays re-enter through the logical endpoint so the next
     // dispatch resolves the *current* active target instead of pinning to
     // whatever standby served the dead-lettered attempt.
@@ -5097,15 +5294,28 @@ export class RetryQueue {
     opts: DeadLetterBatchReplayOpts = {}
   ): DeadLetterReplayPreview[] | DeadLetterBatchReplayResult {
     if (opts.dryRun === true) {
-      return this.matchDeadLetters(filter).map((e) => ({
-        id: e.id,
-        endpoint: e.targetUrl,
-        ...(e.tenantId !== undefined ? { tenant: e.tenantId } : {}),
-        attempts: e.attempts,
-        lastError: e.lastError,
-        deadLetteredAt: e.deadLetteredAt,
-        payloadBytes: e.payloadBytes,
-      }));
+      return this.matchDeadLetters(filter).map((e) => {
+        // WR-149: preview whether the guard would suppress this entry.
+        // A dry run never touches payloads, so an undecryptable sealed
+        // entry previews as replayable (the real replay would fail with
+        // a decrypt error instead) — the preview stays metadata-only.
+        let willSkip = false;
+        try {
+          willSkip = opts.force !== true && this.replayGuardDeliveredAfterMs(e) !== undefined;
+        } catch {
+          willSkip = false;
+        }
+        return {
+          id: e.id,
+          endpoint: e.targetUrl,
+          ...(e.tenantId !== undefined ? { tenant: e.tenantId } : {}),
+          attempts: e.attempts,
+          lastError: e.lastError,
+          deadLetteredAt: e.deadLetteredAt,
+          payloadBytes: e.payloadBytes,
+          ...(willSkip ? { will_skip: true as const } : {}),
+        };
+      });
     }
     // WR-135: one-shot approval for the whole batch, consumed before any
     // entry is touched — a denial replays nothing. The per-entry calls
@@ -5139,10 +5349,37 @@ export class RetryQueue {
       const replayed: string[] = [];
       const failed: DeadLetterReplayFailure[] = [];
       const throttled: string[] = [];
+      const skipped: string[] = [];
       const seen = new Set<string>();
       for (const entries of groups.values()) {
         for (const entry of entries) {
           seen.add(entry.id);
+          // WR-149: collect guard-suppressed entries here so the batch
+          // reports them as `skipped`, not `failed`. A suppressed entry
+          // stays dead-lettered (audited as `replay_skipped_delivered`
+          // via the hook); `force` skips this pre-check and rides the
+          // inner per-entry call instead (which fires `replay_forced`
+          // once). A decrypt failure lands in `failed` like any replay
+          // failure.
+          if (opts.force !== true) {
+            try {
+              const deliveredAtMs = this.replayGuardDeliveredAfterMs(entry);
+              if (deliveredAtMs !== undefined) {
+                skipped.push(entry.id);
+                this.onReplaySkipped?.({
+                  id: entry.id,
+                  endpoint: entry.targetUrl,
+                  ...(entry.tenantId !== undefined ? { tenant: entry.tenantId } : {}),
+                  deadLetteredAt: entry.deadLetteredAt,
+                  deliveredAt: new Date(deliveredAtMs).toISOString(),
+                });
+                continue;
+              }
+            } catch (err) {
+              failed.push({ id: entry.id, error: err instanceof Error ? err.message : String(err) });
+              continue;
+            }
+          }
           // WR-68: the shared egress gate throttles re-queue admission.
           // The bucket is keyed by the *logical* endpoint the entry will
           // be re-queued on (`failoverEndpoint ?? targetUrl` — the same
@@ -5161,8 +5398,10 @@ export class RetryQueue {
           try {
             // WR-135: the batch already consumed the approval token above
             // (or took the explicit bypass) — the per-entry calls are one
-            // execution, not one token each.
-            if (this.replayDeadLetter(entry.id, { bypassApproval: true })) {
+            // execution, not one token each. WR-149: `force` rides along
+            // so the inner call fires `replay_forced` for entries the
+            // pre-check above skipped over.
+            if (this.replayDeadLetter(entry.id, { bypassApproval: true, force: opts.force })) {
               replayed.push(entry.id);
             } else {
               failed.push({ id: entry.id, error: "dead-letter entry no longer present" });
@@ -5180,7 +5419,7 @@ export class RetryQueue {
           if (!seen.has(id)) failed.push({ id, error: "unknown dead-letter id" });
         }
       }
-      return { replayed, failed, throttled };
+      return { replayed, failed, throttled, skipped };
     } finally {
       for (const entry of matched) this.releaseReplay(entry.id);
     }
@@ -6521,6 +6760,11 @@ export class RetryQueue {
           // WR-148: a delivered attempt steps the slow-start ramp up the
           // curve (only while a recovery is ramping — a no-op otherwise).
           this.slowStartFor(tenant)?.recordOutcome(target, true);
+          // WR-149: index the delivered (endpoint, payload) pair so a
+          // later dead-letter replay of the same event can be suppressed
+          // when the downstream already holds a newer copy (the
+          // lost-response payment-callback case).
+          this.replayIdempotencyFor(tenant)?.recordDelivered(target, entry.payload);
           this.failover?.recordOutcome(logicalEndpoint, target, true);
           // WR-66: an answering target is a healthy target — same rule as
           // failover; non_retryable delivery outcomes feed both routers so
@@ -8246,6 +8490,25 @@ export class RetryQueue {
       for (const row of controller.stats()) {
         rows.push(tenant === undefined ? row : { ...row, tenant });
       }
+    }
+    return rows;
+  }
+
+  /**
+   * WR-149: per-tenant replay-idempotency guard state — how many
+   * (endpoint, payload) pairs are currently indexed and the oldest
+   * record's timestamp. `undefined` when the guard is disabled. Guards
+   * that never indexed a delivery are absent (activity-gated). Rows
+   * carry `tenant` only when set.
+   */
+  getReplayIdempotencyStats(): ReplayIdempotencyStats[] | undefined {
+    if (this.replayIdempotencyOpts === undefined) return undefined;
+    const rows: ReplayIdempotencyStats[] = [];
+    for (const [tenantKey, guard] of this.replayIdempotencyGuards) {
+      const tenant = tenantKey === "" ? undefined : tenantKey;
+      const row = guard.stats();
+      if (row.trackedPairs === 0) continue;
+      rows.push(tenant === undefined ? row : { ...row, tenant });
     }
     return rows;
   }

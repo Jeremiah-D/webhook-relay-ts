@@ -312,7 +312,7 @@ describe("server operator key ring", () => {
       const replay = await call(port, "POST", "/dead-letter/replay", adminKey, "{}");
       assert.equal(replay.status, 200);
       // `replayed` is the id list (empty here), not a count.
-      assert.deepEqual(JSON.parse(replay.text), { replayed: [], failed: [] });
+      assert.deepEqual(JSON.parse(replay.text), { replayed: [], failed: [], skipped: [] });
       // Unknown schedule: scope passes, then the operator 404.
       assert.equal((await call(port, "POST", "/scheduled/nope/pause", adminKey)).status, 404);
       const batch = readEvents(audit).filter((e) => e.event === "dead_letter_batch_replayed");

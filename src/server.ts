@@ -5621,6 +5621,16 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       });
       opts.retry?.onCircuitStateChange?.(endpoint, from, to, tenant);
     },
+    // WR-149: audit replay-idempotency guard decisions; the caller's own
+    // hooks still fire afterwards.
+    onReplaySkipped: (info) => {
+      opts.auditLog.append({ event: "replay_skipped_delivered", ...info });
+      opts.retry?.onReplaySkipped?.(info);
+    },
+    onReplayForced: (info) => {
+      opts.auditLog.append({ event: "replay_forced", ...info });
+      opts.retry?.onReplayForced?.(info);
+    },
     // Wrap the caller's onConfigChange so every runtime config change is
     // audited, not just observed.
     onConfigChange: (endpoint, changes) => {
@@ -6201,7 +6211,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         respondJson(res, 400, { error: "body must be a JSON object" });
         return;
       }
-      const { endpoint, tenant, ids, dryRun, approvalToken } = body;
+      const { endpoint, tenant, ids, dryRun, approvalToken, force } = body;
       if (endpoint !== undefined && typeof endpoint !== "string") {
         respondJson(res, 400, { error: "endpoint must be a string" });
         return;
@@ -6223,6 +6233,10 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       }
       if (approvalToken !== undefined && typeof approvalToken !== "string") {
         respondJson(res, 400, { error: "approvalToken must be a string" });
+        return;
+      }
+      if (force !== undefined && typeof force !== "boolean") {
+        respondJson(res, 400, { error: "force must be a boolean" });
         return;
       }
       const filter = {
@@ -6252,9 +6266,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       const headerToken = req.headers["x-replay-approval-token"];
       const batchApprovalToken =
         approvalToken ?? (typeof headerToken === "string" ? headerToken : undefined);
-      let result: { replayed: string[]; failed: { id: string; error: string }[]; throttled: string[] };
+      let result: { replayed: string[]; failed: { id: string; error: string }[]; throttled: string[]; skipped: string[] };
       try {
-        result = queue.replayDeadLetters(filter, { approvalToken: batchApprovalToken });
+        result = queue.replayDeadLetters(filter, { approvalToken: batchApprovalToken, force });
       } catch (err) {
         if (err instanceof ReplayApprovalError) {
           if (err.reason === "expired") {
@@ -6276,6 +6290,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         keyId: operatorKeyId,
         replayed: result.replayed,
         failed: result.failed,
+        skipped: result.skipped,
         ...(endpoint !== undefined ? { endpoint } : {}),
         ...(tenant !== undefined ? { tenant } : {}),
       });
@@ -6290,7 +6305,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
           ...(tenant !== undefined ? { tenant } : {}),
         });
       }
-      respondJson(res, 200, { replayed: result.replayed, failed: result.failed });
+      respondJson(res, 200, { replayed: result.replayed, failed: result.failed, skipped: result.skipped });
       return;
     }
     if (isApproveRequest) {
@@ -7468,12 +7483,15 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // WR-135: the single replay honors the two-phase gate when enabled —
     // same 403 semantics as the batch endpoint. The approval token may
     // ride the (optional) JSON body or the `x-replay-approval-token`
-    // header; with the feature off the body is never read, keeping the
-    // legacy path byte-identical.
+    // header. WR-149: the body also carries `force` (override the
+    // replay-idempotency guard); the optional body is always read when
+    // present, so `force` works with or without approval enabled — a
+    // bodyless request behaves exactly like the legacy path.
     let singleApprovalToken: string | undefined;
+    let singleForce: boolean | undefined;
+    const singleBody = await readOptionalJsonBody(req, res, maxBodyBytes);
+    if (singleBody === undefined) return;
     if (queue.getReplayApprovalStore() !== undefined) {
-      const singleBody = await readOptionalJsonBody(req, res, maxBodyBytes);
-      if (singleBody === undefined) return;
       const bodyToken = singleBody.approvalToken;
       if (bodyToken !== undefined && typeof bodyToken !== "string") {
         respondJson(res, 400, { error: "approvalToken must be a string" });
@@ -7483,9 +7501,19 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       singleApprovalToken =
         bodyToken ?? (typeof headerToken === "string" ? headerToken : undefined);
     }
+    const bodyForce = singleBody.force;
+    if (bodyForce !== undefined && typeof bodyForce !== "boolean") {
+      respondJson(res, 400, { error: "force must be a boolean" });
+      return;
+    }
+    singleForce = bodyForce;
+    // WR-149: a `false` return is ambiguous — the id may be unknown, or
+    // the replay-idempotency guard may have suppressed the replay. Check
+    // liveness first so the response can tell the two apart.
+    const knownBefore = queue.getDeadLetter().some((e) => e.id === id);
     let singleReplayed: boolean;
     try {
-      singleReplayed = queue.replayDeadLetter(id, { approvalToken: singleApprovalToken });
+      singleReplayed = queue.replayDeadLetter(id, { approvalToken: singleApprovalToken, force: singleForce });
     } catch (err) {
       if (err instanceof ReplayApprovalError) {
         if (err.reason === "expired") {
@@ -7509,6 +7537,13 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         opts.auditLog.append({ event: "replay_approved", keyId: operatorKeyId, id });
       }
       respondJson(res, 200, { id, replayed: true });
+    } else if (knownBefore) {
+      // WR-149: the id exists but the replay-idempotency guard suppressed
+      // the replay — the downstream already holds a newer copy of the
+      // same (endpoint, payload). 200, not 404: the request was processed
+      // and the replay was intentionally skipped; the audit log carries
+      // the `replay_skipped_delivered` event.
+      respondJson(res, 200, { id, replayed: false, skipped: true, reason: "replay_suppressed_delivered" });
     } else {
       respondJson(res, 404, { error: "unknown dead-letter id" });
     }

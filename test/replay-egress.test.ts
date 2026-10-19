@@ -117,7 +117,7 @@ describe("WR-68 replay egress gate", () => {
       ]);
       await timer.run();
       const result = q.replayDeadLetters();
-      assert.deepEqual(result, { replayed: ["a", "b", "c"], failed: [], throttled: [] });
+      assert.deepEqual(result, { replayed: ["a", "b", "c"], failed: [], throttled: [], skipped: [] });
       assert.equal(q.getDeadLetterStats().throttled, 0);
       assert.equal(q.getReplayEgressGate(), undefined);
       q.stop();

@@ -162,9 +162,9 @@ export const OPERATOR_ROUTES: readonly OperatorRoute[] = [
     methods: ["POST"],
     summary: "Batch-replay dead letters",
     description:
-      "WR-23: replay dead letters back into the delivery queue with a fresh retry budget, grouped per endpoint. `dryRun: true` returns the would-be-replayed metadata with zero side effects (nothing re-queued, nothing audited, payloads never touched). WR-135: when two-phase replay approval is enabled, a real (non-dry-run) replay consumes a one-shot `approvalToken` issued by `POST /dead-letter/replay/approve-request` — pass it in the body or the `x-replay-approval-token` header; missing, expired, reused, or scope-mismatched tokens answer 403.",
+      "WR-23: replay dead letters back into the delivery queue with a fresh retry budget, grouped per endpoint. `dryRun: true` returns the would-be-replayed metadata with zero side effects (nothing re-queued, nothing audited, payloads never touched). WR-135: when two-phase replay approval is enabled, a real (non-dry-run) replay consumes a one-shot `approvalToken` issued by `POST /dead-letter/replay/approve-request` — pass it in the body or the `x-replay-approval-token` header; missing, expired, reused, or scope-mismatched tokens answer 403. WR-149: when the replay-idempotency guard is enabled, entries whose (endpoint, payload) was delivered after dead-lettering are suppressed (`skipped`, audited as `replay_skipped_delivered`) unless `force: true` overrides the guard (audited as `replay_forced`).",
     okDescription:
-      "`{ replayed, failed }`, or `{ dryRun: true, entries: [...] }` for a dry run.",
+      "`{ replayed, failed, skipped }`, or `{ dryRun: true, entries: [...] }` for a dry run (suppressible rows carry `will_skip: true`).",
     requestBody: {
       description: "Replay filter; all fields optional.",
       required: [],
@@ -177,6 +177,11 @@ export const OPERATOR_ROUTES: readonly OperatorRoute[] = [
           description: "Only replay these dead-letter ids; unknown ids are an explicit error.",
         },
         dryRun: { type: "boolean", description: "Preview only: return metadata, change nothing." },
+        force: {
+          type: "boolean",
+          description:
+            "WR-149: override the replay-idempotency guard — replay entries even when a newer delivered copy of the same (endpoint, payload) exists. Audited per entry as `replay_forced`.",
+        },
         approvalToken: {
           type: "string",
           description:
@@ -213,9 +218,25 @@ export const OPERATOR_ROUTES: readonly OperatorRoute[] = [
     methods: ["POST"],
     summary: "Replay one dead letter",
     description:
-      "Re-queue a single dead-letter entry with a fresh retry budget. Audited as `dead_letter_replayed`. WR-135: when two-phase replay approval is enabled, the replay consumes a one-shot `approvalToken` (body or `x-replay-approval-token` header); missing, expired, reused, or scope-mismatched tokens answer 403.",
-    okDescription: "`{ id, replayed: true }`, or 404 for an unknown id.",
+      "Re-queue a single dead-letter entry with a fresh retry budget. Audited as `dead_letter_replayed`. WR-135: when two-phase replay approval is enabled, the replay consumes a one-shot `approvalToken` (body or `x-replay-approval-token` header); missing, expired, reused, or scope-mismatched tokens answer 403. WR-149: the optional JSON body accepts `force: true` to override the replay-idempotency guard (replay even when a newer delivered copy exists, audited as `replay_forced`); when the guard suppresses the replay the response is `{ id, replayed: false, skipped: true }` (audited as `replay_skipped_delivered`).",
+    okDescription: "`{ id, replayed: true }`, `{ id, replayed: false, skipped: true }` when the WR-149 guard suppresses it, or 404 for an unknown id.",
     pathParams: [{ name: "id", description: "The dead-letter entry id." }],
+    requestBody: {
+      description: "Optional replay modifiers; all fields optional.",
+      required: [],
+      properties: {
+        approvalToken: {
+          type: "string",
+          description:
+            "WR-135: one-shot approval token (see POST /dead-letter/replay/approve-request); required when two-phase approval is enabled. The x-replay-approval-token header is an alternative carrier.",
+        },
+        force: {
+          type: "boolean",
+          description:
+            "WR-149: override the replay-idempotency guard — replay even when a newer delivered copy of the same (endpoint, payload) exists. Audited as `replay_forced`.",
+        },
+      },
+    },
   },
   {
     path: "/dead-letter/auto-replay/status",

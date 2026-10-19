@@ -239,8 +239,8 @@ describe("dead-letter batch replay", () => {
   it("returns empty results when nothing matches", async () => {
     const { q, timer } = seedDeadLetters([{ id: "a", targetUrl: EP_A }]);
     await timer.run();
-    assert.deepEqual(q.replayDeadLetters({ endpoint: EP_B }), { replayed: [], failed: [], throttled: [] });
-    assert.deepEqual(q.replayDeadLetters({ ids: [] }), { replayed: [], failed: [], throttled: [] });
+    assert.deepEqual(q.replayDeadLetters({ endpoint: EP_B }), { replayed: [], failed: [], throttled: [], skipped: [] });
+    assert.deepEqual(q.replayDeadLetters({ ids: [] }), { replayed: [], failed: [], throttled: [], skipped: [] });
     assert.deepEqual(q.replayDeadLetters({}, { dryRun: true }).length, 1);
   });
 
@@ -421,3 +421,201 @@ async function getDeadLetterEntries(
     await new Promise((r) => setTimeout(r, 25));
   }
 }
+
+describe("WR-149 replay-idempotency guard operator endpoints", () => {
+  const AUTH = "op-secret";
+
+  /** Server whose sender is controllable; counts every delivery attempt. */
+  async function makeGuardServer() {
+    const dir = mkdtempSync(join(tmpdir(), "audit-guard-"));
+    const audit = new AuditLog(join(dir, "audit.jsonl"));
+    let fail = true;
+    let calls = 0;
+    const relay = createRelayServer({
+      secret: SECRET,
+      forwardUrl: "http://127.0.0.1:1/unused",
+      auditLog: audit,
+      sender: async () => {
+        calls += 1;
+        if (fail) throw new Error("downstream 500");
+      },
+      retry: {
+        baseDelayMs: 10,
+        jitterMs: 0,
+        maxAttempts: 1,
+        // The guard compares ms timestamps with a strict `>`: run its
+        // clock 60s ahead of wall time so delivered records are
+        // deterministically newer than the dead-lettering instant.
+        replayIdempotency: { now: () => Date.now() + 60_000 },
+      },
+      operatorToken: AUTH,
+    });
+    const port = await listen(relay);
+    return {
+      relay,
+      port,
+      audit,
+      setFail: (v: boolean) => (fail = v),
+      calls: () => calls,
+    };
+  }
+
+  async function intake(port: number) {
+    const res = await post(port, "/", BODY, { "x-signature": signSha256(BODY, SECRET) });
+    assert.equal(res.status, 202);
+  }
+
+  async function waitForCalls(srv: { calls: () => number }, n: number) {
+    const deadline = Date.now() + 5000;
+    for (;;) {
+      if (srv.calls() >= n) return;
+      if (Date.now() >= deadline) throw new Error("timed out waiting for deliveries");
+      await new Promise((r) => setTimeout(r, 25));
+    }
+  }
+
+  async function waitForDeadLetterCount(port: number, n: number) {
+    const deadline = Date.now() + 5000;
+    for (;;) {
+      const entries = await getDeadLetterEntries(port, AUTH, 0);
+      if (entries.length === n) return entries;
+      if (Date.now() >= deadline) throw new Error("timed out waiting for dead-letter count");
+      await new Promise((r) => setTimeout(r, 25));
+    }
+  }
+
+  /** Dead-letter one item, then deliver a newer copy of the same (endpoint, payload). */
+  async function seedSuppressed(port: number, srv: { setFail: (v: boolean) => void; calls: () => number }) {
+    await intake(port);
+    const dead = await getDeadLetterEntries(port, AUTH, 1);
+    const id = dead[0].id;
+    srv.setFail(false);
+    await intake(port);
+    await waitForCalls(srv, 2); // the second intake's delivery completed
+    assert.equal((await getDeadLetterEntries(port, AUTH, 1)).length, 1);
+    return id;
+  }
+
+  function auditEvents(audit: AuditLog) {
+    return audit.readAll() as Array<Record<string, unknown>>;
+  }
+
+  it("batch replay suppresses the guarded entry, reports skipped, audits replay_skipped_delivered", async () => {
+    const srv = await makeGuardServer();
+    const { relay, port, audit } = srv;
+    try {
+      const id = await seedSuppressed(port, srv);
+      const auditBefore = auditEvents(audit).length;
+
+      const res = await postBatch(port, {}, AUTH);
+      assert.equal(res.status, 200);
+      assert.deepEqual(JSON.parse(res.text), { replayed: [], failed: [], skipped: [id] });
+
+      // Still dead-lettered: suppressed, not executed.
+      assert.equal((await getDeadLetterEntries(port, AUTH, 1)).length, 1);
+
+      const fresh = auditEvents(audit).slice(auditBefore);
+      const skipEvent = fresh.find((e) => e.event === "replay_skipped_delivered");
+      assert.ok(skipEvent, "expected a replay_skipped_delivered audit event");
+      assert.equal(skipEvent!.id, id);
+      const batchEvent = fresh.find((e) => e.event === "dead_letter_batch_replayed");
+      assert.ok(batchEvent);
+      assert.deepEqual(batchEvent!.skipped, [id]);
+      assert.deepEqual(batchEvent!.replayed, []);
+    } finally {
+      relay.close();
+      await new Promise((r) => relay.once("close", r));
+    }
+  });
+
+  it("batch replay with force replays the guarded entry and audits replay_forced", async () => {
+    const srv = await makeGuardServer();
+    const { relay, port, audit } = srv;
+    try {
+      const id = await seedSuppressed(port, srv);
+      const auditBefore = auditEvents(audit).length;
+
+      const res = await postBatch(port, { force: true }, AUTH);
+      assert.equal(res.status, 200);
+      assert.deepEqual(JSON.parse(res.text), { replayed: [id], failed: [], skipped: [] });
+
+      // The forced replay delivered (sender healthy): the dead letter is gone.
+      await waitForDeadLetterCount(port, 0);
+
+      const fresh = auditEvents(audit).slice(auditBefore);
+      const forcedEvent = fresh.find((e) => e.event === "replay_forced");
+      assert.ok(forcedEvent, "expected a replay_forced audit event");
+      assert.equal(forcedEvent!.id, id);
+    } finally {
+      relay.close();
+      await new Promise((r) => relay.once("close", r));
+    }
+  });
+
+  it("dry-run preview marks the suppressible entry with will_skip", async () => {
+    const srv = await makeGuardServer();
+    const { relay, port } = srv;
+    try {
+      const id = await seedSuppressed(port, srv);
+      const res = await postBatch(port, { dryRun: true }, AUTH);
+      assert.equal(res.status, 200);
+      const body = JSON.parse(res.text) as { entries: Array<Record<string, unknown>> };
+      assert.equal(body.entries.length, 1);
+      assert.equal(body.entries[0].id, id);
+      assert.equal(body.entries[0].will_skip, true);
+      assert.equal((await getDeadLetterEntries(port, AUTH, 1)).length, 1, "dry-run changes nothing");
+    } finally {
+      relay.close();
+      await new Promise((r) => relay.once("close", r));
+    }
+  });
+
+  it("single replay answers 200 {replayed:false, skipped:true} when suppressed, replays with force", async () => {
+    const srv = await makeGuardServer();
+    const { relay, port } = srv;
+    const authHeader = { authorization: `Bearer ${AUTH}` };
+    try {
+      const id = await seedSuppressed(port, srv);
+
+      const suppressed = await post(port, `/dead-letter/${id}/replay`, Buffer.from("{}"), authHeader);
+      assert.equal(suppressed.status, 200);
+      assert.deepEqual(JSON.parse(suppressed.text), {
+        id,
+        replayed: false,
+        skipped: true,
+        reason: "replay_suppressed_delivered",
+      });
+      assert.equal((await getDeadLetterEntries(port, AUTH, 1)).length, 1, "still dead-lettered");
+
+      const forced = await post(
+        port,
+        `/dead-letter/${id}/replay`,
+        Buffer.from(JSON.stringify({ force: true })),
+        authHeader
+      );
+      assert.equal(forced.status, 200);
+      assert.deepEqual(JSON.parse(forced.text), { id, replayed: true });
+      await waitForDeadLetterCount(port, 0);
+    } finally {
+      relay.close();
+      await new Promise((r) => relay.once("close", r));
+    }
+  });
+
+  it("single replay still 404s on unknown ids", async () => {
+    const srv = await makeGuardServer();
+    const { relay, port } = srv;
+    try {
+      const res = await post(
+        port,
+        "/dead-letter/nope/replay",
+        Buffer.from("{}"),
+        { authorization: `Bearer ${AUTH}` }
+      );
+      assert.equal(res.status, 404);
+    } finally {
+      relay.close();
+      await new Promise((r) => relay.once("close", r));
+    }
+  });
+});

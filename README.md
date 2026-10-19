@@ -4278,6 +4278,65 @@ process open, and `RetryQueue.stop()` / `shutdown()` cancel any pending
 round — a round never fires mid-shutdown and re-queues dead letters the
 operator expected to stay parked.
 
+### Dead-letter replay idempotency guard (opt-in)
+
+The payment-callback nightmare: the downstream *did* process the event,
+but the response was lost, so the relay retried, exhausted its budget,
+and dead-lettered the item. Replaying that dead letter now would repeat
+the business action (a duplicate charge, a duplicate payout). WR-14
+dedup only guards *inbound* duplicates — it cannot see replays.
+
+`retry.replayIdempotency` (opt-in, off by default) keeps a bounded,
+in-memory index of delivered events keyed by `(endpoint,
+sha256(payload))` with their delivery timestamps. Before
+`replayDeadLetter(s)` re-queues an entry, the queue checks the index:
+when the same (endpoint, payload) was delivered *strictly after* the
+entry was dead-lettered, the downstream already holds a newer copy, so
+the replay is **suppressed** — the entry stays dead-lettered for
+operator review instead of re-firing the business action:
+
+```ts
+const queue = new RetryQueue({
+  sender,
+  replayIdempotency: {
+    windowMs: 86_400_000, // how long a delivered record suppresses a
+                           // replay; default 24h, must be > 0
+    maxEntries: 10_000,    // tracked pairs cap, oldest evicted first;
+                           // default 10_000, integer >= 1
+  },
+});
+```
+
+- **Single replay** — `replayDeadLetter(id)` returns `false` and the
+  entry stays in the dead-letter list when suppressed; pass
+  `{ force: true }` to replay anyway (audited as `replay_forced`).
+- **Batch replay** — `replayDeadLetters()` returns suppressed ids in a
+  new `skipped` array (alongside `replayed` / `failed` / `throttled`);
+  `{ force: true }` overrides the guard for the whole batch. Dry-run
+  previews mark suppressible rows with `will_skip: true` and never
+  touch payloads.
+- **Operator endpoints** — `POST /dead-letter/replay` accepts
+  `force: true` in the body and reports `skipped` in both the response
+  and the `dead_letter_batch_replayed` audit event;
+  `POST /dead-letter/{id}/replay` accepts `force: true` and answers
+  `200 { id, replayed: false, skipped: true, reason:
+  "replay_suppressed_delivered" }` when the guard suppresses (404 stays
+  for genuinely unknown ids).
+- **Audit** — suppressions fire `onReplaySkipped` (audited as
+  `replay_skipped_delivered`); forced overrides fire `onReplayForced`
+  (audited as `replay_forced`, only when a newer delivered copy
+  actually existed).
+- **Observability** — `getReplayIdempotencyStats()` exposes each
+  tenant's indexed pair count and oldest record (activity-gated; absent
+  rows never delivered anything).
+- **Failure semantics** — the index is in-memory and bounded, so a
+  restart clears it: after a crash the guard degrades to plain replay
+  (fail-open by design — a missing record never *blocks* a replay, it
+  only fails to *suppress* one). Sealed (WR-11 encrypted) payloads are
+  decrypted for hashing, so the guard works on encrypted dead letters
+  too; an undecryptable entry fails the replay like any other replay
+  failure. Invalid options throw `RangeError` at construction.
+
 ### Dead-letter retention
 
 Opt-in TTL-based cleanup of the dead-letter list (`src/deadletter-retention.ts`):
