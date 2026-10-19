@@ -2198,6 +2198,44 @@ const queue = new RetryQueue({
   `RangeError` at construction; the clock is injectable for
   deterministic tests.
 
+## Per-endpoint outbound rate limiting
+
+The tenant-agnostic counterpart to the section above.
+`retry.outboundRateLimit` (opt-in, off by default; also accepted as a
+server-level `outboundRateLimit`, which wins) adds a token bucket per
+**endpoint** (`targetUrl`, no tenant dimension) — `burst` capacity
+refilled at `refillRps` tokens per second:
+
+```ts
+const queue = new RetryQueue({
+  outboundRateLimit: {
+    refillRps: 10,   // tokens per second; required
+    burst: 50,       // bucket capacity; required
+  },
+});
+```
+
+- **Queue mode only** — an over-limit attempt is rescheduled for the
+  next token refill at dispatch (never dropped, never charged to the
+  retry budget, never reported to the circuit breaker as an outcome),
+  with a little jitter so many delayed items do not re-check in
+  lockstep. A new endpoint starts with a full bucket, so the first
+  burst of budget is available immediately.
+- **Orthogonal to WR-97** — same lazy-refill token-bucket mechanics
+  (the two limiters share one implementation; WR-97's is the
+  tenant-scoped sibling), but this gate keys on the endpoint alone, so
+  it also paces the default tenant's flood. **Orthogonal to WR-150** —
+  throttling only paces; only endpoint auto-disable stops delivery.
+- **Observability** — every throttled attempt bumps the endpoint's
+  counter, exported to Prometheus as
+  `relay_ratelimit_throttled_total{endpoint}` (activity-gated — absent
+  until the first throttle) and to OTLP as the canonical
+  `rate_limited` event carrying `relay.retry_after_ms` (shared with
+  WR-97). `getOutboundRateLimitStats()` exposes per-endpoint throttle
+  counts plus the configured `refillRps` / `burst`. Invalid options
+  throw `RangeError` at construction; the clock is injectable for
+  deterministic tests.
+
 ## Per-tenant monthly delivery budgets
 
 Usage-based billing needs a ceiling, not just a meter. `retry.budget`

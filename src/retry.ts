@@ -198,6 +198,11 @@ import {
   type TenantRateLimitVerdict,
 } from "./tenant-ratelimit.ts";
 import {
+  OutboundRateLimiter,
+  type OutboundRateLimitOptions,
+  type OutboundRateLimitStats,
+} from "./outbound-ratelimit.ts";
+import {
   LatencyPhasesTracker,
   dominantPhaseOf,
   type EndpointLatencyPhaseStats,
@@ -455,6 +460,11 @@ export type {
   TenantRateLimitVerdict,
 } from "./tenant-ratelimit.ts";
 export { TenantRateLimiter } from "./tenant-ratelimit.ts";
+export type {
+  OutboundRateLimitOptions,
+  OutboundRateLimitStats,
+} from "./outbound-ratelimit.ts";
+export { OutboundRateLimiter } from "./outbound-ratelimit.ts";
 export type {
   LatencyPhaseName,
   LatencyPhaseOptions,
@@ -1504,6 +1514,25 @@ export interface RetryQueueOptions {
    * at construction.
    */
   tenantRateLimit?: TenantRateLimitOptions;
+  /**
+   * Per-endpoint outbound token-bucket rate limiting (WR-154; see
+   * `src/outbound-ratelimit.ts`). Opt-in: `{ refillRps, burst }` paces
+   * *outbound* dispatch attempts per endpoint (`targetUrl`, tenant
+   * agnostic) — each send attempt costs one token; an over-limit
+   * attempt is rescheduled for the next token refill (never dropped,
+   * never charged to the retry budget, never shown to the circuit
+   * breaker as an outcome), with a little jitter so many delayed items
+   * do not re-check in lockstep.
+   *
+   * Orthogonal to WR-97 (the per-(tenant, endpoint) limiter, same
+   * bucket mechanics reused) and to WR-150 endpoint auto-disable
+   * (throttling only paces; only auto-disable stops delivery).
+   * Throttled attempts bump `relay_ratelimit_throttled_total{endpoint}`
+   * and emit the canonical `rate_limited` OTLP event. Disabled by
+   * default (absent = unlimited). Invalid values throw `RangeError` at
+   * construction.
+   */
+  outboundRateLimit?: OutboundRateLimitOptions;
   /**
    * Random source in [0, 1) used for jitter; defaults to `Math.random`.
    * Injectable so tests can verify jitter bounds deterministically.
@@ -3437,6 +3466,8 @@ export class RetryQueue {
   private readonly adaptiveConcurrencyOpts?: AdaptiveConcurrencyOptions;
   /** WR-97: the shared per-(tenant, endpoint) outbound rate limiter; undefined when disabled. */
   private readonly tenantRateLimiter?: TenantRateLimiter;
+  /** WR-154: the shared per-endpoint outbound token-bucket rate limiter; undefined when disabled. */
+  private readonly outboundRateLimiter?: OutboundRateLimiter;
   /** WR-94: per-tenant adaptive concurrency controllers (WR-48 scoping). */
   private readonly adaptiveConcurrencies = new Map<string, AdaptiveConcurrencyController>();
   /** WR-95: latency phase options; undefined when disabled. */
@@ -4126,6 +4157,13 @@ export class RetryQueue {
     // so no per-tenant instances are needed.
     if (opts.tenantRateLimit !== undefined) {
       this.tenantRateLimiter = new TenantRateLimiter(opts.tenantRateLimit);
+    }
+    // WR-154: opt-in per-endpoint outbound token-bucket rate limiting.
+    // The limiter validates eagerly so illegal configs throw at
+    // construction, never mid-delivery. Buckets are per endpoint inside
+    // the one shared instance, so no per-endpoint instances are needed.
+    if (opts.outboundRateLimit !== undefined) {
+      this.outboundRateLimiter = new OutboundRateLimiter(opts.outboundRateLimit);
     }
     // WR-95: opt-in latency phase tracking. Same eager-default/lazy-tenant
     // pattern: invalid options throw at construction.
@@ -6677,6 +6715,29 @@ export class RetryQueue {
         return;
       }
     }
+    // WR-154: per-endpoint outbound token-bucket rate limiting. An
+    // over-limit attempt is rescheduled for the next token refill —
+    // never dropped, never charged to the retry budget, and never shown
+    // to the circuit breaker as an outcome: a throttled wait is not a
+    // delivery outcome, exactly like the WR-97 gate above (tenant
+    // agnostic here). Orthogonal to WR-150 auto-disable: throttling
+    // only paces, only auto-disable stops delivery. WR-97's canonical
+    // `rate_limited` OTLP event is reused for the throttled attempt.
+    const outLimiter = this.outboundRateLimiter;
+    if (outLimiter !== undefined) {
+      const outVerdict = outLimiter.take(target);
+      if (!outVerdict.ok) {
+        this.recordTenantRateLimitedEvent({
+          eventId: id,
+          traceId,
+          endpoint: target,
+          retryAfterMs: outVerdict.retryAfterMs,
+        });
+        // A little jitter keeps many delayed items from re-checking in lockstep.
+        this.schedule(id, outVerdict.retryAfterMs + this.random() * 50);
+        return;
+      }
+    }
     let probe = false;
     const breaker = this.breakerFor(tenant);
     if (breaker) {
@@ -8179,6 +8240,19 @@ export class RetryQueue {
               })),
           }
         : {}),
+      // WR-154: activity-gated — the series appears only once an
+      // endpoint has actually been throttled, so an untouched relay's
+      // exposition is byte-identical.
+      ...(this.outboundRateLimiter !== undefined
+        ? {
+            outboundRateLimited: (this.getOutboundRateLimitStats() ?? [])
+              .filter((s) => s.throttled > 0)
+              .map((s) => ({
+                endpoint: s.endpoint,
+                throttled: s.throttled,
+              })),
+          }
+        : {}),
       // WR-113: activity-gated — the ordered series appear only for
       // ordered endpoints with recorded activity (a held follower, a
       // poison-parked head, or an urgent bypass), so a relay with the
@@ -8825,6 +8899,16 @@ export class RetryQueue {
    */
   getTenantRateLimitStats(): TenantRateLimitStats[] | undefined {
     return this.tenantRateLimiter?.stats();
+  }
+
+  /**
+   * WR-154: per-endpoint outbound rate-limit state — one row per
+   * endpoint that has taken at least once, in first-seen order, with
+   * the cumulative denial count (`throttled`) and the configured
+   * `refillRps` / `burst`. `undefined` when the feature is disabled.
+   */
+  getOutboundRateLimitStats(): OutboundRateLimitStats[] | undefined {
+    return this.outboundRateLimiter?.stats();
   }
 
   /**

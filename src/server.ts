@@ -159,6 +159,7 @@ import {
   type InboundTenantRateLimitOptions,
 } from "./tenant-inbound-ratelimit.ts";
 import type { TenantRateLimitOptions } from "./tenant-ratelimit.ts";
+import type { OutboundRateLimitOptions } from "./outbound-ratelimit.ts";
 import { InboundIpAcl, IpAclMetrics, type IpAclOptions } from "./ip-acl.ts";
 import { InboundApiKeyAuth, type ApiKeyOptions, type EndpointApiKeyRule } from "./api-key.ts";
 import {
@@ -1746,6 +1747,15 @@ export interface RelayServerOptions {
    * queue. Disabled by default.
    */
   tenantRateLimit?: TenantRateLimitOptions;
+  /**
+   * Per-endpoint outbound token-bucket rate limiting (WR-154; see
+   * `src/outbound-ratelimit.ts` and `RetryQueueOptions.outboundRateLimit`).
+   * An explicit server-level value wins over the nested
+   * `retry.outboundRateLimit`; either way the queue owns the limiter.
+   * Over-limit attempts wait for the next token refill at dispatch
+   * (never dropped). Disabled by default.
+   */
+  outboundRateLimit?: OutboundRateLimitOptions;
   /**
    * Per-endpoint ordered delivery (head-of-line blocking; see
    * `RetryQueueOptions.ordered` and `src/ordered.ts`). An explicit
@@ -5201,6 +5211,10 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // limiter (the intake consults it via `admitTenantDelivery()` in
     // `reject-429` mode).
     tenantRateLimit: opts.tenantRateLimit ?? opts.retry?.tenantRateLimit,
+    // WR-154: an explicit server-level `outboundRateLimit` wins over the
+    // nested `retry.outboundRateLimit`; either way the queue owns the
+    // limiter.
+    outboundRateLimit: opts.outboundRateLimit ?? opts.retry?.outboundRateLimit,
     // WR-113: an explicit server-level `ordered` wins over the nested
     // `retry.ordered`; either way the queue owns the line state. WR-114:
     // registry `ordered` records supply the whole ordered config when

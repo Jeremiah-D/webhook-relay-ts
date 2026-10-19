@@ -298,6 +298,17 @@ export interface TenantRateLimitMetricsInput {
 }
 
 /**
+ * One endpoint's outbound token-bucket rate-limit denials (WR-154), in
+ * Prometheus label order.
+ */
+export interface OutboundRateLimitMetricsInput {
+  /** Downstream endpoint (physical `targetUrl` at dispatch). */
+  endpoint: string;
+  /** Cumulative over-limit decisions (delays) for this endpoint. */
+  throttled: number;
+}
+
+/**
  * One tenant's dispatch-gate waits (WR-140), in Prometheus label order.
  */
 export interface TenantConcurrencyWaitMetricsInput {
@@ -438,6 +449,13 @@ export interface MetricsInput {
    * untouched relay's exposition is byte-identical.
    */
   tenantRateLimited?: TenantRateLimitMetricsInput[];
+  /**
+   * Present only when per-endpoint outbound token-bucket rate limiting
+   * (WR-154) is enabled; one counter series per endpoint that actually
+   * throttled — absent entirely when the feature is off, so an
+   * untouched relay's exposition is byte-identical.
+   */
+  outboundRateLimited?: OutboundRateLimitMetricsInput[];
   /**
    * Present only when the per-tenant concurrency cap (WR-140) is
    * configured (finite); one counter series per tenant that actually
@@ -676,6 +694,26 @@ export function renderTenantRateLimitedBlock(series: TenantRateLimitMetricsInput
   for (const s of series) {
     lines.push(
       `relay_tenant_ratelimited_total{endpoint="${escapeLabelValue(s.endpoint)}"${tenantLabel(s.tenant)}} ${s.limited}`
+    );
+  }
+  return lines;
+}
+
+/**
+ * Render just the per-endpoint outbound token-bucket rate-limit denial
+ * block (WR-154) as exposition lines; `[]` when the series is empty, so
+ * callers can keep their output byte-identical until the first denial
+ * actually happens.
+ */
+export function renderOutboundRateLimitedBlock(series: OutboundRateLimitMetricsInput[]): string[] {
+  if (series.length === 0) return [];
+  const lines = [
+    "# HELP relay_ratelimit_throttled_total Over-limit decisions (delays) by the per-endpoint outbound token-bucket rate limiter (WR-154), queue mode.",
+    "# TYPE relay_ratelimit_throttled_total counter",
+  ];
+  for (const s of series) {
+    lines.push(
+      `relay_ratelimit_throttled_total{endpoint="${escapeLabelValue(s.endpoint)}"} ${s.throttled}`
     );
   }
   return lines;
@@ -1113,6 +1151,9 @@ export function renderPrometheus(input: MetricsInput): string {
   // WR-97: activity-gated the same way — the series appears only once a
   // (tenant, endpoint) scope has actually been rate-limited.
   lines.push(...renderTenantRateLimitedBlock(input.tenantRateLimited ?? []));
+  // WR-154: activity-gated the same way — the series appears only once
+  // an endpoint has actually been throttled.
+  lines.push(...renderOutboundRateLimitedBlock(input.outboundRateLimited ?? []));
   // WR-140: activity-gated the same way — the series appears only once
   // a tenant has actually waited for a tenant concurrency slot.
   lines.push(...renderTenantConcurrencyWaitBlock(input.tenantConcurrencyWaits ?? []));
