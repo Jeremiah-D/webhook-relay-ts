@@ -162,6 +162,7 @@ import type { TenantRateLimitOptions } from "./tenant-ratelimit.ts";
 import type { OutboundRateLimitOptions } from "./outbound-ratelimit.ts";
 import type { DeliveryReceiptOptions } from "./delivery-receipt.ts";
 import { InboundIpAcl, IpAclMetrics, type IpAclOptions } from "./ip-acl.ts";
+import { GeoIpInboundPolicy, type GeoIpOptions } from "./geoip.ts";
 import { InboundApiKeyAuth, type ApiKeyOptions, type EndpointApiKeyRule } from "./api-key.ts";
 import {
   SenderReputationTracker,
@@ -1600,6 +1601,29 @@ export interface RelayServerOptions {
    * the legacy one. Invalid CIDRs throw `RangeError` at startup.
    */
   ipAcl?: IpAclOptions;
+  /**
+   * Inbound GeoIP country policy (WR-158, see `src/geoip.ts`): a
+   * config-only country gate — no MaxMind, no binary, no lookups, just a
+   * `{ cidr, country }` table of IPv4/IPv6 CIDRs to ISO 3166-1 alpha-2
+   * country codes plus a `policy` of `{ default: "allow" | "deny",
+   * countries: { <CC>: "allow" | "deny" } }`. The first table match wins;
+   * an unmapped IP follows the policy default; an unparseable client IP
+   * fails closed to `deny`.
+   *
+   * The check runs in the intake gates after the WR-53 IP ACL and before
+   * the body is read — the same header-only admission tier — so a blocked
+   * country costs zero bandwidth and zero downstream state: the denial
+   * never enqueues, burns no retry budget, and never trips the breaker.
+   * Denials are answered 403 (with `connection: close`) and audited as
+   * `rejected` with reason `geo_blocked` (plus `ip` and `country`).
+   *
+   * The client IP reuses the WR-53 `clientIp` resolution when an IP ACL
+   * is configured (`x-forwarded-for` through `trustedProxies`), otherwise
+   * the direct socket peer — identical trusted-proxy semantics either
+   * way. Off by default: with no `geoIp`, intake behavior is exactly the
+   * legacy one. Invalid tables/policies throw `RangeError` at startup.
+   */
+  geoIp?: GeoIpOptions;
   /**
    * Inbound per-endpoint API key authentication (WR-65, see
    * `src/api-key.ts`): a bearer-key admission gate for senders that
@@ -5952,6 +5976,11 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // can never fail a request mid-flight.
   const ipAcl = opts.ipAcl !== undefined ? new InboundIpAcl(opts.ipAcl) : undefined;
   const ipAclMetrics = new IpAclMetrics();
+  // Inbound GeoIP country policy (WR-158): the table and policy are
+  // validated (and every CIDR pre-parsed) once at startup, so a bad
+  // country code or CIDR can never fail a request mid-flight. Unset =
+  // off: intake behavior is byte-identical to the legacy one.
+  const geoIpPolicy = opts.geoIp !== undefined ? new GeoIpInboundPolicy(opts.geoIp) : undefined;
   // Inbound per-endpoint API key authentication (WR-65): rules are
   // validated (constant-time comparison needs no precomputation, so this
   // is pure validation) once at startup, so a bad pattern or key entry
@@ -7845,6 +7874,43 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         // `connection: close` drops the socket after the 403, so the
         // client cannot keep streaming a flood into a dead request (same
         // rationale as the WR-25 413).
+        res
+          .writeHead(403, { "content-type": "text/plain", connection: "close" })
+          .end("Forbidden");
+        return undefined;
+      }
+    }
+
+    // Inbound GeoIP country policy (WR-158): the coarse geography filter
+    // layered *after* the WR-53 IP ACL and before the body is read — the
+    // same header-only admission tier. Ordering rationale: the WR-53 gate
+    // is the more specific, explicitly configured per-endpoint rule (an
+    // operator's allow/deny list), so it runs first; the GeoIP policy is
+    // the coarser country-level layer on top of it. A denial is 403 with
+    // `connection: close`, audited as `rejected` with reason
+    // `geo_blocked` — it never enqueues, so it burns no retry budget and
+    // never trips the breaker. The client IP reuses the WR-53
+    // `clientIp` resolution when an IP ACL is configured
+    // (x-forwarded-for through trustedProxies), otherwise the direct
+    // socket peer — the trusted-proxy semantics stay identical whether or
+    // not the ACL is configured. Unset = off: zero behavior change.
+    if (geoIpPolicy !== undefined) {
+      const geoClientIp = ipAcl
+        ? ipAcl.clientIp(req.socket.remoteAddress, req.headers["x-forwarded-for"])
+        : (req.socket.remoteAddress ?? "unknown");
+      const geo = geoIpPolicy.classify(geoClientIp);
+      if (geo.verdict === "deny") {
+        opts.auditLog.append({
+          event: "rejected",
+          id,
+          traceId,
+          reason: "geo_blocked",
+          ip: geoClientIp,
+          country: geo.country ?? "unknown",
+        });
+        // `connection: close` like the other pre-body rejections: the
+        // caller is denied before the body is read, so don't let it stream
+        // a flood into a dead request.
         res
           .writeHead(403, { "content-type": "text/plain", connection: "close" })
           .end("Forbidden");

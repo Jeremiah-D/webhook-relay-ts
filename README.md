@@ -400,6 +400,27 @@ reliability primitives that matter for any signed-payload pipeline.
   dual-stack `::ffff:127.0.0.1` remoteAddress matches a `127.0.0.1/32`
   rule). Wired into the server via `ipAcl: { rules, trustedProxies }`
   (off by default); invalid CIDRs throw `RangeError` at startup.
+- `src/geoip.ts` — inbound GeoIP country policy (`GeoIpInboundPolicy`,
+  WR-158): a config-only country gate, deliberately no MaxMind / no
+  binary / no lookups — the operator supplies a small `{ cidr, country }`
+  table (IPv4/IPv6 CIDRs → uppercase ISO 3166-1 alpha-2 country codes)
+  plus a `policy` of `{ default: "allow" | "deny", countries: { <CC>:
+  "allow" | "deny" } }`. It is a coarse geography filter, not a
+  substitute for a real GeoIP database: the table is matched in config
+  order (first match wins, so document the more specific range first),
+  an unmapped client IP follows the policy default, and an unparseable
+  client IP fails closed to `deny`. The check runs in the intake gates
+  *after* the WR-53 IP ACL and *before* the body is read — the same
+  header-only admission tier — so a blocked country costs zero bandwidth
+  and zero downstream state (a denial never enqueues: no retry budget
+  burned, no breaker tripped). Denials are answered 403 (with
+  `connection: close`) and audited as `rejected` (reason `geo_blocked`,
+  with `ip` and `country`). The client IP reuses the WR-53 `clientIp`
+  resolution when an IP ACL is configured (`x-forwarded-for` through
+  `trustedProxies`), otherwise the direct socket peer — identical
+  trusted-proxy semantics either way. Wired into the server via
+  `geoIp: { table, policy }` (off by default; invalid tables/policies
+  throw `RangeError` at startup).
 - `src/source-baseline.ts` — inbound source baseline anomaly detection
   (`SourceBaselineDetector`, WR-63): opt-in per-endpoint learning of the
   sender baseline — (source IP, approximate TLS fingerprint) triples. The
@@ -2802,6 +2823,60 @@ const server = createRelayServer({
 - Invalid rules (non-array, pattern not starting with `/`,
   non-positive-integer `maxBodyBytes`) throw `RangeError` at startup, so
   a bad config can never fail a request mid-flight.
+
+## GeoIP inbound country policy (opt-in)
+
+`geoIp` layers a coarse country filter over the WR-53 IP ACL — a relay
+that only serves certain jurisdictions (or wants to cut off background
+radiation from regions it never serves) can block whole countries
+without maintaining per-IP blocklists:
+
+```ts
+const server = createRelayServer({
+  // ... secret, forwardUrl, auditLog ...
+  geoIp: {
+    table: [
+      { cidr: "203.0.113.0/24", country: "US" },  // operator-curated ranges
+      { cidr: "2001:db8::/32", country: "JP" },
+    ],
+    policy: {
+      default: "deny",              // unmapped countries are blocked
+      countries: { US: "allow", JP: "allow" },
+    },
+  },
+});
+```
+
+- **Config-only, zero dependencies** — deliberately no MaxMind, no
+  binary database, no runtime lookups. The table is operator-curated
+  CIDR → country rows (IPv4/IPv6, the `parseCidr` spellings from
+  `src/ip-acl.ts`: bare addresses mean single hosts, host bits are
+  masked off). It is a coarse geography filter, not a substitute for a
+  real GeoIP database — say so in your operator docs if you curate one.
+- **Deterministic matching** — the table is matched in config order and
+  the first match wins, so put the more specific range first when
+  ranges overlap. An unmapped client IP follows `policy.default`; an
+  unparseable client IP fails closed to `deny` (a caller the relay
+  cannot even parse is never admitted).
+- **Same admission tier as the IP ACL** — the check runs in the intake
+  gates *after* the WR-53 IP ACL and *before* the body is read, so a
+  blocked country costs zero bandwidth and zero downstream state: the
+  denial never enqueues, burns no retry budget, and never trips the
+  breaker. Ordering rationale: the WR-53 gate is the more specific,
+  explicitly configured per-endpoint rule, so it runs first; GeoIP is
+  the coarser country-level layer on top. Denials are answered 403
+  (with `connection: close`, so the client cannot keep streaming into a
+  dead request) and audited as `rejected` with reason `geo_blocked`
+  (plus `ip` and `country`, `"unknown"` when the IP did not parse).
+- **Same client-IP semantics** — when an IP ACL is configured, the
+  GeoIP check reuses its `clientIp` resolution (`x-forwarded-for`
+  through `trustedProxies`); otherwise it is the direct socket peer. A
+  spoofed XFF is ignored exactly like it is for the ACL.
+- **Off by default, fail fast at startup** — with no `geoIp`, intake
+  behavior is byte-identical to the legacy one. A bad CIDR, a country
+  code that is not an uppercase ISO 3166-1 alpha-2 string, an illegal
+  `default`, or a malformed `countries` map throws `RangeError` at
+  startup, so a bad config can never fail a request mid-flight.
 
 ## Inbound signature algorithm negotiation (opt-in)
 
