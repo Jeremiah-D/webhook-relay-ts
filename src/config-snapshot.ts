@@ -95,6 +95,19 @@ export interface ConfigSnapshotInventory {
   compression: Record<string, { thresholdBytes?: number }>;
   /** Tenant ids observed in the queue's configured keyspace (WR-48). */
   tenants: string[];
+  /**
+   * Revoked inbound API key ids (WR-156): id-only, never key bytes.
+   * Grouped by the rule's exact `pattern`; sorted by (pattern, keyId).
+   * Append-only: revocation never un-applies, so a snapshot can only
+   * add revocations the live config lacks. Optional so pre-WR-156
+   * inventory readers keep validating — absent means "no revocations".
+   */
+  revokedApiKeys?: Array<{ pattern: string; keyIds: string[] }>;
+  /**
+   * Revoked operator key ids (WR-156): id-only, never key bytes,
+   * sorted. Append-only, same one-way rule; optional, same as above.
+   */
+  revokedOperatorKeys?: string[];
 }
 
 /** A declarative config snapshot. */
@@ -118,6 +131,18 @@ export interface ConfigSnapshotEnv {
   audit?: (event: Record<string, unknown>) => void;
   /** Clock for `takenAtMs`; defaults to `Date.now`. */
   nowMs?: () => number;
+  /**
+   * Revoke an inbound API key at runtime (WR-156). Required to apply
+   * `inventory.revokedApiKeys` diffs; a missing hook refuses the apply
+   * (`unsupported`). Returns true when the key was newly revoked.
+   */
+  revokeApiKey?: (rulePattern: string, keyId: string) => boolean;
+  /**
+   * Revoke an operator key at runtime (WR-156). Required to apply
+   * `inventory.revokedOperatorKeys` diffs. Returns true when newly
+   * revoked.
+   */
+  revokeOperatorKey?: (id: string) => boolean;
 }
 
 /** One live-vs-snapshot difference. */
@@ -355,7 +380,7 @@ function assertValidInventorySnapshot(inventory: unknown): void {
   if (!isRecord(inventory)) fail("invalid_snapshot", "inventory must be an object or null");
   const inv = inventory;
   for (const k of Object.keys(inv)) {
-    if (!["routing", "signingKeys", "mtls", "tlsPins", "proxies", "compression", "tenants"].includes(k)) {
+    if (!["routing", "signingKeys", "mtls", "tlsPins", "proxies", "compression", "tenants", "revokedApiKeys", "revokedOperatorKeys"].includes(k)) {
       fail("invalid_snapshot", `unknown inventory key ${JSON.stringify(k)}`);
     }
   }
@@ -438,6 +463,40 @@ function assertValidInventorySnapshot(inventory: unknown): void {
   }
   if (!Array.isArray(inv.tenants) || !inv.tenants.every((t) => typeof t === "string")) {
     fail("invalid_snapshot", "inventory.tenants must be an array of strings");
+  }
+  // WR-156: revoked-key inventory is id-only by construction — no key
+  // bytes can hide here, but validate the shape anyway (fail-fast, and
+  // applyConfig's revocation path trusts these rows to name real keys).
+  // The keys are optional for backward compatibility: a pre-WR-156
+  // inventory reader that omits them validates fine (absent = none).
+  if (inv.revokedApiKeys !== undefined) {
+    if (!Array.isArray(inv.revokedApiKeys)) {
+      fail("invalid_snapshot", "inventory.revokedApiKeys must be an array");
+    }
+    for (const row of inv.revokedApiKeys as unknown[]) {
+      if (
+        !isRecord(row) ||
+        typeof row.pattern !== "string" ||
+        row.pattern === "" ||
+        !Array.isArray(row.keyIds) ||
+        !(row.keyIds as unknown[]).every((k) => typeof k === "string" && k !== "") ||
+        Object.keys(row).length !== 2
+      ) {
+        fail(
+          "invalid_snapshot",
+          "inventory.revokedApiKeys entries must be exactly { pattern, keyIds: string[] } — id inventory only, never key bytes"
+        );
+      }
+      refuseSecrets("inventory.revokedApiKeys", row);
+    }
+  }
+  if (inv.revokedOperatorKeys !== undefined) {
+    if (
+      !Array.isArray(inv.revokedOperatorKeys) ||
+      !(inv.revokedOperatorKeys as unknown[]).every((k) => typeof k === "string" && k !== "")
+    ) {
+      fail("invalid_snapshot", "inventory.revokedOperatorKeys must be an array of non-empty strings");
+    }
   }
 }
 
@@ -626,6 +685,31 @@ function diffRetryAndInventory(live: ConfigSnapshot, snapshot: ConfigSnapshot): 
     if (!deepEqual([...l.tenants].sort(), [...s.tenants].sort())) {
       push("inventory", "tenants", l.tenants, s.tenants, false, false);
     }
+    // WR-156: revocation diffs are append-only — a snapshot can only add
+    // revocations the live config lacks; it can never un-revoke (that
+    // would be a security hole, and revocation is one-way by design).
+    // Revoked ids are identifiers, never key bytes, so these diffs are
+    // appliable through the runtime revoke hooks (hot-reload path).
+    // The revocation keys are optional on the inventory (pre-WR-156
+    // readers omit them): absent means none.
+    const addedApiKeyRevocations: Array<{ pattern: string; keyIds: string[] }> = [];
+    const liveApiRevoked = new Map<string, Set<string>>(
+      (l.revokedApiKeys ?? []).map((r) => [r.pattern, new Set(r.keyIds)])
+    );
+    for (const row of s.revokedApiKeys ?? []) {
+      const liveIds = liveApiRevoked.get(row.pattern) ?? new Set<string>();
+      const added = [...new Set(row.keyIds)].filter((id) => !liveIds.has(id)).sort();
+      if (added.length > 0) addedApiKeyRevocations.push({ pattern: row.pattern, keyIds: added });
+    }
+    if (addedApiKeyRevocations.length > 0) {
+      push("inventory", "revokedApiKeys", l.revokedApiKeys ?? [], addedApiKeyRevocations, true, false);
+    }
+    const addedOperatorRevocations = [...new Set(s.revokedOperatorKeys ?? [])]
+      .filter((id) => !(l.revokedOperatorKeys ?? []).includes(id))
+      .sort();
+    if (addedOperatorRevocations.length > 0) {
+      push("inventory", "revokedOperatorKeys", l.revokedOperatorKeys ?? [], addedOperatorRevocations, true, false);
+    }
   }
   return items;
 }
@@ -643,6 +727,8 @@ function emptyInventory(): ConfigSnapshotInventory {
     proxies: {},
     compression: {},
     tenants: [],
+    revokedApiKeys: [],
+    revokedOperatorKeys: [],
   };
 }
 
@@ -779,11 +865,55 @@ export function applyConfig(
     return { dryRun: true, applied: [], plan: appliable, pending };
   }
 
+  // WR-156: key-revocation diffs apply through the runtime revoke hooks
+  // before anything else. Revocation is one-way (a CRL append): it is
+  // never rolled back, even if a later endpoint item fails and rolls
+  // back — un-revoking on a partial failure would resurrect a key the
+  // operator just killed, which is the wrong failure mode for a
+  // security action.
+  const applied: ConfigApplyItem[] = [];
+  const revocationDiffs = appliable.filter(
+    (d) => d.scope === "inventory" && (d.field === "revokedApiKeys" || d.field === "revokedOperatorKeys")
+  );
+  if (revocationDiffs.length > 0) {
+    for (const d of revocationDiffs) {
+      if (d.field === "revokedApiKeys") {
+        if (env.revokeApiKey === undefined) {
+          throw new ConfigApplyError(
+            "unsupported",
+            "snapshot revokes inbound API keys but no revokeApiKey hook was supplied — nothing applied",
+            { items: revocationDiffs }
+          );
+        }
+        for (const row of d.to as Array<{ pattern: string; keyIds: string[] }>) {
+          for (const keyId of row.keyIds) {
+            env.revokeApiKey(row.pattern, keyId);
+          }
+        }
+      } else {
+        if (env.revokeOperatorKey === undefined) {
+          throw new ConfigApplyError(
+            "unsupported",
+            "snapshot revokes operator keys but no revokeOperatorKey hook was supplied — nothing applied",
+            { items: revocationDiffs }
+          );
+        }
+        for (const id of d.to as string[]) {
+          env.revokeOperatorKey(id);
+        }
+      }
+      applied.push({ scope: d.scope, field: d.field, from: d.from, to: d.to });
+    }
+  }
+  const endpointDiffs = appliable.filter(
+    (d) => !(d.scope === "inventory" && (d.field === "revokedApiKeys" || d.field === "revokedOperatorKeys"))
+  );
+
   // Group appliable items per (tenant, endpoint); retry.* is queue-global
   // and rides on the first endpoint call (WR-32 applies it through the
   // same imperative setter).
   const byScope = new Map<string, ConfigDiffItem[]>();
-  for (const d of appliable) {
+  for (const d of endpointDiffs) {
     const list = byScope.get(d.scope) ?? [];
     list.push(d);
     byScope.set(d.scope, list);
@@ -879,7 +1009,6 @@ export function applyConfig(
     };
   });
 
-  const applied: ConfigApplyItem[] = [];
   const appliedCalls: PlannedCall[] = [];
   try {
     for (const call of calls) {

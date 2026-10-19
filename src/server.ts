@@ -171,10 +171,9 @@ import {
   type ReputationTransition,
 } from "./reputation.ts";
 import {
-  assertValidOperatorKeys,
   bearerToken,
-  matchOperatorKey,
   operatorMay,
+  OperatorKeyRing,
   type OperatorKeyEntry,
 } from "./operator-keys.ts";
 import { resolveTraceId, TRACE_ID_HEADER } from "./trace.ts";
@@ -5841,6 +5840,18 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
           .filter((t): t is string => t !== undefined)
       ),
     ],
+    // WR-156: revoked-key inventory is id-only (never key bytes) — safe
+    // to capture in the snapshot; applyConfig can re-apply it (append
+    // only) through the runtime revoke hooks below.
+    revokedApiKeys: (apiKeyAuth?.revokedKeys() ?? []).reduce<
+      Array<{ pattern: string; keyIds: string[] }>
+    >((acc, { pattern, keyId }) => {
+      const row = acc.find((r) => r.pattern === pattern);
+      if (row === undefined) acc.push({ pattern, keyIds: [keyId] });
+      else row.keyIds.push(keyId);
+      return acc;
+    }, []),
+    revokedOperatorKeys: [...operatorKeyRing.revokedIds()],
   });
   // WR-55: persistent delivery-event archive. Subscribes to the queue's
   // delivery events and appends every event to `<dir>/events.jsonl`
@@ -5931,8 +5942,17 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // Inbound per-endpoint API key authentication (WR-65): rules are
   // validated (constant-time comparison needs no precomputation, so this
   // is pure validation) once at startup, so a bad pattern or key entry
-  // can never fail a request mid-flight.
-  const apiKeyAuth = opts.apiKeys !== undefined ? new InboundApiKeyAuth(opts.apiKeys) : undefined;
+  // can never fail a request mid-flight. WR-156 wires the revocation
+  // hook: every successful revokeKey audits `api_key_revoked`
+  // (pattern + key id — identifiers, never key bytes).
+  const apiKeyAuth =
+    opts.apiKeys !== undefined
+      ? new InboundApiKeyAuth({
+          ...opts.apiKeys,
+          onRevoked: ({ pattern, keyId }) =>
+            opts.auditLog.append({ event: "api_key_revoked", pattern, keyId }),
+        })
+      : undefined;
   // Inbound sender reputation scoring (WR-119): validated once at
   // startup so bad config can never fail a request mid-flight. Opt-in:
   // unset means the tracker is never constructed and intake is
@@ -5965,8 +5985,12 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       : undefined;
   // Scoped operator API keys (WR-82): validated once at startup so a bad
   // scope, empty id/key, or duplicate id/key can never fail a request
-  // mid-flight.
-  assertValidOperatorKeys(opts.operatorKeys);
+  // mid-flight. WR-156 wraps the ring in OperatorKeyRing so a
+  // compromised operator key can be revoked at runtime; every successful
+  // revokeKey audits `operator_key_revoked` (key id only, never the key).
+  const operatorKeyRing = new OperatorKeyRing(opts.operatorKeys ?? [], {
+    onRevoked: ({ id }) => opts.auditLog.append({ event: "operator_key_revoked", keyId: id }),
+  });
   // Inbound source baseline anomaly detection (WR-63): validated once at
   // startup so bad config can never fail a request mid-flight. Alert-only
   // — it never rejects — so it is orthogonal to the WR-53 IP ACL above.
@@ -6175,19 +6199,20 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // `"legacy"`), or any `operatorKeys` ring entry authenticates with
     // its own scopes. Neither configured → 404 fail-closed, exactly the
     // legacy behavior; a non-matching bearer → 403. Key comparison is
-    // constant-time (see `src/operator-keys.ts`).
-    const operatorKeys = opts.operatorKeys ?? [];
+    // constant-time (see `src/operator-keys.ts`). WR-156: the ring skips
+    // revoked keys, so a revoked operator key authenticates exactly like
+    // a wrong key — 403 fail-closed, with no oracle distinguishing
+    // "revoked" from "unknown".
     const operatorEnabled =
       (opts.operatorToken !== undefined && opts.operatorToken !== "") ||
-      operatorKeys.length > 0;
+      operatorKeyRing.size > 0;
     if (!operatorEnabled) {
       respondJson(res, 404, { error: "operator endpoints disabled" });
       return;
     }
-    const identity = matchOperatorKey(
+    const identity = operatorKeyRing.match(
       bearerToken(req.headers["authorization"]),
-      opts.operatorToken,
-      operatorKeys
+      opts.operatorToken
     );
     if (identity === null) {
       respondJson(res, 403, { error: "forbidden" });
@@ -7128,6 +7153,13 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
           applyConfig(queue, body.snapshot, {
             dryRun: body.dryRun === true,
             readInventory: readConfigInventory,
+            // WR-156: revocation diffs (`inventory.revokedApiKeys` /
+            // `inventory.revokedOperatorKeys`) apply through these hooks —
+            // the hot-reload path for key revocation. A missing ring
+            // refuses the apply (`unsupported`); revocation is one-way and
+            // is never rolled back, even on a later endpoint-item failure.
+            revokeApiKey: (pattern, keyId) => apiKeyAuth?.revokeKey(pattern, keyId) ?? false,
+            revokeOperatorKey: (id) => operatorKeyRing.revokeKey(id),
             audit: (event) =>
               opts.auditLog.append({
                 ...event,

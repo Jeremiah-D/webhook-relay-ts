@@ -1451,6 +1451,35 @@ curl -X POST http://127.0.0.1:PORT/config/snapshot \
   `secret_material_refused`, `unsupported`); an unexpected mid-apply
   failure is a 500 after rollback (`apply_failed`).
 
+## Key revocation (operator / inbound API keys)
+
+When a key leaks, it has to die in one move — no config reload, no
+restart. Both key planes support runtime revocation:
+
+- **Inbound API keys** (`InboundApiKeyAuth`, per intake rule): call
+  `auth.revokeKey(rulePattern, keyId)`. Returns `true` only on a fresh
+  revoke — unknown patterns, unknown key ids, and double revokes return
+  `false`. A revoked key verifies exactly like a wrong key (same 401
+  `api_key_invalid`), so nothing in the response distinguishes
+  "revoked" from "unknown" (fail-closed, no attacker oracle).
+- **Operator keys** (`OperatorKeyRing`): call
+  `ring.revokeKey(keyId)`. A revoked operator key authenticates exactly
+  like a wrong key (same 403). The legacy `operatorToken` is not a ring
+  entry and cannot be revoked — rotate it out of config instead.
+- **Audit** — every successful revoke audits `api_key_revoked` or
+  `operator_key_revoked` (pattern + key id only, never key bytes).
+- **Snapshot capture / hot apply** — the snapshot inventory records the
+  revoked ids (`inventory.revokedApiKeys` / `inventory.revokedOperatorKeys`,
+  id-only, never key bytes). Applying a snapshot through `POST
+  /config/snapshot` routes revocation diffs through the runtime revoke
+  hooks before any endpoint change, so a snapshot exported after a revoke
+  can be re-applied to converge another instance. The diff is append-only
+  — a snapshot cannot un-revoke — and revocation is one-way: it is never
+  rolled back, even if a later endpoint item fails and rolls back.
+- **Safety contract** — revocation is pure bookkeeping, so it cannot fail
+  intake mid-flight; hook exceptions never undo a revoke; revoking an
+  empty or null id refuses (`false`) rather than touching the ring.
+
 ## Endpoint pause/resume (operator switch)
 
 An operator hold on a downstream: while an endpoint is paused, its

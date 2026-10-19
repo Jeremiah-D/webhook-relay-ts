@@ -203,3 +203,112 @@ export function operatorMay(identity: OperatorIdentity, method: string): boolean
   if (method === "GET") return identity.scopes.includes("read") || identity.scopes.includes("admin");
   return identity.scopes.includes("admin");
 }
+
+/** Options for {@link OperatorKeyRing}. */
+export interface OperatorKeyRingOptions {
+  /**
+   * Fired once per successful `revokeKey` call with `{ id }`. The server
+   * wires it to the `operator_key_revoked` audit event. Throwing here
+   * does not undo the revocation — revoke is fail-closed and one-way.
+   */
+  onRevoked?: (info: { id: string }) => void;
+}
+
+/**
+ * Revocable operator key ring (WR-156).
+ *
+ * The pure `matchOperatorKey` function stays the stateless matcher; this
+ * class layers the WR-156 revocation tombstones on top so the server can
+ * kill a compromised operator key at runtime without a restart. The
+ * legacy `operatorToken` is not a ring entry and cannot be revoked
+ * through the ring — rotate it out of config instead (documented in the
+ * README).
+ */
+export class OperatorKeyRing {
+  private readonly entries: OperatorKeyEntry[];
+  private readonly onRevoked: ((info: { id: string }) => void) | undefined;
+  /** Revoked key ids. One-way: there is no un-revoke. */
+  private readonly revoked = new Set<string>();
+
+  constructor(keys: readonly OperatorKeyEntry[] = [], opts: OperatorKeyRingOptions = {}) {
+    assertValidOperatorKeys([...keys]);
+    this.entries = [...keys];
+    this.onRevoked = opts.onRevoked;
+  }
+
+  /** The configured (non-revoked-filtered) entry count — startup checks. */
+  get size(): number {
+    return this.entries.length;
+  }
+
+  /**
+   * Match a presented bearer token against the legacy `operatorToken`
+   * and the ring, skipping revoked entries: a revoked key authenticates
+   * exactly like a wrong key — `null` — so the operator plane answers
+   * 403 fail-closed with no oracle distinguishing "revoked" from
+   * "unknown". Constant-time comparison, no early exit on a match,
+   * never throws on hostile input (same contract as
+   * `matchOperatorKey`).
+   */
+  match(presented: string | null, legacyToken: string | undefined): OperatorIdentity | null {
+    try {
+      if (presented === null) return null;
+      if (legacyToken !== undefined && legacyToken !== "" && keysEqual(legacyToken, presented)) {
+        return { id: "legacy", scopes: ["admin"] };
+      }
+      let matched: OperatorIdentity | null = null;
+      for (const entry of this.entries) {
+        if (this.revoked.has(entry.id)) continue;
+        // No early exit: compare every key so timing does not reveal
+        // which entry matched; keep the first matching id so the audit
+        // trail is deterministic.
+        if (keysEqual(entry.key, presented) && matched === null) {
+          matched = { id: entry.id, scopes: entry.scopes ?? [] };
+        }
+      }
+      return matched;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Revoke one operator key (WR-156): after this call the key no longer
+   * authenticates — `match` returns `null` for it, so the operator plane
+   * answers 403 fail-closed. Returns `true` when the key was newly
+   * revoked, `false` when no entry with that id exists or the key was
+   * already revoked. Fires `onRevoked` once on a new revocation. The
+   * legacy token (`"legacy"`) is not a ring entry and returns `false`.
+   * Never throws.
+   */
+  revokeKey(id: string): boolean {
+    try {
+      if (!this.entries.some((e) => e.id === id)) return false;
+      if (this.revoked.has(id)) return false;
+      this.revoked.add(id);
+      try {
+        this.onRevoked?.({ id });
+      } catch {
+        // Revocation already happened above; a throwing hook must not
+        // resurrect the key or report failure.
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Whether `id` is revoked. */
+  isRevoked(id: string): boolean {
+    return this.revoked.has(id);
+  }
+
+  /**
+   * The revoked key ids as an id-only list (never key bytes), sorted
+   * for deterministic snapshots — the WR-156 config snapshot capture
+   * point.
+   */
+  revokedIds(): readonly string[] {
+    return [...this.revoked].sort();
+  }
+}

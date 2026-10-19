@@ -86,6 +86,13 @@ export interface ApiKeyOptions {
    * Unset (or empty) means no endpoint is guarded — the feature is off.
    */
   rules?: EndpointApiKeyRule[];
+  /**
+   * Fired once per successful `revokeKey` call with `{ pattern, keyId }`.
+   * The server wires it to the `api_key_revoked` audit event. Throwing
+   * here does not undo the revocation — revoke is fail-closed and
+   * one-way.
+   */
+  onRevoked?: (info: { pattern: string; keyId: string }) => void;
 }
 
 /** Fail with a RangeError naming the offending input. */
@@ -166,10 +173,19 @@ export function selectEndpointApiKeyRule<T extends { pattern: string }>(
  */
 export class InboundApiKeyAuth {
   private readonly rules: EndpointApiKeyRule[];
+  private readonly onRevoked: ((info: { pattern: string; keyId: string }) => void) | undefined;
+  /**
+   * Revoked key ids, grouped by the rule's exact `pattern`. Revocation
+   * is one-way (there is no un-revoke — a compromised key must stay
+   * dead), so a tombstone set per rule is enough; the entry itself
+   * stays in the rule so config dumps still show the intended key set.
+   */
+  private readonly revoked = new Map<string, Set<string>>();
 
   constructor(opts: ApiKeyOptions = {}) {
     assertValidEndpointApiKeyRules(opts.rules);
     this.rules = opts.rules ?? [];
+    this.onRevoked = opts.onRevoked;
   }
 
   /**
@@ -181,19 +197,79 @@ export class InboundApiKeyAuth {
   }
 
   /**
+   * Revoke one API key (WR-156): after this call the key no longer
+   * verifies — `verifyKey` returns `null` for it, so a revoked key
+   * answers the same 401 `api_key_invalid` as a wrong key (fail-closed,
+   * indistinguishable to an attacker holding the old value).
+   *
+   * `rulePattern` is the rule's `pattern` string; the first rule with an
+   * exactly equal pattern is the revocation target. Returns `true` when
+   * the key was newly revoked, `false` when no rule with that pattern
+   * exists, no entry with that id exists, or the key was already
+   * revoked. Fires `onRevoked` once on a new revocation. Never throws.
+   */
+  revokeKey(rulePattern: string, keyId: string): boolean {
+    try {
+      const rule = this.rules.find((r) => r.pattern === rulePattern);
+      if (rule === undefined) return false;
+      if (!rule.keys.some((e) => e.id === keyId)) return false;
+      let set = this.revoked.get(rule.pattern);
+      if (set !== undefined && set.has(keyId)) return false;
+      if (set === undefined) {
+        set = new Set<string>();
+        this.revoked.set(rule.pattern, set);
+      }
+      set.add(keyId);
+      try {
+        this.onRevoked?.({ pattern: rule.pattern, keyId });
+      } catch {
+        // Revocation already happened above; a throwing hook must not
+        // resurrect the key or report failure.
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Whether `keyId` in the rule with exact `rulePattern` is revoked. */
+  isKeyRevoked(rulePattern: string, keyId: string): boolean {
+    return this.revoked.get(rulePattern)?.has(keyId) === true;
+  }
+
+  /**
+   * The revoked key set as id-only rows (never key bytes), sorted by
+   * (pattern, keyId) for deterministic snapshots — the WR-156 config
+   * snapshot capture point.
+   */
+  revokedKeys(): Array<{ pattern: string; keyId: string }> {
+    const rows: Array<{ pattern: string; keyId: string }> = [];
+    for (const [pattern, ids] of this.revoked) {
+      for (const keyId of ids) rows.push({ pattern, keyId });
+    }
+    rows.sort((a, b) =>
+      a.pattern < b.pattern ? -1 : a.pattern > b.pattern ? 1 : a.keyId < b.keyId ? -1 : a.keyId > b.keyId ? 1 : 0
+    );
+    return rows;
+  }
+
+  /**
    * Verify the presented key against the rule's key set in constant
    * time: every entry is compared with `timingSafeEqual` (no early exit
    * on a match), so the comparison timing reveals neither the key nor
    * which entry matched. Returns the matched entry's `id`, or `null`.
    * A length mismatch is an instant non-match — the key length is not
-   * the protected secret. Never throws.
+   * the protected secret. A revoked entry never matches (WR-156
+   * fail-closed). Never throws.
    */
   verifyKey(rule: EndpointApiKeyRule, presented: string): string | null {
     try {
       if (typeof presented !== "string") return null;
       const candidate = Buffer.from(presented, "utf8");
+      const revoked = this.revoked.get(rule.pattern);
       let matchedId: string | null = null;
       for (const entry of rule.keys) {
+        if (revoked !== undefined && revoked.has(entry.id)) continue;
         const expected = Buffer.from(entry.key, "utf8");
         if (expected.length !== candidate.length) continue;
         // No early exit: compare every key so timing does not reveal
