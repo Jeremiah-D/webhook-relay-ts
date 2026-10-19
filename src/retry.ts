@@ -25,6 +25,12 @@ import {
   type EndpointAutoDisableOptions,
   type EndpointDisableStatsRow,
 } from "./endpoint-disable.ts";
+import {
+  QueueDepthAlert,
+  type QueueDepthAlertOptions,
+  type QueueDepthBreachInfo,
+  type QueueDepthStatsRow,
+} from "./queue-depth.ts";
 import { OtelTracer, type OtelTracingOptions, type OtelTracingStats } from "./otel-tracing.ts";
 import { SlowStartController, type SlowStartOptions, type SlowStartEndpointStats } from "./slowstart.ts";
 import {
@@ -295,6 +301,7 @@ import {
   type DeadLetterEscalationMetricsInput,
   type StalePauseMetricsInput,
   type EndpointDisableMetricsInput,
+  type QueueDepthBreachMetricsInput,
   type OcspMetricsInput,
   type OrderedMetricsInput,
   type AssertionFailureMetricsInput,
@@ -2079,6 +2086,30 @@ export interface RetryQueueOptions {
    */
   onEndpointEnabled?: (info: EndpointEnabledInfo) => void;
   /**
+   * WR-153: per-endpoint queue-depth breach alerting (see
+   * `src/queue-depth.ts`). When set, an endpoint whose backlog —
+   * queued + in-flight + backoff-waiting deliveries, the WR-71 pending
+   * counter — reaches its configured threshold fires `onQueueDepthBreach`
+   * exactly once per episode (edge-triggered; the gate re-arms after
+   * the depth drops back below the threshold). The alert only
+   * notifies: it never pauses, gates, or reroutes a delivery, so it is
+   * orthogonal to the circuit breaker (WR-10) and to the WR-150
+   * auto-disable gate (which *does* stop deliveries). Invalid
+   * thresholds throw `RangeError` at construction. Disabled by default
+   * (`undefined`) — the relay then behaves exactly as before.
+   */
+  queueDepthAlert?: QueueDepthAlertOptions;
+  /**
+   * WR-153: called once per queue-depth breach episode (see
+   * {@link QueueDepthAlert}). Edge-triggered: one call per episode.
+   * A throwing callback can never break the delivery path — the
+   * exception is swallowed and the backlog keeps moving. The server
+   * audits these as `queue_depth_breached` (endpoint, depth,
+   * threshold) — the operator alert channel for this feature;
+   * library users get the hook directly.
+   */
+  onQueueDepthBreach?: (info: QueueDepthBreachInfo) => void;
+  /**
    * Relay-level cap on concurrent in-flight deliveries *across all
    * endpoints* (see {@link GlobalConcurrencyGate}). Orthogonal to
    * `maxConcurrentPerEndpoint` (WR-06, per endpoint): both gates compose
@@ -3195,6 +3226,17 @@ export class RetryQueue {
    */
   private readonly autoDisable?: EndpointAutoDisable;
   /**
+   * WR-153: per-endpoint queue-depth breach tracker. `undefined` when
+   * the `queueDepthAlert` option is absent — the tracker, the edge
+   * state, and the series are all compiled out of the delivery path
+   * then. The tracker itself never touches delivery: it only feeds
+   * `onQueueDepthBreach`, so the feature is pure observation.
+   */
+  private readonly queueDepthAlert?: QueueDepthAlert;
+  private readonly onQueueDepthBreach?: (info: QueueDepthBreachInfo) => void;
+  /** `relay_queue_depth_breach_total`, cumulative breach episodes per endpoint. */
+  private readonly queueDepthBreachCounts = new Map<string, number>();
+  /**
    * WR-151: per-delivery OTel trace lifecycle. `undefined` when the
    * `otelTracing` option is absent — every hook is then a single
    * `undefined` check on the delivery path.
@@ -3655,6 +3697,14 @@ export class RetryQueue {
       opts.endpointAutoDisable !== undefined
         ? new EndpointAutoDisable(opts.endpointAutoDisable)
         : undefined;
+    // WR-153: the tracker validates eagerly — an illegal threshold
+    // throws RangeError here, at construction, never mid-delivery.
+    // The hook itself is read-only observation: it is invoked on the
+    // backlog-mutation path (see `bumpPending`) but never consults or
+    // alters any dispatch gate.
+    this.onQueueDepthBreach = opts.onQueueDepthBreach;
+    this.queueDepthAlert =
+      opts.queueDepthAlert !== undefined ? new QueueDepthAlert(opts.queueDepthAlert) : undefined;
     // WR-151: the tracer validates eagerly — an illegal endpoint or
     // sample rate throws RangeError here, at construction, never
     // mid-delivery.
@@ -4397,11 +4447,55 @@ export class RetryQueue {
     const next = (inner.get(targetUrl) ?? 0) + delta;
     if (next <= 0) inner.delete(targetUrl);
     else inner.set(targetUrl, next);
+    // WR-153: the backlog changed — re-evaluate the endpoint's
+    // queue-depth alert gate. `bumpPending` is the single choke point
+    // for every queue admission and settle, so no path can mutate the
+    // depth without the gate seeing it.
+    this.checkQueueDepth(targetUrl);
   }
 
   /** WR-71: current pending count for one (tenant, endpoint). */
   private pendingFor(tenantId: string | undefined, targetUrl: string): number {
     return this.pendingByEndpoint.get(tenantInstanceKey(tenantId))?.get(targetUrl) ?? 0;
+  }
+
+  /**
+   * WR-153: current backlog depth for one logical endpoint, across all
+   * tenants — queued + in-flight + backoff-waiting deliveries (the
+   * WR-71 pending counter). Pre-queue staging is excluded by design:
+   * batch-window-buffered (WR-09) and deliver_at-parked (WR-57) items
+   * have not entered the queue yet, so the depth measures what the
+   * queue is actually holding.
+   */
+  private queueDepthFor(endpoint: string): number {
+    let n = 0;
+    for (const inner of this.pendingByEndpoint.values()) {
+      n += inner.get(endpoint) ?? 0;
+    }
+    return n;
+  }
+
+  /**
+   * WR-153: evaluate the endpoint's queue-depth alert gate after a
+   * backlog mutation. The gate is pure observation — a breach counts
+   * one `relay_queue_depth_breach_total{endpoint}` and fans out to
+   * `onQueueDepthBreach`; the dispatch path, the circuit breaker, and
+   * the WR-150 auto-disable streak are never touched.
+   */
+  private checkQueueDepth(endpoint: string): void {
+    const tracker = this.queueDepthAlert;
+    if (tracker === undefined) return;
+    const breach = tracker.evaluate(endpoint, this.queueDepthFor(endpoint));
+    if (breach === undefined) return;
+    this.queueDepthBreachCounts.set(endpoint, (this.queueDepthBreachCounts.get(endpoint) ?? 0) + 1);
+    // The alert is lost, the delivery is not: a throwing observer must
+    // never break the backlog-mutation path (same rule as WR-147's
+    // `onBurnRateAlert`).
+    try {
+      this.onQueueDepthBreach?.(breach);
+    } catch {
+      // Alerting must never break the delivery path.
+    }
   }
 
   /**
@@ -7926,6 +8020,14 @@ export class RetryQueue {
     const endpointDisabledNow: string[] = disableStats
       .filter((s) => s.disabled)
       .map((s) => s.endpoint);
+    // WR-153: one counter row per endpoint whose depth has actually
+    // breached a configured threshold — activity-gated, so a relay
+    // with the feature off (or never breached) exposes no
+    // `relay_queue_depth_breach_total` series at all. The queue's
+    // cumulative episode counts are the source.
+    const queueDepthBreach: QueueDepthBreachMetricsInput[] = [...this.queueDepthBreachCounts]
+      .filter(([, breaches]) => breaches > 0)
+      .map(([endpoint, breaches]) => ({ endpoint, breaches }));
     // WR-113: one counter row per ordered endpoint with recorded
     // activity — activity-gated, so a relay with the feature off (or
     // never exercised) exposes no `relay_ordered_*` series at all.
@@ -8046,6 +8148,9 @@ export class RetryQueue {
       // while at least one endpoint is disabled.
       ...(endpointDisable.length > 0 ? { endpointDisable } : {}),
       ...(endpointDisabledNow.length > 0 ? { endpointDisabledNow } : {}),
+      // WR-153: activity-gated (see above) — the breach counter appears
+      // once an endpoint's depth has actually reached its threshold.
+      ...(queueDepthBreach.length > 0 ? { queueDepthBreach } : {}),
       // WR-94: activity-gated — the gauge appears only once an adaptive
       // outcome has been recorded for an endpoint. Non-finite limits are
       // skipped: a Prometheus gauge cannot hold Infinity.
@@ -8411,6 +8516,33 @@ export class RetryQueue {
    */
   getEndpointDisableStats(): EndpointDisableStatsRow[] {
     return this.autoDisable?.getStats() ?? [];
+  }
+
+  /**
+   * WR-153: per-endpoint queue-depth snapshot (operator metadata only —
+   * no payloads). One row per endpoint with at least one live queued
+   * delivery, in first-seen order; endpoints with no alert configured
+   * report their depth with no threshold. Empty when nothing is
+   * queued — the health summary stays quiet for an idle relay.
+   */
+  getQueueDepthStats(): QueueDepthStatsRow[] {
+    const seen = new Set<string>();
+    const rows: QueueDepthStatsRow[] = [];
+    for (const inner of this.pendingByEndpoint.values()) {
+      for (const endpoint of inner.keys()) {
+        if (seen.has(endpoint)) continue;
+        seen.add(endpoint);
+        const depth = this.queueDepthFor(endpoint);
+        const threshold = this.queueDepthAlert?.thresholdFor(endpoint);
+        rows.push({
+          endpoint,
+          depth,
+          ...(threshold === undefined ? {} : { threshold }),
+          breached: threshold !== undefined && depth >= threshold,
+        });
+      }
+    }
+    return rows;
   }
 
   /**

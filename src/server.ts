@@ -5689,6 +5689,20 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       });
       opts.retry?.onEndpointEnabled?.({ endpoint });
     },
+    // WR-153: audit each queue-depth breach episode. Edge-triggered in
+    // the queue — one event per episode (endpoint, depth, threshold).
+    // Unlike the auto-disable above this is pure observation: the
+    // breach never pauses or gates deliveries, it only notifies.
+    onQueueDepthBreach: ({ endpoint, depth, threshold }) => {
+      opts.auditLog.append({
+        event: "queue_depth_breached",
+        endpoint,
+        depth,
+        threshold,
+        ...(activeOperatorKeyId !== undefined ? { keyId: activeOperatorKeyId } : {}),
+      });
+      opts.retry?.onQueueDepthBreach?.({ endpoint, depth, threshold });
+    },
     // Wrap the caller's onBatch so every flushed batch is audited, not just observed.
     onBatch: (info) => {
       opts.auditLog.append({
@@ -6551,6 +6565,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
           circuits: queue.getCircuitStats(),
           quotas: queue.getQuotaStats(),
           probes: queue.getProbeStats(),
+          // WR-153: per-endpoint current queue depth (absent when
+          // nothing is queued) — read-only observation for operators.
+          queueDepth: queue.getQueueDepthStats(),
           retryBudget: queue.getRetryBudgetStats(),
           usage: usageMeter?.snapshot(),
           // WR-136: surface the adaptive inbound throttle state (absent

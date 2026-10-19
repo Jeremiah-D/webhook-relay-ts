@@ -263,6 +263,14 @@ export interface EndpointDisableMetricsInput {
   disables: number;
 }
 
+/** One endpoint's queue-depth breach count (WR-153), in Prometheus label order. */
+export interface QueueDepthBreachMetricsInput {
+  /** Endpoint whose depth reached its threshold (logical `targetUrl`). */
+  endpoint: string;
+  /** Cumulative breach episodes for this endpoint. */
+  breaches: number;
+}
+
 /**
  * One endpoint's adaptive concurrency limit (WR-94), in Prometheus label
  * order. Only finite limits are rendered — a gauge cannot hold Infinity.
@@ -391,6 +399,13 @@ export interface MetricsInput {
    * convention as the stale-pause series.
    */
   endpointDisabledNow?: string[];
+  /**
+   * Present only for endpoints whose backlog depth has actually reached
+   * a configured threshold (WR-153); absent entirely when the feature
+   * is off or no breach has happened — the same activity-gated
+   * convention as the stale-pause series.
+   */
+  queueDepthBreach?: QueueDepthBreachMetricsInput[];
   /**
    * Present only for endpoints where an OCSP revocation check (WR-101)
    * actually ran; absent entirely when the feature is off — the same
@@ -1188,6 +1203,21 @@ export function renderPrometheus(input: MetricsInput): string {
     lines.push("# TYPE relay_endpoint_disabled gauge");
     for (const endpoint of input.endpointDisabledNow) {
       lines.push(`relay_endpoint_disabled{endpoint="${escapeLabelValue(endpoint)}"} 1`);
+    }
+  }
+  // WR-153: activity-gated like the auto-disable series — the counter
+  // appears only for endpoints whose depth has actually reached a
+  // configured threshold, so a relay with the feature off exposes no
+  // `relay_queue_depth_breach_total` series at all.
+  if (input.queueDepthBreach !== undefined && input.queueDepthBreach.length > 0) {
+    lines.push(
+      "# HELP relay_queue_depth_breach_total Queue-depth threshold breaches (WR-153) per endpoint."
+    );
+    lines.push("# TYPE relay_queue_depth_breach_total counter");
+    for (const s of input.queueDepthBreach) {
+      lines.push(
+        `relay_queue_depth_breach_total{endpoint="${escapeLabelValue(s.endpoint)}"} ${s.breaches}`
+      );
     }
   }
   // WR-101: activity-gated like the probe series — the OCSP series

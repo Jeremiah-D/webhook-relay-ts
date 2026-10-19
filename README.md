@@ -1542,6 +1542,48 @@ curl -X POST http://127.0.0.1:PORT/endpoints/enable \
 - **Off by default** — without the option the tracker is never
   constructed: zero behavior change, zero hot-path cost.
 
+## Queue-depth breach alerting (opt-in)
+
+Pure observation for backlog pressure: when an endpoint's queue depth —
+queued + in-flight + backoff-waiting deliveries — reaches a configured
+per-endpoint threshold, the relay *notifies* and keeps delivering. This is
+the alert below the auto-disable gate above: auto-disable concludes the
+downstream is sick and *stops* deliveries; this concludes the downstream
+is slow and tells the operator while deliveries continue at full speed.
+
+```ts
+const queue = new RetryQueue({
+  queueDepthAlert: { thresholds: { "https://downstream/hook": 500 } }, // opt-in per endpoint
+  onQueueDepthBreach: ({ endpoint, depth, threshold }) => {
+    pageOperator(`${endpoint} backlog at ${depth} (threshold ${threshold})`);
+  },
+});
+queue.getQueueDepthStats(); // per-endpoint rows: depth, threshold, breached
+```
+
+```sh
+curl http://127.0.0.1:PORT/health/summary -H "Authorization: Bearer $OPERATOR_TOKEN" | jq .endpoints
+# → [{ endpoint, queueDepth: { depth: 512, threshold: 500, breached: true }, ... }]
+```
+
+- **Edge-triggered, self re-arming** — reaching the threshold fires exactly
+  once; staying above it fires nothing more. The gate re-arms only after
+  the depth drops back below the threshold, so the next episode fires
+  again. Each episode is one audit event and one counter increment.
+- **Orthogonal to auto-disable** — the alert keeps no failure streak,
+  records no verdict, and the dispatch path never consults it. An alerted
+  endpoint keeps delivering; a disabled endpoint's alert state is untouched
+  by the disable. A throwing `onQueueDepthBreach` can never break the
+  delivery path (the alert is lost, the delivery is not).
+- **Audited and metered** — each episode is written as
+  `queue_depth_breached` (endpoint, depth, threshold); Prometheus exposes
+  `relay_queue_depth_breach_total{endpoint}` (activity-gated — absent when
+  the feature is off or no breach has happened); `GET /health/summary`
+  shows the live depth per endpoint even without a configured threshold.
+- **Off by default** — without the option the tracker is never
+  constructed: zero behavior change, zero hot-path cost beyond one
+  undefined check per backlog mutation.
+
 ## Delivery dry-run drill mode (opt-in)
 
 Rehearse the whole delivery pipeline against a downstream without

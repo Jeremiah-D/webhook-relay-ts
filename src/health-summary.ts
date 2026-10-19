@@ -2,7 +2,8 @@
  * Operator health summary (WR-87): one human-readable JSON aggregate over
  * the relay's per-endpoint health signals — circuit state and
  * consecutive-failure streaks (WR-10), quota exhaustion (WR-15),
- * downstream probe state (WR-34), the global retry-budget headroom
+ * downstream probe state (WR-34), per-endpoint queue depth (WR-153),
+ * the global retry-budget headroom
  * (WR-38), and the top-N tenants by delivery volume (WR-78 usage meter).
  *
  * Pure read aggregation: it only calls the queue's stats getters and the
@@ -16,6 +17,7 @@ import type { CircuitState, CircuitStats } from "./circuit.ts";
 import type { QuotaStats } from "./quota.ts";
 import type { ProbeEndpointStats } from "./downstream-probe.ts";
 import type { TenantUsage } from "./usage.ts";
+import type { QueueDepthStatsRow } from "./queue-depth.ts";
 import { tenantScopeKey } from "./tenant.ts";
 
 /** WR-10 circuit snapshot for one (tenant, endpoint) row. */
@@ -39,6 +41,21 @@ export interface HealthSummaryProbe {
   lastProbeAtMs?: number;
 }
 
+/**
+ * WR-153 queue-depth snapshot (endpoint-scoped, not per tenant): the
+ * endpoint's current backlog depth — queued + in-flight +
+ * backoff-waiting deliveries — plus its alert threshold when one is
+ * configured.
+ */
+export interface HealthSummaryQueueDepth {
+  /** Current backlog depth. */
+  depth: number;
+  /** Configured alert threshold; absent when the endpoint has no alert. */
+  threshold?: number;
+  /** Whether the depth is currently at/above the threshold. */
+  breached: boolean;
+}
+
 /** One merged health row. */
 export interface HealthSummaryEndpoint {
   endpoint: string;
@@ -55,6 +72,14 @@ export interface HealthSummaryEndpoint {
    * disabled.
    */
   probe?: HealthSummaryProbe;
+  /**
+   * WR-153 queue-depth state. Like the probe, depth is endpoint-scoped:
+   * the same object repeats on every tenant row of that endpoint —
+   * read it as endpoint-global, not per tenant. Absent when the
+   * endpoint has no queued deliveries (the summary stays quiet for an
+   * idle endpoint).
+   */
+  queueDepth?: HealthSummaryQueueDepth;
 }
 
 /** WR-38 global retry-budget headroom. */
@@ -109,6 +134,8 @@ export interface HealthSummaryInput {
   circuits: CircuitStats[];
   quotas: QuotaStats[];
   probes: ProbeEndpointStats[];
+  /** WR-153 per-endpoint queue-depth rows; `undefined` (or empty) when nothing is queued. */
+  queueDepth?: QueueDepthStatsRow[];
   /** `undefined` when the global retry budget is disabled. */
   retryBudget?: HealthSummaryRetryBudget;
   /** `undefined` (or empty) when usage metering is unconfigured. */
@@ -180,6 +207,29 @@ export function buildHealthSummary(input: HealthSummaryInput): HealthSummary {
     }
     if (!fannedOut) {
       rows.set(tenantScopeKey(undefined, p.endpoint), { endpoint: p.endpoint, probe });
+    }
+  }
+  // WR-153: queue depth is endpoint-scoped like probes — fan the same
+  // object out to every tenant row of that endpoint, and add a
+  // tenant-less row when the endpoint has no other health signal yet.
+  // Rows are activity-gated upstream (`getQueueDepthStats` only emits
+  // endpoints with live queued deliveries), so an idle relay adds no
+  // rows here.
+  for (const q of input.queueDepth ?? []) {
+    const queueDepth: HealthSummaryQueueDepth = {
+      depth: q.depth,
+      ...(q.threshold !== undefined ? { threshold: q.threshold } : {}),
+      breached: q.breached,
+    };
+    let fannedOut = false;
+    for (const row of rows.values()) {
+      if (row.endpoint === q.endpoint) {
+        row.queueDepth = queueDepth;
+        fannedOut = true;
+      }
+    }
+    if (!fannedOut) {
+      rows.set(tenantScopeKey(undefined, q.endpoint), { endpoint: q.endpoint, queueDepth });
     }
   }
 
