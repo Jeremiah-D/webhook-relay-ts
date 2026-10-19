@@ -160,6 +160,7 @@ import {
 } from "./tenant-inbound-ratelimit.ts";
 import type { TenantRateLimitOptions } from "./tenant-ratelimit.ts";
 import type { OutboundRateLimitOptions } from "./outbound-ratelimit.ts";
+import type { DeliveryReceiptOptions } from "./delivery-receipt.ts";
 import { InboundIpAcl, IpAclMetrics, type IpAclOptions } from "./ip-acl.ts";
 import { InboundApiKeyAuth, type ApiKeyOptions, type EndpointApiKeyRule } from "./api-key.ts";
 import {
@@ -1756,6 +1757,16 @@ export interface RelayServerOptions {
    * (never dropped). Disabled by default.
    */
   outboundRateLimit?: OutboundRateLimitOptions;
+  /**
+   * Structured delivery receipts (WR-155; see
+   * `src/delivery-receipt.ts` and `RetryQueueOptions.deliveryReceipts`).
+   * An explicit server-level value wins over the nested
+   * `retry.deliveryReceipts`; either way the queue owns the store.
+   * Every terminal delivery gets a receipt, the matching
+   * `onDelivered`/`onFailed` callback fires, and the receipt lands in
+   * a bounded log (optional JSONL journal). Disabled by default.
+   */
+  deliveryReceipts?: DeliveryReceiptOptions;
   /**
    * Per-endpoint ordered delivery (head-of-line blocking; see
    * `RetryQueueOptions.ordered` and `src/ordered.ts`). An explicit
@@ -5215,6 +5226,10 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // nested `retry.outboundRateLimit`; either way the queue owns the
     // limiter.
     outboundRateLimit: opts.outboundRateLimit ?? opts.retry?.outboundRateLimit,
+    // WR-155: an explicit server-level `deliveryReceipts` wins over the
+    // nested `retry.deliveryReceipts`; either way the queue owns the
+    // store.
+    deliveryReceipts: opts.deliveryReceipts ?? opts.retry?.deliveryReceipts,
     // WR-113: an explicit server-level `ordered` wins over the nested
     // `retry.ordered`; either way the queue owns the line state. WR-114:
     // registry `ordered` records supply the whole ordered config when

@@ -203,6 +203,14 @@ import {
   type OutboundRateLimitStats,
 } from "./outbound-ratelimit.ts";
 import {
+  DeliveryReceiptStore,
+  type DeliveryReceipt,
+  type DeliveryReceiptCallbacks,
+  type DeliveryReceiptFilter,
+  type DeliveryReceiptOptions,
+  type DeliveryReceiptOutcome,
+} from "./delivery-receipt.ts";
+import {
   LatencyPhasesTracker,
   dominantPhaseOf,
   type EndpointLatencyPhaseStats,
@@ -465,6 +473,14 @@ export type {
   OutboundRateLimitStats,
 } from "./outbound-ratelimit.ts";
 export { OutboundRateLimiter } from "./outbound-ratelimit.ts";
+export type {
+  DeliveryReceipt,
+  DeliveryReceiptCallbacks,
+  DeliveryReceiptFilter,
+  DeliveryReceiptOptions,
+  DeliveryReceiptOutcome,
+} from "./delivery-receipt.ts";
+export { DeliveryReceiptStore } from "./delivery-receipt.ts";
 export type {
   LatencyPhaseName,
   LatencyPhaseOptions,
@@ -1533,6 +1549,20 @@ export interface RetryQueueOptions {
    * construction.
    */
   outboundRateLimit?: OutboundRateLimitOptions;
+  /**
+   * Structured delivery receipts (WR-155; see `src/delivery-receipt.ts`).
+   * Opt-in: every terminal delivery — delivered or dead-lettered —
+   * produces a `DeliveryReceipt{deliveryId, endpoint, attempt, latencyMs,
+   * statusCode, outcome}` (the business-semantic delivery record,
+   * complementary to metrics/audit), fires the matching
+   * `onDelivered`/`onFailed` callback, and lands in a bounded in-memory
+   * log with an optional append-only JSONL journal (`journalDir`).
+   * Query with `getDeliveryReceipts()`, export with
+   * `exportDeliveryReceipts()`. Callback failures are isolated — they
+   * never break the delivery path. Disabled by default (absent = zero
+   * overhead: no receipts are built, no callbacks fire, no store exists).
+   */
+  deliveryReceipts?: DeliveryReceiptOptions;
   /**
    * Random source in [0, 1) used for jitter; defaults to `Math.random`.
    * Injectable so tests can verify jitter bounds deterministically.
@@ -3468,6 +3498,10 @@ export class RetryQueue {
   private readonly tenantRateLimiter?: TenantRateLimiter;
   /** WR-154: the shared per-endpoint outbound token-bucket rate limiter; undefined when disabled. */
   private readonly outboundRateLimiter?: OutboundRateLimiter;
+  /** WR-155: the structured delivery-receipt log; undefined when disabled. */
+  private readonly deliveryReceipts?: DeliveryReceiptStore;
+  /** WR-155: receipt callbacks and clock; undefined when receipts are disabled. */
+  private readonly deliveryReceiptOpts?: DeliveryReceiptOptions;
   /** WR-94: per-tenant adaptive concurrency controllers (WR-48 scoping). */
   private readonly adaptiveConcurrencies = new Map<string, AdaptiveConcurrencyController>();
   /** WR-95: latency phase options; undefined when disabled. */
@@ -4164,6 +4198,13 @@ export class RetryQueue {
     // the one shared instance, so no per-endpoint instances are needed.
     if (opts.outboundRateLimit !== undefined) {
       this.outboundRateLimiter = new OutboundRateLimiter(opts.outboundRateLimit);
+    }
+    // WR-155: opt-in structured delivery receipts. The store validates
+    // eagerly so illegal configs throw at construction, never
+    // mid-delivery. Absent = zero overhead: no receipts are built.
+    if (opts.deliveryReceipts !== undefined) {
+      this.deliveryReceipts = new DeliveryReceiptStore(opts.deliveryReceipts);
+      this.deliveryReceiptOpts = opts.deliveryReceipts;
     }
     // WR-95: opt-in latency phase tracking. Same eager-default/lazy-tenant
     // pattern: invalid options throw at construction.
@@ -7160,6 +7201,24 @@ export class RetryQueue {
         this.evaluateSloRisk(tenant, entry.targetUrl);
         // The hooks see the physical target the delivery actually went to.
         this.onDelivered?.({ ...entry, targetUrl: target }, entry.attempt + 1, responseSummary);
+        // WR-155: terminal receipt — the business-semantic delivery
+        // record. `latencyMs` prefers the WR-13 accepted→delivered
+        // measure; the enqueuedAt fallback keeps it always present when
+        // latency tracking is off.
+        this.emitDeliveryReceipt({
+          deliveryId: entry.id,
+          endpoint: target,
+          attempt: (entry.attempt ?? 0) + 1,
+          latencyMs:
+            latencyMs ??
+            Math.max(0, this.receiptNow() - (entry.enqueuedAt ?? this.receiptNow())),
+          ...(typeof responseSummary?.statusCode === "number"
+            ? { statusCode: responseSummary.statusCode }
+            : {}),
+          outcome: "delivered",
+          ...(entry.traceId === undefined ? {} : { traceId: entry.traceId }),
+          ...(tenant === undefined ? {} : { tenant }),
+        });
         // WR-106: count the member's ack toward its fan-out quorum.
         // Unknown ids (non-members) are ignored.
         this.quorum?.recordDelivered(entry.id, {
@@ -7635,6 +7694,23 @@ export class RetryQueue {
     // usable body and no meaningful TTFB, so those stay "unavailable".
     const responseSummary = summarizeDeadLetterFailure(err);
     this.onDeadLetter?.({ ...entry, targetUrl: target }, entry.attempt, err, classified.failureClass, responseSummary);
+    // WR-155: terminal receipt for the failed delivery. The failure
+    // path already incremented `entry.attempt`, so it is the 1-based
+    // count of completed attempts here (matching the onDeadLetter
+    // hook's convention); latency runs to the moment the delivery was
+    // declared dead.
+    this.emitDeliveryReceipt({
+      deliveryId: entry.id,
+      endpoint: target,
+      attempt: entry.attempt ?? 1,
+      latencyMs: Math.max(0, this.receiptNow() - (entry.enqueuedAt ?? this.receiptNow())),
+      ...(typeof responseSummary?.statusCode === "number"
+        ? { statusCode: responseSummary.statusCode }
+        : {}),
+      outcome: "dead_letter",
+      ...(entry.traceId === undefined ? {} : { traceId: entry.traceId }),
+      ...(entry.tenantId === undefined ? {} : { tenant: entry.tenantId }),
+    });
     // WR-106: the WR-30 classification of the final failure rides into
     // the fan-out's loss record (audit + stats). The member's own
     // retry/backoff/dead-letter lifecycle already ran to completion
@@ -8909,6 +8985,52 @@ export class RetryQueue {
    */
   getOutboundRateLimitStats(): OutboundRateLimitStats[] | undefined {
     return this.outboundRateLimiter?.stats();
+  }
+
+  /**
+   * WR-155: the receipt clock — the caller-supplied `now` when given,
+   * otherwise the wall clock. The store stamps `at` with the same
+   * source, so `at` and the `latencyMs` fallback always agree.
+   */
+  private receiptNow(): number {
+    return this.deliveryReceiptOpts?.now?.() ?? Date.now();
+  }
+
+  /**
+   * WR-155: record a terminal delivery's receipt, fire the matching
+   * callback (error-isolated), and persist it. The single place receipts
+   * are created, so the feature costs nothing when disabled.
+   */
+  private emitDeliveryReceipt(receipt: Omit<DeliveryReceipt, "at">): void {
+    const store = this.deliveryReceipts;
+    if (store === undefined) return;
+    const stored = store.record(receipt);
+    const cb =
+      stored.outcome === "delivered"
+        ? this.deliveryReceiptOpts?.onDelivered
+        : this.deliveryReceiptOpts?.onFailed;
+    if (cb === undefined) return;
+    try {
+      cb(stored);
+    } catch {
+      // A receipt callback must never break the delivery path.
+    }
+  }
+
+  /**
+   * WR-155: query the receipt log, newest first. `undefined` when
+   * receipts are disabled.
+   */
+  getDeliveryReceipts(filter?: DeliveryReceiptFilter): DeliveryReceipt[] | undefined {
+    return this.deliveryReceipts?.query(filter);
+  }
+
+  /**
+   * WR-155: export the receipt log as JSONL. `undefined` when receipts
+   * are disabled.
+   */
+  exportDeliveryReceipts(): string | undefined {
+    return this.deliveryReceipts?.exportJsonl();
   }
 
   /**

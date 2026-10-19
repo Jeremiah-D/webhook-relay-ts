@@ -2236,6 +2236,44 @@ const queue = new RetryQueue({
   throw `RangeError` at construction; the clock is injectable for
   deterministic tests.
 
+## Delivery receipts
+
+Metrics and the audit log answer "how is the relay doing"; a delivery
+receipt answers "what happened to *this* delivery". `retry.deliveryReceipts`
+(opt-in, off by default; also accepted as a server-level
+`deliveryReceipts`, which wins) turns on the business-semantic
+delivery record: every terminal delivery — delivered or dead-lettered —
+produces a `DeliveryReceipt{deliveryId, endpoint, attempt, latencyMs,
+statusCode, outcome}` where `attempt` is 1-based, `latencyMs` runs from
+queue admission to terminal, and `statusCode` is the last attempt's HTTP
+status (omitted when the sender saw no response):
+
+```ts
+const queue = new RetryQueue({
+  deliveryReceipts: {
+    maxEntries: 5000,            // in-memory ring bound; default 1000
+    journalDir: "./receipts",     // optional append-only JSONL journal
+    onDelivered: (r) => notifyCustomer(r),  // error-isolated
+    onFailed: (r) => pageOnCall(r),          // error-isolated
+  },
+});
+```
+
+- **Complementary to metrics/audit** — receipts carry no Prometheus
+  series of their own; they are the per-delivery record the
+  observation layer aggregates. `traceId` / `tenant` ride along for
+  correlation with audit events and OTLP records.
+- **Queryable, exportable** — `getDeliveryReceipts({ endpoint, outcome,
+  since, until, limit })` queries newest-first;
+  `exportDeliveryReceipts()` returns the log as JSONL. The journal
+  file (`<journalDir>/delivery-receipts.jsonl`) survives restarts and
+  its tail is recovered into the ring on construction; corrupt lines
+  are skipped, never fatal.
+- **Zero overhead when off** — disabled by default: no receipts are
+  built, no callbacks fire, no store exists. A throwing callback can
+  never break the delivery path (the receipt is recorded first, the
+  callback runs isolated).
+
 ## Per-tenant monthly delivery budgets
 
 Usage-based billing needs a ceiling, not just a meter. `retry.budget`
