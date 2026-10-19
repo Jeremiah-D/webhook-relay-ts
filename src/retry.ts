@@ -19,6 +19,7 @@ import {
   type StalePauseSweepResult,
 } from "./stale-pause.ts";
 import { EndpointCircuitBreaker, type CircuitBreakerOptions, type CircuitState, type CircuitStats } from "./circuit.ts";
+import { SlowStartController, type SlowStartOptions, type SlowStartEndpointStats } from "./slowstart.ts";
 import {
   DownstreamProber,
   type ProbeAuditEvent,
@@ -376,6 +377,7 @@ export type {
 };
 
 export type { CircuitBreakerOptions, CircuitState, CircuitStats };
+export type { SlowStartOptions, SlowStartEndpointStats };
 export type {
   BurnRateAlertInfo,
   ErrorBudgetBurnAuditEvent,
@@ -1482,6 +1484,21 @@ export interface RetryQueueOptions {
     tenant?: string
   ) => void;
   /**
+   * WR-148: slow-start recovery ramp (see `src/slowstart.ts`). When set,
+   * a breaker's half_open -> closed transition starts a per-endpoint
+   * ramp instead of restoring the full concurrency limit at once: the
+   * effective limit drops to `floor` (default 1) and climbs an
+   * exponential (`1 -> 2 -> 4`) or additive (`+1`) curve per successful
+   * delivery until it reaches the ceiling (default: the fixed
+   * `maxConcurrentPerEndpoint` cap). A failure mid-ramp drops the limit
+   * back to the floor instantly. The effective per-endpoint limit is
+   * `min(fixed, adaptive, ramp)` — the ramp can only ever pace recovery,
+   * never exceed the steady-state limits. Disabled by default; and
+   * without a `circuitBreaker` configured the ramp can never start, so
+   * the option alone changes nothing.
+   */
+  slowStart?: SlowStartOptions;
+  /**
    * Opt-in active health probing of downstream endpoints (see
    * `src/downstream-probe.ts`). When set, each listed endpoint gets a timed HEAD (or
    * GET) request every `intervalMs` on a lightweight path — independent
@@ -2386,27 +2403,39 @@ export class EndpointConcurrencyLimiter {
    * only ever tighten the fixed cap, never exceed it.
    */
   private readonly adaptiveLimitFor?: (endpoint: string) => number;
+  /**
+   * WR-148: optional slow-start recovery ramp per endpoint. When set,
+   * the effective limit folds it in as `min(fixed, adaptive, ramp)` —
+   * the ramp paces breaker-close recoveries and is a no-op otherwise.
+   */
+  private readonly rampLimitFor?: (endpoint: string) => number;
   private readonly inFlight = new Map<string, number>();
   private readonly waiters = new Map<string, Array<() => void>>();
 
   constructor(
     maxConcurrentPerEndpoint: number = Infinity,
-    opts: { adaptiveLimitFor?: (endpoint: string) => number } = {}
+    opts: { adaptiveLimitFor?: (endpoint: string) => number; rampLimitFor?: (endpoint: string) => number } = {}
   ) {
     assertConcurrencyLimit(maxConcurrentPerEndpoint);
     this.defaultMax = maxConcurrentPerEndpoint;
     this.adaptiveLimitFor = opts.adaptiveLimitFor;
+    this.rampLimitFor = opts.rampLimitFor;
   }
 
   /**
    * Effective concurrency limit for `endpoint`: the WR-32 override wins
-   * over the default, and the WR-94 adaptive cap (when configured)
-   * tightens whichever of those applies.
+   * over the default, and the WR-94 adaptive cap and WR-148 slow-start
+   * ramp (when configured) each tighten whichever of those applies —
+   * the effective limit is `min(fixed, adaptive, ramp)`.
    */
   maxFor(endpoint: string): number {
     const fixed = this.endpointMax.get(endpoint) ?? this.defaultMax;
+    let limit = fixed;
     const adaptive = this.adaptiveLimitFor?.(endpoint);
-    return adaptive === undefined ? fixed : Math.min(fixed, adaptive);
+    if (adaptive !== undefined) limit = Math.min(limit, adaptive);
+    const ramp = this.rampLimitFor?.(endpoint);
+    if (ramp !== undefined) limit = Math.min(limit, ramp);
+    return limit;
   }
 
   /**
@@ -2938,6 +2967,12 @@ export class RetryQueue {
    */
   private readonly breakers = new Map<string, EndpointCircuitBreaker>();
   private readonly circuitBreakerOpts?: CircuitBreakerOptions;
+  /**
+   * WR-148: per-tenant slow-start ramp controllers, keyed by tenant
+   * instance key; `undefined` options mean the feature is off.
+   */
+  private readonly slowStartOpts?: SlowStartOptions;
+  private readonly slowStarts = new Map<string, SlowStartController>();
   /**
    * WR-147: the per-endpoint error-budget burn-rate monitor. `undefined`
    * when the feature is off — the hot path then has one extra branch,
@@ -3500,6 +3535,16 @@ export class RetryQueue {
     // the latest circuit state, even when nobody subscribes to the hook.
     // The wrapper is installed per tenant instance in `breakerFor()`.
     this.circuitBreakerOpts = opts.circuitBreaker;
+    // WR-148: opt-in slow-start recovery ramp. The default tenant's
+    // controller is created eagerly so invalid options throw at
+    // construction, never mid-delivery; other tenants' controllers stay
+    // lazy (WR-48). The ramp ceiling defaults to the fixed
+    // `maxConcurrentPerEndpoint`, so the ramp can never climb past the
+    // static cap even without explicit configuration.
+    this.slowStartOpts = opts.slowStart;
+    if (opts.slowStart !== undefined) {
+      this.slowStartFor(undefined);
+    }
     this.circuitBreakerOnStateChange = opts.onCircuitStateChange ?? opts.circuitBreaker?.onStateChange;
     // WR-147: build the error-budget monitor eagerly so an invalid
     // config throws at construction, never mid-delivery. `enabled:
@@ -4028,6 +4073,13 @@ export class RetryQueue {
         ...this.circuitBreakerOpts,
         onStateChange: (endpoint, from, to) => {
           innerFor(this.circuitStates, t).set(endpoint, to);
+          // WR-148: a half-open probe that succeeded closed the circuit —
+          // the downstream just proved it can serve again. Start the
+          // slow-start ramp instead of restoring full concurrency at
+          // once; without slow start this is a no-op.
+          if (from === "half_open" && to === "closed") {
+            this.slowStartFor(t)?.onCircuitClosed(endpoint);
+          }
           this.circuitBreakerOnStateChange?.(endpoint, from, to, t);
         },
       });
@@ -4057,9 +4109,14 @@ export class RetryQueue {
       // the outcome-driven cap; effective limit = min(fixed, adaptive).
       // When adaptive concurrency is disabled the callback yields
       // Infinity, so behavior is byte-identical to the fixed cap alone.
+      // WR-148: the limiter also consults the tenant's slow-start ramp;
+      // inactive (or disabled) it yields Infinity, so the min() below is
+      // a no-op and behavior is byte-identical to the pre-ramp code.
       l = new EndpointConcurrencyLimiter(this.maxConcurrentPerEndpoint, {
         adaptiveLimitFor: (endpoint) =>
           this.adaptiveConcurrencyFor(tenant)?.limitFor(endpoint) ?? Infinity,
+        rampLimitFor: (endpoint) =>
+          this.slowStartFor(tenant)?.limitFor(endpoint) ?? Infinity,
       });
       this.limiters.set(key, l);
     }
@@ -4179,6 +4236,27 @@ export class RetryQueue {
   }
 
   /**
+   * WR-148: the calling tenant's slow-start controller; `undefined` when
+   * slow start is disabled. The ramp ceiling defaults to the queue's
+   * fixed `maxConcurrentPerEndpoint`, so the ramp can never climb past
+   * the static cap; the adaptive controller (when set) tightens the
+   * effective limit further through the limiter's `min()`.
+   */
+  private slowStartFor(tenant: string | undefined): SlowStartController | undefined {
+    if (this.slowStartOpts === undefined) return undefined;
+    const key = tenantInstanceKey(tenant);
+    let c = this.slowStarts.get(key);
+    if (c === undefined) {
+      c = new SlowStartController({
+        ...this.slowStartOpts,
+        maxLimit: this.slowStartOpts.maxLimit ?? this.maxConcurrentPerEndpoint,
+      });
+      this.slowStarts.set(key, c);
+    }
+    return c;
+  }
+
+  /**
    * WR-95: the calling tenant's latency phase tracker; `undefined` when
    * phase tracking is off.
    */
@@ -4216,6 +4294,9 @@ export class RetryQueue {
   }
   private get adaptiveConcurrency(): AdaptiveConcurrencyController | undefined {
     return this.adaptiveConcurrencyFor(undefined);
+  }
+  private get slowStart(): SlowStartController | undefined {
+    return this.slowStartFor(undefined);
   }
   private get latencyPhases(): LatencyPhasesTracker | undefined {
     return this.latencyPhasesFor(undefined);
@@ -6437,6 +6518,9 @@ export class RetryQueue {
           // WR-94: a delivered attempt cools the endpoint's adaptive
           // concurrency limit (additive increase on a healthy window).
           this.adaptiveConcurrencyFor(tenant)?.recordOutcome(target, true);
+          // WR-148: a delivered attempt steps the slow-start ramp up the
+          // curve (only while a recovery is ramping — a no-op otherwise).
+          this.slowStartFor(tenant)?.recordOutcome(target, true);
           this.failover?.recordOutcome(logicalEndpoint, target, true);
           // WR-66: an answering target is a healthy target — same rule as
           // failover; non_retryable delivery outcomes feed both routers so
@@ -6630,6 +6714,9 @@ export class RetryQueue {
             // congestion signal — the endpoint answered — so it feeds the
             // adaptive controller as a success, like the breaker verdict.
             this.adaptiveConcurrencyFor(tenant)?.recordOutcome(target, true);
+            // WR-148: an answering endpoint steps the ramp too — it is not
+            // a sick endpoint, even when the payload was rejected.
+            this.slowStartFor(tenant)?.recordOutcome(target, true);
             this.failover?.recordOutcome(logicalEndpoint, target, true);
             this.weighted?.recordOutcome(logicalEndpoint, target, true);
           }
@@ -6656,6 +6743,10 @@ export class RetryQueue {
           // cuts the endpoint's limit multiplicatively once a full
           // outcome window looks congested.
           this.adaptiveConcurrencyFor(tenant)?.recordOutcome(target, false);
+          // WR-148: a retryable failure mid-ramp drops the ramp back to
+          // the floor instantly — the downstream flinched, so pacing
+          // restarts. A no-op when no ramp is active.
+          this.slowStartFor(tenant)?.recordOutcome(target, false);
           this.failover?.recordOutcome(logicalEndpoint, target, false);
           this.weighted?.recordOutcome(logicalEndpoint, target, false);
         }
@@ -8132,6 +8223,25 @@ export class RetryQueue {
     if (this.adaptiveConcurrencyOpts === undefined) return undefined;
     const rows: AdaptiveConcurrencyEndpointStats[] = [];
     for (const [tenantKey, controller] of this.adaptiveConcurrencies) {
+      const tenant = tenantKey === "" ? undefined : tenantKey;
+      for (const row of controller.stats()) {
+        rows.push(tenant === undefined ? row : { ...row, tenant });
+      }
+    }
+    return rows;
+  }
+
+  /**
+   * WR-148: per-(tenant, endpoint) slow-start ramp state — which
+   * endpoints are mid-ramp and their current limits. `undefined` when
+   * slow start is disabled. Endpoints with no ramp in progress are
+   * absent: they run at the full limit. Rows carry `tenant` only when
+   * set.
+   */
+  getSlowStartStats(): SlowStartEndpointStats[] | undefined {
+    if (this.slowStartOpts === undefined) return undefined;
+    const rows: SlowStartEndpointStats[] = [];
+    for (const [tenantKey, controller] of this.slowStarts) {
       const tenant = tenantKey === "" ? undefined : tenantKey;
       for (const row of controller.stats()) {
         rows.push(tenant === undefined ? row : { ...row, tenant });

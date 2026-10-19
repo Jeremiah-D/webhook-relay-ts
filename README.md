@@ -1963,6 +1963,55 @@ const queue = new RetryQueue({
   first outcome is recorded; a gauge cannot hold Infinity). Invalid
   options throw `RangeError` at construction.
 
+## Slow-start recovery ramp (opt-in)
+
+When a circuit breaker trips, the endpoint is known-down; when it
+recovers (half-open probe succeeds → closed), restoring the full
+concurrency limit at once risks a thundering herd against a downstream
+that just came back to life. `retry.slowStart` (opt-in, off by default)
+paces the recovery: the breaker's close event starts a per-endpoint
+ramp at `floor` (default 1) that climbs toward the ceiling — the fixed
+`maxConcurrentPerEndpoint` cap unless you set `maxLimit` explicitly:
+
+```ts
+const queue = new RetryQueue({
+  maxConcurrentPerEndpoint: 32, // fixed cap (WR-06); the ramp ceiling
+  circuitBreaker: { failureThreshold: 5, cooldownMs: 30_000 },
+  slowStart: {
+    curve: "exponential", // 1 -> 2 -> 4 -> ... per success (default);
+                          // "additive" for 1 -> 2 -> 3 -> ...
+    floor: 1,             // start/fallback concurrency; default 1
+    maxLimit: 32,         // ceiling; default = the fixed cap above
+  },
+});
+```
+
+- **Ramp** — a success steps the limit up the curve; reaching the
+  ceiling completes the ramp and the endpoint runs at the full limit
+  again. A failure mid-ramp drops the limit back to the floor
+  *instantly* and the ramp restarts — the endpoint must re-prove
+  itself. A fresh breaker-close always restarts the ramp at the floor,
+  even if the previous ramp was still climbing.
+- **What counts as success/failure** — the same convention as the
+  breaker and the WR-94 controller: retryable failures (429/5xx/
+  timeout) are failures; successes — including a downstream that
+  answered with a *non-retryable* rejection (an answering endpoint is
+  not a sick endpoint) — step the ramp up. Outcomes are recorded
+  leader-only under WR-91 coalescing.
+- **Composition** — the effective per-endpoint limit is
+  `min(fixed, adaptive, ramp)`: the ramp can only pace a recovery, never
+  exceed the steady-state limits. Orthogonal to WR-94 AIMD (AIMD is
+  *outcome-driven* window adjustment of the steady-state limit; the
+  ramp is *event-driven* recovery pacing on the breaker-close event)
+  and to the WR-10 breaker state machine (it decides open/closed; the
+  ramp only starts on its close event). Without a `circuitBreaker`
+  configured no close event can ever fire, so `slowStart` alone is a
+  complete no-op.
+- **Observability** — `getSlowStartStats()` exposes each mid-ramp
+  endpoint's current limit, floor, ceiling, and curve (`tenant` only
+  when set; absent rows run at the full limit). Invalid options throw
+  `RangeError` at construction.
+
 ## Per-tenant outbound rate limiting
 
 One tenant's flood must not starve the shared downstream or crowd out
