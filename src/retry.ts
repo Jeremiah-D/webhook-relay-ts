@@ -25,6 +25,15 @@ import {
   type ProbeEndpointStats,
   type ProbeOptions,
 } from "./downstream-probe.ts";
+import {
+  ErrorBudgetMonitor,
+  errorBudgetBurnAuditEvent,
+  resolveErrorBudgetOptions,
+  type BurnRateAlertInfo,
+  type ErrorBudgetBurnAuditEvent,
+  type ErrorBudgetOptions,
+  type ResolvedErrorBudgetOptions,
+} from "./error-budget.ts";
 import type { EncryptedPayload, PayloadEncryptor } from "./encrypt.ts";
 import type { FieldMask } from "./masking.ts";
 import {
@@ -367,6 +376,13 @@ export type {
 };
 
 export type { CircuitBreakerOptions, CircuitState, CircuitStats };
+export type {
+  BurnRateAlertInfo,
+  ErrorBudgetBurnAuditEvent,
+  ErrorBudgetOptions,
+  ResolvedErrorBudgetOptions,
+};
+export { ErrorBudgetMonitor, errorBudgetBurnAuditEvent, resolveErrorBudgetOptions };
 export type { EncryptedPayload, PayloadEncryptor };
 export type { EndpointLatencyStats, LatencyTrackerOptions };
 export type { SloRiskInfo, SloRiskObservation, SloRiskOptions };
@@ -1429,6 +1445,19 @@ export interface RetryQueueOptions {
    * summary — every field honestly marked `"unavailable"`.
    */
   onDelivered?: (item: RetryItem, attempts: number, summary?: DownstreamResponseSummary) => void;
+  /**
+   * WR-147: downstream error-budget burn-rate alerting (Google SRE
+   * style, see `src/error-budget.ts`). When set, every delivery attempt
+   * outcome feeds the per-endpoint monitor, which alerts (edge-triggered)
+   * when both the fast (default 1h) and slow (default 6h) burn rates
+   * exceed `alertThreshold` × the budgeted error rate. The alert only
+   * notifies — it never blocks, delays, or reroutes a delivery, so it is
+   * orthogonal to the circuit breaker above (which *does* gate
+   * dispatches) and to WR-34 active probing. A throwing
+   * `onBurnRateAlert` can never break the delivery path. Disabled by
+   * default (`undefined`) — the relay then behaves exactly as before.
+   */
+  errorBudget?: ErrorBudgetOptions;
   /**
    * Per-endpoint circuit breaker (see `src/circuit.ts`). When set,
    * `failureThreshold` consecutive delivery failures trip the endpoint's
@@ -2909,6 +2938,12 @@ export class RetryQueue {
    */
   private readonly breakers = new Map<string, EndpointCircuitBreaker>();
   private readonly circuitBreakerOpts?: CircuitBreakerOptions;
+  /**
+   * WR-147: the per-endpoint error-budget burn-rate monitor. `undefined`
+   * when the feature is off — the hot path then has one extra branch,
+   * nothing more.
+   */
+  private readonly errorBudget?: ErrorBudgetMonitor;
   private readonly circuitBreakerOnStateChange?: (
     endpoint: string,
     from: CircuitState,
@@ -3466,6 +3501,13 @@ export class RetryQueue {
     // The wrapper is installed per tenant instance in `breakerFor()`.
     this.circuitBreakerOpts = opts.circuitBreaker;
     this.circuitBreakerOnStateChange = opts.onCircuitStateChange ?? opts.circuitBreaker?.onStateChange;
+    // WR-147: build the error-budget monitor eagerly so an invalid
+    // config throws at construction, never mid-delivery. `enabled:
+    // false` (or an absent block) leaves the relay exactly as before.
+    this.errorBudget =
+      opts.errorBudget !== undefined && opts.errorBudget.enabled !== false
+        ? new ErrorBudgetMonitor(opts.errorBudget)
+        : undefined;
     this.payloadEncryptor = opts.payloadEncryptor;
     // WR-54: fail-fast — capturing response bodies without an encryptor
     // would log them in the clear; refuse at construction, never
@@ -4253,6 +4295,14 @@ export class RetryQueue {
       inner.set(endpoint, c);
     }
     c[kind] += 1;
+    // WR-147: feed the error-budget monitor exactly one outcome per
+    // delivery attempt — `delivered` / `failed` are the per-attempt
+    // outcomes (`retried` / `deadLetter` are lifecycle states, not
+    // outcomes, so they are not double-counted). Per-endpoint, tenant
+    // included or not — the budget is about the downstream.
+    if (kind === "delivered" || kind === "failed") {
+      this.errorBudget?.recordOutcome(endpoint, kind === "delivered");
+    }
   }
 
   /** WR-118: count one response-assertion failure for `getDeliveryStats` / `renderMetrics`. */
@@ -4351,6 +4401,10 @@ export class RetryQueue {
    * Per-endpoint batch counters: batches flushed, events merged, and items
    * still sitting inside a batch window. Empty when batching is disabled.
    */
+  /**
+   * Per-endpoint batch counters: batches flushed, events merged, and items
+   * still sitting inside a batch window. Empty when batching is disabled.
+   */
   getBatchStats(): Array<{ endpoint: string; batches: number; events: number; buffered: number }> {
     if (!this.batcher) return [];
     const endpoints = new Set([...this.batchStats.keys(), ...this.batcher.endpoints()]);
@@ -4360,6 +4414,15 @@ export class RetryQueue {
       events: this.batchStats.get(endpoint)?.events ?? 0,
       buffered: this.batcher!.bufferedCount(endpoint),
     }));
+  }
+
+  /**
+   * WR-147: the error-budget burn-rate monitor, or `undefined` when the
+   * feature is off. The server renders its gauge into `GET /metrics`;
+   * library users can read per-endpoint burn rates directly.
+   */
+  getErrorBudgetMonitor(): ErrorBudgetMonitor | undefined {
+    return this.errorBudget;
   }
 
   /**

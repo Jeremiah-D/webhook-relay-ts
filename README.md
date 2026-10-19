@@ -1563,6 +1563,48 @@ createRelayServer({
   semantics, documented in `src/hedged.ts`. Invalid `hedgeDelayMs`
   throws `RangeError` at startup.
 
+## Downstream error-budget burn-rate alerting (opt-in)
+
+Watch how fast each downstream is spending its error budget, Google
+SRE style: the relay tracks per-endpoint delivery outcomes in two
+sliding windows — a fast window (default 1h) that catches a sudden
+spike, and a slow window (default 6h) that confirms it is real — and
+alerts when *both* windows' burn rates (observed error rate ÷ budgeted
+error rate) exceed the threshold.
+
+```ts
+createRelayServer({
+  retry: {
+    errorBudget: {
+      budgetErrorRate: 0.01,  // 1% of attempts may fail
+      alertThreshold: 2,      // alert past 2x the budgeted rate
+      onBurnRateAlert: (info) => pageOnCall(info),
+    },
+  },
+});
+```
+
+- **Alert only, never gate** — the alert notifies; it never blocks,
+  delays, or reroutes a delivery. It is orthogonal to the circuit
+  breaker (WR-10), which *does* gate dispatches on its own terms, and
+  to active probing (WR-34): a burning endpoint keeps receiving
+  deliveries until the breaker trips.
+- **Edge-triggered with re-arm** — a sustained breach alerts exactly
+  once per episode; the monitor re-arms only after both windows recover
+  below the threshold, so a flapping endpoint does not page on every
+  outcome. A `minEvents` floor (default 10) keeps a lone failure from
+  looking like a catastrophe.
+- **Callback-safe** — a throwing `onBurnRateAlert` is swallowed by the
+  monitor: the alert is lost, the delivery is not.
+- **Observability** — every fired alert audits `error_budget_burn`
+  (endpoint, burn rates, windows, budget); `relay_error_budget_burn_ratio{endpoint}`
+  gauges the current fast-window burn rate (1.0 = exactly at budget;
+  activity-gated, absent until the first outcome).
+- Invalid configs (`slowWindowMs <= fastWindowMs`, `budgetErrorRate`
+  outside (0, 1), non-positive thresholds) throw `RangeError` at
+  startup. Library users drive `ErrorBudgetMonitor` directly with an
+  injectable clock (`now`) for deterministic tests.
+
 ## Dynamic endpoint registry (opt-in)
 
 Manage the *set* of downstream endpoints without restarting the relay:

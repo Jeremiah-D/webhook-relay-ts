@@ -23,7 +23,7 @@ import {
   selectSignatureAlgorithmVerifier,
   type SignatureAlgorithmRule,
 } from "./signature-alg.ts";
-import { RetryQueue, type DeliveryEvent, type DeliveryPriority, type DownstreamResponse, type RetryItem, type Sender, type SenderCallOptions, type MaintenanceWindowTransition } from "./retry.ts";
+import { RetryQueue, errorBudgetBurnAuditEvent, type BurnRateAlertInfo, type DeliveryEvent, type DeliveryPriority, type DownstreamResponse, type RetryItem, type Sender, type SenderCallOptions, type MaintenanceWindowTransition } from "./retry.ts";
 import { parseDeliverAtHeader, DELIVER_AT_HEADER } from "./retry.ts";
 import type { ShadowDeliveredInfo, ShadowFailedInfo, ShadowTargetConfig, ShadowTargetsConfig } from "./retry.ts";
 import type {
@@ -133,6 +133,8 @@ export {
   assertValidHedgedSenderOptions,
 };
 export type { HedgeAuditEvent, HedgedSender, HedgedSenderOptions } from "./hedged.ts";
+export { errorBudgetBurnAuditEvent };
+export type { BurnRateAlertInfo, ErrorBudgetBurnAuditEvent } from "./retry.ts";
 import type { ReplayGuard } from "./replay.ts";
 import { DeliveryDeduplicator, type DedupOptions } from "./dedup.ts";
 import {
@@ -5005,6 +5007,21 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     ...(sharedDnsCache !== undefined && opts.retry?.probe !== undefined
       ? { probe: { lookup: sharedDnsCache.lookup, ...opts.retry.probe } }
       : {}),
+    // WR-147: wrap the caller's onBurnRateAlert so every burn-rate alert
+    // is audited as `error_budget_burn`, not just observed. The monitor
+    // itself swallows a throwing callback, so alerting can never break
+    // the delivery path.
+    ...(opts.retry?.errorBudget === undefined
+      ? {}
+      : {
+          errorBudget: {
+            ...opts.retry.errorBudget,
+            onBurnRateAlert: (info: BurnRateAlertInfo) => {
+              opts.auditLog.append(errorBudgetBurnAuditEvent(info));
+              opts.retry?.errorBudget?.onBurnRateAlert?.(info);
+            },
+          },
+        }),
     payloadEncryptor: opts.payloadEncryptor ?? opts.retry?.payloadEncryptor,
     fieldMask: opts.fieldMask ?? opts.retry?.fieldMask,
     // WR-49: an explicit server-level `durableQueueDir` wins over the
@@ -6329,7 +6346,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       // new series. Absent entirely with a custom sender (no pool).
       res
         .writeHead(200, { "content-type": "text/plain; version=0.0.4" })
-        .end(queue.renderMetrics() + versionMetrics.render() + schemaMetrics.render() + (schemaRegistry?.renderMetrics() ?? "") + ipAclMetrics.render() + inboundTenantRateLimitMetrics.render() + certExpiryMonitor.render() + tlsVersionMonitor.render() + (ocspMonitor?.render() ?? "") + (usageMeter?.render() ?? "") + (defaultSender?.compressionStats.render() ?? "") + (defaultSender?.dnsCache?.render() ?? "") + (defaultSender?.wsPool.renderMetrics() ?? "") + meshMetrics.render() + (defaultSender?.outboundSchemaMetrics?.render() ?? "") + (reputation?.renderMetrics() ?? "") + hedgeMetrics.render());
+        .end(queue.renderMetrics() + versionMetrics.render() + schemaMetrics.render() + (schemaRegistry?.renderMetrics() ?? "") + ipAclMetrics.render() + inboundTenantRateLimitMetrics.render() + certExpiryMonitor.render() + tlsVersionMonitor.render() + (ocspMonitor?.render() ?? "") + (usageMeter?.render() ?? "") + (defaultSender?.compressionStats.render() ?? "") + (defaultSender?.dnsCache?.render() ?? "") + (defaultSender?.wsPool.renderMetrics() ?? "") + meshMetrics.render() + (defaultSender?.outboundSchemaMetrics?.render() ?? "") + (reputation?.renderMetrics() ?? "") + hedgeMetrics.render() + (queue.getErrorBudgetMonitor()?.render() ?? ""));
       return;
     }
     if (isEvents) {
