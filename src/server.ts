@@ -23,7 +23,7 @@ import {
   selectSignatureAlgorithmVerifier,
   type SignatureAlgorithmRule,
 } from "./signature-alg.ts";
-import { RetryQueue, errorBudgetBurnAuditEvent, type BurnRateAlertInfo, type DeliveryEvent, type DeliveryPriority, type DownstreamResponse, type RetryItem, type Sender, type SenderCallOptions, type MaintenanceWindowTransition } from "./retry.ts";
+import { RetryQueue, errorBudgetBurnAuditEvent, type BurnRateAlertInfo, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type RetryItem, type Sender, type SenderCallOptions, type MaintenanceWindowTransition } from "./retry.ts";
 import { parseDeliverAtHeader, DELIVER_AT_HEADER } from "./retry.ts";
 import type { ShadowDeliveredInfo, ShadowFailedInfo, ShadowTargetConfig, ShadowTargetsConfig } from "./retry.ts";
 import type {
@@ -1897,6 +1897,15 @@ export interface RelayServerOptions {
    * without bound. The stream is live-only — no replay of past events; use
    * `GET /audit` for history. Like the other operator endpoints, it answers
    * 404 when no `operatorToken` is configured.
+   *
+   * WR-162: opt-in subscription filters — `?endpoint=` (exact match on the
+   * event's `targetUrl`, same semantics as `GET /events/archive`) and
+   * `?event=` (one of `delivered` / `retrying` / `dead_letter`; any other
+   * value answers 400 `invalid event`, same as the archive). All filters
+   * are ANDed with the WR-48 `?tenant=` filter and applied server-side
+   * before emit, so a high-traffic operator connection only receives what
+   * it asked for. The `Last-Event-ID` sseReplay path (below) applies the
+   * same filters to the replayed events.
    *
    * WR-123: `sseReplay: true` (opt-in, default off) enables reconnect
    * resume via the standard SSE `Last-Event-ID` header. It requires the
@@ -6113,10 +6122,31 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     res: Parameters<Parameters<typeof createServer>[0]>[1]
   ): void => {
     // WR-48: `?tenant=` subscribes to one tenant's stream only.
-    const tenantFilter =
-      new URL(req.url ?? "/events", "http://internal").searchParams.get("tenant") ?? undefined;
-    const matchesTenant = (event: DeliveryEvent): boolean =>
-      tenantFilter === undefined || event.tenant === tenantFilter;
+    const params = new URL(req.url ?? "/events", "http://internal").searchParams;
+    const tenantFilter = params.get("tenant") ?? undefined;
+    // WR-162: opt-in subscription filters — `?endpoint=` (exact match on
+    // the event's `targetUrl`, same semantics as `GET /events/archive`)
+    // and `?event=` (one of `delivered` / `retrying` / `dead_letter`; any
+    // other value answers 400 `invalid event`, same as the archive).
+    // All filters are ANDed and applied server-side before emit, so the
+    // slow-consumer guard, heartbeat, and `unref` behavior below are
+    // untouched.
+    const endpointFilter = params.get("endpoint") ?? undefined;
+    const eventRaw = params.get("event");
+    if (
+      eventRaw !== null &&
+      eventRaw !== "delivered" &&
+      eventRaw !== "retrying" &&
+      eventRaw !== "dead_letter"
+    ) {
+      respondJson(res, 400, { error: "invalid event" });
+      return;
+    }
+    const eventFilter = (eventRaw ?? undefined) as DeliveryEventType | undefined;
+    const matchesFilter = (event: DeliveryEvent): boolean =>
+      (tenantFilter === undefined || event.tenant === tenantFilter) &&
+      (endpointFilter === undefined || event.targetUrl === endpointFilter) &&
+      (eventFilter === undefined || event.type === eventFilter);
 
     // WR-123: opt-in reconnect resume via the standard SSE `Last-Event-ID`
     // header. The cursor is the archiver-assigned monotonic `eventSeq`
@@ -6209,7 +6239,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       const buffered: DeliveryEvent[] = [];
       let live = false;
       unsubscribe = queue.subscribeDeliveryEvents((event) => {
-        if (closed || !matchesTenant(event)) return;
+        if (closed || !matchesFilter(event)) return;
         if (!live) {
           buffered.push(event);
           return;
@@ -6232,7 +6262,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       openStream();
       let lastReplayed = replayCursor;
       for (const event of replayed.events) {
-        if (closed || !matchesTenant(event)) continue;
+        if (closed || !matchesFilter(event)) continue;
         if (guardSlowConsumer()) return;
         writeFrame(event);
         if (event.eventSeq !== undefined && event.eventSeq > lastReplayed) {
@@ -6252,7 +6282,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     } else {
       openStream();
       unsubscribe = queue.subscribeDeliveryEvents((event) => {
-        if (closed || !matchesTenant(event)) return;
+        if (closed || !matchesFilter(event)) return;
         if (guardSlowConsumer()) return;
         writeFrame(event);
       });
