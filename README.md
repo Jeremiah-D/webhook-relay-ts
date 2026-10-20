@@ -1817,6 +1817,47 @@ createRelayServer({
   startup. Library users drive `ErrorBudgetMonitor` directly with an
   injectable clock (`now`) for deterministic tests.
 
+## Outbound fault-injection drill (opt-in)
+
+Resilience is only real if it is exercised. The chaos drill
+(`src/chaos.ts`) injects controlled faults at the *sender* layer —
+decoupled from any real downstream, so drills run in CI — and the
+relay's retry / backoff / breaker / dead-letter machinery reacts to
+them exactly as it would to real failures:
+
+```ts
+createRelayServer({
+  chaos: {
+    rules: {
+      "https://flaky.example.com/hook": { statusCode: 500 },   // synthetic 500, no network
+      "https://slow.example.com/hook": { latencyMs: 2_000 },    // 2s hold before the attempt
+      "https://reset.example.com/hook": { resetConnection: true }, // simulated ECONNRESET
+    },
+  },
+});
+```
+
+- **Faults** — `latencyMs` holds the attempt back (the hold applies even
+  when the attempt is about to fail); `statusCode` answers with a
+  synthetic HTTP status *without touching the network* — the attempt
+  throws `HttpDeliveryError`, which the queue classifies exactly like a
+  real downstream verdict (5xx → the normal backoff lane, breaker
+  counting, eventual dead-letter; 4xx → immediate dead-letter per
+  WR-30); `resetConnection` fails the attempt with a simulated
+  `ECONNRESET` before any request byte is written, so a retry can never
+  duplicate a side effect. `statusCode` and `resetConnection` are
+  mutually exclusive per rule.
+- **Honest accounting** — every injection audits `chaos_injected`
+  (endpoint, kind, latency/status detail, delivery id, trace id) and
+  counts `relay_chaos_injected_total{endpoint,kind}`. Injected faults are
+  always distinguishable from real downstream failures — a drill never
+  pollutes the production failure statistics.
+- **Fail-fast** — invalid rules (negative latency, out-of-range status,
+  both terminal faults set, empty rule) throw `RangeError` at startup.
+  Off by default: with no `chaos` configured the sender is returned
+  unwrapped — zero behavior change, zero overhead. Shadow senders
+  (WR-85) stay drill-free: chaos targets the main outbound path.
+
 ## Dynamic endpoint registry (opt-in)
 
 Manage the *set* of downstream endpoints without restarting the relay:

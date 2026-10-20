@@ -88,6 +88,13 @@ import type { ReplayEgressOptions } from "./replay-egress.ts";
 import { ReplayApprovalError, type ReplayApprovalDenyReason, type ReplayApprovalOptions } from "./replay-approval.ts";
 import { HttpDeliveryError, parseRetryAfterMs } from "./failure.ts";
 import {
+  resolveChaosConfig,
+  wrapSenderWithChaos,
+  ChaosMetrics,
+  type ChaosConfig,
+  type ChaosInjectionInfo,
+} from "./chaos.ts";
+import {
   DeadlineBudgetTimeoutError,
   readDeadlineBudgetMs,
 } from "./deadline-budget.ts";
@@ -782,6 +789,17 @@ export interface RelayServerOptions {
    * handshake).
    */
   tlsCa?: Record<string, string>;
+  /**
+   * WR-165: outbound fault-injection drill (see `src/chaos.ts`):
+   * `{ rules: { "<exact targetUrl>": { latencyMs?, resetConnection?,
+   * statusCode? } } }`. Injected faults exercise the retry / backoff /
+   * breaker / dead-letter path exactly like real failures, and are
+   * audited as `chaos_injected` plus counted separately in
+   * `relay_chaos_injected_total{endpoint,kind}`. Off by default: with no
+   * `chaos` configured the sender is unwrapped — zero behavior change,
+   * zero overhead. Invalid rules throw `RangeError` at startup.
+   */
+  chaos?: ChaosConfig;
   /**
    * Outbound mTLS client certificates (see `src/mtls.ts`): per-endpoint
    * client identity, keyed by exact delivery `targetUrl`. Each entry is a
@@ -2141,6 +2159,14 @@ export interface PooledSender extends Sender {
    */
   outboundSchemaMetrics: OutboundSchemaMetrics | undefined;
   /**
+   * WR-165: chaos-drill injection counters, when the feature is enabled —
+   * rendered into `GET /metrics` as `relay_chaos_injected_total` via
+   * `render()`. `undefined` when no `chaos` was configured; the metrics
+   * object itself renders `""` until the first injected fault, keeping
+   * `GET /metrics` byte-identical for relays that never run a drill.
+   */
+  chaosMetrics: ChaosMetrics | undefined;
+  /**
    * WR-89: take-and-clear the id of the rotation client certificate most
    * recently used in a handshake attempt for the delivery `deliveryId`
    * (the queue's item id) — the primary's id, or a fallback's id when an
@@ -2390,7 +2416,20 @@ export function createDefaultSender(
    * at startup (`RangeError`); `undefined` keeps the exact pre-WR-163
    * behavior.
    */
-  tlsCa?: Record<string, string>
+  tlsCa?: Record<string, string>,
+  /**
+   * WR-165: outbound fault-injection drill (see `src/chaos.ts`):
+   * `{ rules: { "<exact targetUrl>": { latencyMs?, resetConnection?,
+   * statusCode? } } }`. Validated at startup (`RangeError`); `undefined`
+   * keeps the exact pre-WR-165 behavior (the sender is returned
+   * unwrapped — zero overhead).
+   */
+  chaos?: ChaosConfig,
+  /**
+   * WR-165: called once per injected fault. The server audits these as
+   * `chaos_injected`; library users get the hook directly.
+   */
+  onChaosInjected?: (info: ChaosInjectionInfo) => void
 ): PooledSender {
   if (tlsPins !== undefined) {
     for (const [endpoint, pins] of Object.entries(tlsPins)) {
@@ -2416,6 +2455,10 @@ export function createDefaultSender(
       }
     }
   }
+  // WR-165: fail fast on a misconfigured drill — a typo'd fault must
+  // never silently run (or silently not run) mid-delivery.
+  const resolvedChaos = resolveChaosConfig(chaos, "createDefaultSender");
+  const chaosMetrics = resolvedChaos === undefined ? undefined : new ChaosMetrics();
   // WR-74: fail fast on a misconfigured floor — a typo must not silently
   // leave an endpoint unprotected.
   if (minTlsVersions !== undefined) {
@@ -4178,7 +4221,7 @@ export function createDefaultSender(
     return wsPool.deliver(url, body, relayHeaders, pins, item.targetUrl);
   };
 
-  const sender = function defaultSender(item: RetryItem, callOpts?: SenderCallOptions): Promise<DownstreamResponse | void> {
+  const innerSender = function defaultSender(item: RetryItem, callOpts?: SenderCallOptions): Promise<DownstreamResponse | void> {
     const url = new URL(item.targetUrl);
     // Pinning is per endpoint (exact targetUrl match). When pins are
     // configured for the endpoint, the whitelist is the trust anchor: it
@@ -4383,6 +4426,16 @@ export function createDefaultSender(
       );
     });
   } as PooledSender;
+  // WR-165: wrap the built sender with the chaos drill when configured —
+  // the wrapper delegates every attempt to the real sender and injects
+  // faults only for endpoints with a rule. PooledSender props are
+  // assigned to the wrapper below, so operators see one sender.
+  const sender =
+    resolvedChaos === undefined
+      ? innerSender
+      : (wrapSenderWithChaos(innerSender, resolvedChaos, chaosMetrics!, {
+          onInjected: onChaosInjected,
+        }) as PooledSender);
   sender.pool = pool;
   sender.http2Pool = h2pool;
   sender.wsPool = wsPool;
@@ -4391,6 +4444,10 @@ export function createDefaultSender(
   // — operators read them via `sender.outboundSchemaMetrics.getStats()`;
   // they render into GET /metrics as `relay_outbound_schema_total`.
   sender.outboundSchemaMetrics = outboundSchemaRegistry?.metrics;
+  // WR-165: chaos-drill injection counters (undefined when the feature
+  // is off) — operators read them via `sender.chaosMetrics.getStats()`;
+  // they render into GET /metrics as `relay_chaos_injected_total`.
+  sender.chaosMetrics = chaosMetrics;
   // WR-92: the shared DNS cache instance (undefined when the feature is
   // off) — operators read counters via `sender.dnsCache.getStats()`.
   sender.dnsCache = resolvedDnsCache;
@@ -4911,6 +4968,21 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       bytesSaved: info.bytesSaved,
     });
   };
+  // WR-165: a chaos-drill fault was injected — one audit line per fault
+  // naming the endpoint, the fault kind, and the detail (latency or
+  // synthetic status). Injected faults are always distinguishable from
+  // real downstream failures in the audit trail.
+  const onChaosInjectedAudit = (info: ChaosInjectionInfo) => {
+    opts.auditLog.append({
+      event: "chaos_injected",
+      id: info.id,
+      ...(info.traceId !== undefined ? { traceId: info.traceId } : {}),
+      targetUrl: info.endpoint,
+      kind: info.kind,
+      ...(info.detailMs !== undefined ? { latencyMs: info.detailMs } : {}),
+      ...(info.detailStatus !== undefined ? { statusCode: info.detailStatus } : {}),
+    });
+  };
   // WR-81: an endpoint's E2EE key rotation was picked up at startup —
   // one audit line naming the new primary and the retired keys still
   // inside their grace window. Shared with the shadow sender copies.
@@ -5020,7 +5092,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   }
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, opts.awsSigV4, opts.awsSecretResolver, opts.outboundSchemas, opts.oauth2, undefined, opts.compressBrotli, opts.phaseTimeouts, opts.tlsCa)
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, opts.awsSigV4, opts.awsSecretResolver, opts.outboundSchemas, opts.oauth2, undefined, opts.compressBrotli, opts.phaseTimeouts, opts.tlsCa, opts.chaos, onChaosInjectedAudit)
       : undefined;
   // WR-146: tail-latency hedging for outbound attempts (opt-in). The
   // wrapper sits around whichever sender the queue uses — the default
@@ -6684,7 +6756,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       // new series. Absent entirely with a custom sender (no pool).
       res
         .writeHead(200, { "content-type": "text/plain; version=0.0.4" })
-        .end(queue.renderMetrics() + versionMetrics.render() + schemaMetrics.render() + (schemaRegistry?.renderMetrics() ?? "") + ipAclMetrics.render() + inboundTenantRateLimitMetrics.render() + certExpiryMonitor.render() + tlsVersionMonitor.render() + (ocspMonitor?.render() ?? "") + (usageMeter?.render() ?? "") + (defaultSender?.compressionStats.render() ?? "") + (defaultSender?.dnsCache?.render() ?? "") + (defaultSender?.wsPool.renderMetrics() ?? "") + meshMetrics.render() + (defaultSender?.outboundSchemaMetrics?.render() ?? "") + (reputation?.renderMetrics() ?? "") + hedgeMetrics.render() + (queue.getErrorBudgetMonitor()?.render() ?? ""));
+        .end(queue.renderMetrics() + versionMetrics.render() + schemaMetrics.render() + (schemaRegistry?.renderMetrics() ?? "") + ipAclMetrics.render() + inboundTenantRateLimitMetrics.render() + certExpiryMonitor.render() + tlsVersionMonitor.render() + (ocspMonitor?.render() ?? "") + (usageMeter?.render() ?? "") + (defaultSender?.compressionStats.render() ?? "") + (defaultSender?.dnsCache?.render() ?? "") + (defaultSender?.wsPool.renderMetrics() ?? "") + meshMetrics.render() + (defaultSender?.outboundSchemaMetrics?.render() ?? "") + (defaultSender?.chaosMetrics?.render() ?? "") + (reputation?.renderMetrics() ?? "") + hedgeMetrics.render() + (queue.getErrorBudgetMonitor()?.render() ?? ""));
       return;
     }
     if (isEvents) {
