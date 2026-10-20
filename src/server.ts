@@ -402,6 +402,16 @@ import {
   type ResponseCompressionOptions,
 } from "./response-encoding.ts";
 import {
+  verifyContentDigest,
+  IntegrityMismatchError,
+} from "./response-integrity.ts";
+import {
+  assertValidResponseGuardConfig,
+  DEFAULT_MAX_RESPONSE_BYTES,
+  ResponseTooLargeError,
+  type ResponseGuardConfig,
+} from "./response-limit.ts";
+import {
   resolveForwardHeadersConfig,
   shouldForwardHeader,
   type CompiledForwardHeadersRule,
@@ -1129,6 +1139,37 @@ export interface RelayServerOptions {
    * at startup.
    */
   responseCompression?: Record<string, ResponseCompressionOptions>;
+  /**
+   * Downstream response guard (WR-168 / WR-169; see
+   * `src/response-limit.ts` and `src/response-integrity.ts`): per-endpoint
+   * opt-in, keyed by exact delivery `targetUrl`.
+   * `{ maxResponseBytes?, verifyContentDigest? }`:
+   *
+   * - `maxResponseBytes`: cap on the downstream response body. The sender
+   *   reads in streaming chunks and truncates at the cap; a body that runs
+   *   past it fails the attempt with `ResponseTooLargeError` —
+   *   classified `"retryable"` (normal backoff lane, WR-10 breaker,
+   *   retry budget) and audited as `response_too_large`. Bounds the
+   *   relay's per-response heap so one pathological downstream cannot
+   *   exhaust it; mirrors the inbound WR-25 `maxBodyBytes` on the
+   *   outbound side.
+   * - `verifyContentDigest`: verify the downstream's `Content-Digest`
+   *   response header (RFC 9530 subset: `sha-256` / `sha-512`) against
+   *   the received body. A mismatch fails the attempt with
+   *   `IntegrityMismatchError` — classified `"retryable"` and audited as
+   *   `integrity_mismatch`. A response with no `Content-Digest` header
+   *   resolves exactly as before.
+   *
+   * When either opt-in is on, the endpoint's response read cap becomes
+   * `maxResponseBytes ?? 4 MiB` instead of the plain 64 KiB truncated
+   * capture — a digest check needs the whole body to hash, and a
+   * digest-enabled body that overruns the cap fails closed with
+   * `ResponseTooLargeError` (a truncated body is unverifiable). Applies
+   * to the HTTP/1.1 and HTTP/2 delivery paths; endpoints without an
+   * entry keep the exact current behavior. Invalid values throw
+   * `RangeError` at startup.
+   */
+  responseGuard?: Record<string, ResponseGuardConfig>;
   /**
    * Outbound request header forwarding allowlist (WR-69; see
    * `src/forward-headers.ts`): per-endpoint (exact `targetUrl`) gate on
@@ -2433,7 +2474,21 @@ export function createDefaultSender(
    * WR-165: called once per injected fault. The server audits these as
    * `chaos_injected`; library users get the hook directly.
    */
-  onChaosInjected?: (info: ChaosInjectionInfo) => void
+  onChaosInjected?: (info: ChaosInjectionInfo) => void,
+  /**
+   * WR-168/WR-169: per-endpoint downstream response guard (see
+   * `src/response-limit.ts` and `src/response-integrity.ts`):
+   * `{ "<exact targetUrl>": { maxResponseBytes?, verifyContentDigest? } }`.
+   * A guarded endpoint's response body read is capped (overrun fails the
+   * attempt with `ResponseTooLargeError`, retryable, audited as
+   * `response_too_large`), and a `verifyContentDigest` endpoint's 2xx
+   * body is checked against its `Content-Digest` header (mismatch fails
+   * the attempt with `IntegrityMismatchError`, retryable, audited as
+   * `integrity_mismatch`). Validated at startup (`RangeError`);
+   * `undefined` keeps the exact pre-WR-168 behavior (64 KiB truncated
+   * capture, no digest check).
+   */
+  responseGuard?: Record<string, ResponseGuardConfig>
 ): PooledSender {
   if (tlsPins !== undefined) {
     for (const [endpoint, pins] of Object.entries(tlsPins)) {
@@ -2673,6 +2728,17 @@ export function createDefaultSender(
     } catch (err) {
       throw new RangeError(
         `createDefaultSender: invalid responseCompression config: ${(err as Error).message}`
+      );
+    }
+  }
+  // WR-168/WR-169: RangeError on invalid values, at startup — never
+  // mid-delivery.
+  if (responseGuard !== undefined) {
+    try {
+      assertValidResponseGuardConfig(responseGuard);
+    } catch (err) {
+      throw new RangeError(
+        `createDefaultSender: invalid responseGuard config: ${(err as Error).message}`
       );
     }
   }
@@ -3377,7 +3443,14 @@ export function createDefaultSender(
           // KiB as the plain capture) — the wire form of a compressed
           // response is the smaller side, so one cap bounds both.
           const respCompress = responseCompression?.[item.targetUrl];
-          const wireCap = respCompress?.maxDecompressedBytes ?? RESPONSE_CAPTURE_MAX_BYTES;
+          // WR-168/WR-169: a guarded endpoint reads with its own cap —
+          // the digest check needs the whole body to hash, and the
+          // overrun check needs the bound to enforce. Endpoints without
+          // a guard entry keep the plain 64 KiB truncated capture.
+          const guard = responseGuard?.[item.targetUrl];
+          const guardCap: number | undefined =
+            guard !== undefined ? (guard.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES) : undefined;
+          const wireCap = guardCap ?? respCompress?.maxDecompressedBytes ?? RESPONSE_CAPTURE_MAX_BYTES;
           const chunks: Buffer[] = [];
           let captured = 0;
           let truncated = false;
@@ -3418,6 +3491,35 @@ export function createDefaultSender(
                   );
                   body = decoded.body;
                   contentEncoding = decoded.contentEncoding;
+                }
+                // WR-169: a guarded endpoint whose body ran past the cap
+                // fails the attempt (retryable) instead of resolving with
+                // a truncated body — the sender never holds more than the
+                // cap in memory for one response.
+                if (guard !== undefined && truncated) {
+                  throw new ResponseTooLargeError(
+                    item.targetUrl,
+                    guardCap as number,
+                    statusCode
+                  );
+                }
+                // WR-168: verify the downstream's Content-Digest against
+                // the body the relay actually processes (post WR-62
+                // decode, matching what the WR-37 validators see). No
+                // header → no opinion, the delivery resolves as before; a
+                // mismatch (or an unverifiable header) fails the attempt
+                // (retryable) — fail closed, never a silent pass on
+                // tampered bytes.
+                if (guard?.verifyContentDigest === true) {
+                  const verdict = verifyContentDigest(body, res.headers["content-digest"]);
+                  if (!verdict.verified) {
+                    throw new IntegrityMismatchError(
+                      item.targetUrl,
+                      verdict.algorithm ?? "unsupported",
+                      verdict.reason ?? "verification failed",
+                      statusCode
+                    );
+                  }
                 }
                 // WR-95: phase breakdown for this attempt. `firstByteMs` is
                 // the WR-54 TTFB — on a fresh connection it overlaps
@@ -4165,7 +4267,13 @@ export function createDefaultSender(
             path: `${url.pathname}${url.search}`,
             headers: wire.headers,
             body: wire.body,
-            captureMaxBytes: RESPONSE_CAPTURE_MAX_BYTES,
+            // WR-168/WR-169: a guarded endpoint reads with its own cap
+            // (same contract as the HTTP/1.1 path); unguarded endpoints
+            // keep the plain 64 KiB truncated capture.
+            captureMaxBytes:
+              responseGuard?.[item.targetUrl] !== undefined
+                ? (responseGuard[item.targetUrl]?.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES)
+                : RESPONSE_CAPTURE_MAX_BYTES,
           });
         if (res.statusCode >= 200 && res.statusCode < 300) {
           // WR-62: decode a compressed downstream response before the WR-37
@@ -4173,6 +4281,7 @@ export function createDefaultSender(
           // A capture cut at the cap cannot be decoded: the raw bytes
           // travel on with `truncated: true`.
           const respCompress = responseCompression?.[item.targetUrl];
+          const guard = responseGuard?.[item.targetUrl];
           let body = res.body;
           let contentEncoding: string | undefined;
           if (respCompress !== undefined && !res.truncated) {
@@ -4183,6 +4292,29 @@ export function createDefaultSender(
             );
             body = decoded.body;
             contentEncoding = decoded.contentEncoding;
+          }
+          // WR-169: a guarded endpoint whose body ran past the cap fails
+          // the attempt (retryable) instead of resolving truncated —
+          // same contract as the HTTP/1.1 path.
+          if (guard !== undefined && res.truncated) {
+            throw new ResponseTooLargeError(
+              item.targetUrl,
+              guard.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES,
+              res.statusCode
+            );
+          }
+          // WR-168: verify the downstream's Content-Digest against the
+          // processed body — same contract as the HTTP/1.1 path.
+          if (guard?.verifyContentDigest === true) {
+            const verdict = verifyContentDigest(body, res.headers["content-digest"]);
+            if (!verdict.verified) {
+              throw new IntegrityMismatchError(
+                item.targetUrl,
+                verdict.algorithm ?? "unsupported",
+                verdict.reason ?? "verification failed",
+                res.statusCode
+              );
+            }
           }
           return {
             statusCode: res.statusCode,
@@ -5134,7 +5266,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   }
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, opts.awsSigV4, opts.awsSecretResolver, opts.outboundSchemas, opts.oauth2, undefined, opts.compressBrotli, opts.phaseTimeouts, opts.tlsCa, opts.chaos, onChaosInjectedAudit)
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, opts.awsSigV4, opts.awsSecretResolver, opts.outboundSchemas, opts.oauth2, undefined, opts.compressBrotli, opts.phaseTimeouts, opts.tlsCa, opts.chaos, onChaosInjectedAudit, opts.responseGuard)
       : undefined;
   // WR-146: tail-latency hedging for outbound attempts (opt-in). The
   // wrapper sits around whichever sender the queue uses — the default
@@ -5202,7 +5334,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     if (validators !== undefined && typeof validators === "object") {
       for (const endpoint of Object.keys(validators)) knownEndpoints.add(endpoint);
     }
-    for (const record of [opts.tlsPins, opts.tlsClientCerts, opts.tlsClientCertRotation, opts.compressOutbound, opts.compressThreshold, opts.compressBrotli, opts.proxies, opts.outboundEncryption, opts.responseCompression, opts.forwardHeaders, opts.minTlsVersions, opts.tlsOcsp, opts.payloadTransforms, opts.outboundSchemas]) {
+    for (const record of [opts.tlsPins, opts.tlsClientCerts, opts.tlsClientCertRotation, opts.compressOutbound, opts.compressThreshold, opts.compressBrotli, opts.proxies, opts.outboundEncryption, opts.responseCompression, opts.responseGuard, opts.forwardHeaders, opts.minTlsVersions, opts.tlsOcsp, opts.payloadTransforms, opts.outboundSchemas]) {
       if (record) for (const endpoint of Object.keys(record)) knownEndpoints.add(endpoint);
     }
     for (const endpoint of opts.retry?.probe?.endpoints ?? []) knownEndpoints.add(endpoint);
@@ -5305,7 +5437,14 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
                   // phaseTimeouts stay off for shadow copies (pre-existing);
                   // the trailing slot is the WR-163 tlsCa record.
                   undefined,
-                  t.tlsCa !== undefined ? { [t.targetUrl]: t.tlsCa } : undefined
+                  t.tlsCa !== undefined ? { [t.targetUrl]: t.tlsCa } : undefined,
+                  // chaos stays off for shadow copies (pre-existing);
+                  // the trailing slot is the WR-168/WR-169 responseGuard
+                  // record — a shadow mirror's response read is bounded
+                  // the same way as the main delivery's.
+                  undefined,
+                  undefined,
+                  opts.responseGuard
                 ),
               })
             ),
@@ -5951,6 +6090,41 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
           targetUrl: item.targetUrl,
           schema: lastError.schemaName,
           schemaVersion: lastError.schemaVersion,
+          error: lastError.message,
+        });
+      }
+      // WR-168: a Content-Digest verification failure gets its own audit
+      // line on top of the `dead_letter` above — the operator sees the
+      // tampered response (event id, error, endpoint, algorithm), not
+      // just that the item died. The `failure_class` on the
+      // `dead_letter` event is "retryable": the tamper may be transient,
+      // so every attempt was spent before the item was dead-lettered.
+      if (lastError instanceof IntegrityMismatchError) {
+        opts.auditLog.append({
+          event: "integrity_mismatch",
+          id: item.id,
+          traceId: item.traceId,
+          ...(item.tenantId !== undefined ? { tenant: item.tenantId } : {}),
+          targetUrl: item.targetUrl,
+          algorithm: lastError.algorithm,
+          error: lastError.message,
+        });
+      }
+      // WR-169: a response-body size overrun gets its own audit line on
+      // top of the `dead_letter` above — the operator sees the endpoint
+      // and the exceeded cap (event id, error, endpoint, maxBytes), not
+      // just that the item died. The `failure_class` on the
+      // `dead_letter` event is "retryable": a recovering downstream
+      // deserves another attempt, so every attempt was spent before the
+      // item was dead-lettered.
+      if (lastError instanceof ResponseTooLargeError) {
+        opts.auditLog.append({
+          event: "response_too_large",
+          id: item.id,
+          traceId: item.traceId,
+          ...(item.tenantId !== undefined ? { tenant: item.tenantId } : {}),
+          targetUrl: item.targetUrl,
+          maxBytes: lastError.maxBytes,
           error: lastError.message,
         });
       }

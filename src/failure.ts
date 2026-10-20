@@ -35,6 +35,16 @@
  *   item follows the normal retryable path — backoff, circuit
  *   breaker, retry budget — exactly like a transient downstream
  *   failure.
+ * - a WR-168 `IntegrityMismatchError` → `"retryable"`: the downstream
+ *   answered 2xx but its `Content-Digest` did not match the received
+ *   body. The tamper may be transient (a flapping middlebox), so the
+ *   item follows the normal backoff / circuit / budget lane and is
+ *   audited as `integrity_mismatch`.
+ * - a WR-169 `ResponseTooLargeError` → `"retryable"`: the downstream
+ *   answered 2xx but its body ran past the endpoint's
+ *   `maxResponseBytes`. A recovering downstream deserves another
+ *   attempt, so the item follows the normal backoff / circuit / budget
+ *   lane and is audited as `response_too_large`.
  *
  * Zero dependencies (`node:` only where the caller's clock is needed).
  */
@@ -43,6 +53,8 @@ import { PayloadTransformError } from "./transform.ts";
 import { OutboundSchemaViolationError } from "./outbound-schema.ts";
 import { SigV4SigningError } from "./sigv4.ts";
 import { AssertionFailedError } from "./response-assertions.ts";
+import { IntegrityMismatchError } from "./response-integrity.ts";
+import { ResponseTooLargeError } from "./response-limit.ts";
 
 /**
  * How a delivery failure should be treated by the retry queue.
@@ -197,6 +209,20 @@ export function classifyFailure(err: unknown): ClassifiedFailure {
       failureClass: "assertion_failed",
       ...(err.statusCode !== undefined ? { statusCode: err.statusCode } : {}),
     };
+  }
+  // WR-168: a Content-Digest mismatch is retryable — the tamper may be
+  // transient — and the numeric statusCode rides along so the
+  // dead-letter `response_summary` stays honest (the downstream did
+  // answer 2xx). Audited as `integrity_mismatch`.
+  if (err instanceof IntegrityMismatchError) {
+    return { failureClass: "retryable", statusCode: err.statusCode };
+  }
+  // WR-169: a response-body overrun is retryable — a recovering
+  // downstream deserves another attempt — and the numeric statusCode
+  // rides along for the same audit honesty. Audited as
+  // `response_too_large`.
+  if (err instanceof ResponseTooLargeError) {
+    return { failureClass: "retryable", statusCode: err.statusCode };
   }
   let statusCode: number | undefined;
   let retryAfterMs: number | undefined;

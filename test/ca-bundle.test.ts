@@ -26,15 +26,27 @@ function srvCertDer(): Buffer {
   return Buffer.from(b64, "base64");
 }
 
-/** Call createDefaultSender with the trailing tlsCa slot (params are positional). */
+/** Call createDefaultSender with the tlsCa positional slot (params are positional). */
 function senderWithCa(
   tlsCa: Record<string, string>,
   tlsPins?: Record<string, string[]>
 ): PooledSender {
-  const n = createDefaultSender.length;
-  const args: unknown[] = new Array(n).fill(undefined);
+  // tlsCa is not the last parameter anymore — chaos/onChaosInjected
+  // (WR-165) and responseGuard (WR-168/WR-169) were appended after it —
+  // so locate the slot by declared parameter name instead of assuming a
+  // trailing position. The parse runs against the type-stripped source
+  // (names preserved, type annotations blanked), and fails loudly if the
+  // declaration ever moves or disappears.
+  const paramNames: string[] = [];
+  const decl = /^\s{2}([A-Za-z_$][A-Za-z0-9_$]*)\s*,/gm;
+  const src = createDefaultSender.toString();
+  let m: RegExpExecArray | null;
+  while ((m = decl.exec(src)) !== null) paramNames.push(m[1]);
+  const tlsCaIndex = paramNames.indexOf("tlsCa");
+  assert.ok(tlsCaIndex >= 0, "tlsCa parameter not found in createDefaultSender signature");
+  const args: unknown[] = new Array(createDefaultSender.length).fill(undefined);
   args[0] = tlsPins;
-  args[n - 1] = tlsCa;
+  args[tlsCaIndex] = tlsCa;
   return (createDefaultSender as (...rest: unknown[]) => PooledSender)(...args);
 }
 

@@ -2923,6 +2923,58 @@ const server = createRelayServer({
   non-positive-integer `maxBodyBytes`) throw `RangeError` at startup, so
   a bad config can never fail a request mid-flight.
 
+## Downstream response guard (opt-in)
+
+`responseGuard` hardens the *outbound* side the way `maxBodyBytes` guards
+the inbound side: per-endpoint opt-in, keyed by exact delivery `targetUrl`.
+Two independent checks (WR-168 / WR-169):
+
+```ts
+const server = createRelayServer({
+  responseGuard: {
+    // Verify the downstream's Content-Digest on every 2xx response.
+    "https://ledger.example/hooks": { verifyContentDigest: true },
+    // Cap the response body; overruns fail the attempt (retryable).
+    "https://fragile.example/callback": { maxResponseBytes: 262_144 },
+  },
+});
+```
+
+- **Content-Digest verification (WR-168)** — a guarded endpoint's 2xx
+  body is checked against its `Content-Digest` response header (RFC 9530
+  subset: `sha-256` / `sha-512`; the stronger algorithm wins when several
+  are listed). The digest is computed over the body the relay actually
+  processes (post WR-62 decompression), matching what the WR-37
+  validators see. Fail-closed: a mismatch, an unverifiable header, or a
+  header listing only unsupported algorithms fails the attempt with
+  `IntegrityMismatchError` — classified `"retryable"`, so it takes the
+  normal backoff lane and trips the WR-10 breaker like any retryable
+  failure. A response with no `Content-Digest` header resolves exactly
+  as before (the guard has no opinion). The comparison is
+  timing-safe (`crypto.timingSafeEqual`).
+- **Response body size cap (WR-169)** — the sender reads the body in
+  streaming chunks and truncates at `maxResponseBytes` (default 4 MiB
+  when the guard is on but no cap is named); a body that runs past the
+  cap fails the attempt with `ResponseTooLargeError` — classified
+  `"retryable"` — instead of resolving truncated. The relay never holds
+  more than the cap in memory for one response, so a pathological
+  downstream cannot exhaust the heap. A digest-enabled endpoint whose
+  body overruns the cap fails with `ResponseTooLargeError`: a truncated
+  body is unverifiable by definition, so it fails closed rather than
+  resolving half-checked.
+- **Audit** — both failures get their own audit line on top of the
+  `dead_letter` event (the WR-115 / WR-117 precedent): `integrity_mismatch`
+  (carries `algorithm`) and `response_too_large` (carries `maxBytes`),
+  so the operator sees *why* the item died, not just that it died. The
+  `dead_letter` event's `failure_class` is `"retryable"` and its
+  `response_summary.statusCode` stays honest (the downstream did answer
+  2xx).
+- Applies to the HTTP/1.1 and HTTP/2 delivery paths. Endpoints without
+  a guard entry keep the exact current behavior (64 KiB truncated
+  capture, no digest check). Invalid values (non-positive-integer
+  `maxResponseBytes`, non-boolean `verifyContentDigest`) throw
+  `RangeError` at startup — never mid-delivery.
+
 ## GeoIP inbound country policy (opt-in)
 
 `geoIp` layers a coarse country filter over the WR-53 IP ACL — a relay
