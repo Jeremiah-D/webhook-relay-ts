@@ -184,6 +184,11 @@ import {
   type AdaptiveBackoffOptions,
 } from "./adaptive-backoff.ts";
 import {
+  AdaptiveTimeout,
+  assertValidAdaptiveTimeoutOptions,
+  type AdaptiveTimeoutOptions,
+} from "./adaptive-timeout.ts";
+import {
   AdaptiveConcurrencyController,
   assertAdaptiveConcurrencyOptions,
   type AdaptiveConcurrencyEndpointStats,
@@ -461,6 +466,11 @@ export {
   DEFAULT_ADAPTIVE_WINDOW_SIZE,
 } from "./adaptive-concurrency.ts";
 export type {
+  AdaptiveTimeoutOptions,
+  AdaptiveTimeoutEndpointStats,
+} from "./adaptive-timeout.ts";
+export { AdaptiveTimeout, AdaptiveTimeoutError, assertValidAdaptiveTimeoutOptions } from "./adaptive-timeout.ts";
+export type {
   TenantRateLimitEndpointOverride,
   TenantRateLimitMode,
   TenantRateLimitOptions,
@@ -624,6 +634,17 @@ export interface RetryItem {
    * cap, never the queue-side expiry.
    */
   deadlineBudgetMs?: number;
+  /**
+   * WR-166: per-attempt adaptive outbound timeout (ms) stamped by the
+   * queue at dispatch: the endpoint's p99-derived cap (see
+   * `src/adaptive-timeout.ts`). The default sender enforces it like the
+   * WR-99 deadline budget but raises `AdaptiveTimeoutError`, which the
+   * queue routes to the normal retryable path (backoff, circuit
+   * breaker, dead letter) — unlike `deadlineBudgetMs`, which expires
+   * the delivery. Absent when the feature is off — custom senders
+   * ignore it, which only loses the per-attempt cap.
+   */
+  adaptiveTimeoutMs?: number;
 }
 
 /** Options for the urgent delivery lane (see {@link DeliveryPriority}). */
@@ -2375,6 +2396,21 @@ export interface RetryQueueOptions {
    */
   onDeliveryDeadlineExceeded?: (info: DeliveryDeadlineExceededInfo) => void;
   /**
+   * Adaptive outbound timeout (WR-166; see `src/adaptive-timeout.ts`):
+   * the per-attempt timeout is derived from each endpoint's recent
+   * accepted→delivered p99 (`p99 * (1 + marginRatio)`, clamped to
+   * `[minTimeoutMs, maxTimeoutMs]`) instead of one static value — slow
+   * endpoints get headroom against false kills, stable fast endpoints
+   * get tightened so a hung request cannot hold a pool slot. Opt-in:
+   * absent means no adaptive timeout (exactly the pre-WR-166 static
+   * behavior). A timed-out attempt raises `AdaptiveTimeoutError`,
+   * which routes to the normal retryable path — backoff, circuit
+   * breaker, and dead letter all see it as a regular timeout; the
+   * WR-99 deadline-expiry semantics are untouched. Invalid values
+   * throw `RangeError` at construction.
+   */
+  adaptiveTimeout?: AdaptiveTimeoutOptions;
+  /**
    * WR-85: shadow-target dry-run mirroring (see `src/shadow.ts`).
    * Per-endpoint opt-in: exact `targetUrl` -> shadow target list. After
    * every main delivery *attempt* completes (success or failure), the
@@ -3689,6 +3725,13 @@ export class RetryQueue {
   private readonly globalGate: GlobalConcurrencyGate;
   private readonly globalMaxConcurrent: number;
   /**
+   * WR-166: adaptive outbound timeout (one instance, per-endpoint
+   * windows inside). `undefined` when the feature is off — every feed
+   * point and the dispatch stamp no-op, so unconfigured behavior is
+   * byte-for-byte the pre-WR-166 behavior.
+   */
+  private readonly adaptiveTimeout?: AdaptiveTimeout;
+  /**
    * WR-140: per-tenant dispatch gates (one independent gate per tenant,
    * created lazily). Always constructed; with the default `Infinity` cap
    * every acquisition grants immediately, and tenant-less deliveries skip
@@ -3782,6 +3825,9 @@ export class RetryQueue {
     // WR-51: invalid values throw here, at construction — never mid-delivery.
     this.globalMaxConcurrent = opts.globalMaxConcurrent ?? Infinity;
     this.globalGate = new GlobalConcurrencyGate(this.globalMaxConcurrent);
+    // WR-166: invalid values throw here, at construction — never mid-delivery.
+    this.adaptiveTimeout =
+      opts.adaptiveTimeout !== undefined ? new AdaptiveTimeout(opts.adaptiveTimeout) : undefined;
     // WR-140: invalid values throw here, at construction — never mid-delivery.
     this.tenantMaxConcurrent = opts.tenantMaxConcurrent ?? Infinity;
     this.tenantGates = new TenantConcurrencyGates(this.tenantMaxConcurrent);
@@ -4361,6 +4407,8 @@ export class RetryQueue {
         // A recovery restarts the accepted→delivered clock: the sample
         // measures the post-restart delivery, not the pre-crash wait.
         this.latencyFor(item.tenantId)?.recordAccepted(item.id);
+        // WR-166: same lifecycle event feeds the adaptive-timeout tracker.
+        this.adaptiveTimeout?.recordAccepted(item.id);
         this.durableRestoredItems += 1;
       }
       for (const entry of rec.deadLetters) {
@@ -5355,6 +5403,8 @@ export class RetryQueue {
     // WR-48: the replay keeps the dead letter's tenant, so the clock
     // restarts on the same tenant's tracker.
     this.latencyFor(item.tenantId)?.recordAccepted(item.id);
+    // WR-166: same lifecycle event feeds the adaptive-timeout tracker.
+    this.adaptiveTimeout?.recordAccepted(item.id);
     // WR-151: a replay is a fresh delivery cycle — start a new OTel trace
     // for it (the original trace already terminated at dead_letter).
     this.otelTracer?.intake(requeued);
@@ -5917,6 +5967,8 @@ export class RetryQueue {
     // is queued: the batching delay is by design, not lateness.)
     // WR-48: per-tenant tracker.
     this.latencyFor(item.tenantId)?.recordAccepted(item.id);
+    // WR-166: same lifecycle event feeds the adaptive-timeout tracker.
+    this.adaptiveTimeout?.recordAccepted(item.id);
     // WR-71: the backlog changed — feed the SLO-risk predictor.
     this.bumpPending(item.tenantId, stored.targetUrl, 1);
     // WR-100: first-sighting stamp for the stale-endpoint sweep.
@@ -6968,6 +7020,10 @@ export class RetryQueue {
       // wire copy — the sender caps the per-attempt downstream call at
       // it, so queue wait and the call share one SLO pool.
       if (dispatchBudgetMs !== undefined) wireCopy.deadlineBudgetMs = dispatchBudgetMs;
+      // WR-166: stamp the endpoint's p99-derived per-attempt cap. It is
+      // undefined when the feature is off, so custom senders see no change.
+      const adaptiveTimeoutMs = this.adaptiveTimeout?.timeoutFor(target);
+      if (adaptiveTimeoutMs !== undefined) wireCopy.adaptiveTimeoutMs = adaptiveTimeoutMs;
       // WR-85: mirror-once guard — the success path mirrors right after
       // the sender settles, but a later throw in the same attempt (e.g.
       // a failed WR-37 response validation) lands in the catch below,
@@ -7158,6 +7214,8 @@ export class RetryQueue {
         if (fastLane) this.recordUrgentStat(target, "delivered");
         const latency = this.latencyFor(tenant);
         const latencyMs = latency?.recordDelivered(entry.id, target);
+        // WR-166: same lifecycle event feeds the adaptive-timeout tracker.
+        this.adaptiveTimeout?.recordDelivered(entry.id, target);
         if (latencyMs !== undefined) {
           // The histogram samples the same delivery the JSON latency stats
           // do — accepted→delivered, dead letters excluded by `discard()`.
@@ -7688,6 +7746,8 @@ export class RetryQueue {
     this.recordDelivery(entry.tenantId, target, "deadLetter");
     // Never delivered: drop the pending clock without sampling.
     this.latencyFor(entry.tenantId)?.discard(entry.id);
+    // WR-166: same lifecycle event feeds the adaptive-timeout tracker.
+    this.adaptiveTimeout?.discard(entry.id);
     this.deadLetter.push(dlEntry);
     // WR-54: the last attempt's response summary — only the status code
     // survives (from the failing HTTP response); a failed attempt has no
@@ -7769,6 +7829,15 @@ export class RetryQueue {
    */
   getGlobalConcurrencyStats(): GlobalConcurrencyStats {
     return this.globalGate.stats();
+  }
+
+  /**
+   * WR-166: per-endpoint adaptive-timeout snapshots — the tracker's
+   * current p99-derived timeout per endpoint. Empty when the feature is
+   * off or no endpoint has delivered yet.
+   */
+  getAdaptiveTimeoutStats(): AdaptiveTimeoutEndpointStats[] {
+    return this.adaptiveTimeout?.stats() ?? [];
   }
 
   /**

@@ -99,6 +99,10 @@ import {
   readDeadlineBudgetMs,
 } from "./deadline-budget.ts";
 import {
+  AdaptiveTimeoutError,
+  readAdaptiveTimeoutMs,
+} from "./adaptive-timeout.ts";
+import {
   PhaseTimeoutError,
   assertValidPhaseTimeoutBudgets,
   resolvePhaseTimeouts,
@@ -3575,6 +3579,22 @@ export function createDefaultSender(
           req.on("close", () => clearTimeout(budgetTimer));
         }
 
+        // WR-166: enforce the stamped adaptive outbound timeout. The
+        // default sender does NOT reuse the WR-99 deadline budget: a
+        // deadline-budget expiry is terminal (dead letter, no backoff),
+        // while an adaptive timeout is a normal retryable timeout (it
+        // feeds the breaker and the retry budget like any other timeout).
+        // `AdaptiveTimeoutError` carries no statusCode so the failure
+        // classifier treats it as retryable.
+        const adaptiveTimeoutMs = readAdaptiveTimeoutMs(item);
+        if (adaptiveTimeoutMs !== undefined) {
+          const adaptiveTimer = setTimeout(() => {
+            req.destroy(new AdaptiveTimeoutError(item.targetUrl, adaptiveTimeoutMs));
+          }, adaptiveTimeoutMs);
+          adaptiveTimer.unref?.();
+          req.on("close", () => clearTimeout(adaptiveTimer));
+        }
+
         // WR-143: per-endpoint phase timeout budgets (opt-in via the
         // `phaseTimeouts` record). One unref'd timer per configured
         // phase, armed per delivery attempt: when a phase's budget
@@ -4399,32 +4419,54 @@ export function createDefaultSender(
     // timeouts. The rejection is typed so the queue routes it to the
     // deadline-expiry path, not the retry path. No budget stamped —
     // byte-identical behavior to before.
+    //
+    // WR-166: the uniform race is factored into `raceCap` so the stamped
+    // adaptive outbound timeout applies here too — via
+    // `AdaptiveTimeoutError` (no `statusCode`) so the queue routes it to
+    // the normal retryable path, unlike the deadline-budget expiry.
+    const raceCap = (
+      raced: Promise<DownstreamResponse | void>,
+      capMs: number,
+      makeError: (ms: number) => Error
+    ): Promise<DownstreamResponse | void> =>
+      new Promise<DownstreamResponse | void>((resolve, reject) => {
+        let settled = false;
+        const timer = setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          reject(makeError(capMs));
+        }, capMs);
+        // An SLO timer must never pin process exit.
+        timer.unref?.();
+        raced.then(
+          (res) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            resolve(res);
+          },
+          (err) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            reject(err);
+          }
+        );
+      });
     const budgetMs = readDeadlineBudgetMs(item);
-    if (budgetMs === undefined) return dispatchWithOAuth();
-    return new Promise<DownstreamResponse | void>((resolve, reject) => {
-      let settled = false;
-      const timer = setTimeout(() => {
-        if (settled) return;
-        settled = true;
-        reject(new DeadlineBudgetTimeoutError(item.targetUrl, budgetMs));
-      }, budgetMs);
-      // An SLO timer must never pin process exit.
-      timer.unref?.();
-      dispatchWithOAuth().then(
-        (res) => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          resolve(res);
-        },
-        (err) => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          reject(err);
-        }
-      );
-    });
+    let raced = dispatchWithOAuth();
+    if (budgetMs !== undefined) {
+      raced = raceCap(raced, budgetMs, (ms) => new DeadlineBudgetTimeoutError(item.targetUrl, ms));
+    }
+    // WR-166: enforce the stamped adaptive outbound timeout on every
+    // transport via the race — `AdaptiveTimeoutError` carries no
+    // `statusCode`, so the queue treats it as a regular retryable
+    // timeout (backoff, breaker, dead letter), not a deadline expiry.
+    const adaptiveMs = readAdaptiveTimeoutMs(item);
+    if (adaptiveMs !== undefined) {
+      raced = raceCap(raced, adaptiveMs, (ms) => new AdaptiveTimeoutError(item.targetUrl, ms));
+    }
+    return raced;
   } as PooledSender;
   // WR-165: wrap the built sender with the chaos drill when configured —
   // the wrapper delegates every attempt to the real sender and injects

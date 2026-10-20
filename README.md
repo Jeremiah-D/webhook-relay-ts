@@ -5118,6 +5118,38 @@ attempt-total-timeout behavior untouched. All values are positive
 integer milliseconds with at least one phase per entry; invalid
 entries throw `RangeError` at startup.
 
+#### Adaptive outbound timeout (WR-166)
+
+Opt-in per-attempt timeout derived from each endpoint's recent
+accepted→delivered latency instead of one static value
+(`src/adaptive-timeout.ts`, `adaptiveTimeout` on `retry` options):
+
+```ts
+const queue = new RetryQueue({
+  sender,
+  adaptiveTimeout: {
+    baseTimeoutMs: 5_000, // cold-start timeout before p99 data accumulates
+    marginRatio: 0.5, // timeout = p99 * 1.5 (default)
+    minTimeoutMs: 100, // floor (default)
+    maxTimeoutMs: 20_000, // ceiling, default 4x base
+    minSamples: 10, // samples before p99 kicks in (default)
+  },
+});
+```
+
+The timeout for an endpoint is `clamp(p99 * (1 + marginRatio), minTimeoutMs, maxTimeoutMs)` —
+slow endpoints get headroom against false kills, stable fast endpoints get
+tightened so a hung request cannot hold a pool slot. While cold (fewer than
+`minSamples` deliveries), the `baseTimeoutMs` applies.
+
+A timed-out attempt raises `AdaptiveTimeoutError`, which the queue routes to
+the normal retryable path — backoff, circuit breaker, and dead letter all see
+it as a regular timeout. This is deliberately distinct from the WR-99
+deadline-budget expiry, which is terminal (dead letter, no backoff): the
+adaptive timeout is a per-attempt SLO, not an end-to-end deadline. The
+default sender enforces it on HTTP/1.1 via an unref'd timer that destroys
+the in-flight request, and on H2/WS via the uniform dispatch race.
+
 ### Shadow-target dry-run mirroring
 
 Opt-in per-endpoint dry-run mirroring for the downstream-migration /
