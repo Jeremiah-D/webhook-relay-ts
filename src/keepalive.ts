@@ -4,6 +4,13 @@ import type { ClientRequest, ClientRequestArgs } from "node:http";
 import type { Socket } from "node:net";
 import type { LookupFunction } from "node:net";
 import { createHash } from "node:crypto";
+import {
+  makeHappyEyeballsCreateConnection,
+  resolveHappyEyeballsOptions,
+  type HappyEyeballsOptions,
+  type HappyEyeballsStats,
+  type ResolvedHappyEyeballsOptions,
+} from "./happy-eyeballs.ts";
 import { normalizePin } from "./pinning.ts";
 import { createProxiedAgent, proxyPoolKeyFragment } from "./proxy.ts";
 import { tlsSniPoolKeyFragment, type ResolvedTlsSniOverride } from "./tls-sni.ts";
@@ -113,6 +120,19 @@ export interface KeepAlivePoolOptions {
    */
   lookup?: LookupFunction;
   /**
+   * WR-164: opt-in Happy Eyeballs connection racing (RFC 8305) for new
+   * connections. When set, every new pooled connection races IPv6 and
+   * IPv4 addresses (IPv6 first, `connectionAttemptDelayMs` default 250ms
+   * before IPv4 joins) instead of Node's sequential connect — a dead
+   * IPv6 route stops dragging deliveries behind a handshake timeout.
+   * Racing covers TCP connect only; pooled reuse, TLS pin checks, mTLS
+   * identities, and OCSP/CA/SNI bindings are untouched. Unset = the
+   * historical sequential behavior, exactly as before. Proxied agents
+   * keep their CONNECT-tunnel `createConnection` (racing to the proxy
+   * is out of scope).
+   */
+  happyEyeballs?: HappyEyeballsOptions;
+  /**
    * WR-134: adaptive per-origin socket-cap sizing. Opt-in: the fixed
    * `maxSocketsPerHost` becomes the *initial* cap (clamped into
    * `[minSockets, maxSockets]`), and a background evaluator moves each
@@ -195,6 +215,8 @@ export interface ResolvedKeepAlivePoolOptions {
   lookup: LookupFunction | undefined;
   /** WR-134: resolved adaptive sizing; undefined when disabled. */
   adaptive: ResolvedAdaptiveSockets | undefined;
+  /** WR-164: resolved Happy Eyeballs racing; undefined when disabled. */
+  happyEyeballs: ResolvedHappyEyeballsOptions | undefined;
 }
 
 /** `AdaptiveSocketsOptions` with defaults applied (what the pool reads). */
@@ -228,7 +250,12 @@ export function resolveKeepAlivePoolOptions(
     throw new RangeError("OutboundConnectionPool: lookup must be a function");
   }
   const adaptive = resolveAdaptiveSockets(opts.adaptiveSockets, maxSocketsPerHost);
-  return { maxSocketsPerHost, maxFreeSockets, idleTimeoutMs, keepAliveMsecs, healthProbe, lookup, adaptive };
+  // WR-164: validate up front — a typo'd delay must fail at startup,
+  // never mid-delivery. The pool-level `lookup` (e.g. the WR-92 DNS
+  // cache) is the fallback resolver for the race; an explicit
+  // per-feature lookup wins.
+  const happyEyeballs = resolveHappyEyeballsOptions(opts.happyEyeballs, lookup);
+  return { maxSocketsPerHost, maxFreeSockets, idleTimeoutMs, keepAliveMsecs, healthProbe, lookup, adaptive, happyEyeballs };
 }
 
 /** WR-134: validate the opt-in adaptive sizing block; undefined when disabled. */
@@ -328,6 +355,11 @@ export interface KeepAlivePoolStats {
   reaped: number;
   probeHits: number;
   probeMisses: number;
+  /**
+   * WR-164: Happy Eyeballs race outcomes across the pool. Present only
+   * when `happyEyeballs` is enabled (the activity-gated convention).
+   */
+  happyEyeballs?: HappyEyeballsStats;
 }
 
 interface PoolEntry {
@@ -394,6 +426,8 @@ export class OutboundConnectionPool {
   private readonly reapTimer: ReturnType<typeof setInterval> | undefined;
   /** WR-134: adaptive cap evaluator; undefined when adaptive sizing is disabled. */
   private readonly adaptiveTimer: ReturnType<typeof setInterval> | undefined;
+  /** WR-164: race outcomes, shared by every raced agent in this pool. */
+  private readonly happyEyeballsStats: HappyEyeballsStats = { races: 0, v6Wins: 0, v4Wins: 0 };
 
   constructor(opts: KeepAlivePoolOptions = {}) {
     this.opts = resolveKeepAlivePoolOptions(opts);
@@ -538,6 +572,20 @@ export class OutboundConnectionPool {
           : scheme === "https"
             ? new HttpsAgent(agentOpts)
             : new HttpAgent(agentOpts);
+      // WR-164: `createConnection` is not an agent option — like the
+      // WR-27 proxied agents, it is assigned after construction. Raced
+      // agents get the Happy Eyeballs racer; proxied agents keep their
+      // CONNECT-tunnel createConnection (racing to the proxy is out of
+      // scope). The resolved options already carry the pool-level lookup
+      // as the race resolver, so a raced connection honors the WR-92
+      // DNS cache.
+      if (this.opts.happyEyeballs !== undefined && proxyUrl === undefined) {
+        agent.createConnection = makeHappyEyeballsCreateConnection(
+          scheme,
+          this.opts.happyEyeballs,
+          this.happyEyeballsStats
+        ) as typeof agent.createConnection;
+      }
       entry = { key, scheme, host, port, pinned, clientCert: clientCertId !== undefined, pinWhitelist, agent, seen: new WeakSet(), created: 0, reused: 0, reaped: 0, probeHits: 0, probeMisses: 0, currentMaxSockets: initialMax, lastScaleAtMs: 0, scaleUps: 0, scaleDowns: 0 };
       this.entries.set(key, entry);
       this.byAgent.set(agent, entry);
@@ -750,6 +798,9 @@ export class OutboundConnectionPool {
       reaped: endpoints.reduce((n, e) => n + e.reaped, 0),
       probeHits: endpoints.reduce((n, e) => n + e.probeHits, 0),
       probeMisses: endpoints.reduce((n, e) => n + e.probeMisses, 0),
+      // WR-164: only when the feature is on — a pool without racing
+      // exposes no new fields.
+      ...(this.opts.happyEyeballs !== undefined ? { happyEyeballs: { ...this.happyEyeballsStats } } : {}),
     };
   }
 

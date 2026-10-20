@@ -3978,6 +3978,46 @@ const server = createRelayServer({
   throw `RangeError` at startup. Absent by default: with no `dnsCache`
   configured, every connection uses the OS resolver.
 
+## Outbound Happy Eyeballs connection racing (opt-in, RFC 8305)
+
+In a dual-stack environment where IPv6 is routed but unusable, Node's
+default sequential connect tries the addresses in resolver order — and a
+dead IPv6 route makes every *new* connection pay a full handshake timeout
+before IPv4 is even attempted, dragging deliveries behind a black hole.
+`src/happy-eyeballs.ts` races the addresses instead (RFC 8305 §3.1),
+opt-in via the keep-alive pool:
+
+```ts
+const server = createRelayServer({
+  outboundKeepAlive: { happyEyeballs: { connectionAttemptDelayMs: 250 } },
+});
+```
+
+- **Race** — addresses are grouped by family and interleaved IPv6-first;
+  the first attempt starts immediately, and after the Connection Attempt
+  Delay (default 250ms, configurable) the next address joins while the
+  first is still pending. The first connected socket wins; every loser is
+  destroyed before the winner is handed to the delivery — a losing
+  attempt can never serve a request, and no extra connection is opened
+  when the first attempt wins instantly.
+- **Fail fast** — a refused address (ECONNREFUSED) starts the next
+  attempt immediately instead of waiting out the delay.
+- **Scope** — racing covers *new* TCP connections only. Pooled reuse,
+  TLS pin verification (WR-21, on `secureConnect`), mTLS client
+  identities (WR-36), OCSP/CA/SNI bindings, and the WR-92 DNS cache (the
+  race resolves through the pool's configured lookup) are untouched: the
+  pool installs the racer as the agent's `createConnection`, and for
+  `https:` the winning TCP socket is wrapped with the exact TLS options
+  the default agent would have used. Proxied agents keep their
+  CONNECT-tunnel `createConnection` — racing to the proxy is out of
+  scope.
+- **Observability** — `pool.getStats().happyEyeballs` reports
+  `races` / `v6Wins` / `v4Wins` (present only when the feature is on).
+- **Fail-fast** — an invalid `connectionAttemptDelayMs` throws
+  `RangeError` at pool construction. Absent by default: with no
+  `happyEyeballs` configured, new connections use Node's sequential
+  connect, exactly as before.
+
 ## Outbound TLS OCSP revocation checking (opt-in)
 
 TLS certificate pinning (`tlsPins`) answers "is this the server I
