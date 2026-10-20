@@ -230,7 +230,7 @@ import {
   type NegotiatedInboundDeflate,
   type ResolvedInboundWsOptions,
 } from "./inbound-ws.ts";
-import { decompressMessage } from "./deflate.ts";
+import { decompressMessage, WsInflateBombError } from "./deflate.ts";
 import { assertValidPins, normalizePin, spkiFingerprint, TlsPinMismatchError } from "./pinning.ts";
 import {
   assertValidClientCert,
@@ -10428,7 +10428,10 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // order against later uncompressed ones. A corrupt or truncated
     // compressed frame fails the connection on the WR-130 protocol-error
     // channel (1002); an inflated message past the reassembly cap fails
-    // with 1009 (decompression-bomb guard).
+    // with 1009 (decompression-bomb guard). WR-161 adds the inflate-time
+    // guard: a frame that expands past `maxInflatedBytes` is destroyed
+    // mid-accumulation and fails with 1009 before it can materialize as
+    // a full Buffer.
     let processQueue: Promise<void> = Promise.resolve();
     const deliverMessage = (msg: InboundWsMessage): void => {
       const run = async (): Promise<void> => {
@@ -10436,8 +10439,19 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         if ((msg.kind === "text" || msg.kind === "binary") && msg.compressed) {
           let data: Buffer;
           try {
-            data = await decompressMessage(msg.data);
-          } catch {
+            data = await decompressMessage(msg.data, wsOpts.permessageDeflate?.maxInflatedBytes);
+          } catch (err) {
+            if (err instanceof WsInflateBombError) {
+              opts.auditLog.append({
+                event: "rejected",
+                id: randomUUID(),
+                traceId: connTraceId,
+                reason: "ws_inflate_bomb",
+                path: wsOpts.path,
+              });
+              tearDown("inflate_bomb", 1009, "decompressed message exceeds maxInflatedBytes");
+              return;
+            }
             opts.auditLog.append({
               event: "rejected",
               id: randomUUID(),

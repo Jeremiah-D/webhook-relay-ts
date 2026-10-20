@@ -1017,7 +1017,8 @@ reliability primitives that matter for any signed-payload pipeline.
   (`ws_connected` / `ws_disconnected` / `rejected` / `accepted`).
   Opt-in permessage-deflate (WR-152, RFC 7692, real-time systems): set
   `inboundWs.permessageDeflate` (`true` for defaults, `{ thresholdBytes? }`
-  to tune when *outbound* acks compress, default 1024) and the endpoint
+  to tune when *outbound* acks compress, default 1024, `{ maxInflatedBytes? }`
+  to cap one decompressed message, default 8MiB) and the endpoint
   negotiates compression in the upgrade handshake — strictly, like the
   WR-46 outbound convention: the client's offer must carry both
   `client_no_context_takeover` and `server_no_context_takeover`, or the
@@ -1027,12 +1028,19 @@ reliability primitives that matter for any signed-payload pipeline.
   RSV1 then marks compressed data frames (first frame only, never on
   control frames); the server inflates them with the `src/deflate.ts`
   primitives and answers large acks compressed the same way —
-  opportunistic per message, never expanding the wire. Covered by
-  `test/inbound-ws-deflate.test.ts` against raw sockets.
+  opportunistic per message, never expanding the wire. Backend-engineering
+  security (WR-161): the inflate accumulator accounts every output chunk
+  and destroys the stream the moment it passes `maxInflatedBytes` — a
+  decompression bomb (tiny frame expanding past the cap) never
+  materializes as a Buffer; the connection closes with 1009 and the
+  attempt is audited as `rejected` / `ws_inflate_bomb`. Covered by
+  `test/inbound-ws-deflate.test.ts` and `test/ws-inflate-bomb.test.ts`
+  against raw sockets.
 - `src/deflate.ts` — WebSocket permessage-deflate (RFC 7692, WR-46),
   opt-in per pool via the `permessageDeflate` WebSocket option (`true` for
   defaults, `{ thresholdBytes? }` to tune the payload size at which
-  compression kicks in, default 1024). When enabled, the upgrade request
+  compression kicks in, default 1024, `{ maxInflatedBytes? }` to cap one
+  decompressed message, default 8MiB). When enabled, the upgrade request
   offers `permessage-deflate` with both no-context-takeover parameters
   **required** (`client_no_context_takeover; server_no_context_takeover`);
   a downstream that answers without them fails the handshake (plain
@@ -1051,7 +1059,14 @@ reliability primitives that matter for any signed-payload pipeline.
   control frame fails the delivery as a protocol violation. A compressed
   reply truncated at `maxMessageBytes` fails the delivery — a partial
   deflate stream can neither be inflated nor truncated safely, so the
-  truncation contract applies to plain text only. `getStats()` exposes
+  truncation contract applies to plain text only. Decompression-bomb
+  guard (WR-161, backend-engineering security): `decompressMessage`
+  accounts every inflated chunk during the accumulation drain and
+  destroys the stream the moment the running total passes
+  `maxInflatedBytes`, rejecting with `WsInflateBombError` — a tiny frame
+  that expands past the cap never materializes as a Buffer, and the
+  inbound intake answers it with a 1009 close plus a
+  `rejected` / `ws_inflate_bomb` audit event. `getStats()` exposes
   `deflatedOut` / `deflatedIn` counters. Covered by
   `test/websocket-deflate.test.ts` (negotiation matrix, RFC 7692 wire-form
   round-trips, threshold/never-expand rules, and a raw-socket stub server

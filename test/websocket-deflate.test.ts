@@ -17,9 +17,16 @@ import {
 test("resolvePerMessageDeflate: true/false/undefined/object", () => {
   assert.equal(resolvePerMessageDeflate(undefined), undefined);
   assert.equal(resolvePerMessageDeflate(false), undefined);
-  assert.deepEqual(resolvePerMessageDeflate(true), { thresholdBytes: 1024 });
-  assert.deepEqual(resolvePerMessageDeflate({}), { thresholdBytes: 1024 });
-  assert.deepEqual(resolvePerMessageDeflate({ thresholdBytes: 1 }), { thresholdBytes: 1 });
+  assert.deepEqual(resolvePerMessageDeflate(true), { thresholdBytes: 1024, maxInflatedBytes: 8388608 });
+  assert.deepEqual(resolvePerMessageDeflate({}), { thresholdBytes: 1024, maxInflatedBytes: 8388608 });
+  assert.deepEqual(resolvePerMessageDeflate({ thresholdBytes: 1 }), {
+    thresholdBytes: 1,
+    maxInflatedBytes: 8388608,
+  });
+  assert.deepEqual(resolvePerMessageDeflate({ maxInflatedBytes: 4096 }), {
+    thresholdBytes: 1024,
+    maxInflatedBytes: 4096,
+  });
   for (const bad of [0, -5, 1.5, Number.NaN, "1024", null, []] as unknown[]) {
   assert.throws(
       () => resolvePerMessageDeflate({ thresholdBytes: bad as number }),

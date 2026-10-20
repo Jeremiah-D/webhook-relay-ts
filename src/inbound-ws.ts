@@ -373,7 +373,9 @@ export interface InboundWsOptions {
   /**
    * Opt in to RFC 7692 permessage-deflate for the inbound intake
    * (WR-152): `true` for defaults, `{ thresholdBytes? }` to tune the
-   * payload size at which *outbound* acks compress (default 1024).
+   * payload size at which *outbound* acks compress (default 1024),
+   * `{ maxInflatedBytes? }` to cap one decompressed message
+   * (decompression-bomb guard, WR-161, default 8MiB).
    * Default: off — the endpoint stays plain RFC 6455 unless the client
    * offers permessage-deflate *and* this is enabled. Invalid values
    * throw `RangeError` at startup. When enabled, the server side of the

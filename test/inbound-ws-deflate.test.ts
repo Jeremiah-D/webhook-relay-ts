@@ -251,13 +251,14 @@ describe("resolveInboundWsOptions permessageDeflate (WR-152)", () => {
   it("enables with defaults on `true`", () => {
     assert.deepEqual(resolveInboundWsOptions({ permessageDeflate: true }).permessageDeflate, {
       thresholdBytes: 1024,
+      maxInflatedBytes: 8388608,
     });
   });
 
   it("honors an explicit thresholdBytes", () => {
     assert.deepEqual(
       resolveInboundWsOptions({ permessageDeflate: { thresholdBytes: 2048 } }).permessageDeflate,
-      { thresholdBytes: 2048 }
+      { thresholdBytes: 2048, maxInflatedBytes: 8388608 }
     );
   });
 

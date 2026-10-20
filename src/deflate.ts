@@ -46,6 +46,14 @@ const DEFLATE_TRAILER = Buffer.from([0x00, 0x00, 0xff, 0xff]);
 /** Default payload size (bytes) at which permessage-deflate kicks in. */
 export const DEFAULT_DEFLATE_THRESHOLD_BYTES = 1024;
 
+/**
+ * Default cap (bytes) on the inflated output of one decompressed
+ * message (WR-161). 8MiB sits far above any legitimate event envelope
+ * while keeping a decompression bomb cheap to reject — the output
+ * accumulator short-circuits instead of building an unbounded Buffer.
+ */
+export const DEFAULT_MAX_INFLATED_BYTES = 8 * 1024 * 1024;
+
 /** Tuning for permessage-deflate. Presence of the option object (or `true`) opts in. */
 export interface PerMessageDeflateOptions {
   /**
@@ -53,11 +61,21 @@ export interface PerMessageDeflateOptions {
    * positive integer.
    */
   thresholdBytes?: number;
+  /**
+   * Cap on the inflated bytes of one decompressed message
+   * (decompression-bomb guard, WR-161). Default: 8MiB. Must be a
+   * positive integer. The output accumulator checks every chunk and
+   * aborts the inflate as soon as the running total passes the cap —
+   * a small compressed frame that expands past it never materializes
+   * as a full Buffer.
+   */
+  maxInflatedBytes?: number;
 }
 
 /** Validated deflate options, or `undefined` when the extension is off. */
 export interface ResolvedPerMessageDeflate {
   thresholdBytes: number;
+  maxInflatedBytes: number;
 }
 
 /**
@@ -69,7 +87,11 @@ export function resolvePerMessageDeflate(
   opt: boolean | PerMessageDeflateOptions | undefined
 ): ResolvedPerMessageDeflate | undefined {
   if (opt === undefined || opt === false) return undefined;
-  if (opt === true) return { thresholdBytes: DEFAULT_DEFLATE_THRESHOLD_BYTES };
+  if (opt === true)
+    return {
+      thresholdBytes: DEFAULT_DEFLATE_THRESHOLD_BYTES,
+      maxInflatedBytes: DEFAULT_MAX_INFLATED_BYTES,
+    };
   if (opt === null || typeof opt !== "object" || Array.isArray(opt)) {
     throw new RangeError("permessageDeflate must be a boolean or an options object");
   }
@@ -82,7 +104,14 @@ export function resolvePerMessageDeflate(
       `permessageDeflate.thresholdBytes must be a positive integer, got ${JSON.stringify(opt.thresholdBytes)}`
     );
   }
-  return { thresholdBytes };
+  const maxInflatedBytes =
+    opt.maxInflatedBytes === undefined ? DEFAULT_MAX_INFLATED_BYTES : opt.maxInflatedBytes;
+  if (!Number.isInteger(maxInflatedBytes) || maxInflatedBytes <= 0) {
+    throw new RangeError(
+      `permessageDeflate.maxInflatedBytes must be a positive integer, got ${JSON.stringify(opt.maxInflatedBytes)}`
+    );
+  }
+  return { thresholdBytes, maxInflatedBytes };
 }
 
 /** Parameters the relay honors from the server's extension response. */
@@ -194,16 +223,50 @@ export function compressMessage(payload: Buffer, windowBits = 15): Promise<Buffe
 }
 
 /**
+ * One inflate's output passed `maxInflatedBytes` (WR-161): the peer
+ * sent a decompression bomb. The accumulator already destroyed the
+ * stream, so the caller must fail the connection (1009) instead of
+ * retrying the message.
+ */
+export class WsInflateBombError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "WsInflateBombError";
+  }
+}
+
+/**
  * Decompress one RSV1 message: append the `00 00 ff ff` trailer stripped
  * by the compressor, then inflate with a fresh context (the server
  * negotiated `server_no_context_takeover`, so messages are independent).
  * Rejects on corrupt input — a tampered compressed frame fails the
  * delivery instead of producing garbage bytes.
+ *
+ * WR-161 decompression-bomb guard: `maxInflatedBytes` (default 8MiB)
+ * caps the inflated output. Every output chunk is accounted during the
+ * accumulation drain and the inflate is destroyed the moment the
+ * running total passes the cap, so a small compressed frame that
+ * expands past it never materializes as a full Buffer. Rejects with
+ * {@link WsInflateBombError} in that case, `RangeError` on an illegal
+ * cap.
  */
-export function decompressMessage(payload: Buffer): Promise<Buffer> {
+
+export function decompressMessage(
+  payload: Buffer,
+  maxInflatedBytes: number = DEFAULT_MAX_INFLATED_BYTES
+): Promise<Buffer> {
   return new Promise<Buffer>((resolve, reject) => {
+    if (!Number.isInteger(maxInflatedBytes) || maxInflatedBytes <= 0) {
+      reject(
+        new RangeError(
+          `websocket: maxInflatedBytes must be a positive integer, got ${JSON.stringify(maxInflatedBytes)}`
+        )
+      );
+      return;
+    }
     const inflate = createInflateRaw();
     const chunks: Buffer[] = [];
+    let inflatedBytes = 0;
     inflate.on("error", (err) => {
       inflate.destroy();
       reject(new Error(`websocket: permessage-deflate decompression failed: ${err.message}`));
@@ -214,7 +277,23 @@ export function decompressMessage(payload: Buffer): Promise<Buffer> {
       inflate.write(DEFLATE_TRAILER, () => {
         inflate.flush(zlibConstants.Z_SYNC_FLUSH, () => {
           let chunk: Buffer | null;
-          while ((chunk = inflate.read()) !== null) chunks.push(chunk);
+          // Drain synchronously: at flush completion every output byte is
+          // already in the readable buffer, so read() cannot miss any.
+          // Account each chunk as it lands — the WR-161 bomb guard fires
+          // during accumulation, before the pieces are concatenated.
+          while ((chunk = inflate.read()) !== null) {
+            inflatedBytes += chunk.length;
+            if (inflatedBytes > maxInflatedBytes) {
+              inflate.destroy();
+              reject(
+                new WsInflateBombError(
+                  `websocket: permessage-deflate output exceeds maxInflatedBytes ${maxInflatedBytes}`
+                )
+              );
+              return;
+            }
+            chunks.push(chunk);
+          }
           inflate.destroy();
           resolve(Buffer.concat(chunks));
         });
