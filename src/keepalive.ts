@@ -443,7 +443,7 @@ export class OutboundConnectionPool {
    * override entry pass `undefined` and keep the exact historical pool
    * keys.
    */
-  agentFor(url: URL, pins?: readonly string[], proxyUrl?: string, clientCertId?: string, tlsSni?: ResolvedTlsSniOverride, minTlsVersion?: MinTlsVersion, ocsp?: boolean): HttpAgent {
+  agentFor(url: URL, pins?: readonly string[], proxyUrl?: string, clientCertId?: string, tlsSni?: ResolvedTlsSniOverride, minTlsVersion?: MinTlsVersion, ocsp?: boolean, caBundle?: string): HttpAgent {
     if (url.protocol !== "http:" && url.protocol !== "https:") {
       throw new Error(`OutboundConnectionPool: unsupported protocol ${url.protocol}`);
     }
@@ -474,6 +474,15 @@ export class OutboundConnectionPool {
     // session carrying no certificate at all) can never silently serve
     // an endpoint that must check revocation.
     if (ocsp === true) key += "|ocsp";
+    // WR-163: a private-CA endpoint gets its own agent — a connection
+    // handshaked against the private bundle must never serve an endpoint
+    // that relies on the public PKI (a reused connection skips the
+    // handshake, so the chain check would silently not run), or vice
+    // versa. The bundle is hashed, never embedded in the key.
+    if (caBundle !== undefined) {
+      const digest = createHash("sha256").update(caBundle).digest("hex").slice(0, 16);
+      key += `|ca:${digest}`;
+    }
     let entry = this.entries.get(key);
     if (entry === undefined) {
       // WR-134: the fixed cap is the *initial* cap, clamped into
@@ -517,6 +526,11 @@ export class OutboundConnectionPool {
         // that disable stapling (`useStapled: false`) still get their own
         // agent (resumption stays off) and check via the responder.
         ...(ocsp === true && scheme === "https" ? { requestOCSP: true } : {}),
+        // WR-163: the private CA bundle rides every handshake this agent
+        // opens, so a pooled connection is always handshaked under the
+        // trust store its endpoint was resolved with (the pool key binds
+        // this; per-request `ca` in the sender covers one-off agents).
+        ...(caBundle !== undefined && scheme === "https" ? { ca: caBundle } : {}),
       };
       const agent: HttpAgent =
         proxyUrl !== undefined

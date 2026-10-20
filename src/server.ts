@@ -231,7 +231,7 @@ import {
   type ResolvedInboundWsOptions,
 } from "./inbound-ws.ts";
 import { decompressMessage, WsInflateBombError } from "./deflate.ts";
-import { assertValidPins, normalizePin, spkiFingerprint, TlsPinMismatchError } from "./pinning.ts";
+import { assertValidCaBundle, assertValidPins, normalizePin, spkiFingerprint, TlsPinMismatchError } from "./pinning.ts";
 import {
   assertValidClientCert,
   clientCertIdentity,
@@ -452,6 +452,14 @@ export interface ShadowTargetServerConfig {
    * startup.
    */
   tlsPins?: string[];
+  /**
+   * Independent private-CA trust bundle for this shadow target (WR-163)
+   * — a PEM bundle string, verified against the shadow downstream's
+   * chain. The shadow sender is a separate copy, so it is configured
+   * here, not in the top-level `tlsCa`. Invalid bundles throw
+   * `RangeError` at startup.
+   */
+  tlsCa?: string;
   /**
    * Independent mTLS client identity for this shadow target (WR-36) —
    * the shadow sender presents this certificate during the TLS
@@ -749,6 +757,31 @@ export interface RelayServerOptions {
    * whitelists and malformed pins throw `RangeError` at startup.
    */
   tlsPins?: Record<string, string[]>;
+  /**
+   * Outbound private-CA trust bundles (WR-163; see `src/pinning.ts`):
+   * per-endpoint PEM CA bundle, keyed by exact delivery `targetUrl`. The
+   * value is a PEM *string* (one or more `CERTIFICATE` blocks) held in
+   * memory — no file paths, so rotation is a config change. When set for
+   * an endpoint, Node verifies the downstream's chain against the bundle
+   * instead of the public PKI: this is what makes private-PKI downstreams
+   * (self-signed roots, enterprise CAs) reachable — without it, Node
+   * rejects the chain before a single payload byte is written.
+   * Orthogonal to `tlsPins` (WR-21): the bundle builds *chain trust*,
+   * pins anchor *identity*; when both are set for an endpoint the chain
+   * is verified against the bundle first and the SPKI pin check runs on
+   * `secureConnect` after. The keep-alive pool keys connections by
+   * (origin, proxy, pins, client-cert, ca), so a connection handshaked
+   * against one trust store can never serve an endpoint using another.
+   * Invalid bundles (no `CERTIFICATE` block, unparseable DER) throw
+   * `RangeError` at startup. Endpoints without an entry keep the default
+   * Node TLS verification. `https:` targets only — `wss:` targets keep
+   * the WR-21/WR-45 pinning handshake, and a CA-configured endpoint
+   * never rides the opt-in HTTP/2 pool (the WR-101 OCSP precedent: the
+   * H2 session pool owns its own handshake and takes no `ca`, so the
+   * endpoint falls back to HTTP/1.1 where the bundle rides the
+   * handshake).
+   */
+  tlsCa?: Record<string, string>;
   /**
    * Outbound mTLS client certificates (see `src/mtls.ts`): per-endpoint
    * client identity, keyed by exact delivery `targetUrl`. Each entry is a
@@ -2350,7 +2383,14 @@ export function createDefaultSender(
    * startup (`RangeError`); `undefined` keeps the exact pre-WR-143
    * behavior.
    */
-  phaseTimeouts?: Record<string, PhaseTimeoutBudgets>
+  phaseTimeouts?: Record<string, PhaseTimeoutBudgets>,
+  /**
+   * WR-163: per-endpoint private CA bundle (see the `tlsCa` server
+   * option): `{ "<exact targetUrl>": "<PEM bundle string>" }`. Validated
+   * at startup (`RangeError`); `undefined` keeps the exact pre-WR-163
+   * behavior.
+   */
+  tlsCa?: Record<string, string>
 ): PooledSender {
   if (tlsPins !== undefined) {
     for (const [endpoint, pins] of Object.entries(tlsPins)) {
@@ -2359,6 +2399,19 @@ export function createDefaultSender(
       } catch (err) {
         throw new RangeError(
           `createDefaultSender: invalid TLS pins for ${endpoint}: ${(err as Error).message}`
+        );
+      }
+    }
+  }
+  // WR-163: fail fast on a bundle Node could never build a chain with —
+  // a typo must not silently leave an endpoint unreachable.
+  if (tlsCa !== undefined) {
+    for (const [endpoint, pem] of Object.entries(tlsCa)) {
+      try {
+        assertValidCaBundle(pem);
+      } catch (err) {
+        throw new RangeError(
+          `createDefaultSender: invalid TLS CA bundle for ${endpoint}: ${(err as Error).message}`
         );
       }
     }
@@ -3128,7 +3181,15 @@ export function createDefaultSender(
      * `runWithClientCert`, which destroys the in-flight request when
      * the signal fires. H2/WS paths ignore it (best effort).
      */
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    /**
+     * WR-163: per-endpoint private CA bundle for this delivery
+     * (`undefined` when the endpoint has no `tlsCa` entry). Bound into
+     * the keep-alive pool key and passed as the handshake's `ca`, so
+     * every connection serving this endpoint chains to the same trust
+     * store.
+     */
+    caBundle?: string
   ): Promise<DownstreamResponse | void> => {
     // WR-75: the guarded 415→plaintext fallback needs the compression
     // decision outside the attempt promise. The decision is deterministic
@@ -3228,7 +3289,11 @@ export function createDefaultSender(
             // requested, resumption off) — a connection handshaked
             // without revocation telemetry can never silently serve
             // them.
-            ocsp !== undefined
+            ocsp !== undefined,
+            // WR-163: the CA bundle binds the pool key (see agentFor) —
+            // a connection handshaked against the private bundle can
+            // never serve an endpoint on the public PKI, or vice versa.
+            caBundle
           ) ??
           (proxyUrl !== undefined
             ? (oneOffAgent = createProxiedAgent(
@@ -3368,7 +3433,17 @@ export function createDefaultSender(
                   // WR-92: one-off (unpooled) requests resolve through the
                   // DNS cache too — same stale-while-revalidate as pooled.
                   ...(dnsLookup !== undefined ? { lookup: dnsLookup } : {}),
-                  ...(pins ? { rejectUnauthorized: false } : {}),
+                  // WR-163: per-endpoint private CA bundle — Node verifies
+                  // the chain against it (`rejectUnauthorized` stays on),
+                  // so with pins also configured this is chain-first: a
+                  // chain failure kills the handshake before the pin
+                  // check below runs. Pins alone keep the pre-WR-163
+                  // behavior (`rejectUnauthorized: false`) where the pin
+                  // whitelist replaces PKI verification entirely.
+                  ...(caBundle !== undefined ? { ca: caBundle } : {}),
+                  ...(pins !== undefined && caBundle === undefined
+                    ? { rejectUnauthorized: false }
+                    : {}),
                   // WR-60: per-endpoint TLS SNI/ALPN override. `servername`
                   // and `ALPNProtocols` flow through the agent's
                   // `createConnection` into `tls.connect` — the pooled
@@ -4120,6 +4195,11 @@ export function createDefaultSender(
           // without pins in its record) falls back to the static config.
           (endpointRegistry?.getTlsPins(item.targetUrl) ?? tlsPins?.[item.targetUrl])
         : undefined;
+    // WR-163: per-endpoint private CA bundle (exact targetUrl match,
+    // `https:` only — the wss: path keeps its pinning-only handshake and
+    // the opt-in HTTP/2 pool does not take the bundle). `undefined` for
+    // endpoints without an entry keeps the exact pre-WR-163 behavior.
+    const caBundle = url.protocol === "https:" ? tlsCa?.[item.targetUrl] : undefined;
     // mTLS client identity for this endpoint (exact targetUrl match):
     // the certificate is presented during the TLS handshake so the
     // downstream can verify the relay. Off by default — endpoints without
@@ -4229,16 +4309,20 @@ export function createDefaultSender(
       // WR-143: a phase-timeout endpoint is likewise kept off H2 — a
       // multiplexed session has no per-request connect/tls/firstByte
       // phases to budget, so H2 would silently skip the budgets.
-      if (h2pool !== undefined && proxyUrl === undefined && ocsp === undefined && phaseTimeout === undefined && h2pool.eligibleFor(url)) {
+      // WR-163: a CA-bundle endpoint is likewise kept off H2 — the H2
+      // session pool owns its own handshake and takes no `ca`, so H2
+      // would fail the chain it was configured to trust. HTTP/1.1
+      // instead, where the bundle rides the handshake.
+      if (h2pool !== undefined && proxyUrl === undefined && ocsp === undefined && phaseTimeout === undefined && caBundle === undefined && h2pool.eligibleFor(url)) {
         return deliverViaHttp2(item, url, pins, clientCert, tlsSni, minTlsVersion, clientCertRotation, oauthToken).catch((err) => {
           if (err instanceof Http2UnavailableError) {
             h2pool!.noteFallback();
-            return deliverViaHttp1(item, url, pins, clientCert, proxyUrl, tlsSni, minTlsVersion, clientCertRotation, ocsp, oauthToken, phaseTimeout, callOpts?.signal);
+            return deliverViaHttp1(item, url, pins, clientCert, proxyUrl, tlsSni, minTlsVersion, clientCertRotation, ocsp, oauthToken, phaseTimeout, callOpts?.signal, caBundle);
           }
           throw err;
         });
       }
-      return deliverViaHttp1(item, url, pins, clientCert, proxyUrl, tlsSni, minTlsVersion, clientCertRotation, ocsp, oauthToken, phaseTimeout, callOpts?.signal);
+      return deliverViaHttp1(item, url, pins, clientCert, proxyUrl, tlsSni, minTlsVersion, clientCertRotation, ocsp, oauthToken, phaseTimeout, callOpts?.signal, caBundle);
     };
     // WR-129: resolve the bearer value once per delivery attempt
     // (cached); a 401 forces exactly one refresh + redelivery inside the
@@ -4936,7 +5020,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   }
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, opts.awsSigV4, opts.awsSecretResolver, opts.outboundSchemas, opts.oauth2, undefined, opts.compressBrotli, opts.phaseTimeouts)
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, opts.awsSigV4, opts.awsSecretResolver, opts.outboundSchemas, opts.oauth2, undefined, opts.compressBrotli, opts.phaseTimeouts, opts.tlsCa)
       : undefined;
   // WR-146: tail-latency hedging for outbound attempts (opt-in). The
   // wrapper sits around whichever sender the queue uses — the default
@@ -5103,7 +5187,11 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
                   undefined,
                   // WR-142: like the gzip compressions, the brotli
                   // config mirrors onto shadow senders.
-                  opts.compressBrotli
+                  opts.compressBrotli,
+                  // phaseTimeouts stay off for shadow copies (pre-existing);
+                  // the trailing slot is the WR-163 tlsCa record.
+                  undefined,
+                  t.tlsCa !== undefined ? { [t.targetUrl]: t.tlsCa } : undefined
                 ),
               })
             ),

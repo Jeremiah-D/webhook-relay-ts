@@ -99,3 +99,59 @@ export function pinMatches(certDer: Buffer, pins: readonly string[]): boolean {
   const presented = spkiFingerprint(certDer);
   return pins.some((p) => normalizePin(p) === presented);
 }
+
+/**
+ * Outbound private-CA trust bundle (WR-163).
+ *
+ * Validate a PEM CA bundle the way a constructor would: it must contain at
+ * least one `CERTIFICATE` block whose DER parses as an X.509 certificate.
+ * Throws `RangeError` on the first problem so a bad config fails at
+ * startup, never mid-delivery.
+ *
+ * Semantics (see the `tlsCa` server option): the bundle is per-endpoint and
+ * opt-in. It composes with — rather than replaces — the WR-21 pin
+ * whitelist:
+ *
+ * - CA bundle only: Node verifies the server's chain against the bundle
+ *   (`rejectUnauthorized` stays on). This is what makes private-PKI
+ *   downstreams (self-signed roots, enterprise CAs) reachable — without
+ *   the bundle, Node rejects the chain before any application byte is
+ *   written (pinning deliberately cannot hook `checkServerIdentity`).
+ * - Pins only: unchanged WR-21 behavior — the pin whitelist *replaces*
+ *   PKI chain verification (`rejectUnauthorized: false`); the pin is the
+ *   trust anchor.
+ * - Both: layered — the chain is verified against the private bundle
+ *   first, then the SPKI pin check runs on `secureConnect`. A chain
+ *   failure and a pin mismatch stay distinguishable in the audit trail
+ *   (TLS alert vs `TlsPinMismatchError`).
+ */
+export function assertValidCaBundle(pem: string): void {
+  if (typeof pem !== "string" || pem.trim().length === 0) {
+    throw new RangeError("TLS CA bundle must be a non-empty PEM string");
+  }
+  const blocks = [...pem.matchAll(/-----BEGIN CERTIFICATE-----([\s\S]*?)-----END CERTIFICATE-----/g)];
+  if (blocks.length === 0) {
+    throw new RangeError("TLS CA bundle contains no PEM CERTIFICATE block");
+  }
+  for (const block of blocks) {
+    const b64 = block[1].replace(/\s+/g, "");
+    if (b64.length === 0 || !/^[A-Za-z0-9+/=]+$/.test(b64)) {
+      throw new RangeError("TLS CA bundle contains a CERTIFICATE block with invalid base64");
+    }
+    // Node's base64 decoder is lenient (never throws); the charset guard
+    // above plus the DER parse below are the real validation.
+    const der = Buffer.from(b64, "base64");
+    if (der.length === 0) {
+      throw new RangeError("TLS CA bundle contains an empty CERTIFICATE block");
+    }
+    try {
+      // The constructor throws on unparseable DER — a garbled block must
+      // fail at config time, not when the first delivery handshakes.
+      new X509Certificate(der);
+    } catch {
+      throw new RangeError(
+        "TLS CA bundle contains a CERTIFICATE block that is not a parseable X.509 certificate"
+      );
+    }
+  }
+}

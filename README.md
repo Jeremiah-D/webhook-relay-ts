@@ -688,6 +688,21 @@ reliability primitives that matter for any signed-payload pipeline.
   `dead_letter` with the pin error. Endpoints without pins keep Node's default
   TLS verification. Empty whitelists and malformed pins throw `RangeError` at
   startup, never mid-delivery. Zero dependencies (`node:crypto` only).
+- Outbound private-CA trust bundles (`tlsCa: { "<exact targetUrl>": "<PEM bundle>" }`,
+  also exposed as `createRelayServer({ tlsCa })`): per-endpoint opt-in for
+  private-PKI downstreams (self-signed roots, enterprise CAs). The value is a
+  PEM *string* (one or more `CERTIFICATE` blocks) held in memory — no file
+  paths, so rotation is a config change. When set for an endpoint, Node
+  verifies the downstream's chain against the bundle instead of the public
+  PKI. Orthogonal to `tlsPins`: the bundle builds *chain trust*, pins anchor
+  *identity*; when both are set for an endpoint the chain is verified against
+  the bundle first and the SPKI pin check runs on `secureConnect` after
+  (layered, not either/or). The keep-alive pool keys connections by (origin,
+  proxy, pins, client-cert, ca), so a connection handshaked against one trust
+  store can never serve an endpoint using another. A CA-configured endpoint
+  never rides the opt-in HTTP/2 pool (falls back to HTTP/1.1, where the bundle
+  rides the handshake). Invalid bundles throw `RangeError` at startup.
+  `https:` targets only — `wss:` targets keep the pinning handshake.
 - `src/mtls.ts` — outbound mTLS client certificates: a per-endpoint client
   identity (`tlsClientCerts: { "<exact targetUrl>": { cert, key, passphrase? } }`,
   also exposed as `createRelayServer({ tlsClientCerts })` and the fifth
@@ -4586,6 +4601,15 @@ records the same event stream durably, while the audit log (`GET /audit`)
 records operator actions; the three surfaces are complementary, not
 redundant.
 
+**Stream subscription filters (opt-in):** `GET /events` accepts `?endpoint=`
+(exact match on the event's `targetUrl`, same semantics as
+`GET /events/archive`) and `?event=` (one of `delivered` / `retrying` /
+`dead_letter`; any other value answers `400` with an `invalid event` body,
+same as the archive). All filters are ANDed with the `?tenant=` filter and
+applied server-side before emit, so a high-traffic operator connection only
+receives what it asked for; the `Last-Event-ID` replay path below applies the
+same filters to the replayed events.
+
 **Stream resume (`Last-Event-ID`, opt-in):** with `eventArchive` configured
 *and* `events: { sseReplay: true }`, every frame carries an `id:` field with
 the archiver-assigned monotonic `eventSeq` (dense, strictly increasing
@@ -5345,6 +5369,12 @@ Requires Node 24+ (runs `.ts` directly via type stripping; zero dependencies).
   `DeliveryEventArchiver` sequence unit tests: dense seq assignment +
   event stamping, `eventsAfter`, cross-restart continuation, one-time
   resequence of pre-WR-123 lines, retention advancing the cursor range.
+- `test/sse-filter.test.ts` — `GET /events` subscription filters (WR-162,
+  5 tests): `400 invalid event` on an invalid `?event=` value;
+  `?event=` filtering live frames by delivery-event kind; `?endpoint=`
+  matching the exact `targetUrl` only (no substring matching);
+  `?event=` + `?endpoint=` ANDing; the `Last-Event-ID` replay path
+  applying the same filters.
 - `test/operator-keys.test.ts` — scoped operator API keys (`operatorKeys`):
   `read` keys reach every read-only operator path with byte-identical
   response bodies but get 403 on every mutating path; `admin` keys read and
@@ -5400,6 +5430,17 @@ Requires Node 24+ (runs `.ts` directly via type stripping; zero dependencies).
   same origin never sharing a pool; concurrent pinned handshakes never
   resuming TLS sessions (every pinned handshake is full, so the pin check
   always sees the peer certificate).
+- `test/ca-bundle.test.ts` — outbound private-CA bundles (WR-163, 13
+  tests): `assertValidCaBundle` unit checks (single/multi-cert bundles
+  accepted; empty, non-PEM, non-certificate, and garbled blocks rejected
+  at config time); real TLS handshakes through `createDefaultSender` — a
+  configured bundle chains the private-CA downstream and delivers, the
+  chain fails without it or with the wrong bundle, bundle + matching pin
+  composes (chain first, then pin), bundle + wrong pin fails with
+  `TlsPinMismatchError`; keep-alive pool key binds the trust store (same
+  origin with different bundles gets different agents); end-to-end
+  through the relay server (`tlsCa` option reaches the downstream, an
+  invalid bundle fails the relay at startup).
 - `test/probe.test.ts` — the keep-alive health probe (9 tests):
   `RangeError` on non-boolean `healthProbe`; `isSocketReusable` unit checks
   (live socket passes, destroyed and peer half-closed sockets fail);
