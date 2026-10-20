@@ -49,6 +49,12 @@ import {
   type CorsPolicy,
   type ResolvedCorsPolicy,
 } from "./cors.ts";
+import {
+  assertValidHttpHardening,
+  applyHttpHardening,
+  type HttpHardeningOptions,
+  type ResolvedHttpHardening,
+} from "./http-hardening.ts";
 import type { OrderedAuditEvent, OrderedModeOptions } from "./retry.ts";
 import { parseCronExpression, CRON_HEADER } from "./cron.ts";
 import type { CompletionCallbackOptions } from "./callback.ts";
@@ -1737,6 +1743,21 @@ export interface RelayServerOptions {
    * behavior change. Invalid config throws `RangeError` at startup.
    */
   cors?: CorsPolicy;
+  /**
+   * Inbound HTTP server timeout hardening (WR-160; see
+   * `src/http-hardening.ts`): `{ headersTimeoutMs, requestTimeoutMs,
+   * maxHeaderSizeBytes }` applied to every listener the relay binds
+   * (intake + operator, HTTP and HTTPS alike). Slow headers / slow body
+   * are answered 408 and audited as `rejected` with reason
+   * `http_timeout`; oversized headers are answered 431. The timeout is
+   * enforced inbound-side: a timed-out request never reaches the intake
+   * pipeline, so it burns no retry budget and never trips the breaker.
+   * Unset fields keep Node's defaults (headers: min(requestTimeout,
+   * 60000); request: 300000; max header size: 16384) — fully unconfigured
+   * means zero behavior change. Invalid config throws `RangeError` at
+   * startup.
+   */
+  httpHardening?: HttpHardeningOptions;
   /**
    * Per-tenant inbound rate limiting (see
    * `src/tenant-inbound-ratelimit.ts`): a token bucket per `x-tenant-id`
@@ -4610,6 +4631,14 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     corsPolicy = assertValidCorsPolicy(opts.cors);
   } catch (err) {
     throw new RangeError(`createRelayServer: invalid cors config: ${(err as Error).message}`);
+  }
+  // WR-160: inbound HTTP server timeout hardening — validated once at
+  // startup (`undefined` = Node defaults, zero behavior change).
+  let hardening: ResolvedHttpHardening | undefined;
+  try {
+    hardening = assertValidHttpHardening(opts.httpHardening);
+  } catch (err) {
+    throw new RangeError(`createRelayServer: invalid httpHardening config: ${(err as Error).message}`);
   }
   // WR-130: inbound WebSocket intake — validated once at startup so a bad
   // path or timer can never fail an upgrade mid-flight. The path must not
@@ -9830,12 +9859,30 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     ) => Promise<void>,
     useTls: boolean
   ): RelayServer => {
+    // WR-160: `maxHeaderSize` is construction-time only, so it rides the
+    // createServer/createHttpsServer options; the timeouts + clientError
+    // audit hook are applied after construction.
+    const serverOptions =
+      hardening?.maxHeaderSizeBytes !== undefined
+        ? { maxHeaderSize: hardening.maxHeaderSizeBytes }
+        : undefined;
+    let listener: RelayServer;
     if (useTls && inboundMtlsListenerOpts !== undefined) {
-      const httpsServer = createHttpsServer(inboundMtlsListenerOpts, handler);
+      const httpsServer =
+        serverOptions !== undefined
+          ? createHttpsServer({ ...inboundMtlsListenerOpts, ...serverOptions }, handler)
+          : createHttpsServer(inboundMtlsListenerOpts, handler);
       tlsListeners.push(httpsServer);
-      return httpsServer as unknown as RelayServer;
+      listener = httpsServer as unknown as RelayServer;
+    } else {
+      listener = (
+        serverOptions !== undefined ? createServer(serverOptions, handler) : createServer(handler)
+      ) as RelayServer;
     }
-    return createServer(handler) as RelayServer;
+    if (hardening !== undefined) {
+      applyHttpHardening(listener, hardening, opts.auditLog);
+    }
+    return listener;
   };
 
   let server: RelayServer;

@@ -4111,6 +4111,37 @@ CORS layer for operator paths only — the webhook intake is untouched:
   `allowCredentials`, or a negative `maxAgeSeconds` throws `RangeError`
   at startup. Zero dependencies.
 
+## Inbound HTTP server timeout hardening (opt-in)
+
+Slowloris protection for both listeners (intake + operator, HTTP and
+HTTPS alike). `createRelayServer({ httpHardening })`
+(`src/http-hardening.ts`) wraps Node's server-level knobs:
+
+- `headersTimeoutMs` — max time to receive complete request headers;
+  slow headers are answered **408**.
+- `requestTimeoutMs` — max time to receive the entire request
+  (headers + body); a stalled body is answered **408**.
+- `maxHeaderSizeBytes` — max total request header bytes (a
+  construction-time option); oversized headers are answered **431**.
+- Timeouts are audited as `rejected` with reason `http_timeout`. The
+  rejection is inbound-side: a timed-out request never reaches the
+  intake pipeline, so it burns no retry budget and never trips the
+  breaker.
+- Unset fields keep Node's defaults (headers: min(requestTimeout,
+  60000); request: 300000; max header size: 16384) — fully unconfigured
+  means zero behavior change.
+- Two honest Node mechanics this module accounts for: the timeouts are
+  enforced by a coarse connection sweep (`connectionsCheckingInterval`,
+  30s default), so sub-second timeouts only bite that fast because the
+  sweep runs that often; and the sweep **swaps** the two timeouts when
+  `headersTimeout > requestTimeout` — so an explicit `requestTimeoutMs`
+  also lowers the default `headersTimeout` to
+  `min(60000, requestTimeoutMs)` (mirroring Node's constructor), and
+  `headersTimeoutMs > requestTimeoutMs` throws `RangeError` at startup
+  instead of silently inverting your intent.
+- **Fail-fast** — non-integer/negative timeouts, a non-positive
+  `maxHeaderSizeBytes`, or a non-object option throws `RangeError` at
+  startup. Zero dependencies.
 
 ## Sender reputation (opt-in)
 
