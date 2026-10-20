@@ -42,6 +42,13 @@ import type {
 } from "./retry.ts";
 import type { PhaseDurationsMs } from "./retry.ts";
 import type { StalePauseOptions } from "./retry.ts";
+import {
+  assertValidCorsPolicy,
+  answerCorsPreflight,
+  setCorsResponseHeaders,
+  type CorsPolicy,
+  type ResolvedCorsPolicy,
+} from "./cors.ts";
 import type { OrderedAuditEvent, OrderedModeOptions } from "./retry.ts";
 import { parseCronExpression, CRON_HEADER } from "./cron.ts";
 import type { CompletionCallbackOptions } from "./callback.ts";
@@ -1714,6 +1721,22 @@ export interface RelayServerOptions {
    * nothing. Disabled by default.
    */
   rateLimit?: InboundRateLimitOptions;
+  /**
+   * CORS policy for the operator plane (WR-159; see `src/cors.ts`):
+   * `CorsPolicy` with an exact-match `allowedOrigins` allowlist plus
+   * optional `allowedMethods` / `allowedHeaders` / `allowCredentials` /
+   * `maxAgeSeconds`. A preflight (`OPTIONS`) to an operator path
+   * (`/metrics`, `/audit`, `/dead-letter`, `/events` SSE, …) is answered
+   * 204 here, before operator auth — browsers never send credentials or
+   * client certificates on preflights, so gating them on auth would break
+   * every dashboard. Only allowlisted origins are echoed; anything else
+   * gets a bare 204 and the browser blocks the real request on its own.
+   * Actual operator responses to allowlisted origins carry
+   * `Access-Control-Allow-Origin` (+ `Vary: Origin`). The webhook intake
+   * is untouched. Disabled by default (empty/unset allowlist): zero
+   * behavior change. Invalid config throws `RangeError` at startup.
+   */
+  cors?: CorsPolicy;
   /**
    * Per-tenant inbound rate limiting (see
    * `src/tenant-inbound-ratelimit.ts`): a token bucket per `x-tenant-id`
@@ -4579,6 +4602,14 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   const maxBodyBytes = opts.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
   if (!Number.isInteger(maxBodyBytes) || maxBodyBytes <= 0) {
     throw new RangeError("createRelayServer: `maxBodyBytes` must be a positive integer");
+  }
+  // WR-159: CORS policy for the operator plane — validated once at
+  // startup (`undefined` = disabled, zero behavior change).
+  let corsPolicy: ResolvedCorsPolicy | undefined;
+  try {
+    corsPolicy = assertValidCorsPolicy(opts.cors);
+  } catch (err) {
+    throw new RangeError(`createRelayServer: invalid cors config: ${(err as Error).message}`);
   }
   // WR-130: inbound WebSocket intake — validated once at startup so a bad
   // path or timer can never fail an upgrade mid-flight. The path must not
@@ -9815,6 +9846,12 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     server = createListener(async (req, res) => {
       const pathname = new URL(req.url ?? "/", "http://internal").pathname;
       if (isOperatorPath(pathname)) {
+        // WR-159: CORS preflight short-circuits before auth (browsers
+        // never send credentials/client certs on preflights); actual
+        // operator responses to allowlisted origins carry the CORS
+        // headers. Disabled when no `cors` policy is configured.
+        if (corsPolicy !== undefined && answerCorsPreflight(req, res, corsPolicy)) return;
+        if (corsPolicy !== undefined) setCorsResponseHeaders(req, res, corsPolicy);
         const gate = enforceInboundMtls(req, res, pathname, true);
         if (!gate.proceed) return;
         await guardOperator(req, res, pathname);
@@ -9855,6 +9892,10 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         crossPlaneNotFound(res);
         return;
       }
+      // WR-159: CORS preflight short-circuits before auth; see the
+      // single-plane listener above for the rationale.
+      if (corsPolicy !== undefined && answerCorsPreflight(req, res, corsPolicy)) return;
+      if (corsPolicy !== undefined) setCorsResponseHeaders(req, res, corsPolicy);
       const gate = enforceInboundMtls(req, res, pathname, true);
       if (!gate.proceed) return;
       await guardOperator(req, res, pathname);

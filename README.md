@@ -4084,6 +4084,34 @@ createRelayServer({
   startup. Off by default: unset means plain-HTTP listeners and zero
   behavior change. Zero dependencies (`node:crypto` + `node:tls`).
 
+## Operator CORS policy (opt-in)
+
+Browser dashboards need to call the operator endpoints (`/metrics`,
+`/audit`, `/dead-letter`, `/events` SSE, …) cross-origin.
+`createRelayServer({ cors })` (`src/cors.ts`) enables an allowlist-based
+CORS layer for operator paths only — the webhook intake is untouched:
+
+- `allowedOrigins` — exact-match allowlist. Empty/unset disables CORS
+  entirely: zero behavior change. `"*"` is rejected (origins are matched
+  exactly; list each dashboard origin).
+- A preflight (`OPTIONS`) to an operator path is answered 204 here,
+  **before operator auth** — browsers never send credentials or client
+  certificates on preflights, so gating them on auth would break every
+  dashboard. Only allowlisted origins are echoed (`Vary: Origin`,
+  `Access-Control-Allow-Methods`, `-Headers`, `-Max-Age`, and
+  `-Allow-Credentials` when `allowCredentials: true`); anything else
+  gets a bare 204 and the browser blocks the real request on its own.
+- Actual operator responses to allowlisted origins carry
+  `Access-Control-Allow-Origin` (+ `Vary: Origin`); same-origin and
+  non-browser clients see byte-identical responses to before.
+- Works on both planes in split-plane mode (`operatorPort`); the intake
+  plane still does not speak CORS.
+- **Fail-fast** — a non-object policy, non-string/empty origins,
+  `"*"`, empty `allowedMethods`/`allowedHeaders`, a non-boolean
+  `allowCredentials`, or a negative `maxAgeSeconds` throws `RangeError`
+  at startup. Zero dependencies.
+
+
 ## Sender reputation (opt-in)
 
 Not every sender deserves the same trust. `createRelayServer({
