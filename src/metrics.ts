@@ -358,6 +358,8 @@ export interface MetricsInput {
   retryBudgetDepletedByEndpoint?: Array<{ endpoint: string; depleted: number }>;
   /** Present only when the relay-level global concurrency cap (WR-51) is configured (finite). */
   globalConcurrencyWaits?: number;
+  /** Present only when the relay-level global outbound rate limit (WR-167) is configured. */
+  globalRateDelayed?: number;
   /** Present only once a delivery has been parked for a future deliver_at (WR-57). */
   scheduled?: ScheduledMetricsInput;
   /**
@@ -1113,6 +1115,13 @@ export function renderPrometheus(input: MetricsInput): string {
     );
     lines.push("# TYPE relay_global_concurrency_wait_total counter");
     lines.push(`relay_global_concurrency_wait_total ${input.globalConcurrencyWaits}`);
+  }
+  if (input.globalRateDelayed !== undefined) {
+    lines.push(
+      "# HELP relay_global_rate_delayed_total Dispatches delayed by the relay-level global outbound rate limit."
+    );
+    lines.push("# TYPE relay_global_rate_delayed_total counter");
+    lines.push(`relay_global_rate_delayed_total ${input.globalRateDelayed}`);
   }
   if (input.scheduled !== undefined) {
     lines.push(

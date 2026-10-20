@@ -2127,6 +2127,34 @@ queue.getGlobalConcurrencyStats();
   check bails it out instead of dispatching, so a shutdown waits only
   for genuinely in-flight deliveries.
 
+## Relay-level global outbound rate limit
+
+`globalMaxConcurrent` (WR-51) bounds in-flight *count*; `globalRateLimit`
+(WR-167, `retry.globalRateLimit`) bounds the outbound dispatch *rate*
+across the whole relay — at most N dispatches per second, no matter how
+many endpoints or tenants they fan out to. The two gates compose with the
+per-endpoint quota (`quota`, WR-15): a dispatch needs a token from each.
+
+```ts
+const queue = new RetryQueue({
+  globalRateLimit: {
+    messagesPerSec: 100, // relay-wide QPS cap
+    maxBurst: 200,       // burst capacity (default = messagesPerSec)
+  },
+});
+queue.getGlobalRateLimitStats();
+// → { messagesPerSec: 100, maxBurst: 200, delayedTotal: 41, queuedDepth: 3, availableTokens: 12 }
+```
+
+When the bucket is empty, excess dispatches wait FIFO for the next refill —
+never dropped, never burning retry budget, never touching the circuit
+breaker. The gate sits *ahead* of the WR-51 concurrency gate (waiting holds
+no slot), and the urgent lane does not bypass it: the rate is relay-level
+egress capacity, not per-endpoint policy. `stop()`/`shutdown()` wake every
+waiter via `releaseWaiters()`, whose liveness check bails it out instead of
+dispatching. Delayed dispatches increment `relay_global_rate_delayed_total`
+in the Prometheus exposition (only when the limit is configured).
+
 ## Per-tenant outbound concurrency cap
 
 `globalMaxConcurrent` bounds in-flight deliveries across the whole

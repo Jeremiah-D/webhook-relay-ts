@@ -189,6 +189,12 @@ import {
   type AdaptiveTimeoutOptions,
 } from "./adaptive-timeout.ts";
 import {
+  GlobalRateLimiter,
+  assertValidGlobalRateLimit,
+  type GlobalRateLimitOptions,
+  type GlobalRateLimitStats,
+} from "./global-rate.ts";
+import {
   AdaptiveConcurrencyController,
   assertAdaptiveConcurrencyOptions,
   type AdaptiveConcurrencyEndpointStats,
@@ -470,6 +476,8 @@ export type {
   AdaptiveTimeoutEndpointStats,
 } from "./adaptive-timeout.ts";
 export { AdaptiveTimeout, AdaptiveTimeoutError, assertValidAdaptiveTimeoutOptions } from "./adaptive-timeout.ts";
+export type { GlobalRateLimitOptions, GlobalRateLimitStats } from "./global-rate.ts";
+export { GlobalRateLimiter, assertValidGlobalRateLimit } from "./global-rate.ts";
 export type {
   TenantRateLimitEndpointOverride,
   TenantRateLimitMode,
@@ -2203,6 +2211,20 @@ export interface RetryQueueOptions {
    */
   globalMaxConcurrent?: number;
   /**
+   * Relay-level cap on the outbound dispatch *rate* across all
+   * endpoints (see {@link GlobalRateLimiter}). Orthogonal to
+   * `globalMaxConcurrent` (WR-51, bounds in-flight *count*) and to the
+   * per-endpoint quota `quota` (WR-15, bounds per-downstream rate):
+   * a dispatch needs a token from each. When the bucket is empty,
+   * excess dispatches wait FIFO for the next refill — never dropped,
+   * never burning retry budget, never touching the circuit breaker.
+   * The urgent lane does not bypass this gate: it is relay-level egress
+   * capacity, not per-endpoint policy (same rationale as the WR-51
+   * global gate). Default: absent (unlimited, exactly the pre-WR-167
+   * behavior). Invalid values throw `RangeError` at construction.
+   */
+  globalRateLimit?: GlobalRateLimitOptions;
+  /**
    * Per-tenant cap on concurrent in-flight deliveries *for one tenant
    * across all of its endpoints* (see {@link TenantConcurrencyGates}).
    * Each tenant gets an independent gate (WR-48 isolation): one tenant's
@@ -3732,6 +3754,13 @@ export class RetryQueue {
    */
   private readonly adaptiveTimeout?: AdaptiveTimeout;
   /**
+   * WR-167: relay-level outbound rate gate (one instance — the rate is
+   * relay-wide, across endpoints and tenants). `undefined` when the
+   * feature is off — dispatches never wait on it, so unconfigured
+   * behavior is byte-for-byte the pre-WR-167 behavior.
+   */
+  private readonly globalRateLimiter?: GlobalRateLimiter;
+  /**
    * WR-140: per-tenant dispatch gates (one independent gate per tenant,
    * created lazily). Always constructed; with the default `Infinity` cap
    * every acquisition grants immediately, and tenant-less deliveries skip
@@ -3825,6 +3854,9 @@ export class RetryQueue {
     // WR-51: invalid values throw here, at construction — never mid-delivery.
     this.globalMaxConcurrent = opts.globalMaxConcurrent ?? Infinity;
     this.globalGate = new GlobalConcurrencyGate(this.globalMaxConcurrent);
+    // WR-167: invalid values throw here, at construction — never mid-delivery.
+    this.globalRateLimiter =
+      opts.globalRateLimit !== undefined ? new GlobalRateLimiter(opts.globalRateLimit) : undefined;
     // WR-166: invalid values throw here, at construction — never mid-delivery.
     this.adaptiveTimeout =
       opts.adaptiveTimeout !== undefined ? new AdaptiveTimeout(opts.adaptiveTimeout) : undefined;
@@ -6052,6 +6084,9 @@ export class RetryQueue {
     // liveness check bails them out instead of dispatching, so a stop
     // never leaves a deliver parked on the gate across a restart.
     this.globalGate.releaseWaiters();
+    // WR-167: same for rate-gate waiters — the head timer is cleared and
+    // woken waiters bail out on the liveness check, consuming no token.
+    this.globalRateLimiter?.releaseWaiters();
     // WR-140: same for every tenant's gate waiters.
     this.tenantGates.releaseWaiters();
     // The timers are gone, so no retry fire-time is armed anymore; the
@@ -6128,6 +6163,9 @@ export class RetryQueue {
     // the stopped queue and bail out, so shutdown() waits only for
     // deliveries genuinely in flight instead of hanging on the gate.
     this.globalGate.releaseWaiters();
+    // WR-167: same for rate-gate waiters — the head timer is cleared and
+    // woken waiters bail out on the liveness check, consuming no token.
+    this.globalRateLimiter?.releaseWaiters();
     // WR-140: same for every tenant's gate waiters.
     this.tenantGates.releaseWaiters();
     this.durablePendingRetry.clear();
@@ -6931,6 +6969,25 @@ export class RetryQueue {
       // WR-150: a disable that landed before the global gate dead-letters
       // the delivery instead of dispatching it — terminal, not parked.
       if (this.deadLetterIfEndpointDisabled(entry, id, traceId, target, probe, breaker)) return;
+      // WR-167: relay-level global outbound rate gate — the outermost
+      // dispatch gate, ahead of the WR-51 concurrency gate: waiting for
+      // a token holds no concurrency slot, and a paused endpoint
+      // (checked above) never waits on the gate. Waiting consumes
+      // nothing — no retry budget, no breaker verdict, no quota token —
+      // and the delivery is never dropped, only delayed. The urgent
+      // lane does not bypass it: the rate is relay-level egress
+      // capacity, not per-endpoint policy.
+      if (this.globalRateLimiter !== undefined) {
+        await this.globalRateLimiter.acquire();
+        // The queue may have stopped, or the endpoint paused, while we
+        // waited for a token: re-check liveness before taking a slot.
+        // The gate holds no slot, so there is nothing to release here —
+        // the waiters woken by releaseWaiters() bail out below.
+        if ((!this.running && !force) || !this.queue.has(id)) {
+          if (probe) breaker?.cancelProbe(target);
+          return;
+        }
+      }
       // WR-51: relay-level global dispatch gate — the outermost of the
       // three dispatch gates, so quota/circuit/budget verdicts and lane
       // ordering are all settled before a global slot is taken, and a
@@ -7841,6 +7898,15 @@ export class RetryQueue {
   }
 
   /**
+   * WR-167: relay-level rate-limiter snapshot — the configured rate,
+   * current bucket level, FIFO waiter depth, and cumulative delayed
+   * dispatch count. Undefined when the feature is off.
+   */
+  getGlobalRateLimitStats(): GlobalRateLimitStats | undefined {
+    return this.globalRateLimiter?.stats();
+  }
+
+  /**
    * Per-tenant dispatch gate snapshots (WR-140): one row per tenant that
    * has dispatched through the gate, in first-seen order — the
    * configured per-tenant cap, current in-flight dispatches, FIFO waiter
@@ -8309,6 +8375,13 @@ export class RetryQueue {
       // counters.
       ...(this.globalMaxConcurrent !== Infinity
         ? { globalConcurrencyWaits: this.globalGate.waitedTotal() }
+        : {}),
+      // WR-167: the delayed-dispatch counter is exposed only when the
+      // rate limit is configured — the default unlimited relay never
+      // delays, so the series stays absent exactly like the other
+      // opt-in counters.
+      ...(this.globalRateLimiter !== undefined
+        ? { globalRateDelayed: this.globalRateLimiter.stats().delayedTotal }
         : {}),
       // WR-140: one series per tenant that actually waited for a
       // tenant slot — activity-gated (tenants that never waited expose
