@@ -45,6 +45,11 @@ import {
   type ProbeOptions,
 } from "./downstream-probe.ts";
 import {
+  clusterDeadLetters,
+  topClusters,
+  type DeadLetterCluster,
+} from "./deadletter-cluster.ts";
+import {
   ErrorBudgetMonitor,
   errorBudgetBurnAuditEvent,
   resolveErrorBudgetOptions,
@@ -5651,6 +5656,16 @@ export class RetryQueue {
       byEndpoint: [...byEndpoint].map(([endpoint, count]) => ({ endpoint, count })),
       byTenantEndpoint: [...byTenantEndpoint.values()],
     };
+  }
+
+  /**
+   * WR-175: dead-letter entries clustered by `(endpoint,
+   * failure_class, normalized error signature)` — count-descending,
+   * capped at `top` clusters. Served over HTTP as
+   * `GET /dead-letter/clusters`.
+   */
+  getDeadLetterClusters(top = 50): DeadLetterCluster[] {
+    return topClusters(clusterDeadLetters(this.getDeadLetter()), top);
   }
 
   /**

@@ -29,6 +29,7 @@ const INVENTORY: Array<[string, Array<"GET" | "POST" | "PUT" | "DELETE">]> = [
   ["/dead-letter", ["GET"]],
   ["/dead-letter/export", ["GET"]],
   ["/dead-letter/stats", ["GET"]],
+  ["/dead-letter/clusters", ["GET", "POST"]],
   ["/dead-letter/replay", ["POST"]],
   ["/dead-letter/replay/approve-request", ["POST"]],
   ["/dead-letter/{id}/replay", ["POST"]],

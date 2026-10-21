@@ -5188,6 +5188,35 @@ purged mid-shutdown.
   row stays the sum across tenants).
 - `GET /audit?event=dead_letter_purged` — the per-purge audit trail.
 
+### Dead-letter error-signature clusters
+
+`src/deadletter-cluster.ts` groups dead letters by `(endpoint,
+failure_class, normalized error signature)` so one poison payload or
+one down endpoint shows up as one line, not two hundred. Normalization
+templates volatile tokens — numbers → `{n}`, UUIDs → `{uuid}`,
+ISO-8601/epoch timestamps → `{ts}`, hex digests → `{hex}` — so
+`connect ETIMEDOUT 93.184.216.34:443` and `connect ETIMEDOUT
+203.0.113.7:8443` land in the same cluster (`connect ETIMEDOUT
+{n}.{n}.{n}.{n}:{n}`). Each cluster reports `count`, `firstSeen` /
+`lastSeen`, a reversible `clusterId`, and a `sample` entry (id +
+traceId) for drill-in; clusters sort count-descending.
+
+**Operator surface** (same Bearer <redacted>, fail closed to 404 without
+`operatorToken`; GET = `read` scope, POST = `admin` scope):
+
+- `GET /dead-letter/clusters?top=N` — `{ clusters: [...] }`,
+  count-descending, at most `top` (default 50; non-positive `top` is a
+  400).
+- `POST /dead-letter/clusters` — replays every dead letter matching the
+  cluster selector `{ endpoint, failureClass?, signature? }` with the
+  same fresh-budget semantics and WR-135/WR-149 gates as
+  `POST /dead-letter/replay` (`dryRun` previews with zero side effects;
+  a selector that matches nothing answers 404, not a silent empty
+  replay). Audited as `dead_letter_cluster_replayed`.
+
+`RetryQueue.getDeadLetterClusters(top)` exposes the same view to
+library users without HTTP.
+
 ### Replay egress throttling
 
 Opt-in per-endpoint rate cap on dead-letter *re-queue* admission
@@ -5840,3 +5869,15 @@ Requires Node 24+ (runs `.ts` directly via type stripping; zero dependencies).
   unmatched requests throwing `ReplayNoMatchError` (never a network
   pass-through); recorded errors re-thrown with the original `code`;
   end-to-end record → save → replay.
+- `test/deadletter-cluster.test.ts` — the WR-175 error-signature
+  clustering (10 tests): `normalizeErrorSignature` templating
+  (numbers/UUIDs/timestamps/hex, idempotency, IP dotted quads);
+  `clusterIdFor` / `clusterIdDecode` round-trip and malformed-id
+  rejection; `clusterDeadLetters` grouping by
+  (endpoint, failure_class, signature) with count-descending order,
+  `firstSeen` / `lastSeen` / sample exemplar; `topClusters` cap and
+  `RangeError` validation; `RetryQueue.getDeadLetterClusters` on live
+  dead letters; the `GET/POST /dead-letter/clusters` operator endpoints
+  (cluster listing, bad `top` 400, wrong-token 403, method 405,
+  dry-run preview with zero side effects, selector replay audited as
+  `dead_letter_cluster_replayed`, no-match selector 404).

@@ -99,6 +99,7 @@ import {
   type ChaosConfig,
   type ChaosInjectionInfo,
 } from "./chaos.ts";
+import { normalizeErrorSignature } from "./deadletter-cluster.ts";
 import {
   DeadlineBudgetTimeoutError,
   readDeadlineBudgetMs,
@@ -6885,6 +6886,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     const isList = pathname === "/dead-letter";
     const isExport = pathname === "/dead-letter/export";
     const isStats = pathname === "/dead-letter/stats";
+    // WR-175: error-signature clusters — GET lists, POST replays by selector.
+    const isDeadLetterClusters = pathname === "/dead-letter/clusters";
     const isBatchReplay = pathname === "/dead-letter/replay";
     // WR-135: one-shot approval token issuance for two-phase replays.
     const isApproveRequest = pathname === "/dead-letter/replay/approve-request";
@@ -7071,6 +7074,122 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         });
       }
       respondJson(res, 200, { replayed: result.replayed, failed: result.failed, skipped: result.skipped });
+      return;
+    }
+    if (isDeadLetterClusters) {
+      if (req.method === "GET") {
+        // WR-175: list dead-letter error clusters, count-descending.
+        const topParam =
+          new URL(req.url ?? "/dead-letter/clusters", "http://internal").searchParams.get("top");
+        let top = 50;
+        if (topParam !== null) {
+          const parsed = Number(topParam);
+          if (!Number.isInteger(parsed) || parsed < 1) {
+            respondJson(res, 400, { error: "top must be a positive integer" });
+            return;
+          }
+          top = parsed;
+        }
+        respondJson(res, 200, { clusters: queue.getDeadLetterClusters(top) });
+        return;
+      }
+      // POST: replay every dead letter matching the cluster selector —
+      // same fresh-budget semantics and WR-135/WR-149 gates as
+      // POST /dead-letter/replay, audited as `dead_letter_cluster_replayed`.
+      const clusterBody = await readOptionalJsonBody(req, res, maxBodyBytes);
+      if (clusterBody === undefined) return;
+      const { endpoint, failureClass, signature, dryRun, approvalToken, force } = clusterBody;
+      if (typeof endpoint !== "string" || endpoint === "") {
+        respondJson(res, 400, { error: "endpoint must be a non-empty string" });
+        return;
+      }
+      if (failureClass !== undefined && typeof failureClass !== "string") {
+        respondJson(res, 400, { error: "failureClass must be a string" });
+        return;
+      }
+      if (signature !== undefined && typeof signature !== "string") {
+        respondJson(res, 400, { error: "signature must be a string" });
+        return;
+      }
+      if (dryRun !== undefined && typeof dryRun !== "boolean") {
+        respondJson(res, 400, { error: "dryRun must be a boolean" });
+        return;
+      }
+      if (approvalToken !== undefined && typeof approvalToken !== "string") {
+        respondJson(res, 400, { error: "approvalToken must be a string" });
+        return;
+      }
+      if (force !== undefined && typeof force !== "boolean") {
+        respondJson(res, 400, { error: "force must be a boolean" });
+        return;
+      }
+      const members = queue.getDeadLetter().filter(
+        (e) =>
+          e.targetUrl === endpoint &&
+          (failureClass === undefined || e.failureClass === failureClass) &&
+          (signature === undefined || normalizeErrorSignature(e.lastError) === signature)
+      );
+      if (members.length === 0) {
+        // Fail-loud: a selector that matches nothing is almost always a
+        // typo — answer 404 instead of a silent empty replay.
+        respondJson(res, 404, { error: "no dead-letter cluster matches the selector" });
+        return;
+      }
+      const memberIds = members.map((e) => e.id);
+      if (dryRun === true) {
+        respondJson(res, 200, {
+          dryRun: true,
+          entries: queue.replayDeadLetters({ endpoint, ids: memberIds }, { dryRun: true }),
+        });
+        return;
+      }
+      const clusterHeaderToken = req.headers["x-replay-approval-token"];
+      const clusterApprovalToken =
+        approvalToken ?? (typeof clusterHeaderToken === "string" ? clusterHeaderToken : undefined);
+      let clusterResult: { replayed: string[]; failed: { id: string; error: string }[]; throttled: string[]; skipped: string[] };
+      try {
+        clusterResult = queue.replayDeadLetters(
+          { endpoint, ids: memberIds },
+          { approvalToken: clusterApprovalToken, force }
+        );
+      } catch (err) {
+        if (err instanceof ReplayApprovalError) {
+          if (err.reason === "expired") {
+            opts.auditLog.append({
+              event: "replay_approval_expired",
+              keyId: operatorKeyId,
+              reason: "approval_token_expired",
+              endpoint,
+            });
+          }
+          respondJson(res, 403, { error: approvalDenyMessage(err.reason) });
+          return;
+        }
+        throw err;
+      }
+      opts.auditLog.append({
+        event: "dead_letter_cluster_replayed",
+        keyId: operatorKeyId,
+        endpoint,
+        ...(failureClass !== undefined ? { failureClass } : {}),
+        ...(signature !== undefined ? { signature } : {}),
+        replayed: clusterResult.replayed,
+        failed: clusterResult.failed,
+        skipped: clusterResult.skipped,
+      });
+      if (queue.getReplayApprovalStore() !== undefined) {
+        opts.auditLog.append({
+          event: "replay_approved",
+          keyId: operatorKeyId,
+          replayed: clusterResult.replayed,
+          endpoint,
+        });
+      }
+      respondJson(res, 200, {
+        replayed: clusterResult.replayed,
+        failed: clusterResult.failed,
+        skipped: clusterResult.skipped,
+      });
       return;
     }
     if (isApproveRequest) {

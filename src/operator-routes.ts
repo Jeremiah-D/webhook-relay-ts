@@ -157,6 +157,55 @@ export const OPERATOR_ROUTES: readonly OperatorRoute[] = [
     okDescription: "JSON object with live/retention/per-endpoint counters.",
   },
   {
+    path: "/dead-letter/clusters",
+    pattern: exact("/dead-letter/clusters"),
+    methods: ["GET", "POST"],
+    summary: "Dead-letter error-signature clusters (list / replay)",
+    description:
+      "WR-175: GET lists dead-letter entries clustered by (endpoint, failure_class, normalized error signature) — error messages are templated (numbers/UUIDs/timestamps/hex become placeholders), count-descending, each cluster carrying count, firstSeen/lastSeen, and a sample entry for drill-in. POST replays every dead letter matching the cluster selector {endpoint, failureClass?, signature?} with the same fresh-budget semantics and WR-135/WR-149 gates as POST /dead-letter/replay (dryRun supported, approvalToken or the x-replay-approval-token header when two-phase approval is enabled). A selector that matches nothing answers 404. Audited as `dead_letter_cluster_replayed`.",
+    okDescription:
+      "GET: `{ clusters: [...] }`. POST: `{ replayed, failed, skipped }`, or `{ dryRun: true, entries }` for a preview.",
+    queryParams: [
+      {
+        name: "top",
+        type: "integer",
+        description: "Return at most this many clusters (default 50).",
+      },
+    ],
+    requestBody: {
+      description: "Cluster replay selector; endpoint is required, the rest optional.",
+      required: ["endpoint"],
+      properties: {
+        endpoint: {
+          type: "string",
+          description: "The endpoint (targetUrl) the cluster was dead-lettered for.",
+        },
+        failureClass: {
+          type: "string",
+          description: "Restrict the replay to one failure_class (e.g. \"retryable\").",
+        },
+        signature: {
+          type: "string",
+          description: "Restrict the replay to one normalized error signature.",
+        },
+        dryRun: {
+          type: "boolean",
+          description: "Preview only: return the would-be-replayed metadata with zero side effects.",
+        },
+        approvalToken: {
+          type: "string",
+          description:
+            "WR-135: one-shot approval token; required for a real replay when two-phase approval is enabled, never for a dry run. The x-replay-approval-token header is an alternative carrier.",
+        },
+        force: {
+          type: "boolean",
+          description:
+            "WR-149: override the replay-idempotency guard for the whole cluster (replay even when a newer delivered copy exists, audited per entry as `replay_forced`).",
+        },
+      },
+    },
+  },
+  {
     path: "/dead-letter/replay",
     pattern: exact("/dead-letter/replay"),
     methods: ["POST"],
