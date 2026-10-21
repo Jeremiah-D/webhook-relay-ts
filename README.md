@@ -1471,6 +1471,51 @@ curl -X POST http://127.0.0.1:PORT/config/endpoint \
 # token · 404 when operator endpoints are disabled (fail closed)
 ```
 
+## Named retry policies
+
+Different downstreams deserve different backoff schedules: a payment
+provider that answers slowly wants a patient policy, a flaky analytics
+sink wants a fast-fail one. Named policies (`src/retry-policy.ts`)
+register a backoff schedule once and attach it per endpoint by name —
+instead of one global schedule for every downstream:
+
+```ts
+const queue = new RetryQueue({
+  baseDelayMs: 1000, maxAttempts: 5, // global schedule (unchanged)
+  retryPolicies: [
+    { name: "patient", maxAttempts: 10, baseDelayMs: 2000, maxDelayMs: 120_000 },
+    { name: "fast-fail", maxAttempts: 2, baseDelayMs: 200, maxDelayMs: 5_000,
+      jitterStrategy: "full" },
+  ],
+  endpointRetryPolicies: {
+    "https://payments/hook": "patient",   // exact targetUrl match
+    "https://analytics/hook": "fast-fail",
+  },
+});
+```
+
+- **Exact `targetUrl` match, global fallback** — an endpoint with no
+  assigned policy keeps the queue's global retry config, byte for byte.
+- **Policy governs the whole schedule** — `maxAttempts` (dead-lettering
+  budget), `baseDelayMs` / `maxDelayMs` (exponential backoff), and the
+  jitter (`jitterMs` / `jitterStrategy`, inherited from the queue when
+  the policy omits them).
+- **Explicit beats adaptive** — a policy-assigned endpoint uses its
+  policy base as-is; WR-59 adaptive backoff keeps tuning only the
+  endpoints on the global schedule.
+- **Runtime updates** — `queue.registerRetryPolicy(name, config)`
+  re-registers a policy in place (every endpoint pointing at it picks
+  up the new schedule on its next retry computation), and
+  `queue.updateEndpointConfig(endpoint, { retryPolicyName: "patient" })`
+  re-points an endpoint (`null` detaches back to global). Unknown names
+  throw `RangeError` at configuration time, never mid-delivery.
+- **Observable** — `queue.getRetryPolicies()` returns the registry
+  snapshot (registration order, detached copies);
+  `queue.effectiveRetryConfig(endpoint)` resolves the five effective
+  parameters; the `accepted` audit event carries `retryPolicy` when an
+  endpoint runs on a named policy, so the audit trail shows which
+  schedule governs each delivery.
+
 ## Declarative config snapshots (export / apply / rollback)
 
 The hot-reload layer above is imperative; the snapshot layer

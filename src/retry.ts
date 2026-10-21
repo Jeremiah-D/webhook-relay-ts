@@ -179,6 +179,12 @@ import {
 } from "./replay-approval.ts";
 import { RetryBudget, type RetryBudgetOptions } from "./retry-budget.ts";
 import {
+  RetryPolicyRegistry,
+  assertValidRetryPolicy,
+  type NamedRetryPolicy,
+  type RetryPolicyConfig,
+} from "./retry-policy.ts";
+import {
   AdaptiveBackoffController,
   type AdaptiveBackoffEndpointStats,
   type AdaptiveBackoffOptions,
@@ -450,6 +456,8 @@ export type { ReplayEgressOptions };
 export { ReplayEgressGate, DEFAULT_REPLAY_EGRESS_RPS };
 export type { RetryBudgetOptions } from "./retry-budget.ts";
 export { RetryBudget, DEFAULT_RETRY_BUDGET_PER_MINUTE } from "./retry-budget.ts";
+export type { NamedRetryPolicy, RetryPolicyConfig } from "./retry-policy.ts";
+export { RetryPolicyRegistry, assertValidRetryPolicy } from "./retry-policy.ts";
 export type { AdaptiveBackoffOptions, AdaptiveBackoffEndpointStats } from "./adaptive-backoff.ts";
 export {
   AdaptiveBackoffController,
@@ -1510,6 +1518,28 @@ export interface RetryQueueOptions {
   jitterMs?: number;
   /** Jitter strategy; see {@link JitterStrategy}. Default: "additive". */
   jitterStrategy?: JitterStrategy;
+  /**
+   * WR-172: named retry policies (see `src/retry-policy.ts`). Each entry
+   * registers a policy under its `name` before any endpoint assignment
+   * is validated — invalid policies throw `RangeError` at construction,
+   * exactly like the global retry parameters above. Policies are
+   * re-registrable at runtime via
+   * {@link RetryQueue.registerRetryPolicy}; the queue reads the registry
+   * at schedule time, so an update only affects future scheduling.
+   */
+  retryPolicies?: NamedRetryPolicy[];
+  /**
+   * WR-172: per-endpoint retry-policy assignment — exact `targetUrl`
+   * (the logical endpoint) to a registered policy name. Every name
+   * must be registered (via `retryPolicies` or
+   * {@link RetryQueue.registerRetryPolicy}); an unknown name throws
+   * `RangeError` at construction. Endpoints not listed here keep the
+   * global retry config. Mutable at runtime via
+   * {@link RetryQueue.setEndpointRetryPolicy} /
+   * {@link RetryQueue.clearEndpointRetryPolicy} and WR-32 hot-reload
+   * (`updateEndpointConfig` with a `retryPolicyName` patch).
+   */
+  endpointRetryPolicies?: Record<string, string>;
   /**
    * Adaptive backoff (WR-59; see `src/adaptive-backoff.ts`): scales the
    * exponential backoff's *base* per endpoint from recent delivery
@@ -3278,6 +3308,20 @@ export class RetryQueue {
   private maxAttempts: number;
   private jitterMs: number;
   private jitterStrategy: JitterStrategy;
+  /**
+   * WR-172: named retry policies (see `src/retry-policy.ts`). The
+   * registry is deliberately *not* readonly: policies are re-registrable
+   * at runtime, and `delayForAttempt` / `maxAttemptsFor` read the
+   * registry at schedule time, so a policy update affects only future
+   * scheduling — same rule as WR-32 hot reload for the global params.
+   */
+  private readonly retryPolicyRegistry = new RetryPolicyRegistry();
+  /**
+   * WR-172: per-endpoint policy assignment — exact `targetUrl` (the
+   * logical endpoint) to policy name. Endpoints with no entry fall back
+   * to the queue's global retry config.
+   */
+  private readonly endpointRetryPolicy = new Map<string, string>();
   private readonly random: () => number;
   private readonly setTimer: (fn: () => void, ms: number) => { clear(): void };
   private readonly clearTimer: (handle: { clear(): void }) => void;
@@ -3807,6 +3851,49 @@ export class RetryQueue {
     }
     if (this.jitterStrategy !== "additive" && this.jitterStrategy !== "full") {
       throw new RangeError(`jitterStrategy must be "additive" or "full", got ${this.jitterStrategy}`);
+    }
+    // WR-172: register named retry policies first, so the endpoint
+    // assignment below (and any later `setEndpointRetryPolicy`) can
+    // validate names against a complete registry. Registration is
+    // all-or-nothing: every policy is validated before any of them is
+    // stored, so a bad policy leaves the registry empty rather than
+    // half-filled.
+    if (opts.retryPolicies !== undefined) {
+      if (!Array.isArray(opts.retryPolicies)) {
+        throw new RangeError(
+          `retryPolicies must be an array of { name, ...config }, got ${typeof opts.retryPolicies}`
+        );
+      }
+      for (const p of opts.retryPolicies) {
+        if (typeof p !== "object" || p === null || Array.isArray(p)) {
+          throw new RangeError("retryPolicies must be an array of { name, ...config }");
+        }
+        assertValidRetryPolicy((p as NamedRetryPolicy).name, p);
+      }
+      for (const p of opts.retryPolicies) {
+        const { name, ...config } = p as NamedRetryPolicy;
+        this.retryPolicyRegistry.register(name, config);
+      }
+    }
+    // WR-172: endpoint policy assignment — validate every name before
+    // assigning any, so a typo leaves no endpoint half-configured.
+    if (opts.endpointRetryPolicies !== undefined) {
+      if (
+        typeof opts.endpointRetryPolicies !== "object" ||
+        opts.endpointRetryPolicies === null ||
+        Array.isArray(opts.endpointRetryPolicies)
+      ) {
+        throw new RangeError("endpointRetryPolicies must be an object mapping targetUrl to policy name");
+      }
+      for (const [targetUrl, name] of Object.entries(opts.endpointRetryPolicies)) {
+        if (typeof targetUrl !== "string" || targetUrl.length === 0) {
+          throw new RangeError("endpointRetryPolicies keys must be non-empty targetUrl strings");
+        }
+        this.assertRetryPolicyRegistered(name);
+      }
+      for (const [targetUrl, name] of Object.entries(opts.endpointRetryPolicies)) {
+        this.endpointRetryPolicy.set(targetUrl, name);
+      }
     }
     this.setTimer =
       opts.setTimer ?? ((fn, ms) => {
@@ -6219,16 +6306,28 @@ export class RetryQueue {
    * compose orthogonally.
    */
   delayForAttempt(attempt: number, endpoint?: string, tenant?: string): number {
+    // WR-172: a named policy replaces the queue's global backoff
+    // parameters for this endpoint. The policy's base is used as-is:
+    // WR-59 adaptive backoff is skipped for policy-assigned endpoints
+    // (explicit operator intent beats auto-tuning), while jitter fields
+    // the policy omits inherit the queue's current settings.
+    const policy = endpoint !== undefined ? this.policyForEndpoint(endpoint) : undefined;
+    const baseDelayMs = policy?.baseDelayMs ?? this.baseDelayMs;
+    const maxDelayMs = policy?.maxDelayMs ?? this.maxDelayMs;
+    const jitterMs = policy?.jitterMs ?? this.jitterMs;
+    const jitterStrategy = policy?.jitterStrategy ?? this.jitterStrategy;
     const base =
-      endpoint !== undefined
-        ? (this.adaptiveBackoffFor(tenant)?.baseFor(endpoint) ?? this.baseDelayMs)
-        : this.baseDelayMs;
-    const cap = Math.min(this.maxDelayMs, base * 2 ** attempt);
-    if (this.jitterStrategy === "full") {
+      policy !== undefined
+        ? baseDelayMs
+        : endpoint !== undefined
+          ? (this.adaptiveBackoffFor(tenant)?.baseFor(endpoint) ?? baseDelayMs)
+          : baseDelayMs;
+    const cap = Math.min(maxDelayMs, base * 2 ** attempt);
+    if (jitterStrategy === "full") {
       return this.random() * cap;
     }
-    const jitter = this.jitterMs > 0 ? this.random() * this.jitterMs : 0;
-    return Math.min(this.maxDelayMs, base * 2 ** attempt + jitter);
+    const jitter = jitterMs > 0 ? this.random() * jitterMs : 0;
+    return Math.min(maxDelayMs, base * 2 ** attempt + jitter);
   }
 
   /** Current backoff parameters (reflects any hot-reload updates). */
@@ -6240,6 +6339,98 @@ export class RetryQueue {
       jitterMs: this.jitterMs,
       jitterStrategy: this.jitterStrategy,
     };
+  }
+
+  /**
+   * WR-172: the live policy object for `targetUrl` (the logical
+   * endpoint, exact match), or `undefined` when the endpoint has no
+   * assigned policy and the global config applies. Read at schedule
+   * time, so a policy re-registration takes effect immediately.
+   */
+  private policyForEndpoint(targetUrl: string): NamedRetryPolicy | undefined {
+    const name = this.endpointRetryPolicy.get(targetUrl);
+    return name === undefined ? undefined : this.retryPolicyRegistry.get(name);
+  }
+
+  /** WR-172: throws `RangeError` when `name` is not a registered policy. */
+  private assertRetryPolicyRegistered(name: unknown): void {
+    if (typeof name !== "string" || !this.retryPolicyRegistry.has(name)) {
+      throw new RangeError(
+        `retry policy ${JSON.stringify(name)} is not registered; register it with registerRetryPolicy() first`
+      );
+    }
+  }
+
+  /**
+   * WR-172: register (or re-register) a named retry policy. Validated
+   * eagerly — a bad config throws `RangeError` and leaves the running
+   * registry untouched. Re-registering an existing name updates it in
+   * place: every endpoint pointing at it picks up the new schedule on
+   * its next retry computation, which is the runtime-update story that
+   * composes with WR-32 hot-reload.
+   */
+  registerRetryPolicy(name: string, config: RetryPolicyConfig): void {
+    this.retryPolicyRegistry.register(name, config);
+  }
+
+  /**
+   * WR-172: assign a registered policy to an endpoint (exact
+   * `targetUrl`, the logical endpoint). Throws `RangeError` for an
+   * unknown name — fail fast at configuration time, never mid-delivery.
+   */
+  setEndpointRetryPolicy(targetUrl: string, policyName: string): void {
+    if (typeof targetUrl !== "string" || targetUrl.length === 0) {
+      throw new RangeError("setEndpointRetryPolicy: targetUrl must be a non-empty string");
+    }
+    this.assertRetryPolicyRegistered(policyName);
+    this.endpointRetryPolicy.set(targetUrl, policyName);
+  }
+
+  /**
+   * WR-172: detach the endpoint's policy — it falls back to the global
+   * retry config. Returns `true` when a policy was actually assigned.
+   */
+  clearEndpointRetryPolicy(targetUrl: string): boolean {
+    return this.endpointRetryPolicy.delete(targetUrl);
+  }
+
+  /**
+   * WR-172: the policy name selected for `targetUrl`, or `undefined`
+   * when the global retry config applies. The server stamps this on the
+   * `accepted` audit event so the audit trail shows which backoff
+   * schedule governs each delivery.
+   */
+  retryPolicyFor(targetUrl: string): string | undefined {
+    return this.endpointRetryPolicy.get(targetUrl);
+  }
+
+  /**
+   * WR-172: observability snapshot of every registered policy, in
+   * registration order. The returned objects are copies.
+   */
+  getRetryPolicies(): NamedRetryPolicy[] {
+    return this.retryPolicyRegistry.snapshot();
+  }
+
+  /**
+   * WR-172: the effective backoff parameters for `targetUrl` — the
+   * endpoint's policy when assigned, else the global config. Jitter
+   * fields a policy omits inherit the queue's current settings.
+   */
+  effectiveRetryConfig(targetUrl?: string): { baseDelayMs: number; maxDelayMs: number; maxAttempts: number; jitterMs: number; jitterStrategy: JitterStrategy } {
+    const policy = targetUrl !== undefined ? this.policyForEndpoint(targetUrl) : undefined;
+    return {
+      baseDelayMs: policy?.baseDelayMs ?? this.baseDelayMs,
+      maxDelayMs: policy?.maxDelayMs ?? this.maxDelayMs,
+      maxAttempts: policy?.maxAttempts ?? this.maxAttempts,
+      jitterMs: policy?.jitterMs ?? this.jitterMs,
+      jitterStrategy: policy?.jitterStrategy ?? this.jitterStrategy,
+    };
+  }
+
+  /** WR-172: attempt budget for a delivery — the endpoint's policy wins. */
+  private maxAttemptsFor(targetUrl: string): number {
+    return this.policyForEndpoint(targetUrl)?.maxAttempts ?? this.maxAttempts;
   }
 
   /** Whether the circuit-breaker subsystem is enabled (queue-level). */
@@ -6470,6 +6661,22 @@ export class RetryQueue {
         this.jitterStrategy = r.jitterStrategy;
       }
     }
+    // WR-172: re-point (or detach) the endpoint's named retry policy.
+    // The name check happens here, at apply time, because the validator
+    // has no registry handle. Zero partial application: the throw below
+    // fires before the endpoint's assignment changes.
+    if (patch.retryPolicyName !== undefined) {
+      const name = patch.retryPolicyName;
+      const before = this.endpointRetryPolicy.get(endpoint) ?? null;
+      if (name === null) {
+        this.endpointRetryPolicy.delete(endpoint);
+        rec("retryPolicyName", before, null);
+      } else {
+        this.assertRetryPolicyRegistered(name);
+        this.endpointRetryPolicy.set(endpoint, name);
+        rec("retryPolicyName", before, name);
+      }
+    }
 
     this.onConfigChange?.(endpoint, changes);
     return changes;
@@ -6591,7 +6798,9 @@ export class RetryQueue {
       report("failed", { error });
       return;
     }
-    if (attempt >= this.maxAttempts) {
+    // WR-172: the drill consumes the endpoint's attempt budget, so a
+    // policy-assigned endpoint exhausts on its policy's maxAttempts.
+    if (attempt >= this.maxAttemptsFor(logicalEndpoint)) {
       // Retries exhausted: settle terminally and audit
       // `dry_run_exhausted`. A drill must never enter the dead-letter
       // queue — the operator views stay clean for real dead letters.
@@ -7513,7 +7722,10 @@ export class RetryQueue {
         }
         this.recordDelivery(tenant, target, "failed");
         entry.attempt += 1;
-        if (entry.attempt >= this.maxAttempts) {
+        // WR-172: the attempt budget comes from the logical endpoint's
+        // policy when one is assigned — a payment endpoint on a patient
+        // policy gets its policy's attempts, not the global five.
+        if (entry.attempt >= this.maxAttemptsFor(logicalEndpoint)) {
           this.moveToDeadLetter(entry, id, err, classified, at, traceId, target);
         } else {
           // A downstream-supplied `Retry-After` (429/503) wins over every

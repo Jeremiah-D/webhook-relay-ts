@@ -110,6 +110,13 @@ export interface EndpointConfigPatch {
   weighted?: WeightedPatch;
   /** Queue-global backoff parameters. */
   retry?: RetryPatch;
+  /**
+   * WR-172: named retry policy for the endpoint (exact `targetUrl`). The
+   * name must be registered on the queue — an unknown name throws
+   * `RangeError` when the patch is applied. `null` detaches the
+   * endpoint's policy, falling back to the global retry config.
+   */
+  retryPolicyName?: string | null;
 }
 
 /** One applied configuration change, for audit/observability. */
@@ -238,6 +245,16 @@ export function assertValidEndpointConfigPatch(patch: EndpointConfigPatch): void
     }
     if (r.jitterStrategy !== undefined) {
       assertJitterStrategy(r.jitterStrategy);
+    }
+  }
+  // WR-172: a policy name patch — `null` detaches, a string re-points.
+  // Whether the name is registered is checked when the queue applies
+  // the patch (the validator has no registry handle).
+  if (p.retryPolicyName !== undefined && p.retryPolicyName !== null) {
+    if (typeof p.retryPolicyName !== "string" || p.retryPolicyName.length === 0) {
+      throw new RangeError(
+        `updateEndpointConfig: \`retryPolicyName\` must be a non-empty string or null, got ${JSON.stringify(p.retryPolicyName)}`
+      );
     }
   }
 }

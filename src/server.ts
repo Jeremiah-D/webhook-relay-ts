@@ -9570,6 +9570,11 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // algorithm each accepted webhook verified under.
     if (negotiatedAlg !== undefined) acceptedEvent.algorithm = negotiatedAlg;
     if (priority) acceptedEvent.priority = priority;
+    // WR-172: the named retry policy selected for this endpoint, so the
+    // audit trail shows which backoff schedule governs the delivery.
+    // Absent when the endpoint runs on the global retry config.
+    const retryPolicyName = queue.retryPolicyFor(targetUrl);
+    if (retryPolicyName !== undefined) acceptedEvent.retryPolicy = retryPolicyName;
     if (inboundGzip) acceptedEvent.contentEncoding = "gzip";
     if (opts.auditPayloads) acceptedEvent.payload = body;
     opts.auditLog.append(acceptedEvent);
