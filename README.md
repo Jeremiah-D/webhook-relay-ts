@@ -277,6 +277,23 @@ reliability primitives that matter for any signed-payload pipeline.
   rate (`withinSlo / count` against `sloMs`, default 5000ms). Deliveries
   slower than the budget fire `onSloMiss` and are audited as `slo_missed`.
   The clock is injectable for deterministic tests.
+- `src/changepoint.ts` — online changepoint detection for per-endpoint
+  accepted→delivered latency (`LatencyChangepointDetector` /
+  `LatencyChangepointMonitor`). A Page-Hinkley test watches the latency
+  stream and fires `onLatencyRegimeChange` when the *distribution* shifts —
+  endpoint, detection time, and before/after p50/p95 snapshots included.
+  This catches persistent degradations that sit *below* a fixed SLO line
+  (a 100→250ms shift never trips a 400ms threshold but is a real regime
+  change); it complements, not replaces, WR-13's fixed-threshold alerting
+  and `src/source-baseline.ts`'s inbound anomaly detection. After an
+  alarm the baseline is re-estimated from the new regime, so a second
+  shift is measured against the new normal; memory is bounded to
+  `2 × windowSamples` samples. Tuning knobs: `deltaMs` (min mean shift,
+  default 100), `lambda` (alarm threshold, default 300), `warmupSamples`
+  (median-based baseline, default 10), `windowSamples` (default 50).
+  Honest limitation: the adaptive running mean absorbs per-sample drifts
+  smaller than δ/2 that never plateau — tune δ/λ for the endpoint's noise
+  floor. The clock is injectable for deterministic tests.
 - `src/latency-phases.ts` — delivery-latency phase breakdown
   (`LatencyPhasesTracker`), opt-in under `retry.latencyPhases` (disabled by
   default, zero overhead). The sender decomposes each delivery into
@@ -1325,6 +1342,46 @@ the same path. Invalid rules throw `RangeError` at startup. Orthogonal
 to WR-65 API-key authentication: key-only endpoints never consult the
 secrets; with `requireSignature: true` the dual-secret check is the
 signature leg.
+
+## Stripe-style webhook signatures
+
+Some upstreams (Stripe-style PSPs) sign with `t=<unix_ts>,v1=<hex>`
+headers instead of the plain `sha256=<hex>` scheme: the signed payload is
+`<t>.<rawBody>` (HMAC-SHA256, hex), and during a key rotation the header
+may carry several `v1` values — any one of them authenticates.
+`StripeSignatureVerifier` (in `src/verify.ts`) implements exactly that,
+registered under the scheme name `"stripe-signature"`:
+
+```ts
+registerVerifier(new StripeSignatureVerifier({ secrets: STRIPE_WEBHOOK_SECRET }));
+
+const server = createRelayServer({
+  secret, // global fallback for paths with no rule
+  forwardUrl,
+  endpointVerifiers: [
+    // A Stripe-style upstream on its own path, coexisting with the
+    // HMAC-SHA256 default and Ed25519 verifiers on other paths.
+    { pattern: "/hooks/stripe", verifier: new StripeSignatureVerifier({ secrets: STRIPE_WEBHOOK_SECRET }) },
+    { pattern: "/hooks/solana", verifier: new Ed25519Verifier(SOLANA_PROGRAM_PUBKEY_PEM) },
+  ],
+});
+```
+
+Details:
+
+- **Rotation-tolerant both ways.** The header may carry multiple `v1`
+  values (upstream-side rotation) and the verifier accepts multiple
+  configured secrets (relay-side rotation): any (secret, `v1`) pair that
+  matches authenticates.
+- **Timestamp is mandatory.** A missing `t=` (unparsable header) or a
+  timestamp outside `toleranceSec` (default 300s, both directions) is an
+  explicit rejection — replay protection, never a silent pass.
+- **Fail fast, never throw.** Constructor rejects empty secrets and bad
+  tolerances; `verify` converts every malformed header, wrong key, and
+  crypto error to `false`. Per-call `opts` can override the tolerance and
+  the clock.
+- **Helper.** `signStripe(rawBody, secret, timestamp?, extraSecrets?)`
+  builds a header, including multi-`v1` rotation headers for tests.
 
 ## Graceful shutdown
 
@@ -5881,43 +5938,3 @@ Requires Node 24+ (runs `.ts` directly via type stripping; zero dependencies).
   (cluster listing, bad `top` 400, wrong-token 403, method 405,
   dry-run preview with zero side effects, selector replay audited as
   `dead_letter_cluster_replayed`, no-match selector 404).
-## Stripe-style webhook signatures
-
-Some upstreams (Stripe-style PSPs) sign with `t=<unix_ts>,v1=<hex>`
-headers instead of the plain `sha256=<hex>` scheme: the signed payload is
-`<t>.<rawBody>` (HMAC-SHA256, hex), and during a key rotation the header
-may carry several `v1` values — any one of them authenticates.
-`StripeSignatureVerifier` (in `src/verify.ts`) implements exactly that,
-registered under the scheme name `"stripe-signature"`:
-
-```ts
-registerVerifier(new StripeSignatureVerifier({ secrets: STRIPE_WEBHOOK_SECRET }));
-
-const server = createRelayServer({
-  secret, // global fallback for paths with no rule
-  forwardUrl,
-  endpointVerifiers: [
-    // A Stripe-style upstream on its own path, coexisting with the
-    // HMAC-SHA256 default and Ed25519 verifiers on other paths.
-    { pattern: "/hooks/stripe", verifier: new StripeSignatureVerifier({ secrets: STRIPE_WEBHOOK_SECRET }) },
-    { pattern: "/hooks/solana", verifier: new Ed25519Verifier(SOLANA_PROGRAM_PUBKEY_PEM) },
-  ],
-});
-```
-
-Details:
-
-- **Rotation-tolerant both ways.** The header may carry multiple `v1`
-  values (upstream-side rotation) and the verifier accepts multiple
-  configured secrets (relay-side rotation): any (secret, `v1`) pair that
-  matches authenticates.
-- **Timestamp is mandatory.** A missing `t=` (unparsable header) or a
-  timestamp outside `toleranceSec` (default 300s, both directions) is an
-  explicit rejection — replay protection, never a silent pass.
-- **Fail fast, never throw.** Constructor rejects empty secrets and bad
-  tolerances; `verify` converts every malformed header, wrong key, and
-  crypto error to `false`. Per-call `opts` can override the tolerance and
-  the clock.
-- **Helper.** `signStripe(rawBody, secret, timestamp?, extraSecrets?)`
-  builds a header, including multi-`v1` rotation headers for tests.
-
