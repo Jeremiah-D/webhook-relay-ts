@@ -415,6 +415,20 @@ function countQueuedRequests(agent: HttpAgent): number {
   return n;
 }
 
+/**
+ * WR-170: per-endpoint DNS-over-HTTPS binding for
+ * {@link OutboundConnectionPool.agentFor}. Endpoints with a `doh` entry
+ * resolve through their own `DnsCache` (DoH first, system DNS fallback)
+ * instead of the pool-level lookup — the pool key binds the DoH URL so a
+ * DoH-resolved connection can never serve a system-DNS endpoint.
+ */
+export interface DohAgentBinding {
+  /** The DoH URL (hashed into the pool key; never embedded). */
+  url: string;
+  /** The endpoint's `DnsCache#lookup` resolving through DoH. */
+  lookup: LookupFunction;
+}
+
 export class OutboundConnectionPool {
   private readonly opts: ResolvedKeepAlivePoolOptions;
   private readonly entries = new Map<string, PoolEntry>();
@@ -477,7 +491,7 @@ export class OutboundConnectionPool {
    * override entry pass `undefined` and keep the exact historical pool
    * keys.
    */
-  agentFor(url: URL, pins?: readonly string[], proxyUrl?: string, clientCertId?: string, tlsSni?: ResolvedTlsSniOverride, minTlsVersion?: MinTlsVersion, ocsp?: boolean, caBundle?: string): HttpAgent {
+  agentFor(url: URL, pins?: readonly string[], proxyUrl?: string, clientCertId?: string, tlsSni?: ResolvedTlsSniOverride, minTlsVersion?: MinTlsVersion, ocsp?: boolean, caBundle?: string, doh?: DohAgentBinding): HttpAgent {
     if (url.protocol !== "http:" && url.protocol !== "https:") {
       throw new Error(`OutboundConnectionPool: unsupported protocol ${url.protocol}`);
     }
@@ -517,6 +531,13 @@ export class OutboundConnectionPool {
       const digest = createHash("sha256").update(caBundle).digest("hex").slice(0, 16);
       key += `|ca:${digest}`;
     }
+    // WR-170: a DoH-bound endpoint gets its own agent — a connection
+    // resolved through DNS-over-HTTPS must never be handed to an
+    // endpoint resolving through the system DNS (or a different DoH
+    // URL). The URL is hashed, never embedded in the key.
+    if (doh !== undefined) {
+      key += `|doh:${createHash("sha256").update(doh.url).digest("hex").slice(0, 16)}`;
+    }
     let entry = this.entries.get(key);
     if (entry === undefined) {
       // WR-134: the fixed cap is the *initial* cap, clamped into
@@ -536,6 +557,9 @@ export class OutboundConnectionPool {
         // (scheme, host, port), the socket is built against the resolved
         // IP.
         ...(this.opts.lookup !== undefined ? { lookup: this.opts.lookup } : {}),
+        // WR-170: a per-endpoint DoH lookup overrides the pool-level one —
+        // the most specific resolver wins.
+        ...(doh !== undefined ? { lookup: doh.lookup } : {}),
         // 0 disables Node's internal free-socket reaping: the pool reaps
         // on its own unref'd timer instead, so idle sockets can be
         // unref'd without racing the agent's timer.

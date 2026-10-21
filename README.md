@@ -4099,6 +4099,44 @@ const server = createRelayServer({
   throw `RangeError` at startup. Absent by default: with no `dnsCache`
   configured, every connection uses the OS resolver.
 
+## Per-endpoint DNS-over-HTTPS (opt-in)
+
+The outbound DNS cache above still trusts the host's resolver — a single
+point of failure and, on shared or hostile networks, a single point of
+observation. Per-endpoint DNS-over-HTTPS (`src/doh.ts`, RFC 8484 wire format
+over HTTPS POST, zero dependencies) lets an endpoint resolve through its
+own DoH URL instead of the system DNS:
+
+```ts
+const server = createRelayServer({
+  doh: { "https://downstream.example/hook": "https://cloudflare-dns.com/dns-query" },
+});
+```
+
+- **DoH first, system-DNS fallback** — each lookup POSTs A and AAAA queries
+  in parallel (RFC 8484 `application/dns-message`) and merges the answers,
+  A records first; IP literals short-circuit with no network traffic. Any
+  DoH failure (network error, timeout, protocol error, empty answer set)
+  falls back to the system resolver for that lookup and is audited as
+  `doh_fallback` (hostname + DoH URL + error) — a DoH outage degrades to
+  the pre-WR-170 behavior instead of failing deliveries.
+- **Cache integration** — answers flow through a dedicated per-DoH-URL
+  `DnsCache` with the same stale-while-revalidate semantics as `dnsCache`.
+  Pooled agents for the endpoint resolve through it, and the pool key binds
+  the DoH URL (`|doh:` fragment) so a DoH-resolved connection can never
+  serve a system-DNS endpoint (or an endpoint on a different DoH URL).
+  Endpoints without an entry use the shared `dnsCache` / system DNS exactly
+  as before.
+- **Observability** — `sender.dohCaches.get(dohUrl)?.getStats()` exposes
+  the per-DoH-URL cache counters; the underlying DoH-first/system-fallback
+  resolver reports `dohQueries` / `dohFailures` / `fallbacks` /
+  `systemQueries` the same way.
+- **Fail-fast** — invalid DoH URLs throw `RangeError` at startup. Absent by
+  default: with no `doh` configured, every endpoint uses the shared
+  `dnsCache` / system DNS. Covered by `test/doh.test.ts` (wire-format
+  query builder, response parser incl. compression pointers and malformed
+  packets, parallel A/AAAA merging, fallback stats).
+
 ## Outbound Happy Eyeballs connection racing (opt-in, RFC 8305)
 
 In a dual-stack environment where IPv6 is routed but unusable, Node's

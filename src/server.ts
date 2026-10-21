@@ -1,6 +1,11 @@
 import { Agent as HttpAgent, createServer, request as httpRequest } from "node:http";
-import { request as httpsRequest, createServer as createHttpsServer } from "node:https";
+import {
+  Agent as HttpsAgent,
+  request as httpsRequest,
+  createServer as createHttpsServer,
+} from "node:https";
 import type { IncomingMessage, Server } from "node:http";
+import type { LookupFunction } from "node:net";
 import { randomUUID } from "node:crypto";
 import {
   assertValidEndpointBodyLimitRules,
@@ -306,6 +311,11 @@ import {
   createProxiedAgent,
   resolveProxyUrl,
 } from "./proxy.ts";
+import {
+  assertValidDohUrl,
+  createDohAwareResolver,
+  resolveDohUrl,
+} from "./doh.ts";
 import {
   Http2SessionPool,
   Http2UnavailableError,
@@ -1281,6 +1291,20 @@ export interface RelayServerOptions {
    */
   proxies?: Record<string, string>;
   /**
+   * Per-endpoint DNS-over-HTTPS resolvers (WR-170, see `src/doh.ts`):
+   * `{ "<exact targetUrl>": "<dohUrl>" }`. An endpoint with an entry
+   * resolves outbound hostnames through the DoH URL (RFC 8484 wireformat
+   * over HTTPS POST) instead of the system DNS — useful where the local
+   * resolver is untrusted or hijacked. Answers flow through a dedicated
+   * per-DoH-URL `DnsCache` (the same stale-while-revalidate semantics as
+   * `dnsCache`); a DoH failure falls back to the system resolver for
+   * that lookup and is audited as `doh_fallback` — the delivery keeps
+   * working. Endpoints without an entry use the shared `dnsCache` /
+   * system DNS exactly as before. Invalid URLs throw `RangeError` at
+   * startup. Default: off.
+   */
+  doh?: Record<string, string>;
+  /**
    * Inbound request body size limit (WR-25). A POST whose body exceeds this
    * is answered 413 and audited as `rejected` (reason `body_too_large`):
    * the declared `content-length` is checked before a single body byte is
@@ -2189,6 +2213,14 @@ export interface PooledSender extends Sender {
    */
   dnsCache: DnsCache | undefined;
   /**
+   * WR-170: per-DoH-URL DNS caches for endpoints with a `doh` entry,
+   * keyed by DoH URL. Operators read counters via
+   * `sender.dohCaches.get(dohUrl)?.getStats()`; the underlying
+   * DoH-first/system-fallback resolver stats (queries, failures,
+   * fallbacks) are exposed the same way. Empty when the feature is off.
+   */
+  dohCaches: Map<string, DnsCache>;
+  /**
    * WR-75/WR-142: cumulative per-endpoint byte savings from guarded gzip
    * (WR-75) and brotli (WR-142) compression; rendered into `GET /metrics`
    * as `relay_compressed_bytes_saved_total`.
@@ -2488,7 +2520,19 @@ export function createDefaultSender(
    * `undefined` keeps the exact pre-WR-168 behavior (64 KiB truncated
    * capture, no digest check).
    */
-  responseGuard?: Record<string, ResponseGuardConfig>
+  responseGuard?: Record<string, ResponseGuardConfig>,
+  /**
+   * WR-170: per-endpoint DNS-over-HTTPS (`{ "<exact targetUrl>": "<dohUrl>" }`).
+   * Validated at startup (`RangeError`); `undefined` keeps the exact
+   * pre-WR-170 behavior (shared `dnsCache` / system DNS for every endpoint).
+   */
+  doh?: Record<string, string>,
+  /**
+   * WR-170: called once per DoH resolution failure that falls back to the
+   * system resolver. `createRelayServer` audits these as `doh_fallback`;
+   * library users get the hook directly.
+   */
+  onDohFallback?: (info: { hostname: string; error: string; dohUrl: string }) => void
 ): PooledSender {
   if (tlsPins !== undefined) {
     for (const [endpoint, pins] of Object.entries(tlsPins)) {
@@ -2915,6 +2959,40 @@ export function createDefaultSender(
   }
   // Bound arrow property — no `this` context needed downstream.
   const dnsLookup = resolvedDnsCache?.lookup;
+  // WR-170: fail fast on a misconfigured DoH URL — a typo must not
+  // silently leave an endpoint on the system resolver.
+  if (doh !== undefined) {
+    for (const [endpoint, dohUrl] of Object.entries(doh)) {
+      try {
+        assertValidDohUrl(dohUrl);
+      } catch (err) {
+        throw new RangeError(
+          `createDefaultSender: invalid DoH URL for ${endpoint}: ${(err as Error).message}`
+        );
+      }
+    }
+  }
+  // WR-170: per-endpoint DNS-over-HTTPS — one DnsCache per DoH URL whose
+  // resolver tries DoH first and falls back to the system resolver on
+  // any failure (reported via onDohFallback). Built lazily on first use
+  // so an endpoint that never delivers allocates nothing; shared by the
+  // pooled and one-off request paths of every endpoint on that DoH URL.
+  const dohCaches = new Map<string, DnsCache>();
+  const dohLookupFor = (
+    targetUrl: string
+  ): { url: string; lookup: LookupFunction } | undefined => {
+    const dohUrl = resolveDohUrl(targetUrl, doh);
+    if (dohUrl === undefined) return undefined;
+    let cache = dohCaches.get(dohUrl);
+    if (cache === undefined) {
+      const aware = createDohAwareResolver(dohUrl, {
+        onFallback: (info) => onDohFallback?.(info),
+      });
+      cache = new DnsCache({ resolve: aware.resolve });
+      dohCaches.set(dohUrl, cache);
+    }
+    return { url: dohUrl, lookup: cache.lookup };
+  };
   // WR-92: the pool's agents resolve through the DNS cache when one is
   // configured — connections are built against the resolved IP while the
   // pool key stays the logical (scheme, host, port).
@@ -3386,6 +3464,10 @@ export function createDefaultSender(
         // one-off tunneled agent — fresh tunnel per delivery, destroyed when
         // the request settles.
         let oneOffAgent: HttpAgent | undefined;
+        // WR-170: per-endpoint DoH binding — the pool keys the agent per
+        // DoH URL so a DoH-resolved connection never serves a
+        // system-DNS endpoint.
+        const dohBinding = dohLookupFor(item.targetUrl);
         const agent =
           pool?.agentFor(
             url,
@@ -3406,7 +3488,10 @@ export function createDefaultSender(
             // WR-163: the CA bundle binds the pool key (see agentFor) —
             // a connection handshaked against the private bundle can
             // never serve an endpoint on the public PKI, or vice versa.
-            caBundle
+            caBundle,
+            // WR-170: per-endpoint DoH binding (undefined = system DNS /
+            // shared cache).
+            dohBinding
           ) ??
           (proxyUrl !== undefined
             ? (oneOffAgent = createProxiedAgent(
@@ -3414,7 +3499,16 @@ export function createDefaultSender(
                 proxyUrl,
                 { keepAlive: false, maxSockets: 1, maxFreeSockets: 0 }
               ))
-            : undefined);
+            : dohBinding !== undefined
+              ? // WR-170: one-off DoH-bound agent (pooling disabled) —
+                // resolves through the endpoint's DoH cache.
+                (oneOffAgent = new (url.protocol === "https:" ? HttpsAgent : HttpAgent)({
+                  keepAlive: false,
+                  maxSockets: 1,
+                  maxFreeSockets: 0,
+                  lookup: dohBinding.lookup,
+                }))
+              : undefined);
         // WR-143: phase-timeout response hook — assigned below when the
         // endpoint configures `phaseTimeouts`. `onResponse` invokes it so
         // the firstByte → body budget handoff observes exactly the
@@ -4625,6 +4719,9 @@ export function createDefaultSender(
   // WR-92: the shared DNS cache instance (undefined when the feature is
   // off) — operators read counters via `sender.dnsCache.getStats()`.
   sender.dnsCache = resolvedDnsCache;
+  // WR-170: per-DoH-URL DNS caches (empty when the feature is off) —
+  // operators read counters via `sender.dohCaches.get(dohUrl)?.getStats()`.
+  sender.dohCaches = dohCaches;
   // WR-89: take-and-clear the rotation certificate id used by a
   // delivery's latest handshake attempt, for audit stamping (see the
   // `rotationClientCertUsed` map above).
@@ -5142,6 +5239,19 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       bytesSaved: info.bytesSaved,
     });
   };
+  // WR-170: a DoH resolution failed and fell back to the system
+  // resolver — one audit line per failure naming the hostname and the
+  // DoH URL (the delivery keeps working; the operator may want to check
+  // the DoH endpoint's health). Shared by the main sender and every
+  // WR-85 shadow sender copy below.
+  const onDohFallbackAudit = (info: { hostname: string; error: string; dohUrl: string }) => {
+    opts.auditLog.append({
+      event: "doh_fallback",
+      hostname: info.hostname,
+      dohUrl: info.dohUrl,
+      error: info.error,
+    });
+  };
   // WR-165: a chaos-drill fault was injected — one audit line per fault
   // naming the endpoint, the fault kind, and the detail (latency or
   // synthetic status). Injected faults are always distinguishable from
@@ -5266,7 +5376,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   }
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, opts.awsSigV4, opts.awsSecretResolver, opts.outboundSchemas, opts.oauth2, undefined, opts.compressBrotli, opts.phaseTimeouts, opts.tlsCa, opts.chaos, onChaosInjectedAudit, opts.responseGuard)
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, opts.awsSigV4, opts.awsSecretResolver, opts.outboundSchemas, opts.oauth2, undefined, opts.compressBrotli, opts.phaseTimeouts, opts.tlsCa, opts.chaos, onChaosInjectedAudit, opts.responseGuard, opts.doh, onDohFallbackAudit)
       : undefined;
   // WR-146: tail-latency hedging for outbound attempts (opt-in). The
   // wrapper sits around whichever sender the queue uses — the default
@@ -5444,7 +5554,13 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
                   // the same way as the main delivery's.
                   undefined,
                   undefined,
-                  opts.responseGuard
+                  opts.responseGuard,
+                  // WR-170: shadow mirrors resolve through the same
+                  // per-endpoint DoH config (each shadow sender keeps
+                  // its own per-DoH-URL cache), with the same
+                  // doh_fallback audit line on failure.
+                  opts.doh,
+                  onDohFallbackAudit
                 ),
               })
             ),
