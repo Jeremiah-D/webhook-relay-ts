@@ -5215,6 +5215,39 @@ Off by default; a present-but-empty object uses the default
 `replaysPerSecond` of 10; invalid values throw `RangeError` at
 construction.
 
+### Downstream interaction record/replay harness (WR-174)
+
+`src/record-replay.ts` is a test harness for the delivery path,
+orthogonal to the WR-165 chaos drill (chaos *injects* synthetic faults;
+this module *records* real downstream interactions and *replays* them
+deterministically for offline regression/CI).
+
+**Record mode** — `new RecordingStore()` + `store.wrap(sender)`: every
+attempt is captured after it settles as `(method, url, header-names,
+payload-hash) → (status/body | transport error, latency)`. The capture
+holds the payload **hash, never the plaintext**, and request header
+*names* only (values may carry credentials) — sensitive data never
+reaches the recording file. `store.saveToFile(path)` persists a
+version-pinned JSON fixture (`version: 1`) that can be committed next to
+the tests it drives; recordings past `maxRecordings` (default 10000)
+evict oldest-first.
+
+**Replay mode** — `createReplaySender(recordings)`: a network-free
+`Sender` that answers matched requests with the recorded response.
+Matching strategies (`matchStrategy`): `"exact-url"` (default; method +
+url equality), `"url-prefix"` (longest recorded prefix wins),
+`"payload-hash"` (same event fanned out to many endpoints), or a custom
+function. Requests that match nothing throw `ReplayNoMatchError`
+fail-loud — an offline CI run never silently passes through to a real
+downstream. Recorded transport errors re-throw with the recorded `code`,
+so the queue classifies the replay exactly like the original failure
+(backoff / circuit / dead-letter).
+
+Corrupt fixtures fail loud: `loadFromFile` rejects wrong versions,
+non-array recordings, and malformed entries, so a replay harness never
+runs on a broken fixture and looks green. Invalid configs throw
+`RangeError` at construction.
+
 ### Delivery deadline (end-to-end SLO)
 
 Opt-in per-endpoint deadline from queue admission to delivery
@@ -5795,3 +5828,15 @@ Requires Node 24+ (runs `.ts` directly via type stripping; zero dependencies).
   surfacing `HttpDeliveryError` with no fallback; proxied endpoints
   bypassing H2 for the CONNECT tunnel (zero H2 sessions); `getStats()`
   shape and `destroy()` closing sessions.
+- `test/record-replay.test.ts` — the WR-174 record/replay harness (17
+  tests): config `RangeError` validation; record mode capturing method /
+  url / header-names / payload-hash (payload plaintext and header values
+  never in the capture); success / void-response / transport-failure
+  passthrough; `maxRecordings` oldest-first eviction; injected-clock
+  latency; `saveToFile` / `loadFromFile` round-trip with no payload
+  plaintext on disk; fail-loud fixture validation (bad JSON, wrong
+  version, malformed entries, missing file); replay strategies
+  (exact-url, url-prefix longest-wins, payload-hash, custom matcher);
+  unmatched requests throwing `ReplayNoMatchError` (never a network
+  pass-through); recorded errors re-thrown with the original `code`;
+  end-to-end record → save → replay.
