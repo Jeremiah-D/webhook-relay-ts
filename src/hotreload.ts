@@ -29,6 +29,10 @@
 import type { JitterStrategy } from "./retry.ts";
 import { assertValidWeightedTargets, type WeightedTargetConfig } from "./weighted.ts";
 import type { CircuitTripMode } from "./circuit.ts";
+import {
+  assertValidStatusRetryPolicy,
+  type StatusRetryPolicyConfig,
+} from "./status-retry.ts";
 
 /** Patch for one endpoint's circuit-breaker trip/cooldown thresholds. */
 export interface CircuitBreakerPatch {
@@ -117,6 +121,15 @@ export interface EndpointConfigPatch {
    * endpoint's policy, falling back to the global retry config.
    */
   retryPolicyName?: string | null;
+  /**
+   * WR-178: per-status retry policy for the endpoint (see
+   * `src/status-retry.ts`). Replaces the endpoint's whole policy —
+   * the shape is always complete, never a partial merge. `null`
+   * detaches the policy, falling back to the WR-172 policy / global
+   * schedule. An illegal value throws `RangeError` and leaves the
+   * running config untouched.
+   */
+  statusRetryPolicy?: StatusRetryPolicyConfig | null;
 }
 
 /** One applied configuration change, for audit/observability. */
@@ -254,6 +267,18 @@ export function assertValidEndpointConfigPatch(patch: EndpointConfigPatch): void
     if (typeof p.retryPolicyName !== "string" || p.retryPolicyName.length === 0) {
       throw new RangeError(
         `updateEndpointConfig: \`retryPolicyName\` must be a non-empty string or null, got ${JSON.stringify(p.retryPolicyName)}`
+      );
+    }
+  }
+  // WR-178: a per-status retry policy patch — `null` detaches, an object
+  // replaces the endpoint's whole policy. Validated with the same
+  // fail-fast RangeError as the construction-time setter.
+  if (p.statusRetryPolicy !== undefined && p.statusRetryPolicy !== null) {
+    try {
+      assertValidStatusRetryPolicy(p.statusRetryPolicy);
+    } catch (err) {
+      throw new RangeError(
+        `updateEndpointConfig: \`statusRetryPolicy\` is invalid: ${(err as Error).message}`
       );
     }
   }

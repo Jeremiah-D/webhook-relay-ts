@@ -1573,6 +1573,71 @@ const queue = new RetryQueue({
   endpoint runs on a named policy, so the audit trail shows which
   schedule governs each delivery.
 
+## Per-status retry policies
+
+Named policies are endpoint-granular but status-blind: a `429` from a
+rate-limited payment provider and a `503` from a flapping edge cache
+share one schedule. Per-status retry policies (`src/status-retry.ts`)
+tune the backoff *by the status code the downstream actually answered
+with*, per endpoint — the backend-engineering answer to downstreams
+whose error semantics differ:
+
+```ts
+const queue = new RetryQueue({
+  baseDelayMs: 1000, maxAttempts: 5, // global schedule (unchanged)
+  endpointStatusRetryPolicies: {
+    "https://payments/hook": {
+      "429": { baseDelayMs: 5_000, maxAttempts: 12 },               // exact status code
+      "5xx": { baseDelayMs: 500, maxAttempts: 6, multiplier: 3 },    // status class
+    },
+  },
+});
+```
+
+- **Config shape** — each endpoint maps a status selector to a
+  schedule: `{ baseDelayMs, maxAttempts, multiplier? }`. Selectors are
+  exact codes (`"429"`, `"503"`, 100–599) or classes (`"2xx"`, `"3xx"`,
+  `"4xx"`, `"5xx"`). `multiplier` defaults to 2 (the WR-02 house
+  convention). Illegal values (`baseDelayMs <= 0`, `maxAttempts < 1`
+  non-integer, `multiplier <= 0`, malformed keys) throw `RangeError`
+  at configuration time, never mid-delivery.
+- **Match order** — exact code beats class (`"429"` over `"4xx"`);
+  when nothing matches, the delivery falls back to the endpoint's
+  normal schedule (its WR-172 named policy when assigned, else the
+  WR-02 global backoff — base/cap/jitter untouched).
+- **What a match governs** — the retry delay for that status:
+  `baseDelayMs * multiplier^attempt` (deterministic — no jitter on
+  this schedule), and the attempt budget for deliveries failing with
+  that status. Nothing else: failure *classification* is untouched,
+  each failed attempt still consumes exactly one attempt, and the
+  WR-38 retry budget and WR-10 circuit breaker see the same events
+  they always did — the policy only reschedules, never mints or
+  forgives attempts.
+- **429 exception** — a downstream-supplied `Retry-After` is never
+  ignored: when a status schedule matches, the effective delay is
+  `max(policy delay, retryAfterMs)` — the downstream's explicit
+  backpressure request always wins (WR-30's "wins over every lane",
+  as a max instead of a pure override). Without a matching policy,
+  `Retry-After` keeps its old behavior (used as-is).
+- **4xx exception** — a `4xx` other than `408`/`429` is
+  `"non_retryable"` (WR-30): the item is dead-lettered on the first
+  attempt, before any policy lookup. A `"4xx"`/`"400"` policy entry is
+  therefore inert — it can restate but never soften the instant
+  dead-letter.
+- **Fast lane** — an `urgent`-priority delivery that takes the fast
+  lane keeps its fixed `urgent.retryDelayMs`; per-item priority
+  outranks the endpoint's status schedule, just as it outranks the
+  global backoff. (A `Retry-After` still composes as `max()` there —
+  WR-30 wins over every lane.)
+- **Runtime updates** — `queue.setEndpointStatusRetryPolicy(endpoint,
+  config)` / `queue.clearEndpointStatusRetryPolicy(endpoint)`, and
+  WR-32 hot-reload: `queue.updateEndpointConfig(endpoint, {
+  statusRetryPolicy: {...} })` replaces the whole policy
+  (`null` detaches back to the normal schedule); every change is
+  validated atomically and reported through `onConfigChange` like any
+  other patch. `queue.statusRetryPolicyFor(endpoint)` returns the live
+  config as a detached copy.
+
 ## Declarative config snapshots (export / apply / rollback)
 
 The hot-reload layer above is imperative; the snapshot layer

@@ -190,6 +190,14 @@ import {
   type RetryPolicyConfig,
 } from "./retry-policy.ts";
 import {
+  assertValidStatusRetryPolicy,
+  matchStatusRetryPolicy,
+  normalizeStatusRetryPolicy,
+  statusRetryDelayMs,
+  type StatusRetryPolicyConfig,
+  type StatusRetryPolicyEntry,
+} from "./status-retry.ts";
+import {
   AdaptiveBackoffController,
   type AdaptiveBackoffEndpointStats,
   type AdaptiveBackoffOptions,
@@ -463,6 +471,13 @@ export type { RetryBudgetOptions } from "./retry-budget.ts";
 export { RetryBudget, DEFAULT_RETRY_BUDGET_PER_MINUTE } from "./retry-budget.ts";
 export type { NamedRetryPolicy, RetryPolicyConfig } from "./retry-policy.ts";
 export { RetryPolicyRegistry, assertValidRetryPolicy } from "./retry-policy.ts";
+export type { StatusRetryPolicyConfig, StatusRetryPolicyEntry } from "./status-retry.ts";
+export {
+  assertValidStatusRetryPolicy,
+  matchStatusRetryPolicy,
+  normalizeStatusRetryPolicy,
+  statusRetryDelayMs,
+} from "./status-retry.ts";
 export type { AdaptiveBackoffOptions, AdaptiveBackoffEndpointStats } from "./adaptive-backoff.ts";
 export {
   AdaptiveBackoffController,
@@ -1545,6 +1560,23 @@ export interface RetryQueueOptions {
    * (`updateEndpointConfig` with a `retryPolicyName` patch).
    */
   endpointRetryPolicies?: Record<string, string>;
+  /**
+   * WR-178: per-endpoint per-status retry policies (see
+   * `src/status-retry.ts`) — exact `targetUrl` (the logical endpoint)
+   * to a policy keyed by status selector (`"429"` exact beats `"5xx"`
+   * class). The matched entry tunes *only* the delay schedule and the
+   * attempt budget for retries failing with that status; a
+   * `Retry-After` (429/503, WR-30) composes as `max(policy delay,
+   * retryAfterMs)`, never ignored. Every config is validated with
+   * `RangeError` at construction, exactly like `endpointRetryPolicies`.
+   * Endpoints not listed here keep the WR-172 policy / global schedule.
+   * Mutable at runtime via
+   * {@link RetryQueue.setEndpointStatusRetryPolicy} /
+   * {@link RetryQueue.clearEndpointStatusRetryPolicy} and WR-32
+   * hot-reload (`updateEndpointConfig` with a `statusRetryPolicy`
+   * patch, `null` clears).
+   */
+  endpointStatusRetryPolicies?: Record<string, StatusRetryPolicyConfig>;
   /**
    * Adaptive backoff (WR-59; see `src/adaptive-backoff.ts`): scales the
    * exponential backoff's *base* per endpoint from recent delivery
@@ -3327,6 +3359,8 @@ export class RetryQueue {
    * to the queue's global retry config.
    */
   private readonly endpointRetryPolicy = new Map<string, string>();
+  /** WR-178: per-endpoint per-status retry policy configs (normalized copies). */
+  private readonly endpointStatusRetryPolicy = new Map<string, StatusRetryPolicyConfig>();
   private readonly random: () => number;
   private readonly setTimer: (fn: () => void, ms: number) => { clear(): void };
   private readonly clearTimer: (handle: { clear(): void }) => void;
@@ -3898,6 +3932,28 @@ export class RetryQueue {
       }
       for (const [targetUrl, name] of Object.entries(opts.endpointRetryPolicies)) {
         this.endpointRetryPolicy.set(targetUrl, name);
+      }
+    }
+    // WR-178: per-endpoint per-status retry policies. Two passes like
+    // the WR-172 block above: validate every config first so an illegal
+    // one throws before any endpoint is touched (zero partial
+    // application), then store normalized copies.
+    if (opts.endpointStatusRetryPolicies !== undefined) {
+      if (
+        typeof opts.endpointStatusRetryPolicies !== "object" ||
+        opts.endpointStatusRetryPolicies === null ||
+        Array.isArray(opts.endpointStatusRetryPolicies)
+      ) {
+        throw new RangeError("endpointStatusRetryPolicies must be an object mapping targetUrl to status retry policy configs");
+      }
+      for (const [targetUrl, config] of Object.entries(opts.endpointStatusRetryPolicies)) {
+        if (typeof targetUrl !== "string" || targetUrl.length === 0) {
+          throw new RangeError("endpointStatusRetryPolicies keys must be non-empty targetUrl strings");
+        }
+        assertValidStatusRetryPolicy(config);
+      }
+      for (const [targetUrl, config] of Object.entries(opts.endpointStatusRetryPolicies)) {
+        this.endpointStatusRetryPolicy.set(targetUrl, normalizeStatusRetryPolicy(config));
       }
     }
     this.setTimer =
@@ -6420,6 +6476,56 @@ export class RetryQueue {
   }
 
   /**
+   * WR-178: attach a per-status retry policy to an endpoint (exact
+   * `targetUrl`, the logical endpoint). Validated eagerly — a bad
+   * config throws `RangeError` and leaves the running config untouched.
+   * Stores a normalized copy, so the caller's object can never mutate
+   * the live schedule.
+   */
+  setEndpointStatusRetryPolicy(targetUrl: string, config: StatusRetryPolicyConfig): void {
+    if (typeof targetUrl !== "string" || targetUrl.length === 0) {
+      throw new RangeError("setEndpointStatusRetryPolicy: targetUrl must be a non-empty string");
+    }
+    assertValidStatusRetryPolicy(config);
+    this.endpointStatusRetryPolicy.set(targetUrl, normalizeStatusRetryPolicy(config));
+  }
+
+  /**
+   * WR-178: detach the endpoint's per-status retry policy — its retries
+   * fall back to the WR-172 policy / global schedule. Returns `true`
+   * when a policy was actually attached.
+   */
+  clearEndpointStatusRetryPolicy(targetUrl: string): boolean {
+    return this.endpointStatusRetryPolicy.delete(targetUrl);
+  }
+
+  /**
+   * WR-178: the endpoint's per-status retry policy as a detached copy,
+   * or `undefined` when the endpoint has none. The server stamps nothing
+   * on the `accepted` audit event for this — the schedule only becomes
+   * visible when a retry actually matches a status selector.
+   */
+  statusRetryPolicyFor(targetUrl: string): StatusRetryPolicyConfig | undefined {
+    const found = this.endpointStatusRetryPolicy.get(targetUrl);
+    return found === undefined ? undefined : normalizeStatusRetryPolicy(found);
+  }
+
+  /**
+   * WR-178: the matched schedule entry for `targetUrl`'s policy and a
+   * failure's status code (exact selector beats class), or `undefined`
+   * when the endpoint has no policy or nothing matched — the caller
+   * then falls back to the normal schedule. Keyed by the *logical*
+   * endpoint (like the WR-172 attempt budget), not the physical
+   * target: failover routing never changes which policy governs.
+   */
+  private matchStatusRetryEntry(
+    targetUrl: string,
+    statusCode: number | undefined
+  ): StatusRetryPolicyEntry | undefined {
+    return matchStatusRetryPolicy(this.endpointStatusRetryPolicy.get(targetUrl), statusCode);
+  }
+
+  /**
    * WR-172: observability snapshot of every registered policy, in
    * registration order. The returned objects are copies.
    */
@@ -6690,6 +6796,23 @@ export class RetryQueue {
         this.assertRetryPolicyRegistered(name);
         this.endpointRetryPolicy.set(endpoint, name);
         rec("retryPolicyName", before, name);
+      }
+    }
+    // WR-178: replace (or clear) the endpoint's per-status retry policy.
+    // The patch was validated structurally by
+    // assertValidEndpointConfigPatch; a normalized copy is stored so the
+    // caller's object can never mutate the live config. Zero partial
+    // application — already-scheduled retries keep the delay they were
+    // scheduled with (the schedule is read at schedule time).
+    if (patch.statusRetryPolicy !== undefined) {
+      const policy = patch.statusRetryPolicy;
+      const before = this.statusRetryPolicyFor(endpoint) ?? null;
+      if (policy === null) {
+        this.endpointStatusRetryPolicy.delete(endpoint);
+        rec("statusRetryPolicy", before, null);
+      } else {
+        this.endpointStatusRetryPolicy.set(endpoint, normalizeStatusRetryPolicy(policy));
+        rec("statusRetryPolicy", before, this.statusRetryPolicyFor(endpoint));
       }
     }
 
@@ -7737,16 +7860,33 @@ export class RetryQueue {
         }
         this.recordDelivery(tenant, target, "failed");
         entry.attempt += 1;
-        // WR-172: the attempt budget comes from the logical endpoint's
-        // policy when one is assigned — a payment endpoint on a patient
-        // policy gets its policy's attempts, not the global five.
-        if (entry.attempt >= this.maxAttemptsFor(logicalEndpoint)) {
+        // WR-178: the per-status policy entry matched for this failure's
+        // status code (exact selector beats class) governs the attempt
+        // budget for this retry decision — a 429-answering payment hook
+        // can keep a longer tail of attempts than the global budget
+        // allows. The WR-172 named policy wins when no status selector
+        // matched. The classification above is untouched: a
+        // non-retryable 4xx (WR-30) never reaches this branch, so a
+        // "4xx"/"400" policy entry can restate but never soften the
+        // instant dead-letter — and non-HTTP failures (no status code)
+        // fall straight through to the normal schedule.
+        const statusEntry = this.matchStatusRetryEntry(logicalEndpoint, classified.statusCode);
+        const effectiveMaxAttempts = statusEntry?.maxAttempts ?? this.maxAttemptsFor(logicalEndpoint);
+        if (entry.attempt >= effectiveMaxAttempts) {
           this.moveToDeadLetter(entry, id, err, classified, at, traceId, target);
         } else {
-          // A downstream-supplied `Retry-After` (429/503) wins over every
-          // lane's own delay: ignoring the backpressure signal the
-          // downstream explicitly sent would be perverse.
+          // WR-178: a matched per-status entry prescribes this retry's
+          // delay. A downstream-supplied `Retry-After` (429/503) is never
+          // ignored — the two compose as a floor: the longer of the
+          // policy's delay and the downstream's explicit request wins
+          // (WR-30's "wins over every lane's own delay", as a max
+          // instead of a pure override).
+          const statusDelayMs =
+            statusEntry !== undefined ? statusRetryDelayMs(statusEntry, entry.attempt) : undefined;
           let retryDelayMs = classified.retryAfterMs;
+          if (retryDelayMs !== undefined && statusDelayMs !== undefined) {
+            retryDelayMs = Math.max(statusDelayMs, retryDelayMs);
+          }
           if (retryDelayMs === undefined) {
             if (fastLane && this.urgentLimiter.take(target)) {
               // Skip the exponential backoff: fixed fast-lane retry delay.
@@ -7759,7 +7899,13 @@ export class RetryQueue {
                 this.recordUrgentStat(target, "throttled");
                 entry.priority = "normal";
               }
-              retryDelayMs = this.delayForAttempt(entry.attempt, target, tenant);
+              // WR-178: the status schedule replaces the normal backoff
+              // (WR-172 policy or WR-02 global) for this failure's
+              // status. The fast lane already took its fixed delay above
+              // and keeps it — per-item priority outranks the
+              // endpoint's status schedule, just as it outranks the
+              // global backoff.
+              retryDelayMs = statusDelayMs ?? this.delayForAttempt(entry.attempt, target, tenant);
             }
           }
           this.recordDelivery(tenant, target, "retried");
