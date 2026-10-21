@@ -399,6 +399,16 @@ export const OPERATOR_ROUTES: readonly OperatorRoute[] = [
     queryParams: [{ name: "tenant", type: "string", description: "Restrict to one tenant." }],
   },
   {
+    path: "/endpoint-health",
+    pattern: exact("/endpoint-health"),
+    methods: ["GET"],
+    summary: "Outbound endpoint health snapshot",
+    description:
+      "WR-179: one row per endpoint with at least one recorded delivery outcome — the 0-100 health score (success-rate EWMA + p95 latency deviation vs sloMs + circuit-open penalty), the degraded state, and the consecutive low-score count.",
+    okDescription: "JSON array of per-endpoint health rows.",
+    queryParams: [{ name: "tenant", type: "string", description: "Restrict to one tenant." }],
+  },
+  {
     path: "/quorum",
     pattern: exact("/quorum"),
     methods: ["GET"],

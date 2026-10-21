@@ -326,6 +326,30 @@ reliability primitives that matter for any signed-payload pipeline.
   `relay_slo_risk_seconds{endpoint}` reports the predicted headroom in
   seconds while an endpoint is elevated. Event-driven (no timers), so the
   whole thing is deterministic under an injected clock.
+- `src/endpoint-health.ts` — outbound endpoint health scoring
+  (`EndpointHealthTracker`), opt-in under `retry.endpointHealth`
+  (disabled by default; an explicit server-level `endpointHealth` wins
+  over the nested option). Every leader-only delivery verdict feeds the
+  per-(tenant, endpoint) tracker: the 0–100 score is
+  `100 × (0.7 × successEwma + 0.3 × latencyTerm)` where `successEwma` is
+  the success-rate EWMA (α = 0.2, pristine start) and `latencyTerm` is
+  the rolling p95 of accepted→delivered latency against `sloMs`
+  (full marks at or under `sloMs`, 0 at 2× `sloMs`); while the
+  endpoint's circuit is open the score is penalized to 0 (a tripped
+  breaker *is* the health verdict — `half_open` carries no penalty).
+  Thresholds use hysteresis, symmetric with the WR-119 inbound
+  reputation: strictly below `degradeThreshold` (default 40) fires
+  `onEndpointDegraded` once per episode (carrying
+  `{ endpoint, score, consecutiveLowScores }`, audited as
+  `endpoint_degraded`); strictly above `recoverThreshold` (default 70)
+  fires `onEndpointRecovered` (audited as `endpoint_recovered`) — a
+  hovering score never flaps. `getEndpointHealthStats()` — also served
+  at `GET /endpoint-health` (Bearer <redacted>-guarded, optional
+  `?tenant=`) — exposes score, degraded state, and the consecutive
+  low-score count per endpoint, and
+  `relay_endpoint_health_score{endpoint}` reports the live score.
+  Event-driven (no timers), so the whole thing is deterministic under an
+  injected clock.
 - `src/audit.ts` — append-only JSONL audit log (`append` / `readAll`) plus an
   indexed query (`query({ event, endpoint, since, until, limit })`): a lazily
   maintained line-offset index maps each complete line to its `ts`/`event`/
@@ -5160,6 +5184,10 @@ endpoints (404 when disabled):
   before breach, in seconds (0 = breach predicted now), only for endpoints
   currently elevated by the SLO-risk predictor, only when
   `retry.latency.sloRisk` is enabled.
+- `relay_endpoint_health_score{endpoint}` — outbound endpoint health
+  score, 0–100 (100 = healthy; 0 while the endpoint's circuit is open),
+  only for endpoints with at least one recorded delivery outcome, only
+  when `retry.endpointHealth` is enabled.
 
 ### Dead-letter auto-replay
 
@@ -5651,7 +5679,8 @@ upgrades it to a key ring of `{ id, key, scopes? }` entries (see
 `src/operator-keys.ts`) with exactly two case-sensitive scopes:
 
 - `read` — every read-only operator path: `GET /metrics`, `GET /audit`,
-  `GET /audit/verify`, `GET /latency`, `GET /slo-risk`, `GET /usage`,
+  `GET /audit/verify`, `GET /latency`, `GET /slo-risk`,
+  `GET /endpoint-health`, `GET /usage`,
   `GET /events`, `GET /events/archive`, `GET /deliveries/:traceId`,
   `GET /dead-letter`, `GET /dead-letter/stats`,
   `GET /dead-letter/auto-replay/status`, `GET /scheduled`.

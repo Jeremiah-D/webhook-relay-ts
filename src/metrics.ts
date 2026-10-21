@@ -73,6 +73,10 @@
  *   remaining before breach, in seconds (WR-71 early warning). Present
  *   only for endpoints currently elevated by the SLO-risk predictor —
  *   absent entirely when the predictor is disabled or nothing is at risk.
+ * - `relay_endpoint_health_score{endpoint}`: gauge of the per-endpoint
+ *   0–100 health score (WR-179; 100 = healthy). Present only for
+ *   endpoints with at least one recorded delivery outcome — absent
+ *   entirely when health scoring is off.
  * - `relay_cert_expiry_seconds{endpoint,kind}`: gauge of seconds until the
  *   observed TLS certificate expires (negative when already expired;
  *   WR-73). `kind` is `downstream` (the peer's certificate, captured at
@@ -369,6 +373,13 @@ export interface MetricsInput {
    */
   sloRisk?: SloRiskMetricsInput[];
   /**
+   * Present only for endpoints with at least one recorded delivery
+   * outcome when outbound endpoint health scoring is enabled (WR-179);
+   * absent entirely when the feature is off — the same activity-gated
+   * convention as the SLO-risk series.
+   */
+  endpointHealth?: EndpointHealthMetricsInput[];
+  /**
    * Present only for endpoints whose TLS certificate was observed by the
    * WR-73 expiry monitor (handshake peer certs plus the relay's own mTLS
    * client certs); absent entirely when the monitor is disabled or
@@ -568,6 +579,37 @@ export interface SloRiskMetricsInput {
   tenant?: string;
   /** Predicted SLO headroom remaining before breach, in seconds (>= 0). */
   headroomSeconds: number;
+}
+
+/**
+ * One endpoint's health score (WR-179), in Prometheus label order.
+ */
+export interface EndpointHealthMetricsInput {
+  /** Downstream endpoint (physical `targetUrl`). */
+  endpoint: string;
+  /** Tenant id (WR-48); when set it is rendered as a `tenant` label. */
+  tenant?: string;
+  /** Current 0–100 health score (100 = healthy). */
+  score: number;
+}
+
+/**
+ * Render just the endpoint-health score block (WR-179) as exposition
+ * lines; `[]` when the series is empty, so callers keep their output
+ * byte-identical until the first delivery outcome is actually recorded.
+ */
+export function renderEndpointHealthBlock(series: EndpointHealthMetricsInput[]): string[] {
+  if (series.length === 0) return [];
+  const lines = [
+    "# HELP relay_endpoint_health_score Outbound endpoint health score (WR-179; 0-100, 100 = healthy), by endpoint.",
+    "# TYPE relay_endpoint_health_score gauge",
+  ];
+  for (const s of series) {
+    lines.push(
+      `relay_endpoint_health_score{endpoint="${escapeLabelValue(s.endpoint)}"${tenantLabel(s.tenant)}} ${s.score}`
+    );
+  }
+  return lines;
 }
 
 /**
@@ -1151,6 +1193,9 @@ export function renderPrometheus(input: MetricsInput): string {
       );
     }
   }
+  // WR-179: activity-gated like the SLO-risk gauge — the series appears
+  // only once an endpoint has recorded at least one delivery outcome.
+  lines.push(...renderEndpointHealthBlock(input.endpointHealth ?? []));
   // WR-73: activity-gated like the slo-risk gauge — the series appears
   // only once the monitor has actually observed a certificate.
   lines.push(...renderCertExpiryBlock(input.certExpiry ?? []));

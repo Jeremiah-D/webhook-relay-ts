@@ -88,6 +88,15 @@ import {
   type SloRiskObservation,
   type SloRiskOptions,
 } from "./slo-risk.ts";
+import {
+  EndpointHealthTracker,
+  assertValidEndpointHealthOptions,
+  type EndpointDegradedInfo,
+  type EndpointHealthMetricsInput,
+  type EndpointHealthOptions,
+  type EndpointHealthStatsRow,
+  type EndpointRecoveredInfo,
+} from "./endpoint-health.ts";
 import { EndpointDeliveryWindow, parseDeliveryWindowSpec, type DeliveryWindowOptions, type DeliveryWindowStats, type TimezoneWindowConfig } from "./delivery-window.ts";
 import { EndpointMaintenanceWindow, type MaintenanceWindowOptions, type MaintenanceWindowStats } from "./maintenance-window.ts";
 export { parseDeliveryWindowSpec, EndpointDeliveryWindow };
@@ -342,6 +351,7 @@ import {
   type DryRunMetricsInput,
   type WeightedMetricsInput,
   type DeadLetterEscalationMetricsInput,
+  type EndpointHealthMetricsInput,
   type StalePauseMetricsInput,
   type EndpointDisableMetricsInput,
   type QueueDepthBreachMetricsInput,
@@ -454,6 +464,14 @@ export type { EncryptedPayload, PayloadEncryptor };
 export type { EndpointLatencyStats, LatencyTrackerOptions };
 export type { SloRiskInfo, SloRiskObservation, SloRiskOptions };
 export type { FieldMask, FieldMaskRule, MaskStrategy };
+export { EndpointHealthTracker, assertValidEndpointHealthOptions };
+export type {
+  EndpointDegradedInfo,
+  EndpointHealthMetricsInput,
+  EndpointHealthOptions,
+  EndpointHealthStatsRow,
+  EndpointRecoveredInfo,
+};
 export { PayloadTransformer, PayloadTransformError, TemplateError };
 export type { PayloadTransformRules, TransformContext };
 export type { QuotaOptions, QuotaStats };
@@ -1858,6 +1876,23 @@ export interface RetryQueueOptions {
    * than `sloMs`. Disabled by default.
    */
   latency?: LatencyOptions;
+  /**
+   * WR-179: outbound endpoint health scoring (see
+   * `src/endpoint-health.ts`). When set, every leader-only delivery
+   * verdict feeds the per-(tenant, endpoint) health tracker: the 0–100
+   * score weights the success-rate EWMA against the p95 latency
+   * deviation from `sloMs`, with a penalty while the endpoint's circuit
+   * is open. Scores strictly below `degradeThreshold` fire
+   * `onEndpointDegraded` (once per degradation episode, carrying the
+   * consecutive low-score count); scores back strictly above
+   * `recoverThreshold` fire `onEndpointRecovered` — hysteresis, so a
+   * hovering score never flaps. The score is exposed as
+   * `relay_endpoint_health_score{endpoint}` and via
+   * `getEndpointHealthStats()` / `GET /endpoint-health`. Disabled by
+   * default (`undefined`) — the relay then behaves exactly as before,
+   * with no tracker instances and no health series.
+   */
+  endpointHealth?: EndpointHealthOptions;
   /**
    * Delivery-latency phase breakdown (WR-95; see
    * `src/latency-phases.ts`). When set, the queue records per-phase
@@ -3523,6 +3558,10 @@ export class RetryQueue {
    */
   private readonly sloRisks = new Map<string, SloRiskPredictor>();
   private readonly sloRiskOpts?: SloRiskOptions;
+  private readonly endpointHealths = new Map<string, EndpointHealthTracker>();
+  private readonly endpointHealthOpts?: EndpointHealthOptions;
+  private readonly onEndpointDegraded?: (info: EndpointDegradedInfo) => void;
+  private readonly onEndpointRecovered?: (info: EndpointRecoveredInfo) => void;
   private readonly onSloRisk?: (info: SloRiskInfo) => void;
   /**
    * WR-71: per-(tenant, endpoint) pending deliveries (queued + in-flight
@@ -4303,6 +4342,15 @@ export class RetryQueue {
       // lazy, like the latency trackers.)
       new SloRiskPredictor(this.sloRiskOpts);
     }
+    // WR-179: outbound endpoint health scoring. Same eager-validation
+    // treatment as the SLO-risk predictor: bad config throws at
+    // construction, never mid-delivery. Per-tenant trackers stay lazy.
+    this.endpointHealthOpts = opts.endpointHealth;
+    this.onEndpointDegraded = opts.endpointHealth?.onEndpointDegraded;
+    this.onEndpointRecovered = opts.endpointHealth?.onEndpointRecovered;
+    if (this.endpointHealthOpts !== undefined) {
+      new EndpointHealthTracker(this.endpointHealthOpts);
+    }
     // WR-48: latency trackers and quotas are per-tenant now; instances are
     // created lazily by `latencyFor()` / `quotaFor()`.
     this.quotaDeliveriesPerMinute = opts.quota?.deliveriesPerMinute;
@@ -4746,6 +4794,58 @@ export class RetryQueue {
       this.sloRisks.set(key, p);
     }
     return p;
+  }
+
+  /**
+   * WR-179: the calling tenant's endpoint-health tracker; `undefined`
+   * when health scoring is disabled. Outcomes are keyed by the physical
+   * target — the same key the circuit breaker uses — so the score tracks
+   * the downstream that was actually hit. The circuit-state provider is
+   * the tenant's own breaker (absent = closed, no penalty), so the
+   * open-penalty term follows the same breaker the queue consults for
+   * dispatch. The queue's `onEndpointDegraded` / `onEndpointRecovered`
+   * wrappers re-attach the tenant (mirroring the `onSloRisk` wrap).
+   */
+  private endpointHealthFor(tenant: string | undefined): EndpointHealthTracker | undefined {
+    if (this.endpointHealthOpts === undefined) return undefined;
+    const key = tenantInstanceKey(tenant);
+    let h = this.endpointHealths.get(key);
+    if (h === undefined) {
+      const onEndpointDegraded = this.onEndpointDegraded;
+      const onEndpointRecovered = this.onEndpointRecovered;
+      h = new EndpointHealthTracker({
+        ...this.endpointHealthOpts,
+        circuitState: (endpoint) => this.breakerFor(tenant)?.state(endpoint) ?? "closed",
+        onEndpointDegraded:
+          onEndpointDegraded === undefined
+            ? undefined
+            : (info) => onEndpointDegraded({ ...info, ...(tenant === undefined ? {} : { tenant }) }),
+        onEndpointRecovered:
+          onEndpointRecovered === undefined
+            ? undefined
+            : (info) => onEndpointRecovered({ ...info, ...(tenant === undefined ? {} : { tenant }) }),
+      });
+      this.endpointHealths.set(key, h);
+    }
+    return h;
+  }
+
+  /**
+   * WR-179: feed one leader-only delivery verdict into the endpoint's
+   * health tracker, at exactly the sites where the circuit breaker
+   * records its own verdict — the score's success-rate EWMA and the
+   * breaker's failure counting then see the same events. `latencyMs`
+   * (the WR-13 accepted→delivered sample, when known) refreshes the
+   * p95-latency term in the same evaluation. No-op when health scoring
+   * is disabled.
+   */
+  private recordHealthOutcome(
+    tenant: string | undefined,
+    endpoint: string,
+    ok: boolean,
+    latencyMs?: number
+  ): void {
+    this.endpointHealthFor(tenant)?.recordOutcome(endpoint, ok, latencyMs);
   }
 
   /** WR-71: adjust the per-(tenant, endpoint) pending count; zero rows are dropped. */
@@ -7626,6 +7726,10 @@ export class RetryQueue {
           // WR-48: the histogram is per (tenant, endpoint).
           this.recordLatencySample(tenant, target, latencyMs);
         }
+        // WR-179: leader-only, like the breaker verdict above — one
+        // physical attempt, one health observation. The delivered
+        // latency sample feeds the p95 term in the same evaluation.
+        if (attemptLeads) this.recordHealthOutcome(tenant, target, true, latencyMs);
         // WR-95: record this delivery's measured phase breakdown.
         // Leader-only, like the other control-plane verdicts above — one
         // physical attempt, one phase sample.
@@ -7796,6 +7900,9 @@ export class RetryQueue {
           // a second physical observation of the endpoint.
           if (attemptLeads && reachedDownstream) {
             breaker?.recordSuccess(target);
+            // WR-179: the downstream answered (a poison payload is not a
+            // sick endpoint) — the health verdict agrees with the breaker.
+            this.recordHealthOutcome(tenant, target, true);
             // WR-150: the downstream answered (poison payload, not a sick
             // endpoint) — resets the auto-disable streak like any success.
             this.autoDisable?.recordSuccess(target);
@@ -7827,6 +7934,10 @@ export class RetryQueue {
           // (OcspRevokedError, a different class) is a real endpoint
           // failure and counts normally.
           if (!(err instanceof OcspError)) breaker?.recordFailure(target);
+          // WR-179: the same WR-101 guard as the breaker — an OCSP query
+          // failure is a local telemetry outage, not a sick endpoint, so
+          // health and the breaker keep seeing the same events.
+          if (!(err instanceof OcspError)) this.recordHealthOutcome(tenant, target, false);
           // WR-150: feed the auto-disable tracker the same leader-only
           // verdict the breaker gets — one physical failure, one streak
           // event. The WR-101 OCSP rule applies here too: a local
@@ -8463,6 +8574,25 @@ export class RetryQueue {
   }
 
   /**
+   * WR-179: per-(tenant, endpoint) health snapshot — one row per endpoint
+   * with at least one recorded delivery outcome (the current 0–100
+   * score, degraded state, and consecutive low-score count). Rows carry
+   * `tenant` only when set. Empty when health scoring is disabled or
+   * nothing has been observed yet. Also served at `GET /endpoint-health`.
+   */
+  getEndpointHealthStats(tenant?: string): EndpointHealthStatsRow[] {
+    const out: EndpointHealthStatsRow[] = [];
+    for (const [key, tracker] of this.endpointHealths) {
+      if (tenant !== undefined && key !== tenant) continue;
+      const t = key === "" ? undefined : key;
+      for (const row of tracker.snapshot()) {
+        out.push(t === undefined ? row : { ...row, tenant: t });
+      }
+    }
+    return out;
+  }
+
+  /**
    * Prometheus text exposition of the collected metrics (see
    * `src/metrics.ts`): per-endpoint delivery counters
    * (`relay_deliveries_total`), circuit gauges for endpoints that tripped
@@ -8485,7 +8615,9 @@ export class RetryQueue {
    * `relay_scheduled_canceled_total`) once a delivery has actually been
    * parked for a future deliver_at (WR-57), and the SLO-risk headroom gauge
    * (`relay_slo_risk_seconds`) for endpoints currently elevated by the
-   * WR-71 predictor.
+   * WR-71 predictor, and the endpoint health score gauge
+   * (`relay_endpoint_health_score`) for endpoints with a recorded
+   * delivery outcome when health scoring is enabled (WR-179).
    */
   renderMetrics(): string {
     // WR-48: counters are keyed by (tenant, endpoint); the tenant becomes
@@ -8592,6 +8724,21 @@ export class RetryQueue {
           endpoint: row.endpoint,
           ...(tenant === undefined ? {} : { tenant }),
           headroomSeconds: row.headroomSeconds,
+        });
+      }
+    }
+    // WR-179: one gauge row per (tenant, endpoint) with at least one
+    // recorded delivery outcome — activity-gated, so the series stays
+    // absent until the first outcome lands. The trackers are the source;
+    // the queue keeps no parallel counter.
+    const endpointHealth: EndpointHealthMetricsInput[] = [];
+    for (const [tenantKey, tracker] of this.endpointHealths) {
+      const tenant = tenantKey === "" ? undefined : tenantKey;
+      for (const row of tracker.snapshot()) {
+        endpointHealth.push({
+          endpoint: row.endpoint,
+          ...(tenant === undefined ? {} : { tenant }),
+          score: row.score,
         });
       }
     }
@@ -8781,6 +8928,9 @@ export class RetryQueue {
       // WR-71: activity-gated (see above) — the gauge appears only while
       // at least one endpoint is elevated.
       ...(sloRisk.length > 0 ? { sloRisk } : {}),
+      // WR-179: activity-gated (see above) — the gauge appears only
+      // once an endpoint has recorded at least one delivery outcome.
+      ...(endpointHealth.length > 0 ? { endpointHealth } : {}),
       // WR-76: activity-gated (see above).
       ...(deliveryDeadlineExceeded.length > 0 ? { deliveryDeadlineExceeded } : {}),
       // WR-85: activity-gated (see above).

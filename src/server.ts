@@ -46,6 +46,11 @@ import type {
   QuorumTargetDeadLetteredInfo,
 } from "./retry.ts";
 import type { PhaseDurationsMs } from "./retry.ts";
+import type {
+  EndpointDegradedInfo,
+  EndpointHealthOptions,
+  EndpointRecoveredInfo,
+} from "./retry.ts";
 import type { StalePauseOptions } from "./retry.ts";
 import {
   assertValidCorsPolicy,
@@ -1839,6 +1844,26 @@ export interface RelayServerOptions {
    * zero behavior change. Invalid config throws `RangeError` at startup.
    */
   senderReputation?: ReputationOptions;
+  /**
+   * Outbound endpoint health scoring (WR-179; see
+   * `src/endpoint-health.ts`): opt-in per-endpoint 0–100 health score
+   * over delivery outcomes — the success-rate EWMA weighted against the
+   * p95 accepted→delivered latency deviation from `sloMs`, with a
+   * penalty while the endpoint's circuit is open (a tripped breaker *is*
+   * the health verdict: open grades at 0 by default). Scores strictly
+   * below `degradeThreshold` (default 40) fire `onEndpointDegraded`
+   * (once per episode, carrying the consecutive low-score count);
+   * scores back strictly above `recoverThreshold` (default 70) fire
+   * `onEndpointRecovered` — hysteresis, so a hovering score never flaps.
+   * Transitions are audited as `endpoint_degraded` /
+   * `endpoint_recovered` (endpoint + score, no payload data) and the
+   * score is exposed as `relay_endpoint_health_score{endpoint}` plus
+   * `GET /endpoint-health` (Bearer <redacted>-guarded, optional
+   * `?tenant=`). Off by default: unset = zero behavior change. Invalid
+   * config throws `RangeError` at startup. An explicit server-level
+   * `endpointHealth` wins over the nested `retry.endpointHealth`.
+   */
+  endpointHealth?: EndpointHealthOptions;
   /**
    * Inbound source baseline anomaly detection (WR-63; see
    * `src/source-baseline.ts`): opt-in per-endpoint learning of the sender
@@ -4973,6 +4998,7 @@ function isOperatorPath(pathname: string): boolean {
     pathname === "/audit/verify" ||
     pathname === "/latency" ||
     pathname === "/slo-risk" ||
+    pathname === "/endpoint-health" ||
     pathname === "/quorum" ||
     pathname === "/quorum/stats" ||
     pathname === "/usage" ||
@@ -6096,6 +6122,40 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
             : {}),
         }
       : undefined,
+    // WR-179: outbound endpoint health scoring. An explicit server-level
+    // `endpointHealth` wins over the nested `retry.endpointHealth`;
+    // either way the queue owns the tracker. Wrap the caller's
+    // onEndpointDegraded / onEndpointRecovered so every transition is
+    // audited as `endpoint_degraded` / `endpoint_recovered`, not just
+    // observed.
+    ...(opts.endpointHealth !== undefined || opts.retry?.endpointHealth !== undefined
+      ? {
+          endpointHealth: {
+            ...(opts.endpointHealth ?? opts.retry?.endpointHealth ?? {}),
+            onEndpointDegraded: (info: EndpointDegradedInfo) => {
+              opts.auditLog.append({
+                event: "endpoint_degraded",
+                ...(info.tenant !== undefined ? { tenant: info.tenant } : {}),
+                endpoint: info.endpoint,
+                score: info.score,
+                consecutiveLowScores: info.consecutiveLowScores,
+                at: new Date(info.at).toISOString(),
+              });
+              (opts.endpointHealth ?? opts.retry?.endpointHealth)?.onEndpointDegraded?.(info);
+            },
+            onEndpointRecovered: (info: EndpointRecoveredInfo) => {
+              opts.auditLog.append({
+                event: "endpoint_recovered",
+                ...(info.tenant !== undefined ? { tenant: info.tenant } : {}),
+                endpoint: info.endpoint,
+                score: info.score,
+                at: new Date(info.at).toISOString(),
+              });
+              (opts.endpointHealth ?? opts.retry?.endpointHealth)?.onEndpointRecovered?.(info);
+            },
+          },
+        }
+      : {}),
     onDelivered: (item, attempts, summary) => {
       // WR-89: the rotation certificate id that authenticated this
       // delivery — absent for WR-36 single-identity and non-mTLS
@@ -6897,6 +6957,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // WR-127: one-shot per-endpoint maintenance windows.
     const isMaintenanceWindows = pathname === "/maintenance/windows";
     const isSloRisk = pathname === "/slo-risk";
+    // WR-179: outbound endpoint health snapshot.
+    const isEndpointHealth = pathname === "/endpoint-health";
     const isQuorum = pathname === "/quorum";
     const isQuorumStats = pathname === "/quorum/stats";
     const isUsage = pathname === "/usage";
@@ -7358,6 +7420,16 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       // (fail-closed without operatorToken).
       const params = new URL(req.url ?? "/slo-risk", "http://internal").searchParams;
       respondJson(res, 200, queue.getSloRiskStats(params.get("tenant") ?? undefined));
+      return;
+    }
+    if (isEndpointHealth) {
+      // WR-179: outbound endpoint health snapshot — one row per endpoint
+      // with at least one recorded delivery outcome (score, degraded
+      // state, consecutive low-score count). Guarded by the same
+      // operator-token check as the other operator endpoints
+      // (fail-closed without operatorToken).
+      const params = new URL(req.url ?? "/endpoint-health", "http://internal").searchParams;
+      respondJson(res, 200, queue.getEndpointHealthStats(params.get("tenant") ?? undefined));
       return;
     }
     if (isQuorum) {
