@@ -1107,6 +1107,24 @@ reliability primitives that matter for any signed-payload pipeline.
   delivery through the normal retry / dead-letter path and lands in the audit
   trail. Invalid proxy URLs throw `RangeError` at startup. Zero dependencies
   (`node:net` + `node:tls`).
+  A `socks5://` proxy URL (`src/socks5.ts`, WR-171) selects the SOCKS5 path
+  instead of HTTP CONNECT — orthogonal to the module above: RFC 1928
+  handshake (no-auth, or RFC 1929 username/password from the proxy URL's
+  userinfo — `socks5://user:pass@proxy:1080`, port defaults to 1080), then
+  the same tunnel semantics. For `https:` targets the TLS handshake runs
+  over the tunnel, so end-to-end encryption and `tlsPins` verification
+  behave exactly as on a direct connection — the SOCKS5 server sees only the
+  CONNECT request, never the payload. Tunneled sockets join the keep-alive
+  pool keyed per (proxy, origin, pins) with a `|socks5:` key fragment, so a
+  SOCKS5-tunneled connection can never serve an HTTP-CONNECT endpoint (or a
+  direct endpoint) and vice versa; with pooling disabled each delivery opens
+  its own tunnel. `ALL_PROXY=socks5://...` works as the env fallback, and
+  invalid URLs throw `RangeError` at startup. Zero dependencies
+  (`node:http(s)` + `node:net` + `node:tls` + `node:crypto`). Covered by
+  `test/socks5.test.ts` (wire-format unit tests against a fake SOCKS5
+  server, auth paths, handshake failure modes) and
+  `test/doh-socks5-integration.test.ts` (pooled delivery through the tunnel,
+  pool isolation vs. HTTP-CONNECT agents).
 - `bench/keepalive-bench.ts` (`npm run bench:keepalive`) — sequential
   deliveries to a localhost stub, before/after numbers (50 warmup deliveries
   per scenario; connection counts include warmup). Measured 2026-10-08,
@@ -4135,7 +4153,9 @@ const server = createRelayServer({
   default: with no `doh` configured, every endpoint uses the shared
   `dnsCache` / system DNS. Covered by `test/doh.test.ts` (wire-format
   query builder, response parser incl. compression pointers and malformed
-  packets, parallel A/AAAA merging, fallback stats).
+  packets, parallel A/AAAA merging, fallback stats) and
+  `test/doh-socks5-integration.test.ts` (end-to-end delivery through a
+  fake DoH server, fallback-to-system-DNS audit, pool isolation).
 
 ## Outbound Happy Eyeballs connection racing (opt-in, RFC 8305)
 

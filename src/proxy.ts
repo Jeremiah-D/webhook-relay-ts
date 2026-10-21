@@ -3,6 +3,7 @@ import { Agent as HttpsAgent } from "node:https";
 import { connect as tcpConnect, type Socket } from "node:net";
 import { connect as tlsConnect } from "node:tls";
 import { createHash } from "node:crypto";
+import { assertValidSocks5Url, isSocks5ProxyUrl } from "./socks5.ts";
 
 /**
  * Outbound HTTP(S) proxy support (WR-27).
@@ -129,6 +130,11 @@ function proxyFromEnv(protocol: string): string | undefined {
  * delivery — so proxy rotation needs no restart. Returns `undefined` when
  * no proxy applies.
  *
+ * A `socks5://` value (explicit or via `ALL_PROXY`) selects the SOCKS5
+ * path (WR-171, see `src/socks5.ts`); anything else stays on the HTTP
+ * CONNECT path (WR-27). The caller dispatches on the scheme with
+ * `isSocks5ProxyUrl`.
+ *
  * Throws `RangeError` when the selected proxy URL is invalid (explicit
  * values are validated once at startup by `createDefaultSender`; an
  * invalid *environment* value surfaces here, per delivery, and fails that
@@ -142,13 +148,15 @@ export function resolveProxyUrl(
   if (target.protocol !== "http:" && target.protocol !== "https:") return undefined;
   const explicit = proxies?.[targetUrl];
   if (explicit !== undefined) {
-    assertValidProxyUrl(explicit);
+    if (isSocks5ProxyUrl(explicit)) assertValidSocks5Url(explicit);
+    else assertValidProxyUrl(explicit);
     return explicit;
   }
   if (hostBypassedByNoProxy(target.hostname)) return undefined;
   const selected = proxyFromEnv(target.protocol);
   if (selected === undefined) return undefined;
-  assertValidProxyUrl(selected);
+  if (isSocks5ProxyUrl(selected)) assertValidSocks5Url(selected);
+  else assertValidProxyUrl(selected);
   return selected;
 }
 

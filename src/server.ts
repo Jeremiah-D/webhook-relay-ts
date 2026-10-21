@@ -311,6 +311,7 @@ import {
   createProxiedAgent,
   resolveProxyUrl,
 } from "./proxy.ts";
+import { createSocks5Agent, assertValidSocks5Url, isSocks5ProxyUrl } from "./socks5.ts";
 import {
   assertValidDohUrl,
   createDohAwareResolver,
@@ -1278,15 +1279,18 @@ export interface RelayServerOptions {
    * endpoint ride a `CONNECT` tunnel through the proxy — proxy basic-auth
    * credentials come from the proxy URL's userinfo
    * (`http://user:pass@proxy:8080`); only plain-HTTP proxies are
-   * supported (proxy-over-TLS is rejected). Endpoints without an explicit
-   * entry fall back to the environment (`HTTPS_PROXY` / `HTTP_PROXY` /
-   * `ALL_PROXY`, lowercase variants honored, `NO_PROXY` bypasses), read
-   * per delivery so proxy rotation needs no restart. Tunneled sockets join
-   * the keep-alive pool keyed per (proxy, origin, pins), so one CONNECT
+   * supported (proxy-over-TLS is rejected). A `socks5://` value selects
+   * the SOCKS5 path instead (WR-171, see `src/socks5.ts`: RFC 1928
+   * handshake, optional `socks5://user:pass@` auth). Endpoints without an
+   * explicit entry fall back to the environment (`HTTPS_PROXY` /
+   * `HTTP_PROXY` / `ALL_PROXY`, lowercase variants honored, `NO_PROXY`
+   * bypasses — `ALL_PROXY=socks5://...` selects SOCKS5), read per
+   * delivery so proxy rotation needs no restart. Tunneled sockets join
+   * the keep-alive pool keyed per (proxy, origin, pins), so one tunnel
    * serves many deliveries; with pooling disabled each delivery opens its
    * own tunnel. For `https:` targets the TLS handshake runs over the
    * tunnel, so end-to-end encryption and `tlsPins` verification behave
-   * exactly as without a proxy — the proxy sees only the CONNECT line,
+   * exactly as without a proxy — the proxy sees only the tunnel setup,
    * never the payload. Invalid URLs throw `RangeError` at startup.
    */
   proxies?: Record<string, string>;
@@ -2630,7 +2634,10 @@ export function createDefaultSender(
   if (proxies !== undefined) {
     for (const [endpoint, proxyUrl] of Object.entries(proxies)) {
       try {
-        assertValidProxyUrl(proxyUrl);
+        // WR-171: a socks5:// value selects the SOCKS5 path — validate
+        // it as such instead of as a plain-HTTP CONNECT proxy.
+        if (isSocks5ProxyUrl(proxyUrl)) assertValidSocks5Url(proxyUrl);
+        else assertValidProxyUrl(proxyUrl);
       } catch (err) {
         throw new RangeError(
           `createDefaultSender: invalid proxy URL for ${endpoint}: ${(err as Error).message}`
@@ -3494,11 +3501,20 @@ export function createDefaultSender(
             dohBinding
           ) ??
           (proxyUrl !== undefined
-            ? (oneOffAgent = createProxiedAgent(
-                url.protocol === "https:" ? "https" : "http",
-                proxyUrl,
-                { keepAlive: false, maxSockets: 1, maxFreeSockets: 0 }
-              ))
+            ? (oneOffAgent = isSocks5ProxyUrl(proxyUrl)
+                ? // WR-171: SOCKS5-tunneled one-off agent (pooling
+                  // disabled) — the handshake runs per delivery and the
+                  // socket is destroyed when the request settles.
+                  createSocks5Agent(
+                    url.protocol === "https:" ? "https" : "http",
+                    proxyUrl,
+                    { keepAlive: false, maxSockets: 1, maxFreeSockets: 0 }
+                  )
+                : createProxiedAgent(
+                    url.protocol === "https:" ? "https" : "http",
+                    proxyUrl,
+                    { keepAlive: false, maxSockets: 1, maxFreeSockets: 0 }
+                  ))
             : dohBinding !== undefined
               ? // WR-170: one-off DoH-bound agent (pooling disabled) —
                 // resolves through the endpoint's DoH cache.

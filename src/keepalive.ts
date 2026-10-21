@@ -13,6 +13,11 @@ import {
 } from "./happy-eyeballs.ts";
 import { normalizePin } from "./pinning.ts";
 import { createProxiedAgent, proxyPoolKeyFragment } from "./proxy.ts";
+import {
+  createSocks5Agent,
+  isSocks5ProxyUrl,
+  socksPoolKeyFragment,
+} from "./socks5.ts";
 import { tlsSniPoolKeyFragment, type ResolvedTlsSniOverride } from "./tls-sni.ts";
 import type { MinTlsVersion } from "./tls-version.ts";
 
@@ -499,7 +504,15 @@ export class OutboundConnectionPool {
     const host = url.hostname;
     const port = url.port === "" ? (scheme === "https" ? 443 : 80) : Number(url.port);
     let key = `${scheme}//${host}:${port}`;
-    if (proxyUrl !== undefined) key += proxyPoolKeyFragment(proxyUrl);
+    // WR-171: a SOCKS5-tunneled endpoint gets its own agent — a
+    // connection handshaked through a SOCKS5 proxy must never serve an
+    // endpoint on the HTTP CONNECT path (or a direct endpoint), or vice
+    // versa. The URL is hashed, never embedded in the key.
+    if (proxyUrl !== undefined && isSocks5ProxyUrl(proxyUrl)) {
+      key += socksPoolKeyFragment(proxyUrl);
+    } else if (proxyUrl !== undefined) {
+      key += proxyPoolKeyFragment(proxyUrl);
+    }
     const pinned = pins !== undefined && pins.length > 0;
     const pinWhitelist = pinned ? pins.map(normalizePin).sort() : undefined;
     if (pinned) {
@@ -592,17 +605,19 @@ export class OutboundConnectionPool {
       };
       const agent: HttpAgent =
         proxyUrl !== undefined
-          ? createProxiedAgent(scheme, proxyUrl, agentOpts)
+          ? isSocks5ProxyUrl(proxyUrl)
+            ? createSocks5Agent(scheme, proxyUrl, agentOpts)
+            : createProxiedAgent(scheme, proxyUrl, agentOpts)
           : scheme === "https"
             ? new HttpsAgent(agentOpts)
             : new HttpAgent(agentOpts);
       // WR-164: `createConnection` is not an agent option — like the
       // WR-27 proxied agents, it is assigned after construction. Raced
-      // agents get the Happy Eyeballs racer; proxied agents keep their
-      // CONNECT-tunnel createConnection (racing to the proxy is out of
-      // scope). The resolved options already carry the pool-level lookup
-      // as the race resolver, so a raced connection honors the WR-92
-      // DNS cache.
+      // agents get the Happy Eyeballs racer; proxied agents (CONNECT
+      // tunnel or SOCKS5) keep their tunnel createConnection (racing to
+      // the proxy is out of scope). The resolved options already carry
+      // the pool-level lookup as the race resolver, so a raced
+      // connection honors the WR-92 DNS cache.
       if (this.opts.happyEyeballs !== undefined && proxyUrl === undefined) {
         agent.createConnection = makeHappyEyeballsCreateConnection(
           scheme,
