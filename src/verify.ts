@@ -442,6 +442,176 @@ export class RotatingHmacVerifier implements Verifier {
   }
 }
 
+/** Default timestamp tolerance for Stripe-style signatures: 300s (matches Stripe). */
+export const DEFAULT_STRIPE_TOLERANCE_SEC = 300;
+
+/**
+ * Parsed Stripe-style signature header:
+ * `t=<unix_ts>,v1=<hex>[,v1=<hex>...]`.
+ */
+export interface StripeSignatureHeader {
+  /** Unix timestamp (seconds) from the `t=` field. */
+  timestamp: number;
+  /** One signature per `v1=` field, in header order. */
+  signatures: Buffer[];
+}
+
+/**
+ * Parse a Stripe-style signature header. Stripe sends the timestamp and one
+ * signature per signing secret as `t=<unix_ts>,v1=<hex>[,v1=<hex>...]` —
+ * during a secret rotation the header may carry several `v1` values and any
+ * one of them authenticates. Throws on malformed input; callers that must
+ * never throw (like {@link StripeSignatureVerifier.verify}) convert parse
+ * failures to `false`.
+ */
+export function parseStripeSignatureHeader(header: string): StripeSignatureHeader {
+  if (!header || typeof header !== "string") {
+    throw new Error("StripeSignatureVerifier: missing signature header");
+  }
+  const parts = header.split(",");
+  if (parts.length < 2 || !parts[0].startsWith("t=")) {
+    throw new Error("StripeSignatureVerifier: header must start with t=<unix_ts>");
+  }
+  const ts = Number(parts[0].slice(2).trim());
+  if (!Number.isInteger(ts) || ts <= 0) {
+    throw new Error("StripeSignatureVerifier: invalid t=<unix_ts> timestamp");
+  }
+  const signatures = parts.slice(1).map((p) => {
+    const field = p.trim();
+    if (!field.startsWith("v1=")) {
+      throw new Error("StripeSignatureVerifier: expected v1=<hex> fields after t=");
+    }
+    const hex = field.slice(3).trim();
+    if (hex === "" || hex.length % 2 !== 0 || !HEX_RE.test(hex)) {
+      throw new Error("StripeSignatureVerifier: invalid v1=<hex> signature");
+    }
+    return Buffer.from(hex, "hex");
+  });
+  if (signatures.length === 0) {
+    throw new Error("StripeSignatureVerifier: at least one v1=<hex> signature is required");
+  }
+  return { timestamp: ts, signatures };
+}
+
+/** Options for {@link StripeSignatureVerifier}. */
+export interface StripeSignatureConfig {
+  /**
+   * HMAC-SHA256 signing secret(s). Pass an array when the relay holds both
+   * the old and the new secret during a rotation — any configured secret
+   * matching any `v1` value authenticates.
+   */
+  secrets: string | string[];
+  /**
+   * Maximum age/lead of the `t=` timestamp in seconds. Default: 300.
+   * A missing timestamp (unparsable header) or an out-of-tolerance
+   * timestamp is rejected — replay protection.
+   */
+  toleranceSec?: number;
+  /** Clock source for timestamp checks; defaults to Date.now. Injectable for tests. */
+  nowMs?: () => number;
+}
+
+/**
+ * Stripe-style webhook signature verifier (WR-176). Header format:
+ * `t=<unix_ts>,v1=<hex>[,v1=<hex>...]`; the signed payload is
+ * `<t>.<rawBody>` (HMAC-SHA256, hex). Multiple `v1` values and multiple
+ * configured secrets are both tolerated for key rotation — any
+ * (secret, v1) pair that matches authenticates.
+ *
+ * The timestamp is mandatory and must be within `toleranceSec` (default
+ * 300s) of now, both directions — a missing or stale timestamp is an
+ * explicit rejection (replay protection), never a silent pass.
+ *
+ * Register it with {@link registerVerifier} and select it per endpoint
+ * with an {@link EndpointVerifierRule}, so a Stripe-style upstream can
+ * coexist with {@link HmacSha256Verifier} and {@link Ed25519Verifier}
+ * upstreams behind one relay:
+ *
+ * ```ts
+ * registerVerifier(new StripeSignatureVerifier({ secrets: STRIPE_WEBHOOK_SECRET }));
+ * const server = createRelayServer({
+ *   secret, // global fallback
+ *   endpointVerifiers: [
+ *     { pattern: "/hooks/stripe", verifier: new StripeSignatureVerifier({ secrets: STRIPE_WEBHOOK_SECRET }) },
+ *     { pattern: "/hooks/*", verifier: new HmacSha256Verifier(secret) },
+ *   ],
+ * });
+ * ```
+ *
+ * Never throws from `verify` — unparsable headers, wrong keys, and crypto
+ * errors all mean `false`.
+ */
+export class StripeSignatureVerifier implements Verifier {
+  readonly name = "stripe-signature";
+
+  private readonly secrets: string[];
+  private readonly toleranceSec: number;
+  private readonly nowMs: () => number;
+
+  constructor(config: StripeSignatureConfig) {
+    const secrets = Array.isArray(config?.secrets) ? config.secrets : [config?.secrets];
+    if (
+      secrets.length === 0 ||
+      secrets.some((s) => typeof s !== "string" || s === "")
+    ) {
+      throw new Error(
+        "StripeSignatureVerifier: `secrets` must be a non-empty string or an array of non-empty strings"
+      );
+    }
+    const toleranceSec = config?.toleranceSec ?? DEFAULT_STRIPE_TOLERANCE_SEC;
+    if (!Number.isFinite(toleranceSec) || toleranceSec < 0) {
+      throw new Error("StripeSignatureVerifier: `toleranceSec` must be a non-negative number");
+    }
+    this.secrets = secrets;
+    this.toleranceSec = toleranceSec;
+    this.nowMs = config?.nowMs ?? Date.now;
+  }
+
+  verify(rawBody: Buffer, header: string, opts: VerifyOptions = {}): boolean {
+    try {
+      const parsed = parseStripeSignatureHeader(header);
+      const toleranceSec = opts.toleranceSec ?? this.toleranceSec;
+      const nowSec = Math.floor((opts.nowMs ?? this.nowMs)() / 1000);
+      // A missing timestamp never reaches here (the parse throws); an
+      // out-of-tolerance timestamp is an explicit replay-protection reject.
+      if (Math.abs(nowSec - parsed.timestamp) > toleranceSec) {
+        return false;
+      }
+      const signed = Buffer.concat([Buffer.from(`${parsed.timestamp}.`, "utf8"), rawBody]);
+      for (const secret of this.secrets) {
+        const expected = hmacSha256(secret, signed);
+        for (const sig of parsed.signatures) {
+          if (expected.length === sig.length && timingSafeEqual(expected, sig)) {
+            return true;
+          }
+        }
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  }
+}
+
+/**
+ * Build a `t=<ts>,v1=<hex>[,v1=<hex>...]` header (useful for tests and for
+ * senders that need Stripe-style signatures). `extraSecrets` signs the same
+ * payload with additional secrets, emulating a rotation window where the
+ * upstream sends several `v1` values.
+ */
+export function signStripe(
+  rawBody: Buffer,
+  secret: string,
+  timestamp: number = Math.floor(Date.now() / 1000),
+  extraSecrets: string[] = []
+): string {
+  const v1 = (s: string): string => {
+    const signed = Buffer.concat([Buffer.from(`${timestamp}.`, "utf8"), rawBody]);
+    return `v1=${hmacSha256(s, signed).toString("hex")}`;
+  };
+  return [`t=${timestamp}`, v1(secret), ...extraSecrets.map(v1)].join(",");
+}
+
 const verifierRegistry = new Map<string, Verifier>();
 
 /**

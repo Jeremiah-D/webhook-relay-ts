@@ -5881,3 +5881,43 @@ Requires Node 24+ (runs `.ts` directly via type stripping; zero dependencies).
   (cluster listing, bad `top` 400, wrong-token 403, method 405,
   dry-run preview with zero side effects, selector replay audited as
   `dead_letter_cluster_replayed`, no-match selector 404).
+## Stripe-style webhook signatures
+
+Some upstreams (Stripe-style PSPs) sign with `t=<unix_ts>,v1=<hex>`
+headers instead of the plain `sha256=<hex>` scheme: the signed payload is
+`<t>.<rawBody>` (HMAC-SHA256, hex), and during a key rotation the header
+may carry several `v1` values — any one of them authenticates.
+`StripeSignatureVerifier` (in `src/verify.ts`) implements exactly that,
+registered under the scheme name `"stripe-signature"`:
+
+```ts
+registerVerifier(new StripeSignatureVerifier({ secrets: STRIPE_WEBHOOK_SECRET }));
+
+const server = createRelayServer({
+  secret, // global fallback for paths with no rule
+  forwardUrl,
+  endpointVerifiers: [
+    // A Stripe-style upstream on its own path, coexisting with the
+    // HMAC-SHA256 default and Ed25519 verifiers on other paths.
+    { pattern: "/hooks/stripe", verifier: new StripeSignatureVerifier({ secrets: STRIPE_WEBHOOK_SECRET }) },
+    { pattern: "/hooks/solana", verifier: new Ed25519Verifier(SOLANA_PROGRAM_PUBKEY_PEM) },
+  ],
+});
+```
+
+Details:
+
+- **Rotation-tolerant both ways.** The header may carry multiple `v1`
+  values (upstream-side rotation) and the verifier accepts multiple
+  configured secrets (relay-side rotation): any (secret, `v1`) pair that
+  matches authenticates.
+- **Timestamp is mandatory.** A missing `t=` (unparsable header) or a
+  timestamp outside `toleranceSec` (default 300s, both directions) is an
+  explicit rejection — replay protection, never a silent pass.
+- **Fail fast, never throw.** Constructor rejects empty secrets and bad
+  tolerances; `verify` converts every malformed header, wrong key, and
+  crypto error to `false`. Per-call `opts` can override the tolerance and
+  the clock.
+- **Helper.** `signStripe(rawBody, secret, timestamp?, extraSecrets?)`
+  builds a header, including multi-`v1` rotation headers for tests.
+
