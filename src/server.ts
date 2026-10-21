@@ -183,6 +183,11 @@ import {
 } from "./operator-routes.ts";
 import { InboundRateLimiter, type InboundRateLimitOptions } from "./ratelimit.ts";
 import {
+  checkJsonDepth,
+  assertValidMaxJsonDepth,
+  DEFAULT_MAX_JSON_DEPTH,
+} from "./json-depth.ts";
+import {
   InboundTenantRateLimiter,
   InboundTenantRateLimitMetrics,
   type InboundTenantRateLimitOptions,
@@ -1317,6 +1322,20 @@ export interface RelayServerOptions {
    * (`DEFAULT_MAX_BODY_BYTES`). Invalid values throw `RangeError`.
    */
   maxBodyBytes?: number;
+  /**
+   * Inbound JSON nesting-depth limit (WR-173, see `src/json-depth.ts`).
+   * A webhook body whose JSON arrays/objects nest deeper than this is
+   * answered 400 and audited as `rejected` (reason `json_too_deep`): it
+   * never enters the queue, so it consumes no retry budget and never
+   * trips the breaker. `JSON.parse` itself stack-overflows past V8's
+   * own budget — that overflow is treated as over-limit, not a crash.
+   * Non-JSON bodies (and JSON scalars) skip the check entirely.
+   * Orthogonal to WR-25 `maxBodyBytes`: that bounds *volume*, this
+   * bounds *shape* — a 1 KiB `[[[[...` bomb fits the size budget but
+   * dies here. Default: 32 (`DEFAULT_MAX_JSON_DEPTH`). Invalid values
+   * throw `RangeError` at startup.
+   */
+  maxJsonDepth?: number;
   /**
    * Per-endpoint inbound body size overrides (WR-102). Rules are
    * `{ pattern, maxBodyBytes }` — exact (`/hooks/payments`) or prefix
@@ -5061,6 +5080,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   if (!Number.isInteger(maxBodyBytes) || maxBodyBytes <= 0) {
     throw new RangeError("createRelayServer: `maxBodyBytes` must be a positive integer");
   }
+  // WR-173: inbound JSON depth guard — validated once at startup
+  // (`undefined` = the 32-level default).
+  const maxJsonDepth = assertValidMaxJsonDepth(opts.maxJsonDepth ?? DEFAULT_MAX_JSON_DEPTH);
   // WR-159: CORS policy for the operator plane — validated once at
   // startup (`undefined` = disabled, zero behavior change).
   let corsPolicy: ResolvedCorsPolicy | undefined;
@@ -9066,6 +9088,34 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         });
         return { status: 400, id, traceId, reason: "decompression_failed", detail: "Invalid gzip body" };
       }
+    }
+
+    // Inbound JSON depth guard (WR-173): a body nested deeper than
+    // `maxJsonDepth` is answered 400 and audited as `rejected` with
+    // reason `json_too_deep` — it never enters the queue, so it burns
+    // no retry budget and never trips the breaker. This runs on the
+    // verified, canonical (decompressed) body, before version
+    // adaptation and schema validation, so every JSON.parse downstream
+    // of here (adapters, schemas, content routing) only ever sees
+    // bounded input. Non-JSON bodies skip the check entirely.
+    const depthVerdict = checkJsonDepth(body, maxJsonDepth);
+    if (!depthVerdict.ok) {
+      opts.auditLog.append({ ...correlation,
+        event: "rejected",
+        id,
+        traceId,
+        ...tenantLabel,
+        reason: "json_too_deep",
+        depth: depthVerdict.depth,
+        maxJsonDepth,
+      });
+      return {
+        status: 400,
+        id,
+        traceId,
+        reason: "json_too_deep",
+        detail: `JSON nesting depth ${depthVerdict.depth} exceeds the limit of ${maxJsonDepth}`,
+      };
     }
 
     // API version routing (WR-33): a version-prefixed path (e.g. /v1/...)

@@ -2986,6 +2986,38 @@ const server = createRelayServer({
   non-positive-integer `maxBodyBytes`) throw `RangeError` at startup, so
   a bad config can never fail a request mid-flight.
 
+## Inbound JSON depth limit
+
+`maxJsonDepth` (default `32`) bounds the *shape* of inbound JSON —
+orthogonal to `maxBodyBytes`, which bounds *volume*. A 1 KiB body of
+`[[[[…` fits the size budget but can still stack-smash whatever parses
+it next (V8's own `JSON.parse` throws `RangeError` past its stack
+budget; a downstream parser with a deeper budget dies outright).
+
+- **Answered 400, audited `rejected`** — over-limit bodies are rejected
+  with reason `json_too_deep` (carrying the measured `depth` and the
+  effective `maxJsonDepth`). The body never enters the queue: no retry
+  budget burned, breaker untouched. A `JSON.parse` stack overflow is
+  treated as over-limit, never a crash.
+- **Runs on the canonical body** — after signature verification and
+  gzip decompression, before version adaptation and schema validation,
+  so every `JSON.parse` downstream of the gate (adapters, schemas,
+  content routing) only ever sees bounded input. Batch items
+  (`POST /ingest/batch`) are gated per item through the same path.
+- **Non-JSON is untouched** — only bodies whose first non-whitespace
+  byte is `{` or `[` are parsed; anything else (plain text, protobuf,
+  JSON scalars like `123`) skips the check entirely. The depth walk is
+  iterative (explicit stack), so the guard itself cannot be
+  stack-exhausted.
+- Invalid values (non-integer, `< 1`) throw `RangeError` at startup.
+
+```ts
+const server = createRelayServer({
+  secret, forwardUrl, auditLog,
+  maxJsonDepth: 64, // deeper than default for a chatty legacy sender
+});
+```
+
 ## Downstream response guard (opt-in)
 
 `responseGuard` hardens the *outbound* side the way `maxBodyBytes` guards
