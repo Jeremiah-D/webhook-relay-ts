@@ -5891,6 +5891,28 @@ double-recorded event appears twice and queries return it twice. Corrupt
 (torn) lines are skipped on read. Decoupled from the audit log by design:
 audit = operator actions, archive = delivery event stream.
 
+**S3-compatible offload (WR-188)** — sealed-segment cold storage. Set
+`eventArchive: { dir, sealedDir }` and evicted retention lines are sealed
+verbatim into deterministic segment files
+`<yyyymmdd>-seq-<minSeq>-<maxSeq>.jsonl` under `sealedDir` instead of
+being discarded (same retention triggers: `maxAgeMs` / `maxBytes`). Set
+`archiveS3: { sealedDir, endpoint, bucket, region, keyPrefix?,
+accessKeyId, secretRef, secretResolver?, deleteLocalAfterUpload?,
+dryRun? }` and every sealed segment is PUT to the bucket under the
+deterministic key `<prefix><yyyymmdd>/events-<min>-<max>.jsonl`, signed
+with the WR-116 SigV4 pipeline (service `s3`; `secretRef` is a
+reference — env var name by default — never the raw secret, resolved
+per upload so rotation needs no restart). Uploads run fire-and-forget on
+each seal and never touch the delivery path: failures are counted
+(`uploadFailures`) and retried on the next seal's scan; an uploaded
+segment is renamed to `<name>.jsonl.uploaded` (local bytes kept) unless
+`deleteLocalAfterUpload: true` deletes it; `dryRun: true` rehearses by
+recording the intended keys with zero network I/O. `archiveS3` without
+`eventArchive.sealedDir` fails fast at startup. Orthogonal to the
+dead-letter export (WR-128, local CSV/JSONL export *with* payloads) and
+to EB-163 (durable-log segment offload in realtime-event-bus): this
+offloads the *delivery-event archive*, payload-free metadata lines.
+
 ### Operator/intake plane split
 
 Opt-in network segmentation for the control plane:

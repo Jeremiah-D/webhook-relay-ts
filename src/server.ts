@@ -375,6 +375,10 @@ import {
 import type { KeyObject } from "node:crypto";
 import type { AuditLog } from "./audit.ts";
 import { DeliveryEventArchiver } from "./event-archive.ts";
+import {
+  ArchiveS3Offloader,
+  type ArchiveS3OffloadConfig,
+} from "./archive-s3.ts";
 import { resolveOrderedConfig } from "./ordered.ts";
 import { buildDeliverySnapshot } from "./delivery-status.ts";
 import type { EndpointConfigPatch } from "./hotreload.ts";
@@ -2275,7 +2279,29 @@ export interface RelayServerOptions {
    * log: audit records operator actions, the archive records the delivery
    * event stream.
    */
-  eventArchive?: { dir: string; maxAgeMs?: number; maxBytes?: number };
+  eventArchive?: {
+    dir: string;
+    maxAgeMs?: number;
+    maxBytes?: number;
+    /**
+     * WR-188: opt-in segment sealing. When the retention pass evicts
+     * lines, they are sealed verbatim into deterministic segment files
+     * (`<yyyymmdd>-seq-<minSeq>-<maxSeq>.jsonl`) under this directory
+     * instead of being discarded. Unset: evicted lines are dropped,
+     * exactly as before. Required when `archiveS3` is set.
+     */
+    sealedDir?: string;
+  };
+  /**
+   * WR-188: opt-in S3-compatible offload of sealed archive segments
+   * (see `src/archive-s3.ts`). Requires `eventArchive` with
+   * `sealedDir`: every sealed segment is PUT to the configured bucket
+   * under a deterministic key, signed with the WR-116 SigV4 pipeline.
+   * Uploads run fire-and-forget on each seal and never touch the
+   * delivery path — failures are counted in the offloader's stats and
+   * retried on the next seal. Unset by default.
+   */
+  archiveS3?: ArchiveS3OffloadConfig;
   /**
    * Opt-in graceful shutdown on SIGTERM/SIGINT: stop accepting new
    * connections, wait up to `timeoutMs` (default 30_000) for in-flight
@@ -6792,10 +6818,29 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // delivery events and appends every event to `<dir>/events.jsonl`
   // (survives restarts; served at `GET /events/archive`). Unset by
   // default — the endpoint then answers 404 fail-closed.
+  // WR-188: `archiveS3` requires the archive's `sealedDir` — the
+  // offloader only ever sees sealed segments, never the live file.
+  if (opts.archiveS3 !== undefined && opts.eventArchive?.sealedDir === undefined) {
+    throw new RangeError(
+      "createRelayServer: `archiveS3` requires `eventArchive.sealedDir` to be set"
+    );
+  }
+  const archiveS3Offloader =
+    opts.archiveS3 !== undefined ? new ArchiveS3Offloader(opts.archiveS3) : undefined;
   const eventArchiver = opts.eventArchive
     ? new DeliveryEventArchiver({
         ...opts.eventArchive,
         source: { subscribeDeliveryEvents: (l) => queue.subscribeDeliveryEvents(l) },
+        // WR-188: fire-and-forget offload on each seal. The promise is
+        // intentionally not awaited: uploads never touch the delivery
+        // path, and failures are counted in the offloader's stats for
+        // the next seal's scan to retry.
+        onSegmentSealed:
+          archiveS3Offloader !== undefined
+            ? () => {
+                void archiveS3Offloader.scanAndUpload();
+              }
+            : undefined,
       })
     : undefined;
   // WR-78: tenant usage metering for usage-based billing. One permanent

@@ -74,6 +74,32 @@ import {
 import { join } from "node:path";
 import type { DeliveryEvent, DeliveryEventType } from "./retry.ts";
 
+/** What a WR-188 sealed segment file name carries: `<yyyymmdd>-seq-<min>-<max>.jsonl`. */
+export interface SealedSegmentName {
+  /** UTC date of the earliest sealed event, `yyyymmdd`. */
+  date: string;
+  /** Smallest event seq sealed in the segment. */
+  seqMin: number;
+  /** Largest event seq sealed in the segment. */
+  seqMax: number;
+}
+
+/**
+ * WR-188: parse a sealed segment file name back into its date/seq-range.
+ * Returns `undefined` for anything that is not a sealed segment
+ * (temp files, the live `events.jsonl`, uploaded markers, …).
+ */
+export function parseSealedSegmentName(fileName: string): SealedSegmentName | undefined {
+  const m = /^(\d{8})-seq-(\d+)-(\d+)(?:-\d+)?\.jsonl$/.exec(fileName);
+  if (m === null) return undefined;
+  const seqMin = Number(m[2]);
+  const seqMax = Number(m[3]);
+  if (!Number.isSafeInteger(seqMin) || !Number.isSafeInteger(seqMax) || seqMin < 1 || seqMax < seqMin) {
+    return undefined;
+  }
+  return { date: m[1], seqMin, seqMax };
+}
+
 /** Archive file name inside the archive directory. */
 export const EVENT_ARCHIVE_FILE = "events.jsonl";
 
@@ -101,6 +127,24 @@ export interface EventArchiveOptions {
   maxBytes?: number;
   /** Event source to subscribe at construction (e.g. the server's queue). */
   source?: DeliveryEventSource;
+  /**
+   * WR-188: opt-in segment sealing. When a retention pass evicts lines,
+   * they are written verbatim to one sealed segment file under this
+   * directory instead of being discarded, so the archive's time/size
+   * rolling becomes a cold-storage pipeline (see `src/archive-s3.ts`
+   * for the S3-compatible offload). Unset: evicted lines are dropped,
+   * exactly as before. The directory is created recursively when
+   * missing; an uncreatable directory throws at construction.
+   */
+  sealedDir?: string;
+  /**
+   * WR-188: fired once per sealed segment, after the segment file is
+   * durably written and the live archive rewritten. Error-isolated:
+   * a throwing listener is swallowed — sealing/upload bookkeeping can
+   * never fail a retention pass (and therefore never a delivery).
+   * The server wires this to the S3 offloader's fire-and-forget scan.
+   */
+  onSegmentSealed?: (localPath: string) => void;
 }
 
 /** Filters for {@link DeliveryEventArchiver.query}. All filters are ANDed. */
@@ -122,6 +166,8 @@ export interface EventArchiveStats {
   writeErrors: number;
   /** Current on-disk size of `events.jsonl`, best-effort. */
   bytes: number;
+  /** WR-188: sealed segment files written since this archiver was opened. */
+  sealedSegments: number;
 }
 
 /** What `DeliveryEventArchiver.seqRange` reports about the retained history. */
@@ -139,9 +185,12 @@ export class DeliveryEventArchiver {
   private readonly maxAgeMs?: number;
   private readonly maxBytes?: number;
   private readonly unsubscribe?: () => void;
+  private readonly sealedDir?: string;
+  private readonly onSegmentSealed?: (localPath: string) => void;
   private appends = 0;
   private writeErrors = 0;
   private bytes = 0;
+  private sealedSegments = 0;
   private appendsSinceRetain = 0;
   /**
    * WR-123: monotonic event sequence state. `nextSeq` is the last assigned
@@ -160,14 +209,28 @@ export class DeliveryEventArchiver {
    * retention values throw `RangeError` at startup, never mid-request.
    */
   constructor(options: EventArchiveOptions) {
-    const { dir, maxAgeMs, maxBytes, source } = options;
+    const { dir, maxAgeMs, maxBytes, source, sealedDir, onSegmentSealed } = options;
     if (maxAgeMs !== undefined && (!Number.isFinite(maxAgeMs) || maxAgeMs <= 0)) {
       throw new RangeError("DeliveryEventArchiver: `maxAgeMs` must be a positive finite number");
     }
     if (maxBytes !== undefined && (!Number.isInteger(maxBytes) || maxBytes <= 0)) {
       throw new RangeError("DeliveryEventArchiver: `maxBytes` must be a positive integer");
     }
+    if (sealedDir !== undefined && (typeof sealedDir !== "string" || sealedDir === "")) {
+      throw new RangeError("DeliveryEventArchiver: `sealedDir` must be a non-empty string when set");
+    }
+    if (onSegmentSealed !== undefined && typeof onSegmentSealed !== "function") {
+      throw new RangeError("DeliveryEventArchiver: `onSegmentSealed` must be a function when set");
+    }
     mkdirSync(dir, { recursive: true });
+    if (sealedDir !== undefined) {
+      // Sealed segments are cold storage for evicted lines; an
+      // uncreatable directory is an operator misconfiguration and throws
+      // here, fail-fast, never mid-retention.
+      mkdirSync(sealedDir, { recursive: true });
+      this.sealedDir = sealedDir;
+    }
+    this.onSegmentSealed = onSegmentSealed;
     this.path = join(dir, EVENT_ARCHIVE_FILE);
     // A stale temp file is debris from a crash mid-retention, never the
     // source of truth — remove it so a later pass starts clean.
@@ -208,7 +271,12 @@ export class DeliveryEventArchiver {
   }
 
   get stats(): EventArchiveStats {
-    return { appends: this.appends, writeErrors: this.writeErrors, bytes: this.bytes };
+    return {
+      appends: this.appends,
+      writeErrors: this.writeErrors,
+      bytes: this.bytes,
+      sealedSegments: this.sealedSegments,
+    };
   }
 
   /**
@@ -540,6 +608,13 @@ export class DeliveryEventArchiver {
       }
       return;
     }
+    // WR-188: seal the evicted lines before they leave the live file.
+    // The seal is written first; if the seal write fails the lines are
+    // still dropped (fail-safe toward bounded local growth) and the
+    // failure is counted in `writeErrors`.
+    const keptSet = new Set(kept);
+    const evicted = parsed.filter((p) => !keptSet.has(p));
+    const sealedPath = this.sealEvicted(evicted);
     // WR-123: retention evicts the oldest lines, so the cursor range moves.
     // It is recomputed after the atomic rename, from what actually
     // survived; nextSeq (the high-water mark) is untouched — seqs are
@@ -557,6 +632,16 @@ export class DeliveryEventArchiver {
       renameSync(tmp, this.path);
       this.bytes = Buffer.byteLength(data, "utf8");
       this.syncSeqRange(kept.map((p) => p.seq));
+      // WR-188: the seal is durable and the live file no longer holds the
+      // lines — fire the notification (error-isolated: bookkeeping must
+      // never fail a retention pass, and therefore never a delivery).
+      if (sealedPath !== undefined && this.onSegmentSealed !== undefined) {
+        try {
+          this.onSegmentSealed(sealedPath);
+        } catch {
+          /* swallowed — see the option's contract */
+        }
+      }
     } catch {
       // The pre-retention file is untouched — retention is retried later,
       // never half-applied.
@@ -567,5 +652,69 @@ export class DeliveryEventArchiver {
         /* best effort */
       }
     }
+  }
+
+  /**
+   * WR-188: write the evicted lines verbatim to one sealed segment file
+   * under `sealedDir`. The name is deterministic —
+   * `<yyyymmdd>-seq-<minSeq>-<maxSeq>.jsonl` from the earliest evicted
+   * event's UTC date and the sealed seq range — so the S3 offloader can
+   * derive a deterministic object key, and a re-run of the offloader
+   * over the same segment uploads to the same key (idempotent PUT).
+   * Written via temp file + fsync + atomic rename, exactly like
+   * `retain()`. Never throws: failures are counted in `writeErrors`
+   * and the caller drops the lines anyway (fail-safe toward bounded
+   * local growth). Returns the sealed file path, or `undefined` when
+   * sealing is disabled or the write failed.
+   */
+  private sealEvicted(
+    evicted: Array<{ line: string; atMs: number; seq: number }>
+  ): string | undefined {
+    if (this.sealedDir === undefined || evicted.length === 0) return undefined;
+    const seqs = evicted.map((p) => p.seq).filter((s) => s >= 1);
+    const dates = evicted
+      .map((p) => p.atMs)
+      .filter((ms) => Number.isFinite(ms));
+    const stampMs = dates.length > 0 ? Math.min(...dates) : Date.now();
+    const d = new Date(stampMs);
+    const yyyymmdd =
+      `${d.getUTCFullYear()}` +
+      `${String(d.getUTCMonth() + 1).padStart(2, "0")}` +
+      `${String(d.getUTCDate()).padStart(2, "0")}`;
+    const range =
+      seqs.length > 0
+        ? `seq-${Math.min(...seqs)}-${Math.max(...seqs)}`
+        : `noseq-${evicted.length}`;
+    // Seqs are never reused, so segment names are naturally disjoint;
+    // the suffix loop is only belt-and-braces against a hand-placed
+    // file with the same name.
+    let name = `${yyyymmdd}-${range}.jsonl`;
+    let target = join(this.sealedDir, name);
+    for (let i = 2; existsSync(target); i += 1) {
+      name = `${yyyymmdd}-${range}-${i}.jsonl`;
+      target = join(this.sealedDir, name);
+    }
+    const data = evicted.map((p) => p.line).join("\n") + "\n";
+    const tmp = target + ARCHIVE_TMP_SUFFIX;
+    try {
+      const fd = openSync(tmp, "w");
+      try {
+        writeSync(fd, data, null, "utf8");
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+      renameSync(tmp, target);
+    } catch {
+      this.writeErrors += 1;
+      try {
+        rmSync(tmp, { force: true });
+      } catch {
+        /* best effort */
+      }
+      return undefined;
+    }
+    this.sealedSegments += 1;
+    return target;
   }
 }
