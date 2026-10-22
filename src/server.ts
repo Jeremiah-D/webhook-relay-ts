@@ -2235,6 +2235,11 @@ export interface RelayServerOptions {
    * `GET /audit` for history. Like the other operator endpoints, it answers
    * 404 when no `operatorToken` is configured.
    *
+   * WR-186: the audit-event stream (`GET /events/audit`, Server-Sent
+   * Events) shares the `heartbeatMs` cadence and the 1 MiB slow-consumer
+   * disconnect — it fans out every audit line in-memory at append time
+   * (`event: audit`). Same 404 fail-closed without an `operatorToken`.
+   *
    * WR-162: opt-in subscription filters — `?endpoint=` (exact match on the
    * event's `targetUrl`, same semantics as `GET /events/archive`) and
    * `?event=` (one of `delivered` / `retrying` / `dead_letter`; any other
@@ -5204,6 +5209,7 @@ function isOperatorPath(pathname: string): boolean {
     pathname === "/watermarks" ||
     pathname === "/health/summary" ||
     pathname === "/events" ||
+    pathname === "/events/audit" ||
     pathname === "/events/archive" ||
     pathname === "/metrics" ||
     pathname === "/openapi.json" ||
@@ -7153,6 +7159,93 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     res.on("close", cleanup);
   };
 
+  /**
+   * WR-186: SSE live stream of operator audit events. Every audit line —
+   * `endpoint_paused` / `endpoint_resumed`, `endpoint_config_updated`,
+   * `circuit_open` / `circuit_closed`, `failover_switched`,
+   * `dead_letter_auto_replay`, and everything else the audit log records —
+   * fans out in-memory at append time as `event: audit` frames with the
+   * parsed JSONL line as the payload. Orthogonal to WR-90 (the audit
+   * webhook sink tails the file; this stream never reads it) and to
+   * WR-49/WR-55 (the delivery-event surfaces).
+   *
+   * There is no archive behind this stream, so reconnect resume is
+   * impossible: a `Last-Event-ID` header answers 210 `events_gone` and the
+   * client rebuilds from `GET /audit` instead of silently missing events.
+   * Slow-consumer guard, heartbeat, and `unref` behavior mirror `/events`.
+   */
+  const streamAuditEvents = (
+    req: Parameters<Parameters<typeof createServer>[0]>[0],
+    res: Parameters<Parameters<typeof createServer>[0]>[1]
+  ): void => {
+    // No archive backs the audit stream: a reconnect cursor can never be
+    // honored. 210 Gone (rather than silent live-only) tells the client to
+    // rebuild from `GET /audit` — the honest equivalent of the /events
+    // `GET /events/archive` fallback.
+    const lastEventIdRaw = req.headers["last-event-id"];
+    const lastEventId = Array.isArray(lastEventIdRaw) ? lastEventIdRaw[0] : lastEventIdRaw;
+    if (typeof lastEventId === "string" && lastEventId.length > 0) {
+      respondJson(res, 210, {
+        error: "events_gone",
+        message: "audit events are not archived for replay; rebuild from GET /audit",
+      });
+      return;
+    }
+
+    let closed = false;
+    // Assigned exactly once below, before any event can arrive.
+    let unsubscribe: () => void = () => {};
+    let heartbeat: ReturnType<typeof setInterval> | undefined;
+    const cleanup = (): void => {
+      if (closed) return;
+      closed = true;
+      if (heartbeat !== undefined) clearInterval(heartbeat);
+      unsubscribe();
+    };
+    const writeFrame = (event: Record<string, unknown>): void => {
+      // No `id:` field: audit events carry no replay cursor (see above),
+      // so nothing a client could echo back as `Last-Event-ID`.
+      res.write(`event: audit\ndata: ${JSON.stringify(event)}\n\n`);
+    };
+    // Slow-consumer guard: same 1MiB threshold as `/events` — an operator
+    // dashboard that cannot keep up is disconnected instead of buffering
+    // without bound.
+    const guardSlowConsumer = (): boolean => {
+      if (res.writableLength > 1_048_576) {
+        cleanup();
+        res.end();
+        return true;
+      }
+      return false;
+    };
+    const openStream = (): void => {
+      res.writeHead(200, {
+        "content-type": "text/event-stream",
+        "cache-control": "no-cache",
+        connection: "keep-alive",
+        // Tell buffering proxies (e.g. nginx) not to hold frames back.
+        "x-accel-buffering": "no",
+      });
+      // A comment frame right away: some clients only consider the stream
+      // open once the first bytes arrive.
+      res.write(": connected\n\n");
+      heartbeat = setInterval(() => {
+        if (!closed) res.write(": ping\n\n");
+      }, opts.events?.heartbeatMs ?? 15_000);
+      // Never let an idle dashboard pin the process open.
+      (heartbeat as unknown as { unref?: () => unknown }).unref?.();
+    };
+
+    openStream();
+    unsubscribe = opts.auditLog.subscribe((event) => {
+      if (closed) return;
+      if (guardSlowConsumer()) return;
+      writeFrame(event);
+    });
+    req.on("close", cleanup);
+    res.on("close", cleanup);
+  };
+
   /** Operator surface: dead-letter queue + audit-log queries + live event stream. */
   /**
    * WR-135: read an optional JSON object body for the replay-approval
@@ -7283,6 +7376,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     const isWatermarks = pathname === "/watermarks";
     const isHealthSummary = pathname === "/health/summary";
     const isEvents = pathname === "/events";
+    const isEventsAudit = pathname === "/events/audit";
     const isEventsArchive = pathname === "/events/archive";
     const isMetrics = pathname === "/metrics";
     const isAutoStatus = pathname === "/dead-letter/auto-replay/status";
@@ -7688,6 +7782,10 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     }
     if (isEvents) {
       streamDeliveryEvents(req, res);
+      return;
+    }
+    if (isEventsAudit) {
+      streamAuditEvents(req, res);
       return;
     }
     if (isEventsArchive) {

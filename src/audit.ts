@@ -306,7 +306,18 @@ function maskablePayload(
  * `endpoint`) and its byte span in the file, so only matching lines are
  * read back. The index tracks the file size to detect appends (only the new
  * tail is scanned) and truncation/rotation (the index is rebuilt).
+ *
+ * WR-186: `subscribe()` adds an in-memory live listener, fanned out
+ * synchronously at the end of every `append()` — the operator
+ * `GET /events/audit` SSE stream is built on it. Fan-out never touches the
+ * file: it is orthogonal to the WR-90 audit webhook sink, which tails the
+ * JSONL file. A throwing listener can neither break the append path nor
+ * starve the other listeners.
  */
+
+/** WR-186: a live audit-event listener. Receives the parsed JSONL line. */
+export type AuditEventListener = (event: Record<string, unknown>) => void;
+
 export class AuditLog {
   private readonly path: string;
   private readonly payloadEncryptor?: PayloadEncryptor;
@@ -342,6 +353,8 @@ export class AuditLog {
   private readonly auditKeys = new Map<string, Buffer>();
   /** WR-184: the HMAC key id new appends are sealed under. */
   private currentKeyId: string;
+  /** WR-186: in-memory live listeners, fanned out at the end of `append()`. */
+  private readonly auditEventListeners = new Set<AuditEventListener>();
 
   constructor(path: string, opts: AuditLogOptions = {}) {
     this.path = path;
@@ -459,9 +472,58 @@ export class AuditLog {
       this.chainFileBytes = 0;
       this.hmacFileBytes = 0;
     }
+    // WR-186: in-memory fan-out for live subscribers (e.g. the operator
+    // `GET /events/audit` SSE stream). Fires before the WR-183 alert
+    // recursion below so delivery order matches file order. Errors in a
+    // subscriber are isolated — they can never break or slow the append
+    // path (each subscriber is try/caught inside).
+    this.notifyAuditSubscribers(line);
     // WR-183: alert after the line lands — the alert references the
     // persisted line, and its own append is never re-scanned.
     if (hits.length > 0) this.appendSecretLeakAlert(event, hits);
+  }
+
+  /**
+   * WR-186: subscribe to audit events as they are appended. The listener
+   * receives the parsed JSONL line (the same object `query()` would
+   * return), fired synchronously at the end of each `append()`. Returns
+   * an unsubscribe function. A listener that throws never affects the
+   * append path or the other listeners — errors are swallowed per
+   * subscriber, mirroring `RetryQueue.subscribeDeliveryEvents`.
+   */
+  subscribe(listener: AuditEventListener): () => void {
+    this.auditEventListeners.add(listener);
+    return () => {
+      this.auditEventListeners.delete(listener);
+    };
+  }
+
+  /** WR-186: current number of live subscribers (operator bookkeeping). */
+  get subscriberCount(): number {
+    return this.auditEventListeners.size;
+  }
+
+  /**
+   * WR-186: synchronous in-memory fan-out of one just-persisted JSONL line.
+   * Never touches the file — the WR-90 webhook sink remains the only
+   * file-tailed consumer. Never throws: a corrupt line (cannot happen for
+   * a line just written) and every subscriber's errors are isolated.
+   */
+  private notifyAuditSubscribers(line: string): void {
+    if (this.auditEventListeners.size === 0) return;
+    let event: Record<string, unknown>;
+    try {
+      event = JSON.parse(line) as Record<string, unknown>;
+    } catch {
+      return;
+    }
+    for (const listener of this.auditEventListeners) {
+      try {
+        listener(event);
+      } catch {
+        // One misbehaving subscriber never breaks append() or the others.
+      }
+    }
   }
 
   /**

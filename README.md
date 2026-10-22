@@ -5256,6 +5256,28 @@ instead of silently missing events. A malformed cursor answers `400`.
 Off by default: the header is then ignored and the stream stays live-only,
 zero behavior change.
 
+**Audit event stream (observability):** with an `operatorToken` set,
+`GET /events/audit` opens a second Server-Sent Events stream, alongside
+`GET /events`, for *operator audit* events rather than delivery events.
+Every audit line — `endpoint_paused` / `endpoint_resumed`,
+`endpoint_config_updated`, `circuit_open` / `circuit_closed`,
+`failover_switched`, `dead_letter_auto_replay`, and everything else the
+audit log records — fans out in memory at append time as an
+`event: audit` frame carrying the parsed JSONL line, so an operator can
+watch configuration and safety transitions as they happen without
+polling. The subscription is a pure in-memory live tap: it never reads
+the audit file (orthogonal to the WR-90 audit webhook sink, which tails
+the file for external forwarding), and a throwing/slow subscriber can
+neither block nor slow `append()` — errors are isolated per subscriber.
+Auth, heartbeat (`: ping` every `heartbeatMs`, default 15s, unref'd), and
+the 1MiB slow-consumer disconnect mirror `GET /events`, and like the
+other operator endpoints it answers 404 when no `operatorToken` is
+configured (fail-closed). There is intentionally no replay: audit events
+have no archive behind them, so a reconnecting client that sends
+`Last-Event-ID` gets `210 Gone` with an `events_gone` body and rebuilds
+from `GET /audit` instead of silently missing events — the honest
+equivalent of the delivery stream's archive fallback.
+
 **Shutdown:** SIGTERM moves every `retrying` item straight out of the
 machine (dropped, never delivered) while `delivering` items are awaited;
 see Graceful shutdown above.

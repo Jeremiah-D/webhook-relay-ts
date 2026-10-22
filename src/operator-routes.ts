@@ -464,6 +464,15 @@ export const OPERATOR_ROUTES: readonly OperatorRoute[] = [
     okDescription: "Server-sent event stream; each event is a JSON delivery event.",
   },
   {
+    path: "/events/audit",
+    pattern: exact("/events/audit"),
+    methods: ["GET"],
+    summary: "Live audit-event stream (SSE)",
+    description:
+      "WR-186: `text/event-stream` of operator audit events as they are appended — `endpoint_paused` / `endpoint_resumed`, `endpoint_config_updated`, `circuit_open` / `circuit_closed`, `failover_switched`, `dead_letter_auto_replay`, and every other audit line — emitted as `event: audit` JSON frames with periodic `: ping` heartbeats. In-memory live subscription (orthogonal to the WR-90 audit webhook sink, which tails the file). Slow consumers (buffer > 1MiB) are disconnected. No replay: a `Last-Event-ID` header answers 210 `events_gone` — rebuild from `GET /audit` instead of silently missing events.",
+    okDescription: "Server-sent event stream; each event is a JSON audit line.",
+  },
+  {
     path: "/events/archive",
     pattern: exact("/events/archive"),
     methods: ["GET"],

@@ -49,6 +49,7 @@ const INVENTORY: Array<[string, Array<"GET" | "POST" | "PUT" | "DELETE">]> = [
   ["/watermarks", ["GET"]],
   ["/health/summary", ["GET"]],
   ["/events", ["GET"]],
+  ["/events/audit", ["GET"]],
   ["/events/archive", ["GET"]],
   ["/metrics", ["GET"]],
   ["/config/endpoint", ["POST"]],
