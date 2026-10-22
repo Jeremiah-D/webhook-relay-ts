@@ -631,6 +631,34 @@ reliability primitives that matter for any signed-payload pipeline.
   downstream. The config applies to the default sender only — an injected
   sender signs (or doesn't) on its own. Invalid values throw `RangeError`
   at startup.
+- RFC 9421 HTTP Message Signatures outbound signing (`src/rfc9421.ts`,
+  WR-187): the IETF-standard alternative to the relay's custom
+  `x-relay-signature` / `x-relay-ed25519-signature` stamps above — any RFC
+  9421 verifier (a bank gateway, a partner settlement hook) can check the
+  delivery with no relay-specific code. `signRfc9421()` builds the
+  canonical signature base from configurable covered components
+  (`@method`, `@authority`, `@scheme`, `@target-uri`, `@request-target`,
+  `@path`, `@query`, `@query-param`, `@status`, plain header fields like
+  `content-digest`), signs it with `hmac-sha256` or `ed25519` (same
+  `node:crypto` primitives as `verify.ts` / `outbound-ed25519.ts`), and
+  renders the `Signature-Input` / `Signature` header pair;
+  `verifyRfc9421()` parses the pair, rebuilds the base byte-exact from the
+  received message, and checks the signature — never throwing, failing
+  closed on unknown labels, declared-algorithm mismatches, and malformed
+  fields. Signature parameters (`created`, `expires`, `nonce`, `alg`,
+  `keyid`, `tag`) are covered by the signature itself; `created`/`expires`
+  freshness policy is left to the application (RFC §7.2.2).
+  `contentDigestSha512()` renders the RFC 9530 `Content-Digest` value so
+  the body digest can be covered like any header. Tested against the
+  RFC's official Appendix B vectors: the B.2.5 `hmac-sha256` signature
+  base, `Signature-Input`, and signature bytes reproduce exactly, as do
+  the B.2.6 `ed25519` ones (key derived from the RFC's JWK seed), and
+  `contentDigestSha512('{"hello": "world"}')` reproduces the RFC's
+  test-request `Content-Digest` (`node --test test/rfc9421.test.ts`).
+  RSA algorithms are out of scope (the relay's RSA helper uses
+  RSA-PSS/SHA-256 with a 32-byte salt, which does not match the RFC's
+  `rsa-pss-sha512` parameters). Invalid config throws `RangeError` at
+  sign time.
 - AWS SigV4 outbound signing (`awsSigV4`, off by default, WR-116): per
   endpoint, `{ "<exact targetUrl>": { accessKeyId, secretRef, region,
   service } }` stamps `Authorization` + `x-amz-date` per the AWS
