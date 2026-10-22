@@ -292,6 +292,9 @@ import {
 import { TENANT_ID_HEADER, assertValidTenantId, tenantScopeKey, splitTenantScopeKey } from "./tenant.ts";
 import { newTraceId, TRACE_ID_HEADER } from "./trace.ts";
 import { QueueJournal, type CompactItem, type QueueRestoredInfo } from "./durable-queue.ts";
+import { DeliveryWatermark, type WatermarkEndpointStats } from "./watermark.ts";
+export { DeliveryWatermark };
+export type { WatermarkEndpointStats };
 import {
   assertValidEndpointConfigPatch,
   type ConfigChange,
@@ -699,6 +702,17 @@ export interface RetryItem {
    * ignore it, which only loses the per-attempt cap.
    */
   adaptiveTimeoutMs?: number;
+  /**
+   * WR-185: per-endpoint ingress sequence number, stamped by the queue at
+   * admission (`enqueueNow`) when the delivery watermark is enabled
+   * (`watermarkDir`). Monotonic per `targetUrl` in admission order (seqs
+   * start at 1); carried on the stored entry across retries and
+   * dead-letter replays, and reported back to the watermark on successful
+   * delivery so the endpoint's consecutive-delivered prefix can advance.
+   * Unset when the watermark is disabled — senders and replays must
+   * treat a missing value as "no watermark tracking".
+   */
+  ingressSeq?: number;
 }
 
 /** Options for the urgent delivery lane (see {@link DeliveryPriority}). */
@@ -2210,6 +2224,22 @@ export interface RetryQueueOptions {
    * misconfiguration, not a degradation).
    */
   durableQueueDir?: string;
+  /**
+   * Per-endpoint delivery watermark (WR-185; see `src/watermark.ts`).
+   * Opt-in: when set to a directory path, every admitted item gets a
+   * per-endpoint monotonic ingress seq stamped at `enqueueNow` (inbound
+   * receive order), and each successful delivery advances the endpoint's
+   * watermark (max consecutive delivered seq, out-of-order deliveries
+   * buffered). Assignments and deliveries are journaled to
+   * `<dir>/watermarks.jsonl` and restored on restart. Unset means
+   * disabled: purely in-memory behavior, exactly as before — no ingress
+   * seqs are stamped and no watermark is tracked. A set but invalid
+   * value throws `RangeError` at construction; an uncreatable directory
+   * throws (fail-fast, like the WR-49 journal). Orthogonal to WR-49
+   * (durable queue = pending items) and WR-55 (event archive = event
+   * history): this tracks confirmed-delivery progress only.
+   */
+  watermarkDir?: string;
   /**
    * Clock (ms epoch) for durable-queue retry resume math; defaults to
    * `Date.now`. Injectable so tests can verify remaining-backoff resume
@@ -3836,6 +3866,13 @@ export class RetryQueue {
    */
   private readonly durable?: QueueJournal;
   private readonly durableDir?: string;
+  /**
+   * WR-185: opt-in per-endpoint delivery watermark (undefined when
+   * `watermarkDir` is unset). Tracks confirmed-delivery progress only —
+   * orthogonal to the WR-49 durable queue (pending items) and the WR-55
+   * event archive (event history).
+   */
+  private readonly watermark?: DeliveryWatermark;
   private readonly durableNow: () => number;
   /**
    * Armed retry fire-times per item (ms epoch), tracked so compaction
@@ -4653,6 +4690,19 @@ export class RetryQueue {
       // Recovery rewrites the journal down to live state: superseded
       // lines from before the crash never accumulate.
       this.compactDurable(true);
+    }
+    // WR-185: opt-in per-endpoint delivery watermark. Recovery runs here,
+    // at construction — a restarted process resumes each endpoint's
+    // confirmed-delivery progress from the journal before it serves
+    // anything. Corrupt lines are skipped and counted, like the WR-49
+    // journal — a torn write never prevents recovery of the rest.
+    if (opts.watermarkDir !== undefined) {
+      if (typeof opts.watermarkDir !== "string" || opts.watermarkDir.length === 0) {
+        throw new RangeError(
+          `watermarkDir must be a non-empty string, got ${JSON.stringify(opts.watermarkDir)}`
+        );
+      }
+      this.watermark = new DeliveryWatermark(opts.watermarkDir);
     }
     // WR-133: opt-in durable scheduled-delivery journal. Recovery runs at
     // construction, like the WR-49 queue journal: parked one-shot
@@ -6190,6 +6240,27 @@ export class RetryQueue {
   }
 
   /**
+   * WR-185: whether the per-endpoint delivery watermark is enabled
+   * (`watermarkDir` set at construction). The operator `GET /watermarks`
+   * route 404s when this is false (fail-closed, without leaking
+   * anything).
+   */
+  isWatermarkEnabled(): boolean {
+    return this.watermark !== undefined;
+  }
+
+  /**
+   * WR-185: per-endpoint delivery-watermark snapshot — one row per
+   * endpoint with `{ endpoint, ingressSeq, watermark, lag }`, where
+   * `lag = ingressSeq - watermark` is the number of admissions the
+   * downstream has not yet confirmed. Empty when the watermark is
+   * disabled.
+   */
+  getWatermarkStats(): WatermarkEndpointStats[] {
+    return this.watermark?.getWatermarkStats() ?? [];
+  }
+
+  /**
    * WR-80: register a recurring cron schedule. `template.id` becomes the
    * schedule id (unique across queued and scheduled ids); every cycle
    * generates one fresh delivery (`<id>#<n>`, fresh traceId) into the
@@ -6245,6 +6316,16 @@ export class RetryQueue {
       attempt: 0,
       enqueuedAt: item.enqueuedAt ?? this.deadlineNow(),
     };
+    // WR-185: stamp the endpoint's next ingress seq at queue admission —
+    // inbound receive order for normal admissions (batch-window and
+    // deliver_at parking end here, so a merged/flushed item takes its
+    // seq at flush). A caller-supplied `ingressSeq` is honored (dead-letter
+    // replays keep their original seq via spread, so a redelivered item
+    // never consumes a second seq). Unset when the watermark is
+    // disabled: the spread above leaves `ingressSeq` untouched.
+    if (this.watermark !== undefined && stored.ingressSeq === undefined) {
+      stored.ingressSeq = this.watermark.assign(stored.targetUrl);
+    }
     // WR-49: journal before the in-memory mutation — a crash between the
     // two redelivers (at-least-once), never loses.
     this.durable?.appendEnqueue(stored);
@@ -7715,6 +7796,17 @@ export class RetryQueue {
         // monthly budget (the WR-78 billing vocabulary — retries and
         // dead letters never count).
         this.budget.recordDelivered(tenant);
+        // WR-185: advance the endpoint's delivery watermark — the
+        // consecutive-delivered prefix grows here, exactly once per
+        // successfully delivered item (the ingress seq was stamped at
+        // queue admission in `enqueueNow`; the logical endpoint is the
+        // key, so failover/weighted physical-target resolution cannot
+        // split one endpoint's watermark in two). Items predating the
+        // feature carry no seq and are skipped; the call is idempotent,
+        // so a duplicate report never moves the watermark twice.
+        if (entry.ingressSeq !== undefined) {
+          this.watermark?.markDelivered(entry.targetUrl, entry.ingressSeq);
+        }
         if (fastLane) this.recordUrgentStat(target, "delivered");
         const latency = this.latencyFor(tenant);
         const latencyMs = latency?.recordDelivered(entry.id, target);

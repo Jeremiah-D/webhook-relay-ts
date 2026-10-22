@@ -437,6 +437,15 @@ export const OPERATOR_ROUTES: readonly OperatorRoute[] = [
     queryParams: [{ name: "tenant", type: "string", description: "Restrict to one tenant." }],
   },
   {
+    path: "/watermarks",
+    pattern: exact("/watermarks"),
+    methods: ["GET"],
+    summary: "Per-endpoint delivery watermark snapshot",
+    description:
+      "WR-185: one row per endpoint with the highest assigned ingress seq, the max consecutive delivered seq (watermark), and lag = ingressSeq - watermark — admissions the downstream has not yet confirmed. 404 when the watermark is not configured (without leaking its existence to unauthenticated callers — the operator guard runs first).",
+    okDescription: "JSON array of per-endpoint watermark rows.",
+  },
+  {
     path: "/health/summary",
     pattern: exact("/health/summary"),
     methods: ["GET"],

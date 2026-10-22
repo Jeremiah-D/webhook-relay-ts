@@ -1590,6 +1590,55 @@ const server = createRelayServer({
   durability price — leave the option off when you don't need crash
   recovery for scheduled deliveries.
 
+## Delivery watermark (opt-in)
+
+Downstream-outage observation ("下游断点续投观测"): how far each
+delivery endpoint has *confirmed*. When `watermarkDir` is set (also
+available as `retry.watermarkDir`), every item admitted to the queue gets
+a per-endpoint monotonic **ingress seq** stamped at admission (inbound
+receive order; seqs start at 1), and each successful delivery advances
+the endpoint's **watermark** — the max *consecutive* delivered seq.
+Out-of-order deliveries are buffered and the watermark advances by the
+consecutive prefix.
+
+```ts
+const server = createRelayServer({
+  secret, forwardUrl, auditLog,
+  watermarkDir: "/var/lib/relay/watermarks", // opt-in; unset = disabled
+});
+```
+
+`GET /watermarks` (operator bearer token; 404 fail-closed without one,
+and 404 when the watermark is not configured) serves one row per
+endpoint:
+
+```json
+[{ "endpoint": "https://downstream.example/hook", "ingressSeq": 120, "watermark": 118, "lag": 2 }]
+```
+
+- `ingressSeq` — highest assigned seq (the received count).
+- `watermark` — max consecutive delivered seq.
+- `lag = ingressSeq - watermark` — admissions the downstream has not yet
+  confirmed. A downstream outage freezes the watermark while the lag
+  grows; catching up after the outage drains it back toward 0.
+
+- **Persistence**: every assignment and delivery is journaled to
+  `<dir>/watermarks.jsonl` (append-only JSONL) and restored on restart,
+  so the watermark survives process crashes. Torn/corrupt lines are
+  skipped and counted, never fatal; an amortized compaction rewrites the
+  journal down to one snapshot line per endpoint.
+- **At-least-once, idempotent**: a delivery confirmed downstream but lost
+  from the journal is simply re-confirmed on redelivery — duplicate
+  confirmations never move the watermark twice and it never regresses.
+- **Orthogonal by design**: WR-49 (durable queue) journals *pending*
+  items — what is still owed; WR-55 (event archive) journals the delivery
+  *event history*; the watermark tracks *confirmed-delivery progress*
+  only. Items that never deliver (dead letters, expired deadlines) freeze
+  the watermark and grow the lag — that is the intended outage signal,
+  not a bug.
+- `queue.getWatermarkStats()` / `queue.isWatermarkEnabled()` expose the
+  same data in-process.
+
 ## Runtime config hot reload
 
 Delivery policy can be retuned without restarting the process:

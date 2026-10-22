@@ -2201,6 +2201,19 @@ export interface RelayServerOptions {
    */
   durableQueueDir?: string;
   /**
+   * Per-endpoint delivery watermark (WR-185; see `src/watermark.ts`).
+   * Opt-in: every admitted item gets a per-endpoint monotonic ingress seq
+   * and each successful delivery advances the endpoint's watermark
+   * (max consecutive delivered seq), journaled to `<dir>/watermarks.jsonl`
+   * and restored on restart. Served at `GET /watermarks` (operator
+   * bearer <redacted>; 404 fail-closed when this option is unset, so an
+   * unconfigured watermark leaks no existence). Orthogonal to WR-49
+   * (durable queue = pending items) and WR-55 (event archive = event
+   * history): this tracks confirmed-delivery progress only. Wins over
+   * `retry.watermarkDir` when both are set.
+   */
+  watermarkDir?: string;
+  /**
    * Durable scheduled deliveries (WR-133; see `src/scheduled-journal.ts`).
    * Opt-in: one-shot `deliver_at` parked deliveries are journaled to
    * `<dir>/scheduled.jsonl` and restored on restart — past-due items go
@@ -5187,6 +5200,8 @@ function isOperatorPath(pathname: string): boolean {
     pathname === "/quorum" ||
     pathname === "/quorum/stats" ||
     pathname === "/usage" ||
+    // WR-185: per-endpoint delivery watermark snapshot.
+    pathname === "/watermarks" ||
     pathname === "/health/summary" ||
     pathname === "/events" ||
     pathname === "/events/archive" ||
@@ -5898,6 +5913,10 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // journal. Wrap the caller's hook so every recovery is audited as
     // `queue_restored`, not just observed.
     durableQueueDir: opts.durableQueueDir ?? opts.retry?.durableQueueDir,
+    // WR-185: an explicit server-level `watermarkDir` wins over the
+    // nested `retry.watermarkDir`; either way the queue owns the
+    // watermark journal.
+    watermarkDir: opts.watermarkDir ?? opts.retry?.watermarkDir,
     onQueueRestored: (info) => {
       opts.auditLog.append({
         event: "queue_restored",
@@ -7261,6 +7280,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     const isQuorum = pathname === "/quorum";
     const isQuorumStats = pathname === "/quorum/stats";
     const isUsage = pathname === "/usage";
+    const isWatermarks = pathname === "/watermarks";
     const isHealthSummary = pathname === "/health/summary";
     const isEvents = pathname === "/events";
     const isEventsArchive = pathname === "/events/archive";
@@ -7819,6 +7839,20 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       }
       const params = new URL(req.url ?? "/usage", "http://internal").searchParams;
       respondJson(res, 200, usageMeter.snapshot(params.get("tenant") ?? undefined));
+      return;
+    }
+    if (isWatermarks) {
+      // WR-185: per-endpoint delivery watermark snapshot — one row per
+      // endpoint with the received ingress seq, the max consecutive
+      // delivered seq, and lag = ingressSeq - watermark. Same
+      // operator-token guard as the other operator endpoints (404 when
+      // no operatorToken — fail closed); when the watermark itself is
+      // unconfigured the endpoint 404s without leaking anything.
+      if (!queue.isWatermarkEnabled()) {
+        respondJson(res, 404, { error: "delivery watermark is not configured" });
+        return;
+      }
+      respondJson(res, 200, queue.getWatermarkStats());
       return;
     }
     if (isHealthSummary) {
