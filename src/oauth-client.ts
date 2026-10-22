@@ -31,10 +31,31 @@
  * (`OAuth2TokenCacheOptions`), so tests stay deterministic without
  * touching the network. Invalid configuration throws `RangeError` at
  * startup — never mid-delivery.
+ *
+ * WR-189: `private_key_jwt` client authentication (RFC 7523) is an
+ * alternative to `client_secret` — a self-signed JWT
+ * (`client_assertion`) with Ed25519 (`EdDSA`) or RS256, built fresh per
+ * token fetch. The assertion cache, single-flight, and 401-refresh
+ * mechanics are the token cache's and are unchanged: they operate on
+ * the access token, never the assertion.
  */
 
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
+import {
+  createPrivateKey,
+  randomBytes,
+  sign as cryptoSign,
+  type KeyObject,
+} from "node:crypto";
+import { compileEd25519OutboundKey } from "./outbound-ed25519.ts";
+
+/** `client_assertion_type` value for JWT bearer assertions (RFC 7523 §2.2). */
+export const PRIVATE_KEY_JWT_ASSERTION_TYPE =
+  "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
+
+/** How long a `private_key_jwt` assertion is valid (RFC 7523: keep it short). */
+export const PRIVATE_KEY_JWT_EXPIRY_SECONDS = 300;
 
 /** Safety margin: a token counts as expired this early (clock-skew reserve). */
 export const OAUTH2_CLOCK_SKEW_MS = 30_000;
@@ -59,10 +80,33 @@ export interface OAuth2ClientCredentialsConfig {
   /** OAuth2 `client_id`. Non-empty. */
   client_id: string;
   /**
-   * OAuth2 `client_secret`. Non-empty. Memory-only: never logged, never
-   * audited, never rendered by any stats/introspection method.
+   * OAuth2 `client_secret`. Memory-only: never logged, never audited,
+   * never rendered by any stats/introspection method. Exactly one of
+   * `client_secret` / `private_key_jwt` must be set.
    */
-  client_secret: string;
+  client_secret?: string;
+  /**
+   * WR-189: OAuth2 `private_key_jwt` client authentication (RFC 7523).
+   * When set, the relay proves its identity with a self-signed JWT
+   * (`client_assertion`) instead of `client_secret` — what FAPI /
+   * bank-gateway token endpoints require. Exactly one of
+   * `client_secret` / `private_key_jwt` must be set.
+   */
+  private_key_jwt?: {
+    /**
+     * PEM-encoded private key: Ed25519 or RS256 (`alg` selects).
+     * Parsed once at startup, fail-fast. Ed25519 keys reuse the
+     * outbound-Ed25519 key management (`compileEd25519OutboundKey`).
+     */
+    privateKey: string;
+    /**
+     * Stable key id, stamped as the JWT's `kid` so the token endpoint
+     * can select the matching public key. Optional.
+     */
+    keyId?: string;
+    /** Signing algorithm: Ed25519 (EdDSA) or RS256. */
+    alg: "Ed25519" | "RS256";
+  };
   /** Optional space-delimited `scope`. Non-empty when set. */
   scope?: string;
 }
@@ -71,7 +115,16 @@ export interface OAuth2ClientCredentialsConfig {
 export interface ResolvedOAuth2ClientConfig {
   tokenEndpoint: URL;
   clientId: string;
-  clientSecret: string;
+  clientSecret?: string;
+  /**
+   * WR-189: compiled `private_key_jwt` assertion key — the private key
+   * parsed once at startup, the id stamped per assertion.
+   */
+  assertion?: {
+    privateKey: KeyObject;
+    keyId?: string;
+    alg: "Ed25519" | "RS256";
+  };
   scope?: string;
 }
 
@@ -103,8 +156,23 @@ export function resolveOAuth2ClientConfig(
   if (typeof cfg.client_id !== "string" || cfg.client_id === "") {
     throw new RangeError(`${where}: \`client_id\` must be a non-empty string`);
   }
-  if (typeof cfg.client_secret !== "string" || cfg.client_secret === "") {
-    throw new RangeError(`${where}: \`client_secret\` must be a non-empty string`);
+  const hasSecret = typeof cfg.client_secret === "string" && cfg.client_secret !== "";
+  const hasAssertion =
+    cfg.private_key_jwt !== null && typeof cfg.private_key_jwt === "object";
+  // WR-189: exactly one client-authentication method — the token
+  // endpoint must never see a secret *and* an assertion, and it must
+  // see one of them.
+  if (hasSecret === hasAssertion) {
+    throw new RangeError(
+      `${where}: exactly one of \`client_secret\` / \`private_key_jwt\` must be set`
+    );
+  }
+  let assertion: ResolvedOAuth2ClientConfig["assertion"];
+  if (hasAssertion) {
+    assertion = compilePrivateKeyJwtAssertion(
+      cfg.private_key_jwt as NonNullable<OAuth2ClientCredentialsConfig["private_key_jwt"]>,
+      `${where}: \`private_key_jwt\``
+    );
   }
   if (cfg.scope !== undefined && (typeof cfg.scope !== "string" || cfg.scope.trim() === "")) {
     throw new RangeError(`${where}: \`scope\` must be a non-empty string when set`);
@@ -112,9 +180,108 @@ export function resolveOAuth2ClientConfig(
   return {
     tokenEndpoint,
     clientId: cfg.client_id,
-    clientSecret: cfg.client_secret,
+    ...(hasSecret ? { clientSecret: cfg.client_secret as string } : {}),
+    ...(assertion !== undefined ? { assertion } : {}),
     ...(cfg.scope !== undefined ? { scope: cfg.scope } : {}),
   };
+}
+
+/**
+ * WR-189: validate a `private_key_jwt` config and parse the private key
+ * once at startup. Ed25519 keys reuse the outbound-Ed25519 key
+ * management (`compileEd25519OutboundKey` — WR-124); RS256 keys are
+ * parsed here. Throws `RangeError` on any bad shape — call at startup,
+ * never mid-delivery.
+ */
+function compilePrivateKeyJwtAssertion(
+  cfg: NonNullable<OAuth2ClientCredentialsConfig["private_key_jwt"]>,
+  where: string
+): NonNullable<ResolvedOAuth2ClientConfig["assertion"]> {
+  if (cfg.alg !== "Ed25519" && cfg.alg !== "RS256") {
+    throw new RangeError(`${where}: \`alg\` must be "Ed25519" or "RS256"`);
+  }
+  if (cfg.keyId !== undefined && (typeof cfg.keyId !== "string" || cfg.keyId === "")) {
+    throw new RangeError(`${where}: \`keyId\` must be a non-empty string when set`);
+  }
+  if (cfg.alg === "Ed25519") {
+    const compiled = compileEd25519OutboundKey(
+      { privateKey: cfg.privateKey, ...(cfg.keyId !== undefined ? { keyId: cfg.keyId } : {}) },
+      where
+    );
+    return { privateKey: compiled.privateKey, keyId: compiled.keyId, alg: "Ed25519" };
+  }
+  if (typeof cfg.privateKey !== "string" || cfg.privateKey.trim() === "") {
+    throw new RangeError(`${where}: \`privateKey\` must be a non-empty PEM string`);
+  }
+  let key: KeyObject;
+  try {
+    key = createPrivateKey(cfg.privateKey);
+  } catch {
+    throw new RangeError(`${where}: \`privateKey\` is not a valid PEM private key`);
+  }
+  if (key.asymmetricKeyType !== "rsa") {
+    throw new RangeError(
+      `${where}: \`privateKey\` must be an RSA private key for RS256, got ${key.asymmetricKeyType ?? "unknown"}`
+    );
+  }
+  return { privateKey: key, keyId: cfg.keyId, alg: "RS256" };
+}
+
+function base64UrlEncode(data: Buffer | string): string {
+  return Buffer.from(data).toString("base64url");
+}
+
+/** Input for {@link buildPrivateKeyJwtAssertion}. */
+export interface PrivateKeyJwtAssertionInput {
+  /** OAuth2 `client_id` — stamped as the JWT's `iss`/`sub`. */
+  clientId: string;
+  /** Token endpoint URL string — stamped as the JWT's `aud` (RFC 7523 §3). */
+  tokenEndpoint: string;
+  /** Compiled assertion key (from {@link resolveOAuth2ClientConfig}). */
+  assertion: NonNullable<ResolvedOAuth2ClientConfig["assertion"]>;
+  /** Signing instant; defaults to now. Inject for deterministic tests. */
+  nowMs?: number;
+  /** `jti` nonce; defaults to 16 random bytes (hex). */
+  jti?: string;
+}
+
+/**
+ * WR-189: build an OAuth2 `private_key_jwt` client assertion
+ * (RFC 7523 §2.2 / §3): a self-signed JWT with `iss`/`sub` = the
+ * `client_id`, `aud` = the token endpoint, a unique `jti`, and a short
+ * expiry (`PRIVATE_KEY_JWT_EXPIRY_SECONDS`). Signed with Ed25519
+ * (`EdDSA`) or RS256 per the configured `alg`, with `kid` stamped when
+ * a `keyId` is configured. `node:crypto` only, zero new dependencies.
+ *
+ * The assertion carries no secret — only the signature proves
+ * possession of the private key — but it is still a short-lived
+ * credential: callers must never log it (the token fetcher names the
+ * endpoint and status only, exactly like the `client_secret` path).
+ */
+export function buildPrivateKeyJwtAssertion(input: PrivateKeyJwtAssertionInput): string {
+  const nowSec = Math.floor((input.nowMs ?? Date.now()) / 1000);
+  const header: Record<string, string> = {
+    alg: input.assertion.alg === "Ed25519" ? "EdDSA" : "RS256",
+    typ: "JWT",
+  };
+  if (input.assertion.keyId !== undefined) {
+    header["kid"] = input.assertion.keyId;
+  }
+  const payload = {
+    iss: input.clientId,
+    sub: input.clientId,
+    aud: input.tokenEndpoint,
+    jti: input.jti ?? randomBytes(16).toString("hex"),
+    iat: nowSec,
+    exp: nowSec + PRIVATE_KEY_JWT_EXPIRY_SECONDS,
+  };
+  const signingInput = `${base64UrlEncode(JSON.stringify(header))}.${base64UrlEncode(JSON.stringify(payload))}`;
+  const data = Buffer.from(signingInput, "utf8");
+  const signature =
+    input.assertion.alg === "Ed25519"
+      ? cryptoSign(null, data, input.assertion.privateKey)
+      : cryptoSign("RSA-SHA256", data, input.assertion.privateKey);
+  return `${signingInput}.${base64UrlEncode(signature)}`;
 }
 
 /** The token endpoint's JSON response (RFC 6749 §5.1). */
@@ -139,8 +306,17 @@ export class OAuth2TokenError extends Error {
 export interface OAuth2TokenFetchParams {
   tokenEndpoint: URL;
   clientId: string;
-  /** Memory-only: a fetcher must never log or persist this. */
-  clientSecret: string;
+  /**
+   * Memory-only: a fetcher must never log or persist this. Set only
+   * for `client_secret` configs.
+   */
+  clientSecret?: string;
+  /**
+   * WR-189: a freshly built `private_key_jwt` client assertion
+   * (RFC 7523) for this fetch. Set only for `private_key_jwt`
+   * configs, mutually exclusive with `clientSecret`.
+   */
+  clientAssertionJwt?: string;
   scope?: string;
   /** Per-request timeout in ms. */
   timeoutMs: number;
@@ -191,20 +367,39 @@ function assertValidTokenResponse(
 
 /**
  * The default token fetcher: one `POST` with
- * `grant_type=client_credentials`, `node:http(s)` only. The
- * `client_secret` travels in the form body — it is never written to any
- * log, and error messages name the endpoint and status only.
+ * `grant_type=client_credentials`, `node:http(s)` only.
+ *
+ * WR-189: for `private_key_jwt` configs the request carries
+ * `client_assertion_type` + `client_assertion` (RFC 7523 §2.2) instead
+ * of `client_secret`; `client_id` is sent in both cases (the assertion
+ * already identifies the client via `iss`/`sub`, but some token
+ * endpoints expect the field). The assertion — like the secret —
+ * travels in the form body; it is never written to any log, and error
+ * messages name the endpoint and status only.
  */
 export function defaultOAuth2TokenFetcher(
   params: OAuth2TokenFetchParams
 ): Promise<OAuth2TokenResponse> {
   return new Promise((resolve, reject) => {
-    const body = new URLSearchParams({
-      grant_type: "client_credentials",
-      client_id: params.clientId,
-      client_secret: params.clientSecret,
-      ...(params.scope !== undefined ? { scope: params.scope } : {}),
-    }).toString();
+    const form = new URLSearchParams({ grant_type: "client_credentials" });
+    form.set("client_id", params.clientId);
+    if (params.clientAssertionJwt !== undefined) {
+      form.set("client_assertion_type", PRIVATE_KEY_JWT_ASSERTION_TYPE);
+      form.set("client_assertion", params.clientAssertionJwt);
+    } else if (params.clientSecret !== undefined) {
+      form.set("client_secret", params.clientSecret);
+    } else {
+      reject(
+        new OAuth2TokenError(
+          `oauth2 token request failed: no client authentication configured for ${params.tokenEndpoint.host}${params.tokenEndpoint.pathname}`
+        )
+      );
+      return;
+    }
+    if (params.scope !== undefined) {
+      form.set("scope", params.scope);
+    }
+    const body = form.toString();
     const endpoint = params.tokenEndpoint;
     const requestFn = endpoint.protocol === "https:" ? httpsRequest : httpRequest;
     const fail = (message: string): void => {
@@ -320,7 +515,12 @@ export class OAuth2TokenCache {
   }
 
   private keyFor(cfg: ResolvedOAuth2ClientConfig): string {
-    return `${cfg.tokenEndpoint.href}\n${cfg.scope ?? ""}\n${cfg.clientId}`;
+    const base = `${cfg.tokenEndpoint.href}\n${cfg.scope ?? ""}\n${cfg.clientId}`;
+    // WR-189: the assertion key is part of the identity — two configs
+    // with the same client_id but different signing keys must not
+    // share a cached token. Secret-based keys are unchanged
+    // (byte-identical to before).
+    return cfg.assertion !== undefined ? `${base}\n${cfg.assertion.keyId ?? ""}` : base;
   }
 
   /**
@@ -358,10 +558,25 @@ export class OAuth2TokenCache {
   private fetchOnce(key: string, cfg: ResolvedOAuth2ClientConfig): Promise<string> {
     const ongoing = this.inflight.get(key);
     if (ongoing !== undefined) return ongoing;
+    // WR-189: the assertion is built fresh per token fetch — a new
+    // `jti` and a fresh `iat`/`exp` every time, so a leaked or replayed
+    // assertion cannot outlive its 5-minute window. Caching,
+    // single-flight, and the 401 refresh path are unchanged: they
+    // operate on the token, not the assertion.
+    const clientAssertionJwt =
+      cfg.assertion !== undefined
+        ? buildPrivateKeyJwtAssertion({
+            clientId: cfg.clientId,
+            tokenEndpoint: cfg.tokenEndpoint.href,
+            assertion: cfg.assertion,
+            nowMs: this.nowMs(),
+          })
+        : undefined;
     const fetched = this.fetchToken({
       tokenEndpoint: cfg.tokenEndpoint,
       clientId: cfg.clientId,
-      clientSecret: cfg.clientSecret,
+      ...(cfg.clientSecret !== undefined ? { clientSecret: cfg.clientSecret } : {}),
+      ...(clientAssertionJwt !== undefined ? { clientAssertionJwt } : {}),
       ...(cfg.scope !== undefined ? { scope: cfg.scope } : {}),
       timeoutMs: this.tokenRequestTimeoutMs,
     }).then(

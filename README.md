@@ -3997,6 +3997,38 @@ the normal retry / dead-letter path.
   bearer token downstream.
 - Invalid configs throw `RangeError` at startup — never mid-delivery.
 
+### `private_key_jwt` client authentication (opt-in, WR-189)
+
+FAPI / bank-gateway token endpoints often refuse `client_secret` and
+require a self-signed JWT client assertion (RFC 7523) instead. Set
+`private_key_jwt` (exactly one of `client_secret` / `private_key_jwt`
+must be set) and the relay builds a fresh assertion per token fetch —
+`iss`/`sub` = `client_id`, `aud` = the token endpoint, a unique `jti`,
+5-minute expiry — signed with Ed25519 (`EdDSA`) or RS256 per `alg`
+(`node:crypto` only, zero new dependencies). Ed25519 keys reuse the
+outbound-Ed25519 key management (`compileEd25519OutboundKey`); the key
+is parsed once at startup, fail-fast. The token request then carries
+`client_assertion_type` (`urn:ietf:params:oauth:client-assertion-type:jwt-bearer`)
++ `client_assertion` instead of `client_secret`; everything else is
+unchanged — the token cache, single-flight, 30s clock-skew reserve,
+and the 401 → refresh → redelivery path all operate on the access
+token, never the assertion. The assertion, like the secret, is never
+logged or audited.
+
+```ts
+oauth2: {
+  "https://bank.example.com/hook": {
+    token_endpoint: "https://auth.bank.example.com/oauth/token",
+    client_id: "relay-client",
+    private_key_jwt: {
+      privateKey: "<PEM Ed25519 or RSA private key>",
+      keyId: "2026-10-rotation", // optional, stamped as the JWT kid
+      alg: "Ed25519",            // or "RS256"
+    },
+  },
+},
+```
+
 ## W3C trace-context propagation (opt-in)
 
 Distributed-tracing glue between the relay's own end-to-end trace IDs
