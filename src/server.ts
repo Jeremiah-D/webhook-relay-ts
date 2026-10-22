@@ -404,6 +404,11 @@ import {
   type OutboundSchemaMetrics,
 } from "./outbound-schema.ts";
 import type { ProbeOptions } from "./downstream-probe.ts";
+import {
+  ProxyHealthMonitor,
+  type ProxyHealthOptions,
+  type ProxyHealthStats,
+} from "./proxy-health.ts";
 import type { OtlpExporterOptions } from "./otlp.ts";
 import {
   assertValidBrotliCompressConfig,
@@ -705,6 +710,23 @@ export interface RelayServerOptions {
    * Off by default.
    */
   probe?: ProbeOptions;
+  /**
+   * Opt-in outbound proxy health probing + failover (see
+   * `src/proxy-health.ts` and the `proxyHealth` default-sender option):
+   * each configured proxy URL gets a timed CONNECT probe on a
+   * lightweight path — no retry budget, no quota, no latency samples,
+   * no circuit breaker — so probes can never disturb a delivery.
+   * `failureThreshold` consecutive probe failures mark the proxy
+   * unhealthy: subsequent deliveries degrade to a healthy backup proxy
+   * first, then direct (when `directFallback` allows), and otherwise
+   * stay on the sick proxy through the normal retry/dead-letter path
+   * (never silently dropped). Recovery is canary-shaped — traffic only
+   * returns after a scheduled probe succeeds, never on a delivery
+   * outcome. Outcomes are audited as `proxy_unhealthy` /
+   * `proxy_recovered` / `proxy_degraded` and counted in the Prometheus
+   * exposition (`relay_proxy_unhealthy`). Off by default.
+   */
+  proxyHealth?: ProxyHealthOptions;
   /**
    * OTLP/HTTP JSON delivery-event export (WR-83; see `src/otlp.ts` and
    * the `otlp` `RetryQueue` option): exports the `delivered` /
@@ -2602,7 +2624,16 @@ export function createDefaultSender(
    * system resolver. `createRelayServer` audits these as `doh_fallback`;
    * library users get the hook directly.
    */
-  onDohFallback?: (info: { hostname: string; error: string; dohUrl: string }) => void
+  onDohFallback?: (info: { hostname: string; error: string; dohUrl: string }) => void,
+  /**
+   * WR-181: outbound proxy health monitor (see `src/proxy-health.ts`).
+   * When set, every proxied delivery attempt consults it: an unhealthy
+   * proxy degrades to a healthy backup, direct (when allowed), or stays
+   * on the sick proxy through the normal retry/dead-letter path. The
+   * monitor's own `onAudit` carries the `proxy_degraded` events.
+   * `undefined` keeps the exact pre-WR-181 behavior.
+   */
+  proxyHealthMonitor?: ProxyHealthMonitor
 ): PooledSender {
   if (tlsPins !== undefined) {
     for (const [endpoint, pins] of Object.entries(tlsPins)) {
@@ -4642,7 +4673,7 @@ export function createDefaultSender(
     // fails the delivery through the normal retry path; explicit values
     // were validated at startup (static) or at registry-write time.
     const registryProxy = endpointRegistry?.getProxy(item.targetUrl);
-    const proxyUrl = registryProxy ?? resolveProxyUrl(item.targetUrl, proxies);
+    let proxyUrl = registryProxy ?? resolveProxyUrl(item.targetUrl, proxies);
     if (proxyUrl === undefined && registryProxy === undefined && proxies?.[item.targetUrl] !== undefined) {
       return Promise.reject(
         new Error(`outbound proxy: proxy configured for non-HTTP(S) target ${item.targetUrl}`)
@@ -4652,6 +4683,16 @@ export function createDefaultSender(
       return Promise.reject(
         new Error(`outbound proxy: proxy configured for non-HTTP(S) target ${item.targetUrl}`)
       );
+    }
+    // WR-181: proxy health failover. The configured proxy is tracked
+    // lazily (environment/registry proxies join without a restart);
+    // when it is known-unhealthy the delivery degrades to a healthy
+    // backup proxy, direct (when `directFallback` allows), or stays on
+    // the sick proxy through the normal retry/dead-letter path — never
+    // silently dropped. Unknown proxies are treated as healthy.
+    if (proxyHealthMonitor !== undefined && proxyUrl !== undefined) {
+      proxyHealthMonitor.ensureTracked(proxyUrl);
+      proxyUrl = proxyHealthMonitor.resolveProxy(proxyUrl, { targetUrl: item.targetUrl }).proxyUrl;
     }
     // WR-129: per-endpoint OAuth2 client_credentials (exact targetUrl
     // match, http/https only — the WS upgrade path keeps its
@@ -5008,6 +5049,12 @@ export interface RelayServer extends Server {
    * windows). Set only when `operatorRateLimit` was configured.
    */
   getOperatorRateLimitStats?: () => OperatorRateLimitStats;
+  /**
+   * WR-181: outbound proxy health snapshot (per tracked proxy:
+   * health, probe counters, streak). Set only when `proxyHealth` was
+   * configured.
+   */
+  getProxyHealthStats?: () => ProxyHealthStats[];
 }
 
 /**
@@ -5465,9 +5512,32 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       );
     }
   }
+  // WR-181: outbound proxy health probing + failover. Constructed only
+  // when `proxyHealth` is configured; the distinct proxy URLs from the
+  // `proxies` record seed the tracked set (environment/registry proxies
+  // join lazily at dispatch). Invalid values throw RangeError at
+  // startup; `socks5://` entries are skipped (CONNECT probing only).
+  // Every `proxy_unhealthy` / `proxy_recovered` / `proxy_degraded`
+  // event lands in the audit log.
+  const proxyHealthMonitor =
+    opts.proxyHealth !== undefined
+      ? new ProxyHealthMonitor({
+          ...opts.proxyHealth,
+          proxies: [
+            ...new Set(
+              Object.values(opts.proxies ?? {}).filter(
+                (u): u is string => typeof u === "string" && !isSocks5ProxyUrl(u)
+              )
+            ),
+          ],
+          onAudit: (event) => {
+            opts.auditLog.append(event);
+          },
+        })
+      : undefined;
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, opts.awsSigV4, opts.awsSecretResolver, opts.outboundSchemas, opts.oauth2, undefined, opts.compressBrotli, opts.phaseTimeouts, opts.tlsCa, opts.chaos, onChaosInjectedAudit, opts.responseGuard, opts.doh, onDohFallbackAudit)
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, opts.awsSigV4, opts.awsSecretResolver, opts.outboundSchemas, opts.oauth2, undefined, opts.compressBrotli, opts.phaseTimeouts, opts.tlsCa, opts.chaos, onChaosInjectedAudit, opts.responseGuard, opts.doh, onDohFallbackAudit, proxyHealthMonitor)
       : undefined;
   // WR-146: tail-latency hedging for outbound attempts (opt-in). The
   // wrapper sits around whichever sender the queue uses — the default
@@ -6478,6 +6548,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     },
   });
   queue.start();
+  // WR-181: start the proxy health probe schedules with the server.
+  proxyHealthMonitor?.start();
   // WR-114: apply the registry's deliver-policy fields into the queue.
   // Structural validation already ran in the registry constructor; the
   // remaining failure mode is a disabled subsystem (e.g. breaker
@@ -7391,7 +7463,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       // new series. Absent entirely with a custom sender (no pool).
       res
         .writeHead(200, { "content-type": "text/plain; version=0.0.4" })
-        .end(queue.renderMetrics() + versionMetrics.render() + schemaMetrics.render() + (schemaRegistry?.renderMetrics() ?? "") + ipAclMetrics.render() + inboundTenantRateLimitMetrics.render() + operatorRateLimitMetrics.render() + certExpiryMonitor.render() + tlsVersionMonitor.render() + (ocspMonitor?.render() ?? "") + (usageMeter?.render() ?? "") + (defaultSender?.compressionStats.render() ?? "") + (defaultSender?.dnsCache?.render() ?? "") + (defaultSender?.wsPool.renderMetrics() ?? "") + meshMetrics.render() + (defaultSender?.outboundSchemaMetrics?.render() ?? "") + (defaultSender?.chaosMetrics?.render() ?? "") + (reputation?.renderMetrics() ?? "") + hedgeMetrics.render() + (queue.getErrorBudgetMonitor()?.render() ?? ""));
+        .end(queue.renderMetrics() + versionMetrics.render() + schemaMetrics.render() + (schemaRegistry?.renderMetrics() ?? "") + ipAclMetrics.render() + inboundTenantRateLimitMetrics.render() + operatorRateLimitMetrics.render() + (proxyHealthMonitor?.renderMetrics() ?? "") + certExpiryMonitor.render() + tlsVersionMonitor.render() + (ocspMonitor?.render() ?? "") + (usageMeter?.render() ?? "") + (defaultSender?.compressionStats.render() ?? "") + (defaultSender?.dnsCache?.render() ?? "") + (defaultSender?.wsPool.renderMetrics() ?? "") + meshMetrics.render() + (defaultSender?.outboundSchemaMetrics?.render() ?? "") + (defaultSender?.chaosMetrics?.render() ?? "") + (reputation?.renderMetrics() ?? "") + hedgeMetrics.render() + (queue.getErrorBudgetMonitor()?.render() ?? ""));
       return;
     }
     if (isEvents) {
@@ -11535,6 +11607,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
 
   server.on("close", () => {
     queue.stop();
+    // WR-181: stop the proxy health probe schedules with the server —
+    // no new probe rounds mid-shutdown.
+    proxyHealthMonitor?.stop();
     // WR-90: halt the audit-sink worker with the server — no new polls,
     // in-flight POSTs abandoned (the cursor does not advance, so the
     // next start redelivers them).
@@ -11729,6 +11804,12 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // windows). Only set when `operatorRateLimit` was configured.
   if (operatorRateLimiter !== undefined) {
     server.getOperatorRateLimitStats = (): OperatorRateLimitStats => operatorRateLimiter.stats();
+  }
+
+  // WR-181: outbound proxy health snapshot. Only set when `proxyHealth`
+  // was configured.
+  if (proxyHealthMonitor !== undefined) {
+    server.getProxyHealthStats = (): ProxyHealthStats[] => proxyHealthMonitor.stats();
   }
 
   return server;

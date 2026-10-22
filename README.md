@@ -1187,6 +1187,31 @@ reliability primitives that matter for any signed-payload pipeline.
   server, auth paths, handshake failure modes) and
   `test/doh-socks5-integration.test.ts` (pooled delivery through the tunnel,
   pool isolation vs. HTTP-CONNECT agents).
+- `src/proxy-health.ts` — outbound proxy health probing + failover
+  (WR-181): each configured proxy URL gets a timed CONNECT probe (the same
+  `connectViaProxy` handshake the sender uses, against a configurable probe
+  target — the tunnel is torn down the moment the proxy answers `200`, so
+  zero payload bytes ever reach the target). `failureThreshold` consecutive
+  failures mark the proxy unhealthy (`proxy_unhealthy` audit); the first
+  successful probe re-admits it (`proxy_recovered` audit) — traffic only
+  returns after a *scheduled probe* proves the proxy, never on a delivery
+  outcome (WR-39-style failback canary). At dispatch time an unhealthy proxy
+  degrades to a healthy backup proxy first, then direct (when
+  `directFallback` allows), and otherwise stays on the sick proxy through
+  the normal retry / dead-letter path — never silently dropped; every
+  degraded delivery is audited as `proxy_degraded` (with the reason). Probes
+  consume no retry budget, no quota, no latency samples, and never touch the
+  circuit breaker. Unknown proxies are treated as healthy — degradation only
+  ever follows observed sickness. Only `http:` CONNECT proxies are tracked
+  (`socks5://` entries are skipped). Proxy credentials never leave the
+  redaction boundary: metrics labels, audit fields, and stats all use the
+  userinfo-stripped URL. Wired into the server via `proxyHealth: {...}` (off
+  by default); invalid values throw `RangeError` at startup; health is
+  exported as `relay_proxy_unhealthy{proxy_url}` (1/0 gauge) and via
+  `server.getProxyHealthStats()`. Covered by `test/proxy-health.test.ts`
+  (19 tests: threshold/recovery matrix, backup/direct/stay failover, audit
+  shapes, credential redaction, end-to-end relay delivery through a fake
+  backup CONNECT proxy). Zero dependencies (`node:net` + `src/proxy.ts`).
 - `bench/keepalive-bench.ts` (`npm run bench:keepalive`) — sequential
   deliveries to a localhost stub, before/after numbers (50 warmup deliveries
   per scenario; connection counts include warmup). Measured 2026-10-08,
