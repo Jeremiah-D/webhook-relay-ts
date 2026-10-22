@@ -2,9 +2,11 @@ import { appendFileSync, closeSync, openSync, readFileSync, readSync, statSync }
 import { createHash } from "node:crypto";
 import { isEncryptedPayload, type PayloadEncryptor } from "./encrypt.ts";
 import type { FieldMask } from "./masking.ts";
+import { type SecretHit, type SecretScanner } from "./secret-scan.ts";
 
 export type { PayloadEncryptor };
 export type { FieldMask, FieldMaskRule, MaskStrategy } from "./masking.ts";
+export type { SecretHit, SecretPattern, SecretScannerOptions } from "./secret-scan.ts";
 
 /** Options for {@link AuditLog}. */
 export interface AuditLogOptions {
@@ -25,6 +27,18 @@ export interface AuditLogOptions {
    * default: payloads are stored as received.
    */
   fieldMask?: FieldMask;
+  /**
+   * WR-183: secret-leak scanner for audit-persisted payloads. When set,
+   * the `payload` field of an appended event is scanned for secret shapes
+   * *before* the WR-72 field mask runs (the raw value is inspected, but
+   * only the pattern name and field path ever reach the audit trail).
+   * Each hit appends a `secret_leak_suspected` alert event carrying
+   * `{ pattern, path }` — never the secret value. Alert events carry no
+   * payload and are never re-scanned. Unset by default: no scanning.
+   * The server installs one via `setSecretScanner()` when the `secretScan`
+   * option is enabled.
+   */
+  secretScanner?: SecretScanner;
 }
 
 /** Filters for {@link AuditLog.query}. All filters are ANDed together. */
@@ -147,6 +161,9 @@ function hashAuditLink(prevHash: string, canonicalBody: string): string {
   return createHash("sha256").update(prevHash, "utf8").update(canonicalBody, "utf8").digest("hex");
 }
 
+/** WR-183: the alert event name — never re-scanned, never carries a payload. */
+const SECRET_LEAK_EVENT = "secret_leak_suspected";
+
 /** One indexed JSONL line: its searchable fields plus its byte span. */
 interface IndexEntry {
   /** Millisecond epoch of the line's `ts`, or NaN when missing/invalid. */
@@ -228,11 +245,14 @@ export class AuditLog {
    */
   private chainHead: string | null = null;
   private chainFileBytes = 0;
+  /** WR-183: secret-leak scanner for audit-persisted payloads. */
+  private secretScanner?: SecretScanner;
 
   constructor(path: string, opts: AuditLogOptions = {}) {
     this.path = path;
     this.payloadEncryptor = opts.payloadEncryptor;
     this.fieldMask = opts.fieldMask;
+    this.secretScanner = opts.secretScanner;
   }
 
   /** Whether appended `payload` fields are sealed at rest. */
@@ -263,6 +283,12 @@ export class AuditLog {
   }
 
   append(event: object): void {
+    // WR-183: scan the raw payload for secret shapes *before* the WR-72
+    // field mask runs. The scan sees the raw value, but only the pattern
+    // name and field path ever reach the audit trail — the alert event
+    // appended below carries no secret values, and the persisted line is
+    // masked first, so masking still lands before anything hits disk.
+    const hits = this.scanForSecrets(event);
     // WR-72: masking runs before sealing — the raw values never reach
     // the ciphertext or the plaintext line.
     // WR-77: the WR-11 encryptor seals first, then the chain hashes the
@@ -284,6 +310,55 @@ export class AuditLog {
     } catch {
       this.chainFileBytes = 0;
     }
+    // WR-183: alert after the line lands — the alert references the
+    // persisted line, and its own append is never re-scanned.
+    if (hits.length > 0) this.appendSecretLeakAlert(event, hits);
+  }
+
+  /**
+   * WR-183: scan an appended event's payload for secret shapes. Alert
+   * events are never re-scanned; a scan failure degrades to "no hits",
+   * never a dropped audit line.
+   */
+  private scanForSecrets(event: object): SecretHit[] {
+    if (this.secretScanner === undefined) return [];
+    if ((event as Record<string, unknown>).event === SECRET_LEAK_EVENT) return [];
+    return this.secretScanner.scanEventPayload(event);
+  }
+
+  /**
+   * WR-183: attach (or replace) the secret scanner after construction.
+   * The server uses this so one scanner backs both the inbound intake
+   * scan and the audit-log scan from a single option.
+   */
+  setSecretScanner(scanner: SecretScanner): void {
+    this.secretScanner = scanner;
+  }
+
+  /**
+   * WR-183: append the `secret_leak_suspected` alert. Carries only the
+   * pattern name and field path per hit — never the secret value. The
+   * alert rides the normal append path (chain links included) but is
+   * exempt from re-scanning, since it carries no payload. `source`
+   * records where the hit was seen: `"audit"` for audit-persisted
+   * payloads, `"inbound"` for the intake scan in `admitOneEvent`.
+   */
+  reportSecretLeak(
+    context: Record<string, unknown>,
+    hits: SecretHit[],
+    source: "inbound" | "audit"
+  ): void {
+    if (hits.length === 0) return;
+    const alert: Record<string, unknown> = { event: SECRET_LEAK_EVENT, source };
+    for (const f of ["id", "traceId", "tenant", "targetUrl", "endpoint"] as const) {
+      if (typeof context[f] === "string") alert[f] = context[f];
+    }
+    alert.hits = hits.map((h) => ({ pattern: h.pattern, path: h.path }));
+    this.append(alert);
+  }
+
+  private appendSecretLeakAlert(event: object, hits: SecretHit[]): void {
+    this.reportSecretLeak(event as Record<string, unknown>, hits, "audit");
   }
 
   /**

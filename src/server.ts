@@ -173,6 +173,11 @@ export type { BurnRateAlertInfo, ErrorBudgetBurnAuditEvent } from "./retry.ts";
 import type { ReplayGuard } from "./replay.ts";
 import { DeliveryDeduplicator, type DedupOptions } from "./dedup.ts";
 import {
+  SecretScanner,
+  type SecretHit,
+  type SecretPattern,
+} from "./secret-scan.ts";
+import {
   RELAY_HOPS_HEADER,
   assertValidMeshOptions,
   parseRelayHops,
@@ -529,6 +534,58 @@ export interface ShadowTargetServerConfig {
    */
   tlsClientCert?: TlsClientCert;
 }
+
+/**
+ * WR-183: one secret-leak detection handed to the `onSecretLeak`
+ * operator hook. Carries pattern names and field paths only — never the
+ * secret values.
+ */
+export interface SecretLeakInfo {
+  /** The inbound event id. */
+  id: string;
+  /** The inbound trace id. */
+  traceId: string;
+  /** The resolved delivery target. */
+  targetUrl: string;
+  /** The tenant, when the request claimed one (WR-48). */
+  tenantId?: string;
+  /** One entry per (pattern, path) hit, capped at `MAX_SECRET_HITS`. */
+  hits: SecretHit[];
+}
+
+/**
+ * WR-183: inbound payload secret-leak detection options (see
+ * `RelayServerOptions.secretScan`).
+ */
+export interface SecretScanOptions {
+  /**
+   * Master switch. Default `true`: the intake and the audit-log payload
+   * scans run in alert-only mode. Set `false` to disable both.
+   */
+  enabled?: boolean;
+  /**
+   * When `true`, a payload hit is answered 400 `secret_detected` and never
+   * enqueued. Default `false` (alert-only — false positives are tolerated
+   * by design). `blockMode: true` with `enabled: false` is a `RangeError`
+   * at startup.
+   */
+  blockMode?: boolean;
+  /**
+   * Custom secret pattern table — *replaces* the
+   * `DEFAULT_SECRET_PATTERNS` table (see `src/secret-scan.ts`). Invalid
+   * entries throw `RangeError` at startup.
+   */
+  patterns?: SecretPattern[];
+  /**
+   * Operator alert hook, called once per inbound hit (advisory — a throwing
+   * hook is swallowed and never breaks admission). Receives pattern names
+   * and field paths only, never secret values.
+   */
+  onSecretLeak?: (info: SecretLeakInfo) => void;
+}
+
+/** Re-exported for consumers configuring `secretScan.patterns`. */
+export type { SecretHit, SecretPattern, SecretScannerOptions } from "./secret-scan.ts";
 
 export interface RelayServerOptions {
   /** HMAC secret used to verify incoming webhooks. */
@@ -1750,6 +1807,22 @@ export interface RelayServerOptions {
    * the legacy always-deliver behavior unless the operator opts in.
    */
   dedup?: DedupOptions;
+  /**
+   * Payload secret-leak detection and alerting (WR-183, see
+   * `src/secret-scan.ts`). The verified, decompressed inbound body is
+   * scanned for well-known secret shapes (`AKIA…`, `ghp_…`, `sk_live_…`,
+   * `xoxb-…`, `-----BEGIN PRIVATE KEY-----`; the table is configurable).
+   * Default: alert-only — a hit appends a `secret_leak_suspected` audit
+   * event carrying only the pattern name and field path (never the secret
+   * value) and calls `onSecretLeak`; the event is delivered normally.
+   * Opt-in `blockMode` answers 400 `secret_detected` and never enqueues.
+   * The same scanner also backs the `AuditLog`'s scan of persisted
+   * payloads (installed via `auditLog.setSecretScanner()`), so masked
+   * (WR-72) and encrypted (WR-11) payloads are inspected before sealing.
+   * Enabled by default; pass `{ enabled: false }` to disable. `blockMode`
+   * with `enabled: false` is a `RangeError` at startup.
+   */
+  secretScan?: SecretScanOptions;
   /**
    * Relay mesh forwarding (WR-107, see `src/mesh.ts`): chain this relay
    * to other relays so an event can hop relay → relay before reaching
@@ -6755,6 +6828,20 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     opts.payloadSchemas !== undefined ? new InboundSchemaRegistry(opts.payloadSchemas) : undefined;
   const schemaMetrics = new SchemaMetrics();
   const deduplicator = opts.dedup ? new DeliveryDeduplicator(opts.dedup) : undefined;
+  // WR-183: payload secret-leak detection. Enabled by default in
+  // alert-only mode; the same scanner instance backs both the inbound
+  // intake scan in `admitOneEvent` and the audit log's scan of persisted
+  // payloads (installed via `setSecretScanner`, the WR-72 pattern).
+  const secretScanOpts = opts.secretScan;
+  if (secretScanOpts?.blockMode === true && secretScanOpts?.enabled === false) {
+    throw new RangeError("secretScan: blockMode requires the scanner to be enabled");
+  }
+  const secretScanEnabled = secretScanOpts?.enabled !== false;
+  const secretScanner = secretScanEnabled
+    ? new SecretScanner({ patterns: secretScanOpts?.patterns })
+    : undefined;
+  if (secretScanner !== undefined) opts.auditLog.setSecretScanner(secretScanner);
+  const secretScanBlockMode = secretScanOpts?.blockMode === true;
   // WR-136: the adaptive inbound throttle (when `rateLimit.adaptiveInbound`
   // is set) reads the live retry-queue depth, so a wide downstream outage
   // slows the intake instead of piling the backlog deeper. `queue` is
@@ -9898,6 +9985,46 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
           targetUrl,
         });
         return { status: 202, id, traceId, duplicate: true, tenantId };
+      }
+    }
+
+    // WR-183: inbound secret-leak scan — after the payload-hash dedup
+    // check, so suppressed duplicates do not re-alert, and after signature
+    // verification, so unauthenticated callers learn nothing new. JSON
+    // bodies report field paths; non-JSON bodies are scanned as raw text.
+    if (secretScanner !== undefined) {
+      const secretHits = secretScanner.scanBuffer(body);
+      if (secretHits.length > 0) {
+        try {
+          secretScanOpts?.onSecretLeak?.({
+            id,
+            traceId,
+            targetUrl,
+            ...(tenantId === undefined ? {} : { tenantId }),
+            hits: secretHits,
+          });
+        } catch {
+          // The hook is advisory: a throwing hook never breaks admission.
+        }
+        const leakContext = { ...correlation, id, traceId, ...tenantLabel, targetUrl };
+        if (secretScanBlockMode) {
+          opts.auditLog.append({ ...leakContext, event: "rejected", reason: "secret_detected" });
+          opts.auditLog.reportSecretLeak(leakContext, secretHits, "inbound");
+          return {
+            status: 400,
+            id,
+            traceId,
+            reason: "secret_detected",
+            detail: "Payload contains a suspected secret",
+          };
+        }
+        // Alert-only: when audit payloads are persisted, the AuditLog's
+        // own scan alerts on the accepted event's payload — skip a second
+        // alert from here. Otherwise the intake scan is the only one that
+        // sees the payload, so it alerts.
+        if (!opts.auditPayloads) {
+          opts.auditLog.reportSecretLeak(leakContext, secretHits, "inbound");
+        }
       }
     }
 

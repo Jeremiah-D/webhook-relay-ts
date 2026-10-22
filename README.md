@@ -380,6 +380,22 @@ reliability primitives that matter for any signed-payload pipeline.
   original bytes. Non-JSON payloads pass through untouched. One mask backs
   both paths via `createRelayServer({ fieldMask })` (also `new AuditLog(path,
   { fieldMask })` and `retry.fieldMask` directly).
+- `src/secret-scan.ts` — payload secret-leak detection and alerting (WR-183):
+  `SecretScanner` scans inbound payloads and audit-persisted payloads for
+  well-known secret shapes (`AKIA…`/`AKID…`, `ghp_`/`gho_`, `sk_live_`/
+  `sk_test_`, `xoxb-…`, `-----BEGIN PRIVATE KEY-----`; the table is
+  configurable and *replaces* the defaults). JSON payloads report
+  dot-separated field paths, other payloads are scanned as raw text. A hit
+  appends a `secret_leak_suspected` audit event carrying only the pattern name
+  and field path — the secret value never reaches the audit trail — and calls
+  the `onSecretLeak` operator hook. The scan runs before the WR-72 field mask,
+  so masking still lands first on disk. `createRelayServer({ secretScan })`
+  scans the verified, decompressed inbound body after the payload-hash dedup
+  check: default is alert-only (the event is delivered normally); opt-in
+  `blockMode` answers 400 `secret_detected` and never enqueues. The same
+  scanner instance backs the `AuditLog` scan (via `setSecretScanner()`), so
+  masked (WR-72) and encrypted (WR-11) persisted payloads are inspected before
+  sealing. Enabled by default; `{ enabled: false }` disables both scans.
 - `src/replay.ts` — `ReplayGuard`: nonce + timestamp-window replay protection
   for inbound webhooks. A unique `x-nonce` per delivery is remembered for the
   window (`windowSec`, default 300s); resends are rejected as `duplicate_nonce`,
