@@ -363,23 +363,19 @@ reliability primitives that matter for any signed-payload pipeline.
   `verifyChain()` recomputes the chain and reports the first break (rewritten
   line, deleted line, or spliced foreign lines) with its 1-based line number;
   corrupt lines are reported but skipped without breaking continuity,
-  orthogonally to the index. `GET /audit/verify` (operator token; 404 when no
-  token is configured) returns the verification report — the payment-fintech
-  compliance control that makes post-hoc log edits detectable.
-- `src/masking.ts` — field-level masking for audit payloads (`FieldMask`):
-  opt-in per-endpoint rules like `{ path: "card_number", strategy: "last4" }`
-  (`"4111111111111111"` → `"****1111"`, irreversible; `"full"` → `"****"`).
-  Paths are dot-separated from the payload root (`payment.card.number`,
-  numeric segments address arrays); invalid paths throw `RangeError` at
-  construction, `__proto__`/`constructor`/`prototype` segments are refused.
-  Masking always runs *before* the WR-11 encryptor seals anything: the
-  `AuditLog` masks JSON-shaped `payload` fields on `append` (per the
-  event's `targetUrl`/`endpoint`), and the queue masks JSON response bodies
-  before they are sealed into `response_summary.capturedBody` — raw values
-  never reach disk, masked or not. `bodyFingerprintSha256` still covers the
-  original bytes. Non-JSON payloads pass through untouched. One mask backs
-  both paths via `createRelayServer({ fieldMask })` (also `new AuditLog(path,
-  { fieldMask })` and `retry.fieldMask` directly).
+  orthogonally to the index. Every line also carries a keyed
+  HMAC-SHA256 chain link (`hmacPrev` / `hmac` / `hmacKeyId`, WR-184): the same
+  canonical body sealed under the current audit key era, so an attacker with
+  file-write access cannot forge links without the key. The key is
+  configurable (`new AuditLog(path, { auditKey: { id, key } })`); unset, a
+  random 32-byte key is generated at startup (visible via `getAuditKeyId()`).
+  `rotateAuditKey()` starts a new era while old keys are retained, so
+  `verifyHmacChain()` verifies each link with its own era's key and the chain
+  stays continuous across rotations; a line sealed under an unknown key
+  reports `unknown_key`. `GET /audit/verify` (operator token; 404 when no
+  token is configured) returns both verifications — the payment-fintech
+  compliance control that makes post-hoc log edits detectable and
+  non-repudiable.
 - `src/secret-scan.ts` — payload secret-leak detection and alerting (WR-183):
   `SecretScanner` scans inbound payloads and audit-persisted payloads for
   well-known secret shapes (`AKIA…`/`AKID…`, `ghp_`/`gho_`, `sk_live_`/
@@ -396,6 +392,20 @@ reliability primitives that matter for any signed-payload pipeline.
   scanner instance backs the `AuditLog` scan (via `setSecretScanner()`), so
   masked (WR-72) and encrypted (WR-11) persisted payloads are inspected before
   sealing. Enabled by default; `{ enabled: false }` disables both scans.
+- `src/masking.ts` — field-level masking for audit payloads (`FieldMask`):
+  opt-in per-endpoint rules like `{ path: "card_number", strategy: "last4" }`
+  (`"4111111111111111"` → `"****1111"`, irreversible; `"full"` → `"****"`).
+  Paths are dot-separated from the payload root (`payment.card.number`,
+  numeric segments address arrays); invalid paths throw `RangeError` at
+  construction, `__proto__`/`constructor`/`prototype` segments are refused.
+  Masking always runs *before* the WR-11 encryptor seals anything: the
+  `AuditLog` masks JSON-shaped `payload` fields on `append` (per the
+  event's `targetUrl`/`endpoint`), and the queue masks JSON response bodies
+  before they are sealed into `response_summary.capturedBody` — raw values
+  never reach disk, masked or not. `bodyFingerprintSha256` still covers the
+  original bytes. Non-JSON payloads pass through untouched. One mask backs
+  both paths via `createRelayServer({ fieldMask })` (also `new AuditLog(path,
+  { fieldMask })` and `retry.fieldMask` directly).
 - `src/replay.ts` — `ReplayGuard`: nonce + timestamp-window replay protection
   for inbound webhooks. A unique `x-nonce` per delivery is remembered for the
   window (`windowSec`, default 300s); resends are rejected as `duplicate_nonce`,

@@ -7934,7 +7934,14 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       // WR-77: tamper-evidence report for the audit log's hash chain. Behind
       // the same operatorToken guard as the other operator endpoints (404
       // when no operatorToken is configured — fail closed).
-      respondJson(res, 200, opts.auditLog.verifyChain());
+      // WR-184: the report now carries both chains — the WR-77 unkeyed
+      // SHA-256 chain plus the keyed HMAC-SHA256 chain (non-repudiation).
+      // Top-level `ok` / `checked` / `firstBreak` keep the WR-77 shape for
+      // backward compatibility.
+      respondJson(res, 200, {
+        ...opts.auditLog.verifyChain(),
+        hmacChain: opts.auditLog.verifyHmacChain(),
+      });
       return;
     }
     if (deliveryMatch) {

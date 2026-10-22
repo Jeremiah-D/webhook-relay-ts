@@ -1,8 +1,8 @@
 import { appendFileSync, closeSync, openSync, readFileSync, readSync, statSync } from "node:fs";
-import { createHash } from "node:crypto";
+import { createHash, createHmac, randomBytes } from "node:crypto";
 import { isEncryptedPayload, type PayloadEncryptor } from "./encrypt.ts";
 import type { FieldMask } from "./masking.ts";
-import { type SecretHit, type SecretScanner } from "./secret-scan.ts";
+import { randomId, type SecretHit, type SecretScanner } from "./secret-scan.ts";
 
 export type { PayloadEncryptor };
 export type { FieldMask, FieldMaskRule, MaskStrategy } from "./masking.ts";
@@ -39,6 +39,17 @@ export interface AuditLogOptions {
    * option is enabled.
    */
   secretScanner?: SecretScanner;
+  /**
+   * WR-184: key for the HMAC-SHA256 tamper-evident chain. `{ id }` names
+   * the key era, `{ key }` is the raw key bytes (a string is UTF-8
+   * encoded). When unset, a random 32-byte key is generated at
+   * construction — its id is visible via `getAuditKeyId()`, and rotation
+   * via `rotateAuditKey()` keeps old keys for verifying older links.
+   * The WR-77 SHA-256 chain is unkeyed; the HMAC chain adds keyed
+   * non-repudiation (an attacker with file-write access cannot forge
+   * links without the key).
+   */
+  auditKey?: { id: string; key: string | Buffer };
 }
 
 /** Filters for {@link AuditLog.query}. All filters are ANDed together. */
@@ -161,6 +172,73 @@ function hashAuditLink(prevHash: string, canonicalBody: string): string {
   return createHash("sha256").update(prevHash, "utf8").update(canonicalBody, "utf8").digest("hex");
 }
 
+/**
+ * WR-184: the first break in the HMAC chain, as reported by
+ * {@link AuditLog.verifyHmacChain}.
+ */
+export interface HmacChainBreak {
+  /** 1-based physical line number in the file where continuity first breaks. */
+  line: number;
+  /**
+   * Machine-readable reason:
+   * - `missing_hmac_fields` — the line has no (or malformed) `hmacPrev` /
+   *   `hmac` / `hmacKeyId` fields, so nothing keyed can be verified from here
+   *   on (pre-WR-184 lines, or foreign lines spliced in);
+   * - `unknown_key` — the line's `hmacKeyId` names a key this instance does
+   *   not hold (e.g. a log written by a previous process whose random
+   *   startup key was never shared — configure `auditKey` explicitly when
+   *   the HMAC chain must survive restarts);
+   * - `hmac_prev_mismatch` — the line's `hmacPrev` does not equal the
+   *   previous link's `hmac`: a line was deleted, or foreign lines were
+   *   spliced in;
+   * - `hmac_mismatch` — the line's content was rewritten: the stored
+   *   `hmac` does not match a recomputation over the line's own fields
+   *   with its era's key.
+   */
+  reason: "missing_hmac_fields" | "unknown_key" | "hmac_prev_mismatch" | "hmac_mismatch";
+}
+
+/** Result of {@link AuditLog.verifyHmacChain}. JSON-serializable for the operator endpoint. */
+export interface HmacChainVerification {
+  /** False when a break was found; corrupt lines alone do not fail verification. */
+  ok: boolean;
+  /** Number of non-blank physical lines scanned. */
+  lines: number;
+  /** Lines whose HMAC links verified cleanly. */
+  checked: number;
+  /**
+   * 1-based line numbers of segments that were not valid JSON objects.
+   * Reported truthfully, but skipped: a corrupt line never breaks chain
+   * continuity, orthogonally to the WR-04 index which also skips bad lines.
+   */
+  corruptLines: number[];
+  /** The first break, when `ok` is false. */
+  firstBreak?: HmacChainBreak;
+  /**
+   * Hex HMAC of the newest verified link — the trusted head. `ok: false`
+   * reports the head of the trusted prefix; an empty log reports the
+   * genesis value.
+   */
+  head: string;
+  /** The HMAC key id this instance currently appends with. */
+  hmacKeyId: string;
+}
+
+/** WR-184: genesis `hmacPrev` for the first HMAC link — 32 zero bytes, hex. */
+const HMAC_CHAIN_GENESIS = "00".repeat(32);
+
+const HMAC_CHAIN_HASH_RE = /^[0-9a-f]{64}$/;
+
+/**
+ * WR-184: `HMAC-SHA256(key, prevHmac || canonicalBody)`. `prevHmac` is a
+ * fixed 64-hex-char string, so the concatenation is unambiguous; the same
+ * canonical body the WR-77 chain hashes is reused, so one strip of the
+ * chain fields serves both verifications.
+ */
+function hmacAuditLink(key: Buffer, prevHmac: string, canonicalBody: string): string {
+  return createHmac("sha256", key).update(prevHmac, "utf8").update(canonicalBody, "utf8").digest("hex");
+}
+
 /** WR-183: the alert event name — never re-scanned, never carries a payload. */
 const SECRET_LEAK_EVENT = "secret_leak_suspected";
 
@@ -245,14 +323,73 @@ export class AuditLog {
    */
   private chainHead: string | null = null;
   private chainFileBytes = 0;
+  /**
+   * WR-184: hex HMAC of the newest HMAC link written (by anyone), or null
+   * when unknown. `hmacFileBytes` is the file size that tip was derived
+   * from — any size change re-derives the tip, so rotation, truncation, or
+   * another AuditLog instance appending to the same file can never fork
+   * the HMAC chain silently. Mirrors the WR-77 `chainHead` bookkeeping.
+   */
+  private hmacHead: string | null = null;
+  private hmacFileBytes = 0;
   /** WR-183: secret-leak scanner for audit-persisted payloads. */
   private secretScanner?: SecretScanner;
+  /**
+   * WR-184: hmacKeyId → key bytes. The current key is appended with; retired
+   * keys are retained so `verifyHmacChain()` can verify links from before
+   * a rotation.
+   */
+  private readonly auditKeys = new Map<string, Buffer>();
+  /** WR-184: the HMAC key id new appends are sealed under. */
+  private currentKeyId: string;
 
   constructor(path: string, opts: AuditLogOptions = {}) {
     this.path = path;
     this.payloadEncryptor = opts.payloadEncryptor;
     this.fieldMask = opts.fieldMask;
     this.secretScanner = opts.secretScanner;
+    if (opts.auditKey !== undefined) {
+      this.currentKeyId = this.registerAuditKey(opts.auditKey.id, opts.auditKey.key);
+    } else {
+      // WR-184: no key configured — generate a random 32-byte key at
+      // startup. Links it seals verify within this instance; share the
+      // key (or configure `auditKey`) when the HMAC chain must survive
+      // restarts or be verifiable by another process.
+      this.currentKeyId = randomId("auto");
+      this.auditKeys.set(this.currentKeyId, randomBytes(32));
+    }
+  }
+
+  /** Validate and register a key; returns the key id. */
+  private registerAuditKey(id: unknown, key: unknown): string {
+    if (typeof id !== "string" || id.length === 0) {
+      throw new RangeError("auditKey.id must be a non-empty string");
+    }
+    const keyBytes =
+      Buffer.isBuffer(key) ? key : typeof key === "string" ? Buffer.from(key, "utf8") : null;
+    if (keyBytes === null || keyBytes.length === 0) {
+      throw new RangeError(`auditKey ${JSON.stringify(String(id))} must have a non-empty key`);
+    }
+    this.auditKeys.set(id, keyBytes);
+    return id;
+  }
+
+  /**
+   * WR-184: rotate the HMAC chain key. New appends are sealed under the
+   * returned key id; the old key is retained so `verifyHmacChain()` still
+   * verifies pre-rotation links (each link is verified with its own
+   * era's key; the `hmacPrev` linkage carries across the rotation so the
+   * chain stays continuous). The key is random 32 bytes when omitted.
+   */
+  rotateAuditKey(key?: string | Buffer): string {
+    const id = randomId("rot");
+    this.currentKeyId = this.registerAuditKey(id, key ?? randomBytes(32));
+    return this.currentKeyId;
+  }
+
+  /** WR-184: the key id new appends are currently sealed under. */
+  getAuditKeyId(): string {
+    return this.currentKeyId;
   }
 
   /** Whether appended `payload` fields are sealed at rest. */
@@ -302,13 +439,25 @@ export class AuditLog {
     const canonicalBody = canonicalJson(JSON.parse(JSON.stringify(body)));
     const prevHash = this.chainPrevHash();
     const hash = hashAuditLink(prevHash, canonicalBody);
-    const line = JSON.stringify({ ...body, prevHash, hash });
+    // WR-184: the HMAC chain seals the same canonical body under the
+    // current key era. It is layered on the WR-77 chain (computed first,
+    // over the body without any chain fields), and verifyChain strips
+    // these fields back out before its own recomputation.
+    const hmacPrev = this.hmacChainPrev();
+    const key = this.auditKeys.get(this.currentKeyId);
+    if (key === undefined) throw new Error("AuditLog: current audit key is not registered");
+    const hmac = hmacAuditLink(key, hmacPrev, canonicalBody);
+    const line = JSON.stringify({ ...body, prevHash, hash, hmacPrev, hmac, hmacKeyId: this.currentKeyId });
     appendFileSync(this.path, line + "\n", "utf8");
     this.chainHead = hash;
+    this.hmacHead = hmac;
     try {
-      this.chainFileBytes = statSync(this.path).size;
+      const size = statSync(this.path).size;
+      this.chainFileBytes = size;
+      this.hmacFileBytes = size;
     } catch {
       this.chainFileBytes = 0;
+      this.hmacFileBytes = 0;
     }
     // WR-183: alert after the line lands — the alert references the
     // persisted line, and its own append is never re-scanned.
@@ -381,6 +530,28 @@ export class AuditLog {
   }
 
   /**
+   * WR-184: the `hmacPrev` for the next appended HMAC link. Re-derives the
+   * tip from the file whenever this instance has no tip yet or the file
+   * size changed since (rotation, truncation, or another writer appending).
+   * A newest line that predates the HMAC chain (or is corrupt) restarts the
+   * chain at genesis rather than forging continuity — the same rule as the
+   * WR-77 `chainPrevHash`.
+   */
+  private hmacChainPrev(): string {
+    let size = 0;
+    try {
+      size = statSync(this.path).size;
+    } catch {
+      // Missing file: nothing chained yet.
+    }
+    if (this.hmacHead === null || size !== this.hmacFileBytes) {
+      this.hmacHead = this.readHmacTip();
+      this.hmacFileBytes = size;
+    }
+    return this.hmacHead;
+  }
+
+  /**
    * WR-77: scan the file tail for the newest complete line carrying a
    * well-formed `hash` link. A newest line that predates the chain (or is
    * corrupt) restarts the chain at genesis rather than forging continuity.
@@ -407,6 +578,34 @@ export class AuditLog {
       return CHAIN_GENESIS;
     }
     return CHAIN_GENESIS;
+  }
+
+  /**
+   * WR-184: scan the file tail for the newest complete line carrying a
+   * well-formed `hmac` link.
+   */
+  private readHmacTip(): string {
+    let raw: string;
+    try {
+      raw = readFileSync(this.path, "utf8");
+    } catch {
+      return HMAC_CHAIN_GENESIS;
+    }
+    const segments = raw.split("\n");
+    for (let i = segments.length - 1; i >= 0; i--) {
+      if (segments[i].trim().length === 0) continue;
+      let obj: unknown;
+      try {
+        obj = JSON.parse(segments[i]);
+      } catch {
+        continue;
+      }
+      if (!obj || typeof obj !== "object") continue;
+      const hmac = (obj as Record<string, unknown>).hmac;
+      if (typeof hmac === "string" && HMAC_CHAIN_HASH_RE.test(hmac)) return hmac;
+      return HMAC_CHAIN_GENESIS;
+    }
+    return HMAC_CHAIN_GENESIS;
   }
 
   /**
@@ -466,7 +665,7 @@ export class AuditLog {
         firstBreak = { line: lineNo, reason: "prev_mismatch" };
         continue;
       }
-      const { prevHash: _prev, hash: _hash, ...body } = rec;
+      const { prevHash: _prev, hash: _hash, hmacPrev: _hp, hmac: _hm, hmacKeyId: _kid, ...body } = rec;
       if (hashAuditLink(prevHash, canonicalJson(body)) !== hash) {
         firstBreak = { line: lineNo, reason: "hash_mismatch" };
         continue;
@@ -481,6 +680,99 @@ export class AuditLog {
       corruptLines,
       ...(firstBreak === undefined ? {} : { firstBreak }),
       head: expectedPrev,
+    };
+  }
+
+  /**
+   * WR-184: recompute the keyed HMAC-SHA256 chain over the whole file.
+   * Detects rewritten lines (`hmac_mismatch`), deleted lines or spliced-in
+   * foreign lines (`hmac_prev_mismatch`), lines that carry no usable HMAC
+   * link (`missing_hmac_fields` — including pre-WR-184 lines), and lines
+   * sealed under a key this instance does not hold (`unknown_key`).
+   * Each link is verified with its own era's key (keyed by the line's
+   * `hmacKeyId`), so a key rotation does not break verification of older
+   * links. Like WR-77's `verifyChain`, corrupt (non-JSON) lines are
+   * reported in `corruptLines` but skipped — they never break chain
+   * continuity, and tampered lines are reported without halting reads.
+   */
+  verifyHmacChain(): HmacChainVerification {
+    let raw: string;
+    try {
+      raw = readFileSync(this.path, "utf8");
+    } catch {
+      return {
+        ok: true,
+        lines: 0,
+        checked: 0,
+        corruptLines: [],
+        head: HMAC_CHAIN_GENESIS,
+        hmacKeyId: this.currentKeyId,
+      };
+    }
+    const corruptLines: number[] = [];
+    let expectedPrev = HMAC_CHAIN_GENESIS;
+    let lines = 0;
+    let checked = 0;
+    let firstBreak: HmacChainBreak | undefined;
+    const segments = raw.split("\n");
+    for (let i = 0; i < segments.length; i++) {
+      const segment = segments[i];
+      if (i === segments.length - 1 && segment.length === 0) break; // trailing newline
+      if (segment.trim().length === 0) continue; // blank padding: ignored
+      const lineNo = i + 1;
+      lines++;
+      let obj: unknown;
+      let wellFormed = true;
+      try {
+        obj = JSON.parse(segment);
+      } catch {
+        wellFormed = false;
+      }
+      if (!wellFormed || !obj || typeof obj !== "object" || Array.isArray(obj)) {
+        corruptLines.push(lineNo);
+        continue;
+      }
+      if (firstBreak !== undefined) continue; // keep scanning: corrupt lines are still reported
+      const rec = obj as Record<string, unknown>;
+      const hmacPrev = rec.hmacPrev;
+      const hmac = rec.hmac;
+      const hmacKeyId = rec.hmacKeyId;
+      if (
+        typeof hmacPrev !== "string" ||
+        typeof hmac !== "string" ||
+        typeof hmacKeyId !== "string" ||
+        !HMAC_CHAIN_HASH_RE.test(hmacPrev) ||
+        !HMAC_CHAIN_HASH_RE.test(hmac) ||
+        hmacKeyId.length === 0
+      ) {
+        firstBreak = { line: lineNo, reason: "missing_hmac_fields" };
+        continue;
+      }
+      if (hmacPrev !== expectedPrev) {
+        firstBreak = { line: lineNo, reason: "hmac_prev_mismatch" };
+        continue;
+      }
+      const key = this.auditKeys.get(hmacKeyId);
+      if (key === undefined) {
+        firstBreak = { line: lineNo, reason: "unknown_key" };
+        continue;
+      }
+      const { prevHash: _p, hash: _h, hmacPrev: _hp, hmac: _hm, hmacKeyId: _k, ...body } = rec;
+      if (hmacAuditLink(key, hmacPrev, canonicalJson(body)) !== hmac) {
+        firstBreak = { line: lineNo, reason: "hmac_mismatch" };
+        continue;
+      }
+      expectedPrev = hmac;
+      checked++;
+    }
+    return {
+      ok: firstBreak === undefined,
+      lines,
+      checked,
+      corruptLines,
+      ...(firstBreak === undefined ? {} : { firstBreak }),
+      head: expectedPrev,
+      hmacKeyId: this.currentKeyId,
     };
   }
 
