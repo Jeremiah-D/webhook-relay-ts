@@ -427,6 +427,27 @@ export class InboundIpAcl {
     }
     return { ok: true };
   }
+
+  /**
+   * Whether `ip` is admitted by a static `allow` rule for `pathname` —
+   * the WR-182 fail2ban exemption hook. True only when a rule actually
+   * matches the path, the rule carries an `allow` list, and the IP falls
+   * inside it (a deny-list hit can never coexist on the same rule — the
+   * lists are mutually exclusive — so an allow hit is an admission).
+   * Paths with no matching rule are NOT allow-listed (they skip the ACL
+   * entirely). Never throws.
+   */
+  allowedByStaticAllowRule(pathname: string, ip: string): boolean {
+    const rule = selectEndpointIpAclRule(pathname, this.rules);
+    if (rule === undefined || rule.allow.length === 0) return false;
+    let parsed: bigint;
+    try {
+      parsed = parseIpAddress(ip);
+    } catch {
+      return false;
+    }
+    return rule.allow.some((c) => (parsed & prefixMask(c.prefix)) === c.network);
+  }
 }
 
 /**

@@ -3316,6 +3316,74 @@ const server = createRelayServer({
   `default`, or a malformed `countries` map throws `RangeError` at
   startup, so a bad config can never fail a request mid-flight.
 
+## Inbound auth-failure IP banning / fail2ban (opt-in)
+
+Signature verification rejects hostile senders, but only *after* the
+body was read and hashed — a botnet credential-stuffing the intake
+still costs verifier CPU and intake budget on every attempt. Fail2ban
+is the behavioral answer on top of the static WR-53 IP ACL and the
+volumetric WR-22 rate limiter: per-sender-IP consecutive auth-failure
+counting with automatic, time-boxed bans.
+
+```ts
+createRelayServer({
+  // ...,
+  fail2ban: {
+    maxConsecutiveFailures: 5, // ban after 5 consecutive auth failures
+    banDurationMs: 10 * 60_000, // bans last 10 minutes
+    maxEntries: 20000, // optional: bound on tracked IPs (default 10000)
+  },
+});
+```
+
+- **What counts** — inbound 401s (API-key missing/invalid at the intake
+  gate, signature verification failures in admission) and inbound 429s
+  (WR-22, reputation-tightened, and WR-141 tenant limiters) increment
+  the sender IP's consecutive-failure counter. After
+  `maxConsecutiveFailures` consecutive failures the IP is banned for
+  `banDurationMs`; any accepted (202) inbound request zeroes the
+  counter immediately. A ban is per-IP state with its own expiry: after
+  a ban expires with no intervening success, one more failure re-bans
+  at once (repeat-offender semantics), while a single success clears
+  the slate.
+- **What does not count** — operator-plane 401s (mTLS / mesh gates),
+  the WR-53/GeoIP policy 403s, and the WR-97 outbound-pacing 429 are
+  different trust layers the ban cannot enforce, so they never feed the
+  counter. Per-item failures inside a batch envelope do not count
+  either — one bad batch must not arm a ban by itself (the batch
+  envelope's own 401 does).
+- **Zero-cost enforcement** — the ban check runs in the intake gates
+  immediately after the WR-53 IP ACL and before the body is read,
+  before rate limiting, before signature verification: a banned IP
+  costs zero bandwidth and zero CPU. Banned requests are answered 403
+  (with `connection: close`) and audited as `ip_blocked`; ban
+  activations are audited as `ip_banned`. Prometheus:
+  `relay_inbound_ip_banned_total{endpoint}` (blocked requests) and
+  `relay_inbound_ip_ban_activations_total`.
+- **Static-allow exemption wins** — an IP that hits a WR-53 static
+  `allow` rule for the request's path is never banned for that path,
+  even when a ban record exists (e.g. armed via a different,
+  non-allow-listed path). The exemption is per (path, IP): an
+  allow-listed partner abusing some *other* path is still counted and
+  can still be banned there.
+- **Operator surface** — `GET /bans` lists the active bans (`ip`,
+  `bannedAt`, `expiresAt`, `consecutiveFailures`); `POST
+  /bans/:ip/unban` lifts one early and resets its failure counter (an
+  operator unban is an explicit judgment that the ban was wrong or the
+  sender fixed itself). Both sit behind the operator bearer credential
+  (404 when operator endpoints are disabled — fail closed); `GET /bans`
+  needs the `read` scope, the unban needs `admin`. Without `fail2ban`
+  configured the routes 404.
+- **Bounded memory, deterministic tests** — at most `maxEntries` IPs
+  are tracked; when the table is full, expired bans are swept first,
+  then the least-recently-active entry is evicted (a live ban is never
+  evicted to make room). The clock is injectable (`now`), and illegal
+  values (`maxConsecutiveFailures < 1`, non-positive `banDurationMs`,
+  `maxEntries < 1`) throw `RangeError` at startup.
+- **Off by default** — with no `fail2ban`, intake behavior is
+  byte-identical to the legacy one, and `GET /metrics` renders no new
+  series.
+
 ## Inbound signature algorithm negotiation (opt-in)
 
 Upstreams name the algorithm they signed with in the `x-signature-alg`

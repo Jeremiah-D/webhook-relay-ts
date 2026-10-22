@@ -716,6 +716,31 @@ export const OPERATOR_ROUTES: readonly OperatorRoute[] = [
     pathParams: [{ name: "traceId", description: "The end-to-end trace id." }],
   },
   {
+    path: "/bans",
+    pattern: exact("/bans"),
+    methods: ["GET"],
+    summary: "List active fail2ban sender-IP bans",
+    description:
+      "WR-182: the currently active inbound auth-failure IP bans — sender IP, ban start/expiry (ISO-8601), and the consecutive-failure count that armed each ban. Empty when nothing is banned; the route 404s when fail2ban is not configured (fail closed, like the unconfigured event archive).",
+    okDescription: "JSON array of `{ ip, bannedAt, expiresAt, consecutiveFailures }`.",
+  },
+  {
+    path: "/bans/{ip}/unban",
+    pattern: /^\/bans\/(.+)\/unban$/,
+    methods: ["POST"],
+    summary: "Lift a fail2ban sender-IP ban early",
+    description:
+      "WR-182: remove one sender IP's ban before it expires (admin scope). The IP's consecutive-failure counter is reset too — an operator unban is an explicit judgment that the ban was wrong or the sender fixed itself, so the IP starts from a clean slate. Audited as `ip_unbanned`. `{ ip, unbanned }` (`unbanned: false` when the IP was not banned); 404 when fail2ban is not configured.",
+    okDescription: "`{ ip, unbanned: true }` on a lifted ban, `{ ip, unbanned: false }` when the IP was not banned.",
+    pathParams: [
+      {
+        name: "ip",
+        description:
+          "The banned sender IP (URL-decode applies; an IPv6 literal's colons are legal in the path segment).",
+      },
+    ],
+  },
+  {
     path: "/openapi.json",
     pattern: exact("/openapi.json"),
     methods: ["GET"],

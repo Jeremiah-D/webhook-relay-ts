@@ -63,6 +63,8 @@ const INVENTORY: Array<[string, Array<"GET" | "POST" | "PUT" | "DELETE">]> = [
   ["/scheduled", ["GET"]],
   ["/scheduled/{id}/{action}", ["POST"]],
   ["/deliveries/{traceId}", ["GET"]],
+  ["/bans", ["GET"]],
+  ["/bans/{ip}/unban", ["POST"]],
   ["/openapi.json", ["GET"]],
 ];
 

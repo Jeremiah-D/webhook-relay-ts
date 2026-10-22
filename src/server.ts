@@ -210,6 +210,11 @@ import type { TenantRateLimitOptions } from "./tenant-ratelimit.ts";
 import type { OutboundRateLimitOptions } from "./outbound-ratelimit.ts";
 import type { DeliveryReceiptOptions } from "./delivery-receipt.ts";
 import { InboundIpAcl, IpAclMetrics, type IpAclOptions } from "./ip-acl.ts";
+import {
+  Fail2Ban,
+  Fail2BanMetrics,
+  type Fail2BanOptions,
+} from "./fail2ban.ts";
 import { GeoIpInboundPolicy, type GeoIpOptions } from "./geoip.ts";
 import { InboundApiKeyAuth, type ApiKeyOptions, type EndpointApiKeyRule } from "./api-key.ts";
 import {
@@ -1806,6 +1811,40 @@ export interface RelayServerOptions {
    * the legacy one. Invalid CIDRs throw `RangeError` at startup.
    */
   ipAcl?: IpAclOptions;
+  /**
+   * Inbound auth-failure IP banning (WR-182, see `src/fail2ban.ts`):
+   * fail2ban for the webhook intake — per-sender-IP consecutive auth
+   * failure counting with automatic, time-boxed bans. Each inbound 401
+   * (API-key missing/invalid at the intake gate, signature verification
+   * failure in admission) and each inbound 429 (WR-22 / reputation-
+   * tightened / WR-141 tenant limiters) increments the sender IP's
+   * counter; after `maxConsecutiveFailures` consecutive failures the IP
+   * is banned for `banDurationMs`. Any accepted (202) inbound request
+   * zeroes the IP's counter immediately.
+   *
+   * The ban check runs in the intake gates immediately after the WR-53
+   * IP ACL and before the body is read, before rate limiting, before
+   * signature verification — a banned IP costs zero bandwidth and zero
+   * CPU. Banned requests are answered 403 (`connection: close`) and
+   * audited as `ip_blocked`; ban activations are audited as `ip_banned`.
+   * An IP that hits a WR-53 static `allow` rule for the request's path
+   * is never banned (exemption wins, per path). Operator surface:
+   * `GET /bans` (ban list) and `POST /bans/:ip/unban`, behind the
+   * operator bearer token (404 when operator endpoints are disabled —
+   * fail closed); the unban also resets the IP's failure counter.
+   * `GET /bans` needs the `read` scope, the unban needs `admin` (the
+   * WR-82 convention: every recognized GET is read-only, every
+   * recognized POST is mutating). Prometheus:
+   * `relay_inbound_ip_banned_total{endpoint}` (blocked requests) and
+   * `relay_inbound_ip_ban_activations_total`.
+   *
+   * Deliberately NOT counted: operator-plane 401s (mTLS / mesh gates),
+   * the WR-53/GeoIP policy 403s, and the WR-97 outbound-pacing 429 —
+   * different trust layers the ban cannot enforce. Off by default:
+   * unset means zero behavior change. Invalid config throws
+   * `RangeError` at startup.
+   */
+  fail2ban?: Fail2BanOptions;
   /**
    * Inbound GeoIP country policy (WR-158, see `src/geoip.ts`): a
    * config-only country gate — no MaxMind, no binary, no lookups, just a
@@ -5091,7 +5130,10 @@ function isOperatorPath(pathname: string): boolean {
     pathname.startsWith("/scheduled/") ||
     pathname.startsWith("/deliveries/") ||
     // WR-127: one-shot per-endpoint maintenance windows.
-    pathname === "/maintenance/windows"
+    pathname === "/maintenance/windows" ||
+    // WR-182: fail2ban operator surface.
+    pathname === "/bans" ||
+    pathname.startsWith("/bans/")
   );
 }
 
@@ -6745,6 +6787,20 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // can never fail a request mid-flight.
   const ipAcl = opts.ipAcl !== undefined ? new InboundIpAcl(opts.ipAcl) : undefined;
   const ipAclMetrics = new IpAclMetrics();
+  // Inbound auth-failure IP banning (WR-182): the tracker is built once
+  // at startup (bad config throws RangeError here, never mid-request);
+  // unset = off, intake behavior is byte-identical to the legacy one.
+  // The exemption hook wires the WR-53 static-allow rule: an IP that
+  // hits an allow rule for the request's path is never banned.
+  const fail2ban =
+    opts.fail2ban !== undefined
+      ? new Fail2Ban({
+          ...opts.fail2ban,
+          isExempt: (pathname, ip) =>
+            ipAcl !== undefined && ipAcl.allowedByStaticAllowRule(pathname, ip),
+        })
+      : undefined;
+  const fail2banMetrics = new Fail2BanMetrics();
   // Inbound GeoIP country policy (WR-158): the table and policy are
   // validated (and every CIDR pre-parsed) once at startup, so a bad
   // country code or CIDR can never fail a request mid-flight. Unset =
@@ -7147,6 +7203,13 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     const scheduleActionMatch = /^\/scheduled\/([^/]+)\/(pause|resume)$/.exec(pathname);
     const deliveryMatch = /^\/deliveries\/([^/]+)$/.exec(pathname);
     const replayMatch = /^\/dead-letter\/([^/]+)\/replay$/.exec(pathname);
+    // WR-182: fail2ban operator surface — GET lists the active bans,
+    // POST lifts one ban early. Both are declared in the operator route
+    // registry (`src/operator-routes.ts`), so recognition, method
+    // allowance, and the WR-82 scope check (GET = read, POST = admin)
+    // above apply exactly like every other operator route.
+    const isBansList = pathname === "/bans";
+    const unbanMatch = /^\/bans\/(.+)\/unban$/.exec(pathname);
     // WR-111: route recognition is driven by the operator route
     // registry (`src/operator-routes.ts`) — the same registry
     // `GET /openapi.json` documents, so the 404 surface and the published
@@ -7167,6 +7230,56 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // authenticated above, but every operator path answers 403 here.
     if (!operatorMay(identity, req.method ?? "")) {
       respondJson(res, 403, { error: "forbidden" });
+      return;
+    }
+    if (isBansList || unbanMatch !== null) {
+      // WR-182: fail2ban operator surface. The shared operator
+      // authentication above already ran (404 when no operator credential
+      // is configured — fail closed; 403 on a bad bearer; WR-82 scopes:
+      // GET needs `read`, POST needs `admin`). Without fail2ban
+      // configured the routes do not exist (404, like the unconfigured
+      // event archive above).
+      if (fail2ban === undefined) {
+        respondJson(res, 404, { error: "fail2ban is not configured" });
+        return;
+      }
+      if (isBansList) {
+        respondJson(
+          res,
+          200,
+          fail2ban.bans().map((b) => ({
+            ip: b.ip,
+            bannedAt: new Date(b.bannedAt).toISOString(),
+            expiresAt: new Date(b.expiresAt).toISOString(),
+            consecutiveFailures: b.consecutiveFailures,
+          }))
+        );
+        return;
+      }
+      // POST /bans/:ip/unban — the IP segment is URL-decoded (an IPv6
+      // literal's colons are legal in a path segment, so no encoding is
+      // strictly required, but decoding is harmless).
+      let target: string;
+      try {
+        target = decodeURIComponent(unbanMatch[1]);
+      } catch {
+        respondJson(res, 400, { error: "invalid IP" });
+        return;
+      }
+      if (target === "" || target.includes("/")) {
+        respondJson(res, 400, { error: "invalid IP" });
+        return;
+      }
+      const lifted = fail2ban.unban(target);
+      opts.auditLog.append({
+        event: "ip_unbanned",
+        id: randomUUID(),
+        traceId: resolveTraceId(req.headers[TRACE_ID_HEADER]),
+        ip: target,
+        unbanned: lifted,
+        operatorKeyId,
+      });
+      respondJson(res, 200, { ip: target, unbanned: lifted });
       return;
     }
     if (isOpenApiJson) {
@@ -7463,7 +7576,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       // new series. Absent entirely with a custom sender (no pool).
       res
         .writeHead(200, { "content-type": "text/plain; version=0.0.4" })
-        .end(queue.renderMetrics() + versionMetrics.render() + schemaMetrics.render() + (schemaRegistry?.renderMetrics() ?? "") + ipAclMetrics.render() + inboundTenantRateLimitMetrics.render() + operatorRateLimitMetrics.render() + (proxyHealthMonitor?.renderMetrics() ?? "") + certExpiryMonitor.render() + tlsVersionMonitor.render() + (ocspMonitor?.render() ?? "") + (usageMeter?.render() ?? "") + (defaultSender?.compressionStats.render() ?? "") + (defaultSender?.dnsCache?.render() ?? "") + (defaultSender?.wsPool.renderMetrics() ?? "") + meshMetrics.render() + (defaultSender?.outboundSchemaMetrics?.render() ?? "") + (defaultSender?.chaosMetrics?.render() ?? "") + (reputation?.renderMetrics() ?? "") + hedgeMetrics.render() + (queue.getErrorBudgetMonitor()?.render() ?? ""));
+        .end(queue.renderMetrics() + versionMetrics.render() + schemaMetrics.render() + (schemaRegistry?.renderMetrics() ?? "") + ipAclMetrics.render() + fail2banMetrics.render() + inboundTenantRateLimitMetrics.render() + operatorRateLimitMetrics.render() + (proxyHealthMonitor?.renderMetrics() ?? "") + certExpiryMonitor.render() + tlsVersionMonitor.render() + (ocspMonitor?.render() ?? "") + (usageMeter?.render() ?? "") + (defaultSender?.compressionStats.render() ?? "") + (defaultSender?.dnsCache?.render() ?? "") + (defaultSender?.wsPool.renderMetrics() ?? "") + meshMetrics.render() + (defaultSender?.outboundSchemaMetrics?.render() ?? "") + (defaultSender?.chaosMetrics?.render() ?? "") + (reputation?.renderMetrics() ?? "") + hedgeMetrics.render() + (queue.getErrorBudgetMonitor()?.render() ?? ""));
       return;
     }
     if (isEvents) {
@@ -8813,6 +8926,51 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     return { ok: false, retryAfterMs: verdict.retryAfterMs, dimension: verdict.dimension };
   };
 
+  /**
+   * WR-182: resolve the sender IP for fail2ban bookkeeping — the WR-53
+   * client-IP resolution when an IP ACL is configured (`x-forwarded-for`
+   * through `trustedProxies`), otherwise the direct socket peer. Shared
+   * by the ban check, the failure counters, and the success reset, so one
+   * sender always maps to one tracker entry.
+   */
+  const fail2banSenderIp = (
+    req: Parameters<Parameters<typeof createServer>[0]>[0]
+  ): string =>
+    ipAcl !== undefined
+      ? ipAcl.clientIp(req.socket.remoteAddress, req.headers["x-forwarded-for"])
+      : (req.socket.remoteAddress ?? "unknown");
+
+  /**
+   * WR-182: record one inbound auth failure (401/403/429 on the webhook
+   * intake plane) for the sender IP. On the failure that newly triggers
+   * a ban, audit `ip_banned` (with the consecutive-failure count and the
+   * triggering reason) and count the activation. A no-op when fail2ban
+   * is off; never throws.
+   */
+  const noteInboundAuthFailure = (
+    req: Parameters<Parameters<typeof createServer>[0]>[0],
+    pathname: string,
+    id: string,
+    traceId: string,
+    reason: string
+  ): void => {
+    if (fail2ban === undefined) return;
+    const ip = fail2banSenderIp(req);
+    const rec = fail2ban.recordFailure(pathname, ip);
+    if (rec.justBanned) {
+      fail2banMetrics.recordBan();
+      opts.auditLog.append({
+        event: "ip_banned",
+        id,
+        traceId,
+        ip,
+        endpoint: pathname,
+        consecutiveFailures: rec.consecutiveFailures,
+        reason,
+      });
+    }
+  };
+
   const runIntakeGates = async (
     req: Parameters<Parameters<typeof createServer>[0]>[0],
     res: Parameters<Parameters<typeof createServer>[0]>[1],
@@ -8841,6 +8999,33 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         // `connection: close` drops the socket after the 403, so the
         // client cannot keep streaming a flood into a dead request (same
         // rationale as the WR-25 413).
+        res
+          .writeHead(403, { "content-type": "text/plain", connection: "close" })
+          .end("Forbidden");
+        return undefined;
+      }
+    }
+
+    // Inbound auth-failure IP banning (WR-182): fail2ban for the intake —
+    // immediately after the WR-53 IP ACL (a static-allow hit is exempt
+    // and already admitted above) and before the body is read, before
+    // rate limiting, before signature verification, so a banned IP costs
+    // zero bandwidth and zero CPU. A banned request never enqueues, so
+    // it burns no retry budget and never trips the breaker.
+    if (fail2ban !== undefined) {
+      const bannedIp = fail2banSenderIp(req);
+      if (fail2ban.isBanned(pathname, bannedIp)) {
+        fail2banMetrics.recordBlocked(pathname);
+        opts.auditLog.append({
+          event: "ip_blocked",
+          id,
+          traceId,
+          ip: bannedIp,
+          endpoint: pathname,
+        });
+        // `connection: close` like the other pre-body rejections: the
+        // caller is banned before the body is read, so don't let it
+        // stream a flood into a dead request.
         res
           .writeHead(403, { "content-type": "text/plain", connection: "close" })
           .end("Forbidden");
@@ -8905,6 +9090,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
             keyId: "unknown",
             endpoint: rule.pattern,
           });
+          // WR-182: an inbound auth failure for the sender IP.
+          noteInboundAuthFailure(req, pathname, id, traceId, "api_key_missing");
           // `connection: close` like the other pre-body rejections: the
           // caller is unauthenticated, don't let it stream a body into a
           // dead request.
@@ -8923,6 +9110,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
             keyId: "unknown",
             endpoint: rule.pattern,
           });
+          // WR-182: an inbound auth failure for the sender IP.
+          noteInboundAuthFailure(req, pathname, id, traceId, "api_key_invalid");
           res
             .writeHead(401, { "content-type": "text/plain", connection: "close" })
             .end("Unauthorized");
@@ -8972,6 +9161,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       const senderKey = apiKey?.keyId ?? "anonymous";
       const limitCheck = checkInboundRateLimit(ip, senderKey, id, traceId);
       if (!limitCheck.ok) {
+        // WR-182: an inbound auth failure for the sender IP.
+        noteInboundAuthFailure(req, pathname, id, traceId, "rate_limited");
         res
           .writeHead(429, {
             "content-type": "text/plain",
@@ -9001,6 +9192,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
             dimension: "reputation",
             retryAfterMs,
           });
+          // WR-182: an inbound auth failure for the sender IP.
+          noteInboundAuthFailure(req, pathname, id, traceId, "rate_limited");
           res
             .writeHead(429, {
               "content-type": "text/plain",
@@ -9044,6 +9237,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
               tenant: limitedTenant,
               retryAfterMs: tenantCheck.retryAfterMs,
             });
+            // WR-182: an inbound auth failure for the sender IP.
+            noteInboundAuthFailure(req, pathname, id, traceId, "tenant_rate_limited");
             res
               .writeHead(429, {
                 "content-type": "text/plain",
@@ -10084,6 +10279,18 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
             clientCertSubject: mtlsIdentity.subject,
           };
     const outcome = await admitOneEvent(id, traceId, gates.body, req.headers, pathname, mtlsCorrelation, gates.apiKey, inboundTrace, gates.maxBodyBytes);
+    // WR-182: fail2ban bookkeeping — a 202 zeroes the sender IP's
+    // consecutive-failure counter immediately; a 401 (signature
+    // verification failure) or 403 increments it. Other admission
+    // outcomes (400/409/410/413, the WR-97 outbound-pacing 429) are not
+    // inbound auth failures and leave the counter alone.
+    if (fail2ban !== undefined) {
+      if (outcome.status === 202) {
+        fail2ban.recordSuccess(fail2banSenderIp(req));
+      } else if (outcome.status === 401 || outcome.status === 403) {
+        noteInboundAuthFailure(req, pathname, outcome.id, outcome.traceId, outcome.reason ?? "rejected");
+      }
+    }
     const tenantLabel = outcome.tenantId === undefined ? {} : { tenant: outcome.tenantId };
     if (outcome.status === 202) {
       res
@@ -10210,6 +10417,10 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         path: "/ingest/batch",
         reason: "invalid_batch_signature",
       });
+      // WR-182: an inbound auth failure for the sender IP (envelope-level;
+      // per-item outcomes never increment the counter — one bad batch
+      // must not arm a ban by itself).
+      noteInboundAuthFailure(req, "/ingest/batch", batchId, batchTraceId, "invalid_batch_signature");
       res.writeHead(401, { "content-type": "text/plain" }).end("Invalid batch signature");
       return;
     }
@@ -10376,6 +10587,12 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         ? { clientCertFingerprint: mtlsIdentity.fingerprint, clientCertSubject: mtlsIdentity.subject }
         : {}),
     });
+    // WR-182: a fully accepted batch (202) zeroes the sender IP's
+    // consecutive-failure counter; a 207 mixed result is not a success
+    // signal and leaves the counter alone.
+    if (fail2ban !== undefined && accepted === events.length) {
+      fail2ban.recordSuccess(fail2banSenderIp(req));
+    }
     res
       .writeHead(accepted === events.length ? 202 : 207, {
         "content-type": "application/json",
@@ -10609,6 +10826,11 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         ? { clientCertFingerprint: mtlsIdentity.fingerprint, clientCertSubject: mtlsIdentity.subject }
         : {}),
     });
+    // WR-182: a fully accepted batch (202) zeroes the sender IP's
+    // consecutive-failure counter; a 207 mixed result leaves it alone.
+    if (fail2ban !== undefined && accepted === events.length) {
+      fail2ban.recordSuccess(fail2banSenderIp(req));
+    }
     res
       .writeHead(accepted === events.length ? 202 : 207, {
         "content-type": "application/json",
