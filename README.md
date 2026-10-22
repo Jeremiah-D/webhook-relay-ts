@@ -555,6 +555,27 @@ reliability primitives that matter for any signed-payload pipeline.
   (reason `tenant_rate_limited`), and denials are exported as
   `relay_inbound_tenant_limited_total{tenant}` (activity-gated — absent
   until the first denial).
+- `src/operator-ratelimit.ts` — operator-plane API rate limiting
+  (`OperatorRateLimiter`): a per-client 60-second sliding window over every
+  operator path (`/metrics`, `/audit`, `/deliveries/*`,
+  `/config/endpoint`, … — everything `isOperatorPath` recognizes), so one
+  chatty poller can't hammer the operator surface at line rate. Checked
+  after operatorToken/operatorKeys authentication and before any business
+  handling — over-budget requests are answered 429 with `retry-after`
+  (ceiling seconds, minimum 1) and audited as `rejected` (reason
+  `operator_rate_limited`, with the key id); a backward clock never grants
+  extra budget. Client attribution is `keyBy: "token"` (SHA-256 digest of
+  the presented bearer — the raw credential never lands in a key, a log,
+  or a metric) or `"ip"` (source IP, WR-53 trusted-proxy aware; the
+  default). One limiter instance is shared by both planes in WR-56
+  split-plane mode, with per-plane counters so planes can never starve
+  each other. Wired into the server via `operatorRateLimit: {...}`
+  (off by default; default 60 requests/minute per client per plane);
+  invalid values throw `RangeError` at startup; injectable clock for
+  deterministic tests. Denials are exported as
+  `relay_operator_ratelimited_total{plane}` (activity-gated — absent until
+  the first denial), and the live windows are observable via
+  `server.getOperatorRateLimitStats()`.
 - Inbound request body limit (`maxBodyBytes`, `DEFAULT_MAX_BODY_BYTES` = 1 MiB):
   a POST whose body exceeds the budget is answered 413 and audited as
   `rejected` (reason `body_too_large`). Two lines of defense: the declared
@@ -5188,6 +5209,10 @@ endpoints (404 when disabled):
   score, 0–100 (100 = healthy; 0 while the endpoint's circuit is open),
   only for endpoints with at least one recorded delivery outcome, only
   when `retry.endpointHealth` is enabled.
+- `relay_operator_ratelimited_total{plane}` — operator-plane requests
+  rejected by the per-client sliding-window rate limiter (`plane` =
+  `single` / `operator`), only when `operatorRateLimit` is configured and
+  only once a denial has happened.
 
 ### Dead-letter auto-replay
 

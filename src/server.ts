@@ -198,6 +198,14 @@ import {
   InboundTenantRateLimitMetrics,
   type InboundTenantRateLimitOptions,
 } from "./tenant-inbound-ratelimit.ts";
+import {
+  digestOperatorCredential,
+  OperatorRateLimiter,
+  OperatorRateLimitMetrics,
+  type OperatorRateLimitOptions,
+  type OperatorRateLimitPlane,
+  type OperatorRateLimitStats,
+} from "./operator-ratelimit.ts";
 import type { TenantRateLimitOptions } from "./tenant-ratelimit.ts";
 import type { OutboundRateLimitOptions } from "./outbound-ratelimit.ts";
 import type { DeliveryReceiptOptions } from "./delivery-receipt.ts";
@@ -1556,6 +1564,19 @@ export interface RelayServerOptions {
    * values throw `RangeError` at startup.
    */
   operatorPort?: OperatorPortOptions;
+  /**
+   * Opt-in operator-plane API rate limiting (WR-180, see
+   * `src/operator-ratelimit.ts`): a per-client sliding window over every
+   * operator path (`/metrics`, `/audit`, `/deliveries/*`,
+   * `/config/endpoint`, … — everything `isOperatorPath` recognizes).
+   * The check runs after operatorToken/operatorKeys authentication and
+   * before any business handling; over-limit requests are answered 429
+   * with a `retry-after` header and audited as `rejected` with reason
+   * `operator_rate_limited`. Default budget 60 requests/minute per client
+   * per plane when the option is set; unset = unlimited, the operator
+   * path is byte-identical. Invalid values throw `RangeError` at startup.
+   */
+  operatorRateLimit?: OperatorRateLimitOptions;
   /**
    * Opt-in dead-letter auto-replay scheduler (see `src/autoreplay.ts` and
    * the `autoReplay` `RetryQueue` option): timed rounds that replay the
@@ -4982,6 +5003,11 @@ export interface RelayServer extends Server {
    * at startup.
    */
   updateInboundMtlsConfig?: (patch: InboundMtlsConfigPatch) => ConfigChange[];
+  /**
+   * WR-180: operator-plane rate-limiter snapshot (per-client sliding
+   * windows). Set only when `operatorRateLimit` was configured.
+   */
+  getOperatorRateLimitStats?: () => OperatorRateLimitStats;
 }
 
 /**
@@ -6631,6 +6657,17 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     ? new InboundTenantRateLimiter(opts.inboundTenantRateLimit)
     : undefined;
   const inboundTenantRateLimitMetrics = new InboundTenantRateLimitMetrics();
+  // WR-180: operator-plane API rate limiter (one sliding window per
+  // client, shared by both planes in split-plane mode — the plane is
+  // part of the accounting key so planes can never starve each other).
+  // Unset = unlimited: the operator path is byte-identical. The metrics
+  // renderer is always built — it renders "" until the first denial, so
+  // an untouched relay's /metrics stays byte-identical.
+  const operatorRateLimiter =
+    opts.operatorRateLimit !== undefined
+      ? new OperatorRateLimiter(opts.operatorRateLimit)
+      : undefined;
+  const operatorRateLimitMetrics = new OperatorRateLimitMetrics();
   // Inbound IP allowlist/denylist (WR-53): rules and trusted proxies are
   // validated (and every CIDR pre-parsed) once at startup, so a bad CIDR
   // can never fail a request mid-flight.
@@ -6942,6 +6979,53 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       return;
     }
     const operatorKeyId = identity.id;
+    // WR-180: operator-plane rate limit — after operatorToken/operatorKeys
+    // authentication, before any business handling. A rejected request
+    // never reaches a handler. Authentication failures keep their
+    // existing behavior (403 fail-closed, with the pre-existing
+    // anti-brute-force posture untouched); this limiter is orthogonal to
+    // the WR-22 intake limiter (that one guards the webhook intake, this
+    // one guards the operator plane).
+    if (operatorRateLimiter !== undefined) {
+      const presented = bearerToken(req.headers["authorization"]);
+      const clientKey =
+        operatorRateLimiter.keyByMode() === "token" && presented !== null
+          ? digestOperatorCredential(presented)
+          : ipAcl !== undefined
+            ? ipAcl.clientIp(req.socket.remoteAddress, req.headers["x-forwarded-for"])
+            : (req.socket.remoteAddress ?? "unknown");
+      const plane: OperatorRateLimitPlane =
+        operatorPlane === undefined ? "single" : "operator";
+      const limitCheck = operatorRateLimiter.take(clientKey, plane);
+      if (!limitCheck.ok) {
+        operatorRateLimitMetrics.record(plane);
+        // Resolve the trace ID the same way the intake pipeline does, so
+        // the rejection stays traceable.
+        const inboundTrace =
+          traceContextOpts === undefined
+            ? undefined
+            : parseInboundTraceContext(req.headers[TRACEPARENT_HEADER], req.headers[TRACESTATE_HEADER]);
+        const traceId = inboundTrace?.traceId ?? resolveTraceId(req.headers[TRACE_ID_HEADER]);
+        opts.auditLog.append({
+          event: "rejected",
+          id: randomUUID(),
+          traceId,
+          reason: "operator_rate_limited",
+          path: pathname,
+          operatorKeyId,
+          retryAfterMs: limitCheck.retryAfterMs,
+        });
+        res
+          .writeHead(429, {
+            "content-type": "text/plain",
+            // Ceiling seconds, minimum 1: a Retry-After of 0 is meaningless
+            // (the WR-22/WR-141 convention).
+            "retry-after": String(Math.max(1, Math.ceil(limitCheck.retryAfterMs / 1000))),
+          })
+          .end("Too many requests");
+        return;
+      }
+    }
     const isOpenApiJson = pathname === "/openapi.json";
     const isList = pathname === "/dead-letter";
     const isExport = pathname === "/dead-letter/export";
@@ -7307,7 +7391,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       // new series. Absent entirely with a custom sender (no pool).
       res
         .writeHead(200, { "content-type": "text/plain; version=0.0.4" })
-        .end(queue.renderMetrics() + versionMetrics.render() + schemaMetrics.render() + (schemaRegistry?.renderMetrics() ?? "") + ipAclMetrics.render() + inboundTenantRateLimitMetrics.render() + certExpiryMonitor.render() + tlsVersionMonitor.render() + (ocspMonitor?.render() ?? "") + (usageMeter?.render() ?? "") + (defaultSender?.compressionStats.render() ?? "") + (defaultSender?.dnsCache?.render() ?? "") + (defaultSender?.wsPool.renderMetrics() ?? "") + meshMetrics.render() + (defaultSender?.outboundSchemaMetrics?.render() ?? "") + (defaultSender?.chaosMetrics?.render() ?? "") + (reputation?.renderMetrics() ?? "") + hedgeMetrics.render() + (queue.getErrorBudgetMonitor()?.render() ?? ""));
+        .end(queue.renderMetrics() + versionMetrics.render() + schemaMetrics.render() + (schemaRegistry?.renderMetrics() ?? "") + ipAclMetrics.render() + inboundTenantRateLimitMetrics.render() + operatorRateLimitMetrics.render() + certExpiryMonitor.render() + tlsVersionMonitor.render() + (ocspMonitor?.render() ?? "") + (usageMeter?.render() ?? "") + (defaultSender?.compressionStats.render() ?? "") + (defaultSender?.dnsCache?.render() ?? "") + (defaultSender?.wsPool.renderMetrics() ?? "") + meshMetrics.render() + (defaultSender?.outboundSchemaMetrics?.render() ?? "") + (defaultSender?.chaosMetrics?.render() ?? "") + (reputation?.renderMetrics() ?? "") + hedgeMetrics.render() + (queue.getErrorBudgetMonitor()?.render() ?? ""));
       return;
     }
     if (isEvents) {
@@ -11640,6 +11724,12 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     });
     return changes;
   };
+
+  // WR-180: operator-plane rate-limiter snapshot (per-client sliding
+  // windows). Only set when `operatorRateLimit` was configured.
+  if (operatorRateLimiter !== undefined) {
+    server.getOperatorRateLimitStats = (): OperatorRateLimitStats => operatorRateLimiter.stats();
+  }
 
   return server;
 }
