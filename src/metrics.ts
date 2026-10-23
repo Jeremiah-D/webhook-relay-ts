@@ -360,6 +360,13 @@ export interface MetricsInput {
    * first park.
    */
   retryBudgetDepletedByEndpoint?: Array<{ endpoint: string; depleted: number }>;
+  /**
+   * WR-200: per-tenant retry-budget park counts. Present only for
+   * tenants that actually had a retry parked — activity-gated, so
+   * exposition is byte-identical to the pre-WR-200 shape until the
+   * first park.
+   */
+  tenantRetryBudgetDepletedByTenant?: Array<{ tenant?: string; depleted: number }>;
   /** Present only when the relay-level global concurrency cap (WR-51) is configured (finite). */
   globalConcurrencyWaits?: number;
   /** Present only when the relay-level global outbound rate limit (WR-167) is configured. */
@@ -1149,6 +1156,21 @@ export function renderPrometheus(input: MetricsInput): string {
       lines.push(
         `relay_retry_budget_depleted_total{endpoint="${escapeLabelValue(row.endpoint)}"} ${row.depleted}`
       );
+    }
+  }
+  if (input.tenantRetryBudgetDepletedByTenant !== undefined) {
+    lines.push(
+      "# HELP relay_tenant_retry_budget_depleted_total Retries parked because the tenant's own retry budget was exhausted."
+    );
+    lines.push("# TYPE relay_tenant_retry_budget_depleted_total counter");
+    // WR-200: one series per tenant that actually had a retry parked;
+    // the default (tenant-less) tenant renders as an empty label set.
+    // (`tenantLabel` appends `,tenant="…"` after another label, so the
+    // sole-label form is spelled out here.)
+    for (const row of input.tenantRetryBudgetDepletedByTenant) {
+      const label =
+        row.tenant === undefined ? "" : `tenant="${escapeLabelValue(row.tenant)}"`;
+      lines.push(`relay_tenant_retry_budget_depleted_total{${label}} ${row.depleted}`);
     }
   }
   if (input.globalConcurrencyWaits !== undefined) {

@@ -258,6 +258,27 @@ reliability primitives that matter for any signed-payload pipeline.
   records which budget parked the retry (`budgetScope:
   "endpoint" | "global"`). Illegal values throw `RangeError` at
   construction; without overrides the relay is byte-identical to before.
+- `src/tenant-retry-budget.ts` — *per-tenant* retry budget
+  (`TenantRetryBudget`, WR-200): one lazily-created token bucket per
+  tenant, each sized to `retriesPerMinute` per minute (default 6000,
+  mirroring the global budget). Every scheduled retry costs one token
+  from its tenant's bucket; when a tenant's bucket is empty only that
+  tenant's retries park until the next refill — never dropped, never
+  burned against the attempt budget, never touching the circuit breaker,
+  other tenants unaffected. Wired into `RetryQueue` via
+  `retry: { tenantRetryBudget: { retriesPerMinute,
+  perTenantRetriesPerMinute?: { "<tenantId>": n } } }` (disabled by
+  default; illegal values throw `RangeError` at construction). Gate order
+  per retry: per-endpoint override (WR-125) → per-tenant (this) → global
+  (WR-38); a park at an earlier gate never consumes a later gate's
+  token. `getTenantRetryBudgetStats()` reports the default budget and one
+  activity-gated row per parked tenant; parkings are audited as
+  `retry_budget_depleted` with `budgetScope: "tenant"`; Prometheus gains
+  `relay_tenant_retry_budget_depleted_total{tenant}` (one series per
+  parked tenant; the default tenant-less tenant renders as an empty label
+  set). Orthogonal to WR-38 (cross-tenant master gate) and WR-137
+  (per-tenant monthly *delivery* budget — a billing dimension, not a
+  retry gate). Injectable clock for deterministic tests.
 - `src/delivery-window.ts` — per-endpoint delivery time windows ("quiet
   hours", WR-52): `retry: { deliveryWindow: { windows: { "<targetUrl>":
   "HH:MM-HH:MM" } } }` in UTC (open edge inclusive, close edge
