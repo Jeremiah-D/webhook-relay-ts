@@ -437,6 +437,20 @@ export const OPERATOR_ROUTES: readonly OperatorRoute[] = [
     queryParams: [{ name: "tenant", type: "string", description: "Restrict to one tenant." }],
   },
   {
+    path: "/operator-audit",
+    pattern: exact("/operator-audit"),
+    methods: ["GET"],
+    summary: "Centralized operator action audit log",
+    description:
+      "WR-197: the centralized operator ledger — one entry per executed operator mutation (endpoint pause/resume/enable, key revocation, config reloads) with the acting operator's key id, the action name, the target resource, and the before/after diff. Stored separately from the delivery audit stream (read scope). Entries never carry secret material: key ids and config-field diffs only, never key bytes.",
+    okDescription: "`{ entries: [...] }`, newest first.",
+    queryParams: [
+      { name: "keyId", type: "string", description: "Only entries recorded by this operator key id." },
+      { name: "action", type: "string", description: "Only entries with this action name." },
+      { name: "limit", type: "integer", description: "Maximum entries returned, newest first (default 100)." },
+    ],
+  },
+  {
     path: "/watermarks",
     pattern: exact("/watermarks"),
     methods: ["GET"],

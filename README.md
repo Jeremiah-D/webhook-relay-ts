@@ -1979,6 +1979,43 @@ restart. Both key planes support runtime revocation:
   intake mid-flight; hook exceptions never undo a revoke; revoking an
   empty or null id refuses (`false`) rather than touching the ring.
 
+## Operator action audit log (WR-197)
+
+The scattered delivery-stream audit events (`endpoint_paused`,
+`operator_key_revoked`, `endpoint_config_updated`, …) are the delivery
+view. The operator view is centralized: every executed operator mutation —
+endpoint pause/resume/enable, operator/inbound key revocation, endpoint
+config reloads, config-snapshot applies, version-sunset changes — is
+recorded in an independent in-memory operator audit log
+(`src/operator-audit.ts`, `operatorAuditLog` server option) with the
+acting operator's key id, the action name, the target resource, and the
+before/after diff. Entries never carry secret material: key ids and
+config-field diffs only, never key bytes.
+
+```ts
+const server = createRelayServer({
+  // ...,
+  operatorToken: "...",
+  operatorAuditLog: { maxEntries: 10_000 }, // default; oldest evicted past the bound
+});
+```
+
+Read it back via `GET /operator-audit` (operator `read` scope), newest
+first, filterable by acting key id and action:
+
+```
+GET /operator-audit?keyId=ops1&action=endpoints.pause&limit=50
+→ { entries: [{ seq, at, keyId: "ops1", action: "endpoints.pause",
+                target: "https://downstream/hook",
+                before: { paused: false }, after: { paused: true },
+                result: "ok" }] }
+```
+
+Validation failures (400s) record nothing — nothing was mutated.
+Idempotent no-ops (re-pausing a paused endpoint) are still recorded, with
+`before` equal to `after`, so the ledger is a faithful record of what the
+operator asked for.
+
 ## Endpoint pause/resume (operator switch)
 
 An operator hold on a downstream: while an endpoint is paused, its

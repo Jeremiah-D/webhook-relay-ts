@@ -236,6 +236,23 @@ import {
   OperatorKeyRing,
   type OperatorKeyEntry,
 } from "./operator-keys.ts";
+import {
+  OperatorAuditLog,
+  type OperatorAuditLogOptions,
+} from "./operator-audit.ts";
+export {
+  OperatorAuditLog,
+  assertValidOperatorAuditLogOptions,
+  DEFAULT_OPERATOR_AUDIT_MAX_ENTRIES,
+  DEFAULT_OPERATOR_AUDIT_QUERY_LIMIT,
+} from "./operator-audit.ts";
+export type {
+  OperatorAuditEntry,
+  OperatorAuditLogOptions,
+  OperatorAuditQuery,
+  OperatorAuditRecordInput,
+  OperatorAuditResult,
+} from "./operator-audit.ts";
 import { resolveTraceId, TRACE_ID_HEADER } from "./trace.ts";
 import {
   formatTraceparent,
@@ -1707,6 +1724,17 @@ export interface RelayServerOptions {
    * id/key, duplicate id, duplicate key) throw `RangeError` at startup.
    */
   operatorKeys?: OperatorKeyEntry[];
+  /**
+   * WR-197: centralized operator action audit log. Every executed
+   * operator mutation (endpoint pause/resume/enable, key revocation,
+   * config reloads) is recorded here with the acting operator's key id,
+   * the action name, the target resource, and the before/after diff —
+   * stored separately from the delivery audit stream and queryable via
+   * `GET /operator-audit?keyId=`. Invalid values throw `RangeError` at
+   * startup. The log is always active (in-memory, bounded); the option
+   * only tunes the bound.
+   */
+  operatorAuditLog?: OperatorAuditLogOptions;
   /**
    * Operator/intake plane split (WR-56, see `OperatorPortOptions`): serve
    * the operator endpoints on a second listener bound by the relay itself
@@ -5407,6 +5435,8 @@ function isOperatorPath(pathname: string): boolean {
     pathname === "/quorum" ||
     pathname === "/quorum/stats" ||
     pathname === "/usage" ||
+    // WR-197: centralized operator action audit log.
+    pathname === "/operator-audit" ||
     // WR-185: per-endpoint delivery watermark snapshot.
     pathname === "/watermarks" ||
     pathname === "/health/summary" ||
@@ -7198,6 +7228,11 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // country code or CIDR can never fail a request mid-flight. Unset =
   // off: intake behavior is byte-identical to the legacy one.
   const geoIpPolicy = opts.geoIp !== undefined ? new GeoIpInboundPolicy(opts.geoIp) : undefined;
+  // WR-197: centralized operator action audit log — one entry per
+  // executed operator mutation (actor key id, action, target,
+  // before/after diff), separate from the delivery audit stream.
+  // Invalid values throw here, at startup — never mid-request.
+  const operatorAuditLog = new OperatorAuditLog(opts.operatorAuditLog);
   // Inbound per-endpoint API key authentication (WR-65): rules are
   // validated (constant-time comparison needs no precomputation, so this
   // is pure validation) once at startup, so a bad pattern or key entry
@@ -7208,8 +7243,19 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     opts.apiKeys !== undefined
       ? new InboundApiKeyAuth({
           ...opts.apiKeys,
-          onRevoked: ({ pattern, keyId }) =>
-            opts.auditLog.append({ event: "api_key_revoked", pattern, keyId }),
+          onRevoked: ({ pattern, keyId }) => {
+            opts.auditLog.append({ event: "api_key_revoked", pattern, keyId });
+            // WR-197: the same revocation lands in the centralized
+            // operator ledger — the actor is the operator running the
+            // config-snapshot apply, the revoked key is the target.
+            operatorAuditLog.record({
+              keyId: activeOperatorKeyId ?? "unknown",
+              action: "api.key.revoke",
+              target: `${pattern}:${keyId}`,
+              before: { revoked: false },
+              after: { revoked: true },
+            });
+          },
         })
       : undefined;
   // Inbound sender reputation scoring (WR-119): validated once at
@@ -7248,7 +7294,20 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // compromised operator key can be revoked at runtime; every successful
   // revokeKey audits `operator_key_revoked` (key id only, never the key).
   const operatorKeyRing = new OperatorKeyRing(opts.operatorKeys ?? [], {
-    onRevoked: ({ id }) => opts.auditLog.append({ event: "operator_key_revoked", keyId: id }),
+    onRevoked: ({ id }) => {
+      opts.auditLog.append({ event: "operator_key_revoked", keyId: id });
+      // WR-197: the same revocation lands in the centralized operator
+      // ledger — the actor is the operator running the config-snapshot
+      // apply, the revoked key is the target (identifiers only, never
+      // key bytes).
+      operatorAuditLog.record({
+        keyId: activeOperatorKeyId ?? "unknown",
+        action: "operator.key.revoke",
+        target: id,
+        before: { revoked: false },
+        after: { revoked: true },
+      });
+    },
   });
   // Inbound source baseline anomaly detection (WR-63): validated once at
   // startup so bad config can never fail a request mid-flight. Alert-only
@@ -7586,6 +7645,26 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       return;
     }
     const operatorKeyId = identity.id;
+    /**
+     * WR-197: record one executed operator mutation in the centralized
+     * operator audit log. `before`/`after` are the caller's honest
+     * before/after diff of the mutated fields (JSON-serializable, never
+     * secret material). Validation failures (400s) are not recorded —
+     * nothing was mutated.
+     */
+    const recordOperatorAction = (
+      action: string,
+      detail: { target?: string; before?: unknown; after?: unknown; result?: "ok" | "error" } = {}
+    ): void => {
+      operatorAuditLog.record({
+        keyId: operatorKeyId,
+        action,
+        ...(detail.target !== undefined ? { target: detail.target } : {}),
+        ...(detail.before !== undefined ? { before: detail.before } : {}),
+        ...(detail.after !== undefined ? { after: detail.after } : {}),
+        result: detail.result ?? "ok",
+      });
+    };
     // WR-180: operator-plane rate limit — after operatorToken/operatorKeys
     // authentication, before any business handling. A rejected request
     // never reaches a handler. Authentication failures keep their
@@ -7653,6 +7732,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     const isQuorum = pathname === "/quorum";
     const isQuorumStats = pathname === "/quorum/stats";
     const isUsage = pathname === "/usage";
+    const isOperatorAudit = pathname === "/operator-audit";
     const isWatermarks = pathname === "/watermarks";
     const isHealthSummary = pathname === "/health/summary";
     const isEvents = pathname === "/events";
@@ -8219,6 +8299,28 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       respondJson(res, 200, usageMeter.snapshot(params.get("tenant") ?? undefined));
       return;
     }
+    if (isOperatorAudit) {
+      // WR-197: centralized operator action audit log — one entry per
+      // executed operator mutation (actor key id, action, target,
+      // before/after diff). Same operator-token guard as the other
+      // operator endpoints (404 when no operator credential — fail
+      // closed); the read scope suffices (GET is read-only by the
+      // centralized WR-82 check above). Queryable by acting key id.
+      const params = new URL(req.url ?? "/operator-audit", "http://internal").searchParams;
+      const limitRaw = params.get("limit");
+      const limit = limitRaw === null ? undefined : Number(limitRaw);
+      if (limitRaw !== null && (!Number.isInteger(limit) || (limit as number) <= 0)) {
+        respondJson(res, 400, { error: "limit must be a positive integer" });
+        return;
+      }
+      const entries = operatorAuditLog.query({
+        ...(params.get("keyId") !== null ? { keyId: params.get("keyId") as string } : {}),
+        ...(params.get("action") !== null ? { action: params.get("action") as string } : {}),
+        ...(limit !== undefined ? { limit } : {}),
+      });
+      respondJson(res, 200, { entries });
+      return;
+    }
     if (isWatermarks) {
       // WR-185: per-endpoint delivery watermark snapshot — one row per
       // endpoint with the received ingress seq, the max consecutive
@@ -8644,6 +8746,14 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
             tenant as string | undefined
           )
         );
+        // WR-197: the config reload lands in the centralized operator
+        // ledger — the `changes` list already is a field-level
+        // before/after diff, recorded here as before/after maps.
+        recordOperatorAction("config.endpoint.update", {
+          target: tenant !== undefined ? `${tenant}:${endpoint}` : endpoint,
+          before: Object.fromEntries(changes.map((c) => [c.field, c.from])),
+          after: Object.fromEntries(changes.map((c) => [c.field, c.to])),
+        });
         respondJson(res, 200, { endpoint, ...(tenant !== undefined ? { tenant } : {}), changes });
       } catch (err) {
         if (err instanceof RangeError) {
@@ -8708,9 +8818,21 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         // `null` clears the sunset entirely (explicit "never sunset"),
         // valid moments set it; the override wins over any configured
         // `sunsetAt` on the route.
+        const previousSunset = versionRouter.effectiveSunset(prefix);
         versionRouter.setSunset(prefix, sunsetAt as number | string | null);
         const effective = versionRouter.effectiveSunset(prefix);
         const route = versionRouter.sunsetEntries().find((e) => e.prefix === prefix);
+        // WR-197: the config reload lands in the centralized operator
+        // ledger with its before/after diff.
+        recordOperatorAction("config.version-sunset.set", {
+          target: prefix,
+          before: {
+            sunsetAt: previousSunset === undefined ? null : new Date(previousSunset).toISOString(),
+          },
+          after: {
+            sunsetAt: effective === undefined ? null : new Date(effective).toISOString(),
+          },
+        });
         opts.auditLog.append({
           event: "version_sunset_updated",
           prefix,
@@ -8795,6 +8917,19 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
               }),
           })
         );
+        // WR-197: a real (non-dry-run) snapshot apply lands in the
+        // centralized operator ledger with its item-level before/after
+        // diff. Dry runs mutate nothing and are not recorded.
+        if (!result.dryRun) {
+          recordOperatorAction("config.snapshot.apply", {
+            before: Object.fromEntries(
+              result.applied.map((a) => [`${a.scope}.${a.field}`, a.from])
+            ),
+            after: Object.fromEntries(
+              result.applied.map((a) => [`${a.scope}.${a.field}`, a.to])
+            ),
+          });
+        }
         respondJson(res, 200, result);
       } catch (err) {
         if (err instanceof ConfigApplyError) {
@@ -8915,10 +9050,26 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       // queue calls, so `runAsOperator` stamps the `endpoint_paused` /
       // `endpoint_resumed` audit with this call's `keyId`.
       if (isEndpointsPause) {
+        const wasPaused = queue.isEndpointPaused(endpoint);
         runAsOperator(operatorKeyId, () => queue.pauseEndpoint(endpoint));
+        // WR-197: the mutation lands in the centralized operator ledger
+        // with its before/after diff (idempotent re-pause is still a
+        // recorded operator action, with before == after).
+        recordOperatorAction("endpoints.pause", {
+          target: endpoint,
+          before: { paused: wasPaused },
+          after: { paused: true },
+        });
         respondJson(res, 200, { endpoint, paused: true });
       } else {
+        const wasPaused = queue.isEndpointPaused(endpoint);
         runAsOperator(operatorKeyId, () => queue.resumeEndpoint(endpoint));
+        // WR-197: see above.
+        recordOperatorAction("endpoints.resume", {
+          target: endpoint,
+          before: { paused: wasPaused },
+          after: { paused: false },
+        });
         respondJson(res, 200, { endpoint, paused: false });
       }
       return;
@@ -8959,6 +9110,13 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       }
       const wasDisabled = queue.isEndpointDisabled(endpoint);
       runAsOperator(operatorKeyId, () => queue.enableEndpoint(endpoint));
+      // WR-197: the mutation lands in the centralized operator ledger
+      // with its before/after diff.
+      recordOperatorAction("endpoints.enable", {
+        target: endpoint,
+        before: { disabled: wasDisabled },
+        after: { disabled: false },
+      });
       respondJson(res, 200, { endpoint, disabled: false, wasDisabled });
       return;
     }
