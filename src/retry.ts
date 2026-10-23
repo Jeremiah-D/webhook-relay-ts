@@ -217,6 +217,11 @@ import {
   type AdaptiveTimeoutOptions,
 } from "./adaptive-timeout.ts";
 import {
+  AdaptiveMaxDelay,
+  assertValidAdaptiveMaxDelayOptions,
+  type AdaptiveMaxDelayOptions,
+} from "./adaptive-max-delay.ts";
+import {
   GlobalRateLimiter,
   assertValidGlobalRateLimit,
   type GlobalRateLimitOptions,
@@ -525,6 +530,11 @@ export type {
   AdaptiveTimeoutEndpointStats,
 } from "./adaptive-timeout.ts";
 export { AdaptiveTimeout, AdaptiveTimeoutError, assertValidAdaptiveTimeoutOptions } from "./adaptive-timeout.ts";
+export type {
+  AdaptiveMaxDelayOptions,
+  AdaptiveMaxDelayEndpointStats,
+} from "./adaptive-max-delay.ts";
+export { AdaptiveMaxDelay, assertValidAdaptiveMaxDelayOptions } from "./adaptive-max-delay.ts";
 export type { GlobalRateLimitOptions, GlobalRateLimitStats } from "./global-rate.ts";
 export { GlobalRateLimiter, assertValidGlobalRateLimit } from "./global-rate.ts";
 export type {
@@ -2576,6 +2586,19 @@ export interface RetryQueueOptions {
    */
   adaptiveTimeout?: AdaptiveTimeoutOptions;
   /**
+   * WR-196: adaptive retry-backoff cap. When set, the queue derives each
+   * endpoint's `maxDelayMs` from its own recent successful-delivery
+   * latency (`clamp(p99 * (1 + marginRatio), floorMs, ceilMs)`) instead
+   * of using the fixed `maxDelayMs` — and tightens the cap toward
+   * `floorMs` on retryable-failure storms. Cold endpoints use the fixed
+   * `maxDelayMs` until they have `minSamples` samples. Orthogonal to
+   * WR-59 (adaptive base) and WR-143 (per-attempt budgets); named retry
+   * policies (WR-172) skip adaptation. Absent means the fixed cap
+   * everywhere (exactly the pre-WR-196 behavior). Invalid values throw
+   * `RangeError` at construction.
+   */
+  adaptiveMaxDelay?: AdaptiveMaxDelayOptions;
+  /**
    * WR-85: shadow-target dry-run mirroring (see `src/shadow.ts`).
    * Per-endpoint opt-in: exact `targetUrl` -> shadow target list. After
    * every main delivery *attempt* completes (success or failure), the
@@ -3934,6 +3957,13 @@ export class RetryQueue {
    */
   private readonly adaptiveTimeout?: AdaptiveTimeout;
   /**
+   * WR-196: adaptive retry-backoff cap (one instance, per-endpoint
+   * windows inside). `undefined` when the feature is off — every feed
+   * point and the cap lookup no-op, so unconfigured behavior is
+   * byte-for-byte the pre-WR-196 behavior.
+   */
+  private readonly adaptiveMaxDelay?: AdaptiveMaxDelay;
+  /**
    * WR-167: relay-level outbound rate gate (one instance — the rate is
    * relay-wide, across endpoints and tenants). `undefined` when the
    * feature is off — dispatches never wait on it, so unconfigured
@@ -4111,6 +4141,13 @@ export class RetryQueue {
     // WR-166: invalid values throw here, at construction — never mid-delivery.
     this.adaptiveTimeout =
       opts.adaptiveTimeout !== undefined ? new AdaptiveTimeout(opts.adaptiveTimeout) : undefined;
+    // WR-196: invalid values throw here, at construction — never mid-delivery.
+    // The resting cap reads the queue's maxDelayMs live, so a WR-32
+    // hot-reload of the base stays in sync for cold endpoints.
+    if (opts.adaptiveMaxDelay !== undefined) {
+      assertValidAdaptiveMaxDelayOptions(this.maxDelayMs, opts.adaptiveMaxDelay);
+      this.adaptiveMaxDelay = new AdaptiveMaxDelay(() => this.maxDelayMs, opts.adaptiveMaxDelay);
+    }
     // WR-140: invalid values throw here, at construction — never mid-delivery.
     this.tenantMaxConcurrent = opts.tenantMaxConcurrent ?? Infinity;
     this.tenantGates = new TenantConcurrencyGates(this.tenantMaxConcurrent);
@@ -4701,6 +4738,8 @@ export class RetryQueue {
         this.latencyFor(item.tenantId)?.recordAccepted(item.id);
         // WR-166: same lifecycle event feeds the adaptive-timeout tracker.
         this.adaptiveTimeout?.recordAccepted(item.id);
+        // WR-196: same lifecycle event feeds the adaptive-max-delay tracker.
+        this.adaptiveMaxDelay?.recordAccepted(item.id);
         this.durableRestoredItems += 1;
       }
       for (const entry of rec.deadLetters) {
@@ -5762,6 +5801,8 @@ export class RetryQueue {
     this.latencyFor(item.tenantId)?.recordAccepted(item.id);
     // WR-166: same lifecycle event feeds the adaptive-timeout tracker.
     this.adaptiveTimeout?.recordAccepted(item.id);
+    // WR-196: same lifecycle event feeds the adaptive-max-delay tracker.
+    this.adaptiveMaxDelay?.recordAccepted(item.id);
     // WR-151: a replay is a fresh delivery cycle — start a new OTel trace
     // for it (the original trace already terminated at dead_letter).
     this.otelTracer?.intake(requeued);
@@ -6367,6 +6408,8 @@ export class RetryQueue {
     this.latencyFor(item.tenantId)?.recordAccepted(item.id);
     // WR-166: same lifecycle event feeds the adaptive-timeout tracker.
     this.adaptiveTimeout?.recordAccepted(item.id);
+    // WR-196: same lifecycle event feeds the adaptive-max-delay tracker.
+    this.adaptiveMaxDelay?.recordAccepted(item.id);
     // WR-71: the backlog changed — feed the SLO-risk predictor.
     this.bumpPending(item.tenantId, stored.targetUrl, 1);
     // WR-100: first-sighting stamp for the stale-endpoint sweep.
@@ -6600,7 +6643,16 @@ export class RetryQueue {
     // the policy omits inherit the queue's current settings.
     const policy = endpoint !== undefined ? this.policyForEndpoint(endpoint) : undefined;
     const baseDelayMs = policy?.baseDelayMs ?? this.baseDelayMs;
-    const maxDelayMs = policy?.maxDelayMs ?? this.maxDelayMs;
+    // WR-196: with adaptive max-delay enabled and an `endpoint` given,
+    // the cap is the endpoint's current adaptive cap (from its recent
+    // successful-delivery p99, tightened during failure storms);
+    // otherwise the configured fixed cap. A named policy replaces the
+    // cap wholesale — explicit operator intent beats auto-tuning.
+    const maxDelayMs =
+      policy?.maxDelayMs ??
+      (endpoint !== undefined
+        ? (this.adaptiveMaxDelay?.capFor(endpoint) ?? this.maxDelayMs)
+        : this.maxDelayMs);
     const jitterMs = policy?.jitterMs ?? this.jitterMs;
     const jitterStrategy = policy?.jitterStrategy ?? this.jitterStrategy;
     const base =
@@ -6770,7 +6822,12 @@ export class RetryQueue {
     const policy = targetUrl !== undefined ? this.policyForEndpoint(targetUrl) : undefined;
     return {
       baseDelayMs: policy?.baseDelayMs ?? this.baseDelayMs,
-      maxDelayMs: policy?.maxDelayMs ?? this.maxDelayMs,
+      // WR-196: report the endpoint's adaptive cap when one is active.
+      maxDelayMs:
+        policy?.maxDelayMs ??
+        (targetUrl !== undefined
+          ? (this.adaptiveMaxDelay?.capFor(targetUrl) ?? this.maxDelayMs)
+          : this.maxDelayMs),
       maxAttempts: policy?.maxAttempts ?? this.maxAttempts,
       jitterMs: policy?.jitterMs ?? this.jitterMs,
       jitterStrategy: policy?.jitterStrategy ?? this.jitterStrategy,
@@ -7863,6 +7920,10 @@ export class RetryQueue {
         const latencyMs = latency?.recordDelivered(entry.id, target);
         // WR-166: same lifecycle event feeds the adaptive-timeout tracker.
         this.adaptiveTimeout?.recordDelivered(entry.id, target);
+        // WR-196: same lifecycle event feeds the adaptive-max-delay
+        // tracker — the success sample relaxes the endpoint's adapted
+        // backoff cap toward its p99-derived target.
+        this.adaptiveMaxDelay?.recordDelivered(entry.id, target);
         if (latencyMs !== undefined) {
           // The histogram samples the same delivery the JSON latency stats
           // do — accepted→delivered, dead letters excluded by `discard()`.
@@ -8100,6 +8161,10 @@ export class RetryQueue {
           // WR-59: a retryable failure heats the endpoint's adaptive base
           // toward the ceiling.
           this.adaptiveBackoffFor(tenant)?.recordOutcome(target, false);
+          // WR-196: a retryable failure is the storm signal — it
+          // tightens the endpoint's adaptive backoff cap toward the
+          // floor (leader-only, one physical failure one tighten).
+          this.adaptiveMaxDelay?.recordFailure(target);
           // WR-94: a retryable failure (429/5xx/timeout) is a congestion
           // signal — it feeds the adaptive concurrency controller, which
           // cuts the endpoint's limit multiplicatively once a full
@@ -8434,6 +8499,8 @@ export class RetryQueue {
     this.latencyFor(entry.tenantId)?.discard(entry.id);
     // WR-166: same lifecycle event feeds the adaptive-timeout tracker.
     this.adaptiveTimeout?.discard(entry.id);
+    // WR-196: same lifecycle event feeds the adaptive-max-delay tracker.
+    this.adaptiveMaxDelay?.discard(entry.id);
     this.deadLetter.push(dlEntry);
     // WR-54: the last attempt's response summary — only the status code
     // survives (from the failing HTTP response); a failed attempt has no
@@ -8524,6 +8591,15 @@ export class RetryQueue {
    */
   getAdaptiveTimeoutStats(): AdaptiveTimeoutEndpointStats[] {
     return this.adaptiveTimeout?.stats() ?? [];
+  }
+
+  /**
+   * WR-196: per-endpoint adaptive backoff-cap snapshots — the tracker's
+   * current p99-derived cap per endpoint. Empty when the feature is off
+   * or no endpoint has delivered yet.
+   */
+  getAdaptiveMaxDelayStats(): AdaptiveMaxDelayEndpointStats[] {
+    return this.adaptiveMaxDelay?.stats() ?? [];
   }
 
   /**

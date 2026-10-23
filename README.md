@@ -6082,6 +6082,38 @@ adaptive timeout is a per-attempt SLO, not an end-to-end deadline. The
 default sender enforces it on HTTP/1.1 via an unref'd timer that destroys
 the in-flight request, and on H2/WS via the uniform dispatch race.
 
+#### Adaptive retry-backoff cap (WR-196)
+
+Opt-in per-endpoint backoff cap derived from each endpoint's recent
+*successful*-delivery latency instead of one fixed `maxDelayMs`
+(`src/adaptive-max-delay.ts`, `adaptiveMaxDelay` on `retry` options):
+
+```ts
+const queue = new RetryQueue({
+  sender,
+  adaptiveMaxDelay: {
+    marginRatio: 0.5, // cap = p99 * 1.5 (default)
+    floorMs: 1_000, // storm-converged floor (default)
+    ceilMs: 240_000, // ceiling, default 4x maxDelayMs
+    minSamples: 10, // samples before p99 kicks in (default)
+    tightenFactor: 0.8, // per-failure tighten multiplier (default)
+  },
+});
+```
+
+While cold (fewer than `minSamples` successes) the endpoint uses the
+configured `maxDelayMs` unchanged — behavior is byte-identical to the
+static configuration until there is evidence. Once warm, the cap relaxes
+to `clamp(p99 * (1 + marginRatio), floorMs, ceilMs)` on each success, and
+each retryable failure multiplies it by `tightenFactor` toward `floorMs` —
+a backoff storm converges the cap on the floor, and the first successes
+after recovery walk it back up in one step (failures never enter the p99
+window, so the storm cannot pollute it). Orthogonal to WR-59 (which adapts
+the backoff *base*) and to WR-143 (per-attempt phase budgets, which cap a
+single attempt while this caps the wait *between* attempts); named retry
+policies (WR-172) skip adaptation. The current cap per endpoint is exposed
+via `queue.getAdaptiveMaxDelayStats()` and `effectiveRetryConfig(url)`.
+
 ### Shadow-target dry-run mirroring
 
 Opt-in per-endpoint dry-run mirroring for the downstream-migration /
