@@ -405,7 +405,15 @@ reliability primitives that matter for any signed-payload pipeline.
   never reach disk, masked or not. `bodyFingerprintSha256` still covers the
   original bytes. Non-JSON payloads pass through untouched. One mask backs
   both paths via `createRelayServer({ fieldMask })` (also `new AuditLog(path,
-  { fieldMask })` and `retry.fieldMask` directly).
+  { fieldMask })` and `retry.fieldMask` directly). Rules may also use the
+  WR-191 JSONPath subset instead of dot-paths — `{ jsonpath:
+  "$.items[*].pan", strategy: "last4" }` — for shapes that reach into
+  arrays of objects: supported are `.name`, `.*`, `['name']` / `["name"]`
+  (literal keys, may contain dots), `[<non-negative int>]`, `[*]`, and `$`
+  alone (masks the whole payload); `..`, negative indices, slices,
+  filters `?()`, and unclosed brackets/quotes are rejected with
+  `RangeError` at construction. Each rule sets exactly one of `path` or
+  `jsonpath`; both may coexist on one endpoint.
 - `src/replay.ts` — `ReplayGuard`: nonce + timestamp-window replay protection
   for inbound webhooks. A unique `x-nonce` per delivery is remembered for the
   window (`windowSec`, default 300s); resends are rejected as `duplicate_nonce`,
