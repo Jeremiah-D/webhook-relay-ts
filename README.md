@@ -70,6 +70,32 @@ reliability primitives that matter for any signed-payload pipeline.
   window has elapsed so `previousSecret` can be cleared. Orthogonal to
   WR-65: in API-key-only mode the key gate authenticates; in
   `requireSignature` mode the dual-secret check is the signature leg.
+- `src/tenant-keys.ts` — per-tenant inbound HMAC keys (`TenantKeyStore`,
+  WR-195): one inbound HMAC signing key per tenant in the WR-48 tenant
+  namespace (`x-tenant-id`), so each tenant's upstream signs with its
+  own secret — a leaked tenant secret compromises exactly one tenant,
+  and one tenant's rotation never forces every other tenant's senders
+  to cut over together. `setTenantSecret(tenantId, secret)` registers a
+  key (setting twice is a `RangeError`: rotate or remove first, never
+  silently overwrite a live trust anchor);
+  `rotateTenantSecret(tenantId, newSecret, graceMs?)` installs the new
+  primary while the old key keeps verifying inside its grace window
+  (default 24h, inclusive boundary, same convention as the WR-20 key
+  set; a second rotation drops the oldest key — at most two verify per
+  tenant). Each key gets an audit-safe identity
+  (`${tenantId}:${generation}` — never the secret). Wired into the
+  server via `tenantKeys: store`; requests claiming a keyed tenant
+  verify against that tenant's key set (the existing rotating-verifier
+  `keyId` attribution applies, so the accepted audit carries the tenant
+  key id, and every webhook that verified with a retired tenant key is
+  audited as `tenant_key_previous_used`), while tenants with no
+  configured key walk the exact legacy global path — unset means the
+  feature is off entirely. A pinned per-endpoint verifier rule (WR-29)
+  still wins on its path. Invalid arguments throw `RangeError` at call
+  time; verification calls never throw. Orthogonal to WR-65 endpoint
+  API keys (a different credential type: API keys authenticate
+  *endpoints*, tenant keys authenticate *senders*) and to WR-48 tenant
+  isolation (same namespace, different axis).
 - `src/version.ts` — inbound API version routing (`ApiVersionRouter`).
   Version prefixes in the inbound path (`/v1/...`, `/v2/...`, segment
   boundaries only, longest prefix wins) route the payload through a
@@ -1478,6 +1504,58 @@ the same path. Invalid rules throw `RangeError` at startup. Orthogonal
 to WR-65 API-key authentication: key-only endpoints never consult the
 secrets; with `requireSignature: true` the dual-secret check is the
 signature leg.
+
+## Per-tenant inbound HMAC keys
+
+Multi-tenant relays need per-sender trust: with a global signing secret
+every tenant's upstream shares one key, so one leak compromises all
+tenants and one rotation forces every sender to cut over together. Give
+each tenant its own inbound HMAC key instead, in the WR-48 tenant
+namespace:
+
+```ts
+import { TenantKeyStore } from "./src/tenant-keys.ts";
+
+const tenantKeys = new TenantKeyStore();
+tenantKeys.setTenantSecret("acme", ACME_SIGNING_SECRET); // returns "acme:1"
+
+const server = createRelayServer({
+  secret, // global fallback: tenants with no configured key verify here
+  forwardUrl,
+  tenantKeys,
+});
+```
+
+A webhook carrying `x-tenant-id: acme` now verifies against acme's key,
+not the global secret; tenants with no configured key (and requests with
+no tenant header) walk the exact legacy global path — unset `tenantKeys`
+means the feature is off entirely.
+
+Rotation is zero-downtime:
+
+```ts
+tenantKeys.rotateTenantSecret("acme", ACME_NEW_SECRET, 3_600_000); // returns "acme:2"
+```
+
+For the next hour (grace default: 24h, inclusive boundary — the same
+convention as the global `signingKeys` rotation) both keys verify in
+parallel, so in-flight webhooks signed with the old key do not 401-storm;
+once the window elapses the old key is rejected. A second rotation drops
+the oldest key — at most two keys ever verify for one tenant. Watch the
+`tenant_key_previous_used` audit events (they carry the tenant and the
+retired key id) to know when old-key traffic has drained;
+`tenantKeys.rotationComplete("acme")` reports when the cutover is done.
+
+The accepted audit's `keyId` names the verifying tenant key
+(`acme:1`, `acme:2` — never the secret). Setting a key twice is a
+`RangeError`: use `rotateTenantSecret` or `removeTenantSecret` — a live
+trust anchor is never overwritten silently, and every invalid argument
+throws `RangeError` at call time. Precedence on one request: a pinned
+per-endpoint verifier rule (WR-29) wins, then the tenant's key set, then
+the negotiated/global verifier. Orthogonal to WR-65 endpoint API keys
+(API keys authenticate *endpoints*, tenant keys authenticate *senders* —
+both can be required at once) and to WR-48 tenant isolation (same
+namespace, different axis).
 
 ## Stripe-style webhook signatures
 

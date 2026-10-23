@@ -75,6 +75,7 @@ import type {
   DeadLetterEscalationOptions,
 } from "./escalation.ts";
 import { TENANT_ID_HEADER, assertValidTenantId, tenantScopeKey } from "./tenant.ts";
+import { TenantKeyStore } from "./tenant-keys.ts";
 import type { AutoReplayOptions } from "./autoreplay.ts";
 import type { DeadLetterRetentionOptions } from "./deadletter-retention.ts";
 import {
@@ -632,6 +633,25 @@ export interface RelayServerOptions {
    * Default: 86_400_000 (24h). Only meaningful with `signingKeys`.
    */
   keyGraceMs?: number;
+  /**
+   * Per-tenant inbound HMAC keys (WR-195; see `src/tenant-keys.ts`): a
+   * `TenantKeyStore` holding one inbound HMAC signing key per tenant in
+   * the WR-48 tenant namespace (`x-tenant-id`). A request claiming a
+   * tenant with a configured key verifies against that tenant's key set
+   * (with its rotation grace) instead of the global `verifier` /
+   * `signingKeys`; tenants with no configured key walk the exact legacy
+   * global path. Unset (the default) disables the feature entirely —
+   * zero behavior change. A pinned per-endpoint verifier rule (WR-29)
+   * takes precedence over the tenant's key on its path. The accepted
+   * audit's `keyId` names the verifying tenant key
+   * (`${tenantId}:${generation}` — never the secret), and every webhook
+   * that verified with a retired tenant key is audited as
+   * `tenant_key_previous_used`. Orthogonal to WR-65 endpoint API keys
+   * (a different credential type) and to WR-48 tenant isolation (same
+   * namespace, different axis). Pass a `TenantKeyStore` instance;
+   * anything else throws `RangeError` at startup.
+   */
+  tenantKeys?: TenantKeyStore;
   /**
    * Clock source for signing-key retirement checks; defaults to
    * `Date.now`. Injectable for deterministic tests. Only meaningful with
@@ -7080,6 +7100,11 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // Per-endpoint verifier rules are validated once at startup so a bad
   // pattern or verifier can never fail a request mid-flight.
   assertValidEndpointVerifierRules(opts.endpointVerifiers);
+  // WR-195: the per-tenant key store must be a TenantKeyStore instance —
+  // anything else fails fast at startup, never mid-request.
+  if (opts.tenantKeys !== undefined && !(opts.tenantKeys instanceof TenantKeyStore)) {
+    throw new RangeError("createRelayServer: `tenantKeys` must be a TenantKeyStore instance");
+  }
   // WR-138: the signature-algorithm allowlist is validated once at
   // startup for the same reason — an unknown name or a bad verifier
   // can never fail a request mid-flight.
@@ -9895,6 +9920,35 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // A mismatch here is answered 401 below and never enqueues, so it can
     // never trip the downstream circuit breaker.
     let activeVerifier = selectEndpointVerifier(pathname, opts.endpointVerifiers) ?? verifier;
+    // Per-tenant inbound HMAC keys (WR-195): when the request claims a
+    // tenant whose key the operator configured, that tenant's key set
+    // replaces the global verifier for this request — including its
+    // rotation grace. The claim is format-validated here (a malformed
+    // value can never own a key, since `setTenantSecret` rejects it),
+    // and anything invalid or unkeyed falls through to the legacy
+    // verifier, so the post-verification tenant check below still
+    // answers 400 exactly as before. Tenants with no configured key
+    // walk the legacy path: off by default, fully backward compatible.
+    // A pinned per-endpoint rule (WR-29) keeps its precedence — the most
+    // specific trust binding wins.
+    let tenantKeyTenant: string | undefined;
+    if (activeVerifier === verifier && opts.tenantKeys !== undefined) {
+      const claimRaw = headers[TENANT_ID_HEADER];
+      const claim = Array.isArray(claimRaw) ? claimRaw[0] : claimRaw;
+      if (typeof claim === "string" && claim !== "") {
+        try {
+          assertValidTenantId(claim);
+          const tenantVerifier = opts.tenantKeys.getVerifier(claim);
+          if (tenantVerifier !== undefined) {
+            tenantKeyTenant = claim;
+            activeVerifier = tenantVerifier;
+          }
+        } catch {
+          // Invalid format: verify with the legacy verifier; the
+          // post-verification check still answers 400.
+        }
+      }
+    }
     // WR-138: inbound signature algorithm negotiation — the
     // `x-signature-alg` header names the algorithm the upstream used
     // ("hmac-sha256" | "ed25519") and the allowlisted rule's verifier
@@ -10666,6 +10720,24 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         traceId,
         ...tenantLabel,
         endpoint: pathname,
+      });
+    }
+    // WR-195: the request verified with the tenant's retired key inside
+    // its grace window — the operator watches this stream to know when
+    // old-key traffic has drained and the rotation is complete. Only the
+    // key id goes on the audit trail; the secret itself never appears.
+    if (
+      tenantKeyTenant !== undefined &&
+      opts.tenantKeys !== undefined &&
+      verifiedKeyId !== undefined &&
+      verifiedKeyId !== opts.tenantKeys.getCurrentKeyId(tenantKeyTenant)
+    ) {
+      opts.auditLog.append({ ...correlation,
+        event: "tenant_key_previous_used",
+        id,
+        traceId,
+        tenant: tenantKeyTenant,
+        keyId: verifiedKeyId,
       });
     }
     if (version !== undefined) acceptedEvent.version = version;
