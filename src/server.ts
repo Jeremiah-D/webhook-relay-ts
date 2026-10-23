@@ -379,6 +379,10 @@ import {
   ArchiveS3Offloader,
   type ArchiveS3OffloadConfig,
 } from "./archive-s3.ts";
+import {
+  AuditS3Offloader,
+  type AuditS3OffloadConfig,
+} from "./audit-s3.ts";
 import { resolveOrderedConfig } from "./ordered.ts";
 import { buildDeliverySnapshot } from "./delivery-status.ts";
 import type { EndpointConfigPatch } from "./hotreload.ts";
@@ -2302,6 +2306,18 @@ export interface RelayServerOptions {
    * retried on the next seal. Unset by default.
    */
   archiveS3?: ArchiveS3OffloadConfig;
+  /**
+   * WR-190: opt-in S3-compatible offload of sealed audit-log segments
+   * (see `src/audit-s3.ts`). Requires the injected `auditLog` to be
+   * constructed with `sealedDir`: every sealed segment is PUT to the
+   * configured bucket under a deterministic key
+   * (`<prefix><yyyymmdd>/audit-<min>-<max>.jsonl`), signed with the
+   * WR-116 SigV4 pipeline. Uploads run fire-and-forget on each seal and
+   * never touch the audit or delivery paths — failures are counted in
+   * the offloader's stats and retried on the next seal. Unset by
+   * default.
+   */
+  auditS3?: AuditS3OffloadConfig;
   /**
    * Opt-in graceful shutdown on SIGTERM/SIGINT: stop accepting new
    * connections, wait up to `timeoutMs` (default 30_000) for in-flight
@@ -6814,6 +6830,24 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     }, []),
     revokedOperatorKeys: [...operatorKeyRing.revokedIds()],
   });
+  // WR-190: `auditS3` requires the audit log's `sealedDir` — the
+  // offloader only ever sees sealed segments, never the live file.
+  if (opts.auditS3 !== undefined && opts.auditLog.sealedDir === undefined) {
+    throw new RangeError(
+      "createRelayServer: `auditS3` requires the AuditLog to be constructed with `sealedDir`"
+    );
+  }
+  const auditS3Offloader =
+    opts.auditS3 !== undefined ? new AuditS3Offloader(opts.auditS3) : undefined;
+  if (auditS3Offloader !== undefined) {
+    // WR-190: fire-and-forget offload on each audit segment seal. The
+    // promise is intentionally not awaited: uploads never touch the
+    // audit or delivery paths, and failures are counted in the
+    // offloader's stats for the next seal's scan to retry.
+    opts.auditLog.onAuditSegmentSealed(() => {
+      void auditS3Offloader.scanAndUpload();
+    });
+  }
   // WR-55: persistent delivery-event archive. Subscribes to the queue's
   // delivery events and appends every event to `<dir>/events.jsonl`
   // (survives restarts; served at `GET /events/archive`). Unset by

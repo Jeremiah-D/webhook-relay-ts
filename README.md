@@ -4399,6 +4399,45 @@ const server = createRelayServer({
   `buildSyslogFrame()` / `cefLine()` are exported pure functions, so
   the exact bytes are unit-testable without a collector.
 
+## Audit log segment sealing + S3 offload (opt-in)
+
+The audit log can roll its live file into deterministic sealed segments
+for compliance cold storage (`src/audit.ts`, WR-190). Construct the log
+with `new AuditLog(path, { sealedDir, sealMaxBytes, sealMaxAgeMs })` and
+the live `audit.jsonl` is sealed verbatim into
+`<sealedDir>/<yyyymmdd>-seq-<min>-<max>.jsonl` (the WR-188 naming
+convention; a `-<n>` dedupe suffix when the name is taken) whenever the
+size or age threshold trips — the seal runs at the start of the tripping
+`append()`, so the tripping line always opens the new segment. The
+segment date is the UTC date of its earliest line's `ts`; `min`/`max`
+are the segment's 1-based line numbers (`1..N`).
+
+Rotation semantics, stated honestly: both hash chains restart at
+genesis in the new live file, so each sealed segment is independently
+verifiable (`verifyChain()` / `verifyHmacChain()` against the segment
+file itself) — stitch segments by name order for a full-history audit.
+Sealing is best-effort and never throws: a failed seal leaves the live
+file untouched and the threshold stays tripped, so the next `append()`
+retries it; an audit write is never sacrificed for bookkeeping. Sealed
+segments are fired to `onAuditSegmentSealed` handlers (error-isolated),
+and sealing assumes a single writer per live file (documented on the
+class).
+
+**S3-compatible offload** — set the server option `auditS3: {
+sealedDir, endpoint, bucket, region, keyPrefix?, accessKeyId, secretRef,
+secretResolver?, deleteLocalAfterUpload?, dryRun? }` (requires the
+injected `auditLog` to be constructed with `sealedDir`, else startup
+`RangeError`) and every sealed segment is PUT to the bucket under the
+deterministic idempotent key `<prefix><yyyymmdd>/audit-<min>-<max>.jsonl`,
+signed with the WR-116 SigV4 pipeline (`secretRef` is a reference — env
+var name by default — never the raw secret, resolved per upload so
+rotation needs no restart). Uploads run fire-and-forget on each seal and
+never touch the audit or delivery paths: failures are counted
+(`uploadFailures`) and retried on the next seal's scan; an uploaded
+segment is renamed to `<name>.jsonl.uploaded` (local bytes kept) unless
+`deleteLocalAfterUpload: true` deletes it; `dryRun: true` rehearses by
+recording the intended keys with zero network I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same

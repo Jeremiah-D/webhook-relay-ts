@@ -1,5 +1,6 @@
-import { appendFileSync, closeSync, openSync, readFileSync, readSync, statSync } from "node:fs";
+import { appendFileSync, closeSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { createHash, createHmac, randomBytes } from "node:crypto";
+import { join } from "node:path";
 import { isEncryptedPayload, type PayloadEncryptor } from "./encrypt.ts";
 import type { FieldMask } from "./masking.ts";
 import { randomId, type SecretHit, type SecretScanner } from "./secret-scan.ts";
@@ -50,6 +51,35 @@ export interface AuditLogOptions {
    * links without the key).
    */
   auditKey?: { id: string; key: string | Buffer };
+  /**
+   * WR-190: opt-in segment sealing for the audit log (see the class
+   * comment for the contract). When set, the live file is sealed into
+   * deterministic segment files (`<yyyymmdd>-seq-<min>-<max>.jsonl`)
+   * under this directory whenever `sealMaxBytes` or `sealMaxAgeMs`
+   * trips — the same naming convention as WR-188's archive segments.
+   * The directory is created at construction. Unset: no sealing,
+   * byte-identical behavior.
+   */
+  sealedDir?: string;
+  /**
+   * WR-190: seal the live file once it reaches this many bytes. The
+   * seal runs at the start of the next `append()` — the tripping line
+   * always lands in the new segment. Requires `sealedDir`.
+   */
+  sealMaxBytes?: number;
+  /**
+   * WR-190: seal the live file once its oldest line reaches this age in
+   * milliseconds (file mtime at construction, or construction time for
+   * a missing/empty file). Requires `sealedDir`.
+   */
+  sealMaxAgeMs?: number;
+  /**
+   * WR-190: first handler fired (error-isolated) with each sealed
+   * segment's local path. The server registers its S3 offload scan
+   * here when `auditS3` is configured; more handlers can be added with
+   * `onAuditSegmentSealed()`.
+   */
+  onAuditSegmentSealed?: (localPath: string) => void;
 }
 
 /** Filters for {@link AuditLog.query}. All filters are ANDed together. */
@@ -313,10 +343,110 @@ function maskablePayload(
  * file: it is orthogonal to the WR-90 audit webhook sink, which tails the
  * JSONL file. A throwing listener can neither break the append path nor
  * starve the other listeners.
+ *
+ * WR-190: opt-in segment sealing for audit cold storage (compliance
+ * retention). With `sealedDir` set, the live file is sealed verbatim into
+ * `<sealedDir>/<yyyymmdd>-seq-<min>-<max>.jsonl` (a `-<n>` dedupe suffix
+ * when the name is taken) whenever `sealMaxBytes` or `sealMaxAgeMs`
+ * trips — the seal runs at the start of the tripping `append()`, so the
+ * tripping line always lands in the new live file. The segment date is
+ * the UTC date of its earliest line's `ts` (current UTC date when
+ * unparseable); `min`/`max` are the segment's 1-based line numbers
+ * (`1..N`, mirroring the WR-188 archive convention byte-for-byte).
+ *
+ * Rotation semantics, stated honestly:
+ * - The seal writes the segment with an atomic tmp+rename, then
+ *   truncates the live file. Every line lands in exactly one segment —
+ *   no line is dropped and none is sealed twice.
+ * - Both chains restart at genesis in the new live file (the seal
+ *   resets the tip bookkeeping), so each sealed segment is
+ *   independently verifiable: run `verifyChain()`/`verifyHmacChain()`
+ *   against the segment file itself. A live-file verification only ever
+ *   covers its current segment — stitch segments by name order for a
+ *   full-history audit.
+ * - The seal is best-effort: a failed seal never blocks `append()` —
+ *   the live file is left untouched and the threshold stays tripped, so
+ *   the next `append()` retries it.
+ * - Sealed segments are fired to `onAuditSegmentSealed` handlers
+ *   (error-isolated), which the server hooks to its S3 offload scan.
+ * - Interaction with the WR-90 audit webhook sink (`src/audit-sink.ts`):
+ *   the sink tails by path + byte offset with a persisted cursor; on a
+ *   seal the live file shrinks, the sink sees `size < cursor` and
+ *   rewinds to offset 0 — it then forwards only the new live file's
+ *   lines, which it has not forwarded yet. Sealed lines were already
+ *   forwarded before the seal, so a seal neither duplicates nor loses
+ *   webhook deliveries.
+ * - Single-writer assumption: sealing reads the whole live file, then
+ *   truncates it. Run sealing on at most one `AuditLog` instance per
+ *   live file — concurrent appends landing between the seal's read and
+ *   its truncate would be dropped. (The server's single injected
+ *   `AuditLog` is the intended shape; plain appends from several
+ *   instances remain safe, as they always were.)
  */
 
 /** WR-186: a live audit-event listener. Receives the parsed JSONL line. */
 export type AuditEventListener = (event: Record<string, unknown>) => void;
+
+/** WR-190: a sealed-segment handler. Receives the segment's local path. */
+export type AuditSegmentSealedHandler = (localPath: string) => void;
+
+/**
+ * WR-190: a parsed sealed audit-segment file name
+ * (`<yyyymmdd>-seq-<min>-<max>[-<n>].jsonl`).
+ */
+export interface AuditSealedSegmentName {
+  /** UTC date (`yyyymmdd`) of the segment's earliest line. */
+  date: string;
+  /** 1-based first line number in the segment. */
+  seqMin: number;
+  /** 1-based last line number in the segment. */
+  seqMax: number;
+  /** Dedupe suffix (`-<n>`) when the bare name was taken. */
+  dup?: number;
+}
+
+const AUDIT_SEALED_SEGMENT_NAME_RE = /^(\d{8})-seq-(\d+)-(\d+)(?:-(\d+))?\.jsonl$/;
+
+/**
+ * WR-190: parse a sealed audit-segment file name. Returns `undefined`
+ * for names that do not follow the sealing convention — the S3
+ * offloader uploads those under `<prefix>misc/` instead.
+ */
+export function parseAuditSealedSegmentName(fileName: string): AuditSealedSegmentName | undefined {
+  const m = AUDIT_SEALED_SEGMENT_NAME_RE.exec(fileName);
+  if (m === null) return undefined;
+  const seqMin = Number(m[2]);
+  const seqMax = Number(m[3]);
+  if (
+    !Number.isSafeInteger(seqMin) ||
+    !Number.isSafeInteger(seqMax) ||
+    seqMin < 1 ||
+    seqMax < seqMin
+  ) {
+    return undefined;
+  }
+  const dup = m[4] === undefined ? undefined : Number(m[4]);
+  if (dup !== undefined && (!Number.isSafeInteger(dup) || dup < 2)) return undefined;
+  return { date: m[1], seqMin, seqMax, ...(dup === undefined ? {} : { dup }) };
+}
+
+/**
+ * WR-190: the segment date for a seal — the UTC `yyyymmdd` of the
+ * earliest line's `ts`, falling back to the current UTC date when the
+ * line has no parseable timestamp.
+ */
+function auditSealedSegmentDate(firstLine: string): string {
+  let ts: unknown;
+  try {
+    ts = (JSON.parse(firstLine) as Record<string, unknown>).ts;
+  } catch {
+    ts = undefined;
+  }
+  const ms = typeof ts === "string" ? Date.parse(ts) : NaN;
+  const d = Number.isNaN(ms) ? new Date() : new Date(ms);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}`;
+}
 
 export class AuditLog {
   private readonly path: string;
@@ -355,6 +485,21 @@ export class AuditLog {
   private currentKeyId: string;
   /** WR-186: in-memory live listeners, fanned out at the end of `append()`. */
   private readonly auditEventListeners = new Set<AuditEventListener>();
+  /**
+   * WR-190: local dir holding sealed audit segments (unset disables
+   * sealing entirely); the rolling thresholds; handlers fired with
+   * each sealed segment's local path.
+   */
+  private readonly auditSealedDir?: string;
+  private readonly auditSealMaxBytes?: number;
+  private readonly auditSealMaxAgeMs?: number;
+  private readonly auditSegmentSealedHandlers = new Set<AuditSegmentSealedHandler>();
+  /**
+   * WR-190: epoch ms the current live segment started — the live file's
+   * mtime at construction when it exists and is non-empty, else
+   * construction time. Reset to now after every seal.
+   */
+  private auditSegmentStartMs: number;
 
   constructor(path: string, opts: AuditLogOptions = {}) {
     this.path = path;
@@ -370,6 +515,53 @@ export class AuditLog {
       // restarts or be verifiable by another process.
       this.currentKeyId = randomId("auto");
       this.auditKeys.set(this.currentKeyId, randomBytes(32));
+    }
+    // WR-190: opt-in audit-log segment sealing. Fail fast on bad
+    // shapes — sealing is off by default, and a half-configured seal
+    // (thresholds without a directory) is a config bug, not a default.
+    if (opts.sealedDir !== undefined) {
+      if (typeof opts.sealedDir !== "string" || opts.sealedDir.length === 0) {
+        throw new RangeError("AuditLog: `sealedDir` must be a non-empty string when set");
+      }
+      this.auditSealedDir = opts.sealedDir;
+      mkdirSync(opts.sealedDir, { recursive: true });
+    }
+    for (const name of ["sealMaxBytes", "sealMaxAgeMs"] as const) {
+      const value = opts[name];
+      if (value !== undefined && (!Number.isFinite(value) || value <= 0)) {
+        throw new RangeError(`AuditLog: \`${name}\` must be a positive finite number when set`);
+      }
+    }
+    if (
+      (opts.sealMaxBytes !== undefined || opts.sealMaxAgeMs !== undefined) &&
+      this.auditSealedDir === undefined
+    ) {
+      throw new RangeError("AuditLog: `sealMaxBytes`/`sealMaxAgeMs` require `sealedDir` to be set");
+    }
+    this.auditSealMaxBytes = opts.sealMaxBytes;
+    this.auditSealMaxAgeMs = opts.sealMaxAgeMs;
+    if (opts.onAuditSegmentSealed !== undefined) {
+      if (typeof opts.onAuditSegmentSealed !== "function") {
+        throw new RangeError("AuditLog: `onAuditSegmentSealed` must be a function when set");
+      }
+      this.auditSegmentSealedHandlers.add(opts.onAuditSegmentSealed);
+    }
+    this.auditSegmentStartMs = this.initialAuditSegmentStartMs();
+  }
+
+  /**
+   * WR-190: the current live segment's start — the live file's mtime at
+   * construction when it exists and is non-empty, else now. A
+   * pre-existing file counts as "already aging" from its mtime, so a
+   * restart does not reset the age clock.
+   */
+  private initialAuditSegmentStartMs(): number {
+    if (this.auditSealedDir === undefined) return Date.now();
+    try {
+      const st = statSync(this.path);
+      return st.size > 0 ? st.mtimeMs : Date.now();
+    } catch {
+      return Date.now();
     }
   }
 
@@ -419,6 +611,15 @@ export class AuditLog {
   }
 
   /**
+   * WR-190: sealed-segment directory, or `undefined` when sealing is
+   * off. The server requires this to be set when its `auditS3` option
+   * is configured.
+   */
+  get sealedDir(): string | undefined {
+    return this.auditSealedDir;
+  }
+
+  /**
    * WR-72: attach (or replace) the field mask after construction. The
    * server uses this so one mask can back both the audit log and the
    * retry queue from a single option.
@@ -433,6 +634,11 @@ export class AuditLog {
   }
 
   append(event: object): void {
+    // WR-190: roll the live file into a sealed segment when a size/age
+    // threshold tripped, *before* the new line lands — the tripping
+    // line always opens the new live segment. Sealing is best-effort
+    // (see `maybeSealAuditSegment`): it can never block an audit write.
+    this.maybeSealAuditSegment();
     // WR-183: scan the raw payload for secret shapes *before* the WR-72
     // field mask runs. The scan sees the raw value, but only the pattern
     // name and field path ever reach the audit trail — the alert event
@@ -496,6 +702,120 @@ export class AuditLog {
     return () => {
       this.auditEventListeners.delete(listener);
     };
+  }
+
+  /**
+   * WR-190: register a handler fired (error-isolated) with each sealed
+   * segment's local path, mirroring WR-186's `subscribe()`. Returns an
+   * unsubscribe function. The server uses this to hook its S3 offload
+   * scan when `auditS3` is configured; the constructor's
+   * `onAuditSegmentSealed` option registers the first handler. A handler
+   * that throws can neither break the append path nor starve the other
+   * handlers.
+   */
+  onAuditSegmentSealed(handler: AuditSegmentSealedHandler): () => void {
+    if (typeof handler !== "function") {
+      throw new RangeError("AuditLog: onAuditSegmentSealed handler must be a function");
+    }
+    this.auditSegmentSealedHandlers.add(handler);
+    return () => {
+      this.auditSegmentSealedHandlers.delete(handler);
+    };
+  }
+
+  /** WR-190: error-isolated fan-out of one sealed segment's local path. */
+  private notifyAuditSegmentSealed(localPath: string): void {
+    for (const handler of this.auditSegmentSealedHandlers) {
+      try {
+        handler(localPath);
+      } catch {
+        // One misbehaving handler never breaks append() or the others.
+      }
+    }
+  }
+
+  /**
+   * WR-190: size/age rolling seal of the live audit file, evaluated at
+   * the start of every `append()`. Sealing is best-effort and never
+   * throws: a failed seal leaves the live file untouched and the
+   * threshold stays tripped, so the next `append()` retries it — an
+   * audit write is never sacrificed for bookkeeping.
+   */
+  private maybeSealAuditSegment(): void {
+    if (this.auditSealedDir === undefined) return;
+    if (this.auditSealMaxBytes === undefined && this.auditSealMaxAgeMs === undefined) return;
+    let size = 0;
+    try {
+      size = statSync(this.path).size;
+    } catch {
+      return; // No live file yet — nothing to seal.
+    }
+    if (size === 0) return;
+    const tripped =
+      (this.auditSealMaxBytes !== undefined && size >= this.auditSealMaxBytes) ||
+      (this.auditSealMaxAgeMs !== undefined &&
+        Date.now() - this.auditSegmentStartMs >= this.auditSealMaxAgeMs);
+    if (!tripped) return;
+    try {
+      this.sealAuditSegment();
+    } catch {
+      // Swallowed on purpose: see the doc comment above.
+    }
+  }
+
+  /**
+   * WR-190: seal the live file into
+   * `<sealedDir>/<yyyymmdd>-seq-<min>-<max>.jsonl` and truncate the live
+   * file. The segment is written with an atomic tmp+rename first, so a
+   * crash between the write and the truncate costs a re-seal (idempotent
+   * name), never lost lines. The sealed lines are written verbatim —
+   * byte-identical to the live file — so chain verifiers see the same
+   * bytes the live file once held.
+   *
+   * Rotation restarts both chains at genesis in the new live file: the
+   * segment stays independently verifiable (its 1-based line numbers
+   * `1..N` match the genesis-restarted chain it carries), and a
+   * live-file `verifyChain()` only ever covers its current segment.
+   */
+  private sealAuditSegment(): void {
+    const sealedDir = this.auditSealedDir;
+    if (sealedDir === undefined) return;
+    const raw = readFileSync(this.path, "utf8");
+    // AuditLog.append always terminates lines with "\n"; drop the final
+    // empty split and keep only non-empty segments. A foreign partial
+    // line without a trailing newline is sealed too — dropping bytes
+    // silently would be worse than carrying a line the writer intended
+    // to finish, and sealing is a single-writer operation (documented on
+    // the class comment).
+    const lines = raw.split("\n").filter((segment) => segment.length > 0);
+    if (lines.length === 0) return;
+    const date = auditSealedSegmentDate(lines[0]);
+    let taken: Set<string>;
+    try {
+      taken = new Set(readdirSync(sealedDir));
+    } catch {
+      taken = new Set();
+    }
+    let name = `${date}-seq-1-${lines.length}.jsonl`;
+    if (taken.has(name)) {
+      let dup = 2;
+      while (taken.has(`${date}-seq-1-${lines.length}-${dup}.jsonl`)) dup++;
+      name = `${date}-seq-1-${lines.length}-${dup}.jsonl`;
+    }
+    const tmp = join(sealedDir, `${name}.${process.pid}.tmp`);
+    writeFileSync(tmp, lines.join("\n") + "\n", "utf8");
+    renameSync(tmp, join(sealedDir, name));
+    // The segment is durable: now truncate the live file and restart
+    // this instance's segment bookkeeping at genesis.
+    writeFileSync(this.path, "", "utf8");
+    this.index = [];
+    this.indexedBytes = 0;
+    this.chainHead = null;
+    this.chainFileBytes = 0;
+    this.hmacHead = null;
+    this.hmacFileBytes = 0;
+    this.auditSegmentStartMs = Date.now();
+    this.notifyAuditSegmentSealed(join(sealedDir, name));
   }
 
   /** WR-186: current number of live subscribers (operator bookkeeping). */
