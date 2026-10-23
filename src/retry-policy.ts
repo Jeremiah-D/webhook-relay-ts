@@ -92,9 +92,14 @@ export function assertValidRetryPolicy(name: unknown, config: unknown): void {
       `registerRetryPolicy: jitterMs for "${name}" must be a finite number >= 0, got ${JSON.stringify(c.jitterMs)}`
     );
   }
-  if (c.jitterStrategy !== undefined && c.jitterStrategy !== "additive" && c.jitterStrategy !== "full") {
+  if (
+    c.jitterStrategy !== undefined &&
+    c.jitterStrategy !== "additive" &&
+    c.jitterStrategy !== "full" &&
+    c.jitterStrategy !== "decorrelated"
+  ) {
     throw new RangeError(
-      `registerRetryPolicy: jitterStrategy for "${name}" must be "additive" or "full", got ${JSON.stringify(c.jitterStrategy)}`
+      `registerRetryPolicy: jitterStrategy for "${name}" must be "additive", "full" or "decorrelated", got ${JSON.stringify(c.jitterStrategy)}`
     );
   }
 }

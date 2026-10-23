@@ -74,7 +74,7 @@ export interface RetryPatch {
   maxAttempts?: number;
   /** Jitter in ms (uniform 0..jitterMs). Finite >= 0. */
   jitterMs?: number;
-  /** Jitter strategy: "additive" (default) or "full" (AWS-style). */
+  /** Jitter strategy: "additive" (default), "full" (AWS-style) or "decorrelated" (AWS-style random walk). */
   jitterStrategy?: JitterStrategy;
 }
 
@@ -169,9 +169,9 @@ function assertConcurrencyLimit(value: unknown, field: string): void {
 }
 
 function assertJitterStrategy(value: unknown): void {
-  if (value !== "additive" && value !== "full") {
+  if (value !== "additive" && value !== "full" && value !== "decorrelated") {
     throw new RangeError(
-      `updateEndpointConfig: \`retry.jitterStrategy\` must be "additive" or "full", got ${JSON.stringify(value)}`
+      `updateEndpointConfig: \`retry.jitterStrategy\` must be "additive", "full" or "decorrelated", got ${JSON.stringify(value)}`
     );
   }
 }

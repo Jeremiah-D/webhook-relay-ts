@@ -1157,8 +1157,19 @@ export interface AttemptFailedInfo {
  *   choice: when many deliveries fail at once (e.g. a downstream outage),
  *   their retry schedules spread across the whole window instead of
  *   clustering on the exponential grid.
+ * - `"decorrelated"`: the AWS "decorrelated jitter" random walk —
+ *   `sleep = min(cap, uniform(base, prevSleep * 3))`, where `cap` is the
+ *   same per-attempt cap `min(maxDelayMs, base * 2^attempt)` and
+ *   `prevSleep` is the previous sleep of the same delivery's retry
+ *   sequence (starting at `base`). Each delivery's sequence keeps its own
+ *   walk, so two deliveries that fail together decorrelate immediately
+ *   instead of sharing the exponential grid. State is released when the
+ *   delivery settles (delivered or dead-lettered). Callers of
+ *   `delayForAttempt` pass the sequence key (the delivery id on the
+ *   internal path); without a key each call is an independent first step
+ *   from `base`.
  */
-export type JitterStrategy = "additive" | "full";
+export type JitterStrategy = "additive" | "full" | "decorrelated";
 
 /** Per-endpoint retry-budget override (WR-125) observability. */
 export interface RetryBudgetEndpointStats {
@@ -3583,6 +3594,16 @@ export class RetryQueue {
    */
   private readonly phaseTimeoutByDelivery = new Map<string, PhaseTimeoutPhase>();
   /**
+   * WR-193: previous decorrelated-jitter sleep per retry sequence, keyed
+   * by the sequence key passed to `delayForAttempt` (the delivery id on
+   * the internal path). The AWS decorrelated walk needs the last sleep
+   * to compute the next one (`min(cap, uniform(base, prev*3))`);
+   * sequences are per delivery, so entries are dropped when the delivery
+   * settles (delivered or dead-lettered) — next to the other per-delivery
+   * cleanups.
+   */
+  private readonly decorrelatedPrevSleep = new Map<string, number>();
+  /**
    * WR-71: per-tenant SLO-breach predictors, keyed by tenant (`""` =
    * default) — mirrors `latencies` above.
    */
@@ -3964,8 +3985,14 @@ export class RetryQueue {
     if (!Number.isFinite(this.jitterMs) || this.jitterMs < 0) {
       throw new RangeError(`jitterMs must be >= 0, got ${this.jitterMs}`);
     }
-    if (this.jitterStrategy !== "additive" && this.jitterStrategy !== "full") {
-      throw new RangeError(`jitterStrategy must be "additive" or "full", got ${this.jitterStrategy}`);
+    if (
+      this.jitterStrategy !== "additive" &&
+      this.jitterStrategy !== "full" &&
+      this.jitterStrategy !== "decorrelated"
+    ) {
+      throw new RangeError(
+        `jitterStrategy must be "additive", "full" or "decorrelated", got ${this.jitterStrategy}`
+      );
     }
     // WR-172: register named retry policies first, so the endpoint
     // assignment below (and any later `setEndpointRetryPolicy`) can
@@ -6556,8 +6583,16 @@ export class RetryQueue {
    * tenant's controller (WR-48); omit it for the default tenant. The
    * global retry budget (WR-38) gates before this is computed — the two
    * compose orthogonally.
+   *
+   * WR-193: `seqKey` scopes the decorrelated-jitter random walk (the
+   * `"decorrelated"` strategy): consecutive calls with the same key form
+   * one walk (`sleep = min(cap, uniform(base, prevSleep * 3))`, starting
+   * from `base`), so pass a per-delivery key (the internal path uses the
+   * delivery id). Calls without a key are independent first steps from
+   * `base` — still bounded by `cap`, never negative. Ignored by the
+   * `"additive"` / `"full"` strategies.
    */
-  delayForAttempt(attempt: number, endpoint?: string, tenant?: string): number {
+  delayForAttempt(attempt: number, endpoint?: string, tenant?: string, seqKey?: string): number {
     // WR-172: a named policy replaces the queue's global backoff
     // parameters for this endpoint. The policy's base is used as-is:
     // WR-59 adaptive backoff is skipped for policy-assigned endpoints
@@ -6577,6 +6612,18 @@ export class RetryQueue {
     const cap = Math.min(maxDelayMs, base * 2 ** attempt);
     if (jitterStrategy === "full") {
       return this.random() * cap;
+    }
+    if (jitterStrategy === "decorrelated") {
+      // WR-193: AWS "decorrelated jitter" — the walk starts at `base`
+      // and each step is `min(cap, uniform(base, prevSleep * 3))`.
+      // `prevSleep >= base` is the loop invariant (a step never lands
+      // below `base`), so `prevSleep * 3 - base` is always non-negative.
+      const prev = seqKey !== undefined ? (this.decorrelatedPrevSleep.get(seqKey) ?? base) : base;
+      const next = Math.min(cap, base + this.random() * (prev * 3 - base));
+      if (seqKey !== undefined) {
+        this.decorrelatedPrevSleep.set(seqKey, next);
+      }
+      return next;
     }
     const jitter = jitterMs > 0 ? this.random() * jitterMs : 0;
     return Math.min(maxDelayMs, base * 2 ** attempt + jitter);
@@ -7127,7 +7174,7 @@ export class RetryQueue {
       report("exhausted", { error });
       return;
     }
-    const retryDelayMs = this.delayForAttempt(attempt, logicalEndpoint, tenant);
+    const retryDelayMs = this.delayForAttempt(attempt, logicalEndpoint, tenant, id);
     report("retrying", {
       error,
       nextDelayMs: Math.max(0, Math.round(retryDelayMs)),
@@ -7159,6 +7206,8 @@ export class RetryQueue {
     this.queue.delete(id);
     // WR-143: the delivery settled — drop any phase-timeout attribution.
     this.phaseTimeoutByDelivery.delete(id);
+    // WR-193: the retry sequence is over — drop its decorrelated-walk state.
+    this.decorrelatedPrevSleep.delete(id);
     // WR-113: settle the ordered line — a settled head wakes the next head.
     this.orderedSettle(entry.targetUrl, id);
     this.bumpPending(entry.tenantId, entry.targetUrl, -1);
@@ -7778,6 +7827,8 @@ export class RetryQueue {
         // WR-143: the delivery settled — consume the phase-timeout
         // attribution for the slo_missed block below, then drop it.
         const phaseTimeout = this.phaseTimeoutByDelivery.get(id);
+        // WR-193: the retry sequence is over — drop its decorrelated-walk state.
+        this.decorrelatedPrevSleep.delete(id);
         this.phaseTimeoutByDelivery.delete(id);
         // WR-113: settle the ordered line — a settled head wakes the next head.
         this.orderedSettle(entry.targetUrl, id);
@@ -8108,7 +8159,7 @@ export class RetryQueue {
               // and keeps it — per-item priority outranks the
               // endpoint's status schedule, just as it outranks the
               // global backoff.
-              retryDelayMs = statusDelayMs ?? this.delayForAttempt(entry.attempt, target, tenant);
+              retryDelayMs = statusDelayMs ?? this.delayForAttempt(entry.attempt, target, tenant, entry.id);
             }
           }
           this.recordDelivery(tenant, target, "retried");
@@ -8372,6 +8423,8 @@ export class RetryQueue {
     this.queue.delete(id);
     // WR-143: the delivery settled — drop the phase-timeout attribution.
     this.phaseTimeoutByDelivery.delete(id);
+    // WR-193: the retry sequence is over — drop its decorrelated-walk state.
+    this.decorrelatedPrevSleep.delete(id);
     // WR-113: settle the ordered line — a settled head wakes the next head.
     this.orderedSettle(entry.targetUrl, id);
     this.bumpPending(entry.tenantId, entry.targetUrl, -1);

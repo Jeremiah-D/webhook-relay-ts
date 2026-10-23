@@ -294,8 +294,8 @@ function assertValidRetrySnapshot(retry: unknown): void {
   num("maxDelayMs", (n) => Number.isFinite(n) && n > 0, "a finite number > 0");
   num("maxAttempts", (n) => Number.isInteger(n) && n >= 1, "an integer >= 1");
   num("jitterMs", (n) => Number.isFinite(n) && n >= 0, "a finite number >= 0");
-  if (r.jitterStrategy !== "additive" && r.jitterStrategy !== "full") {
-    fail("invalid_snapshot", 'retry.jitterStrategy must be "additive" or "full"');
+  if (r.jitterStrategy !== "additive" && r.jitterStrategy !== "full" && r.jitterStrategy !== "decorrelated") {
+    fail("invalid_snapshot", 'retry.jitterStrategy must be "additive", "full" or "decorrelated"');
   }
   for (const k of Object.keys(r)) {
     if (!["baseDelayMs", "maxDelayMs", "maxAttempts", "jitterMs", "jitterStrategy"].includes(k)) {

@@ -133,11 +133,15 @@ reliability primitives that matter for any signed-payload pipeline.
 - `src/retry.ts` — `RetryQueue` with exponential backoff (`base * 2^attempt`)
   plus jitter, a `maxDelay` cap, a dead-letter list after `maxAttempts`, and an
   injectable sender/timer for deterministic testing. Jitter is configurable:
-  `"additive"` (uniform(0, `jitterMs`) on top, default) or `"full"` (AWS-style
+  `"additive"` (uniform(0, `jitterMs`) on top, default), `"full"` (AWS-style
   uniform(0, min(cap, base*2^attempt)) — the recommended anti-thundering-herd
-  choice when many deliveries fail at once); the random source is injectable
+  choice when many deliveries fail at once), or `"decorrelated"` (AWS-style
+  decorrelated jitter: `sleep = min(cap, uniform(base, prevSleep * 3))`, a
+  per-delivery random walk that decorrelates two deliveries failing together
+  from the first retry); the random source is injectable
   (`random`) so jitter bounds are testable, and invalid configs
-  (non-positive base/cap, `maxAttempts < 1`, negative jitter) throw
+  (non-positive base/cap, `maxAttempts < 1`, negative jitter, unknown
+  jitter strategy) throw
   `RangeError`. The opt-in adaptive backoff (`adaptiveBackoff`, WR-59,
   off by default) scales the backoff *base* per endpoint from recent
   delivery outcomes — consecutive retryable failures double it toward
@@ -6197,6 +6201,14 @@ Requires Node 24+ (runs `.ts` directly via type stripping; zero dependencies).
   slot queueing, independent budgets per endpoint, `RangeError` on invalid
   configs, `getConcurrencyStats()` observability), and `stop()` unblocks
   queued waiters without losing items (restart resumes where it left off).
+- `test/retry-decorrelated.test.ts` — the `"decorrelated"` jitter strategy
+  (WR-193): first step from `base`, per-sequence random walk
+  (`min(cap, uniform(base, prevSleep * 3))`), cap never exceeded, independent
+  sequences stay independent, the walk runs end-to-end through the retry path
+  (deterministic delays 200 → 350 → 575 ms at base 100 ms), named retry
+  policies can select it per endpoint, and unknown strategies throw
+  `RangeError` at the constructor, policy registration, and hot-reload patch
+  entry points; additive/full math unchanged.
 - `test/e2e.test.ts` — end-to-end over real HTTP with the default sender: a
   flaky stub (500, 500, then 200) proves retries happen with visibly growing
   backoff and the payload arrives byte-identical (audit records `delivered`
