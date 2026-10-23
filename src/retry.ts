@@ -191,6 +191,10 @@ import {
   type ReplayApprovalOptions,
   type ReplayApprovalScope,
 } from "./replay-approval.ts";
+import {
+  EndpointDependencyGraph,
+  type EndpointDependencyOptions,
+} from "./endpoint-dependencies.ts";
 import { RetryBudget, type RetryBudgetOptions } from "./retry-budget.ts";
 import {
   RetryPolicyRegistry,
@@ -459,6 +463,8 @@ export type {
 };
 
 export type { CircuitBreakerOptions, CircuitState, CircuitStats };
+export type { EndpointDependencyOptions } from "./endpoint-dependencies.ts";
+export { EndpointDependencyGraph } from "./endpoint-dependencies.ts";
 export type { SlowStartOptions, SlowStartEndpointStats };
 export type { ReplayIdempotencyOptions, ReplayIdempotencyStats };
 export type {
@@ -1133,6 +1139,40 @@ export interface RetryBudgetDepletedInfo {
 }
 
 /**
+ * Fired once when an endpoint becomes blocked by a dependency, and once
+ * when it recovers (WR-199, edge-triggered — not per parked dispatch).
+ */
+export interface EndpointDependencyTransitionInfo {
+  /** The dependent endpoint (`targetUrl`) that paused or resumed. */
+  endpoint: string;
+  /**
+   * The (transitive) dependency whose unhealthy circuit blocked the
+   * endpoint; on recovery, the dependency that was blocking it.
+   */
+  dependency: string;
+  /** Tenant id (WR-48); absent for the default tenant. */
+  tenant?: string;
+}
+
+/**
+ * One currently dependency-blocked endpoint (WR-199). Only blocked
+ * endpoints appear — a recovered endpoint leaves the list (its
+ * transition stays in the audit trail).
+ */
+export interface EndpointDependencyStats {
+  /** The dependent endpoint (`targetUrl`). */
+  endpoint: string;
+  /** Tenant id (WR-48); absent for the default tenant. */
+  tenant?: string;
+  /** The (transitive) dependency currently blocking it. */
+  blockedBy: string;
+  /** Cumulative dispatches parked while dependency-blocked. */
+  parked: number;
+  /** Cumulative blocked/unblocked transitions. */
+  transitions: number;
+}
+
+/**
  * Fired when a delivery attempt fails and a retry is scheduled (WR-43).
  * The raw material for per-trace delivery snapshots
  * (`GET /deliveries/:traceId`): every non-terminal failure yields one line
@@ -1790,6 +1830,38 @@ export interface RetryQueueOptions {
     to: CircuitState,
     tenant?: string
   ) => void;
+  /**
+   * WR-199: endpoint dependency graph (see `src/endpoint-dependencies.ts`).
+   * An endpoint may declare `dependsOn` target URL(s); while any
+   * (transitive) dependency's circuit is not closed, the dependent
+   * pauses dispatch — parked deliveries re-check without burning a
+   * retry-budget token, consuming an attempt, or touching the
+   * dependent's own circuit breaker — and resumes automatically on
+   * recovery. A dependency cycle throws `RangeError` at construction
+   * (fail-fast). Orthogonal to WR-39 failover (routing *within* one
+   * endpoint) and WR-106 quorum (fan-out confirmation): this gates
+   * *whether* an endpoint may dispatch at all, based on *other*
+   * endpoints' health. Opt-in: absent by default (zero behavior change).
+   */
+  endpointDependencies?: EndpointDependencyOptions;
+  /**
+   * WR-199: ms between dependency-health rechecks for a parked
+   * dependent when the dependency's own cooldown horizon is unknown
+   * (no breaker configured). Default: 1000. Must be > 0.
+   */
+  dependencyRecheckMs?: number;
+  /**
+   * WR-199: called once when an endpoint becomes blocked by a
+   * dependency (edge-triggered). The server audits this as
+   * `endpoint_dependency_blocked`.
+   */
+  onEndpointDependencyBlocked?: (info: EndpointDependencyTransitionInfo) => void;
+  /**
+   * WR-199: called once when an endpoint recovers from dependency
+   * block (edge-triggered). The server audits this as
+   * `endpoint_dependency_unblocked`.
+   */
+  onEndpointDependencyUnblocked?: (info: EndpointDependencyTransitionInfo) => void;
   /**
    * WR-148: slow-start recovery ramp (see `src/slowstart.ts`). When set,
    * a breaker's half_open -> closed transition starts a per-endpoint
@@ -3574,6 +3646,21 @@ export class RetryQueue {
   private readonly armedNextAt = new Map<string, number>();
   /** Attempts parked because the endpoint's circuit was open. */
   private circuitBlocked = 0;
+  /** WR-199: endpoint dependency graph; undefined when unconfigured. */
+  private readonly endpointDependencies?: EndpointDependencyGraph;
+  /** WR-199: dependency-health recheck delay for parked dependents. */
+  private readonly dependencyRecheckMs: number;
+  /**
+   * WR-199: scoped key (WR-48) -> the dependency target currently
+   * blocking that dependent. Only blocked dependents appear.
+   */
+  private readonly dependencyBlockedBy = new Map<string, string>();
+  /** WR-199: cumulative dispatches parked while dependency-blocked, per scoped key. */
+  private readonly dependencyParkedBy = new Map<string, number>();
+  /** WR-199: cumulative blocked/unblocked transitions, per scoped key. */
+  private readonly dependencyTransitionsBy = new Map<string, number>();
+  private readonly onEndpointDependencyBlocked?: (info: EndpointDependencyTransitionInfo) => void;
+  private readonly onEndpointDependencyUnblocked?: (info: EndpointDependencyTransitionInfo) => void;
   private readonly payloadEncryptor?: PayloadEncryptor;
   /** WR-54: opt-in sealed response-body capture on `delivered` audit events. */
   private readonly responseBodyCapture: boolean;
@@ -4509,6 +4596,22 @@ export class RetryQueue {
       }
     }
     this.onAssertionFailure = opts.onAssertionFailure;
+    // WR-199: the dependency graph validates at construction — a cycle,
+    // self-dependency, or malformed entry throws RangeError/TypeError
+    // fail-fast, before any delivery can observe the graph.
+    this.endpointDependencies =
+      opts.endpointDependencies !== undefined
+        ? new EndpointDependencyGraph(opts.endpointDependencies.dependsOn)
+        : undefined;
+    const dependencyRecheckMs = opts.dependencyRecheckMs ?? 1000;
+    if (!Number.isFinite(dependencyRecheckMs) || dependencyRecheckMs <= 0) {
+      throw new RangeError(
+        `dependencyRecheckMs must be a finite number > 0, got ${dependencyRecheckMs}`
+      );
+    }
+    this.dependencyRecheckMs = dependencyRecheckMs;
+    this.onEndpointDependencyBlocked = opts.onEndpointDependencyBlocked;
+    this.onEndpointDependencyUnblocked = opts.onEndpointDependencyUnblocked;
     // WR-38: a present-but-empty object means "enabled with the generous
     // default budget"; absent means disabled. RangeError comes from the
     // RetryBudget constructor on an illegal budget.
@@ -4840,6 +4943,24 @@ export class RetryQueue {
       this.breakers.set(key, b);
     }
     return b;
+  }
+
+  /**
+   * WR-199: the first (transitive) dependency of `target` whose circuit
+   * is not closed, or `undefined` when every dependency is healthy.
+   * Reads the (tenant, endpoint) circuit breakers without side effects —
+   * a dependency with no circuit data counts as healthy (no evidence it
+   * is down). The caller must have checked
+   * `this.endpointDependencies !== undefined`.
+   */
+  private dependencyBlocker(tenant: string | undefined, target: string): string | undefined {
+    const graph = this.endpointDependencies as EndpointDependencyGraph;
+    if (!graph.hasDependencies(target)) return undefined;
+    const breaker = this.breakerFor(tenant);
+    for (const dep of graph.allDependencies(target)) {
+      if ((breaker?.state(dep) ?? "closed") !== "closed") return dep;
+    }
+    return undefined;
   }
 
   /** WR-48: the calling tenant's quota instance; `undefined` when quotas are off. */
@@ -7518,6 +7639,55 @@ export class RetryQueue {
       }
       probe = verdict.probe;
     }
+    // WR-199: endpoint dependency graph. While any (transitive)
+    // dependency's circuit is not closed the dependent pauses: the
+    // delivery is parked and re-checked, never dispatched — no
+    // retry-budget token burned, no attempt consumed, no verdict
+    // reported to the dependent's own circuit breaker. Blocked /
+    // unblocked transitions are edge-triggered into
+    // onEndpointDependencyBlocked / onEndpointDependencyUnblocked (the
+    // server audits them as endpoint_dependency_blocked/unblocked).
+    if (this.endpointDependencies !== undefined) {
+      const blockedBy = this.dependencyBlocker(tenant, target);
+      const scopeKey = tenantScopeKey(tenant, target);
+      if (blockedBy !== undefined) {
+        if (probe) breaker?.cancelProbe(target);
+        this.dependencyParkedBy.set(scopeKey, (this.dependencyParkedBy.get(scopeKey) ?? 0) + 1);
+        if (!this.dependencyBlockedBy.has(scopeKey)) {
+          this.dependencyBlockedBy.set(scopeKey, blockedBy);
+          this.dependencyTransitionsBy.set(
+            scopeKey,
+            (this.dependencyTransitionsBy.get(scopeKey) ?? 0) + 1
+          );
+          this.onEndpointDependencyBlocked?.({
+            endpoint: target,
+            dependency: blockedBy,
+            ...(tenant === undefined ? {} : { tenant }),
+          });
+        }
+        // Recheck at the dependency's own cooldown horizon when known —
+        // the earliest honest moment it could have recovered — else the
+        // configured fallback. A little jitter keeps many parked
+        // dependents from re-checking in lockstep.
+        const depBreaker = this.breakerFor(tenant);
+        const depWaitMs = depBreaker !== undefined ? depBreaker.retryInMs(blockedBy) : 0;
+        this.schedule(id, (depWaitMs > 0 ? depWaitMs : this.dependencyRecheckMs) + this.random() * 100);
+        return;
+      }
+      const wasBlockedBy = this.dependencyBlockedBy.get(scopeKey);
+      if (wasBlockedBy !== undefined) {
+        this.dependencyBlockedBy.delete(scopeKey);
+        this.dependencyTransitionsBy.set(
+          scopeKey,
+          (this.dependencyTransitionsBy.get(scopeKey) ?? 0) + 1
+        );
+        this.onEndpointDependencyUnblocked?.({
+          endpoint: target,
+          dependency: wasBlockedBy,
+          ...(tenant === undefined ? {} : { tenant }),
+        });
+      }
+    }
     // Fast-lane admission: every urgent attempt costs one token from the
     // endpoint's bucket. An empty bucket degrades the item to the normal
     // lane — the delivery still happens, just with exponential backoff —
@@ -9267,6 +9437,27 @@ export class RetryQueue {
       for (const row of breaker.stats()) {
         out.push(tenant === undefined ? row : { ...row, tenant });
       }
+    }
+    return out;
+  }
+
+  /**
+   * WR-199: currently dependency-blocked dependents. One row per
+   * blocked (tenant, endpoint) with the dependency blocking it and
+   * cumulative parked/transition counters. Empty when the dependency
+   * graph is unconfigured or nothing is blocked.
+   */
+  getEndpointDependencyStats(): EndpointDependencyStats[] {
+    const out: EndpointDependencyStats[] = [];
+    for (const [scopeKey, blockedBy] of this.dependencyBlockedBy) {
+      const { tenant, endpoint } = splitTenantScopeKey(scopeKey);
+      out.push({
+        endpoint,
+        ...(tenant === undefined ? {} : { tenant }),
+        blockedBy,
+        parked: this.dependencyParkedBy.get(scopeKey) ?? 0,
+        transitions: this.dependencyTransitionsBy.get(scopeKey) ?? 0,
+      });
     }
     return out;
   }

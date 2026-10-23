@@ -6883,6 +6883,27 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       });
       opts.retry?.onCircuitStateChange?.(endpoint, from, to, tenant);
     },
+    // WR-199: audit dependency-block transitions (edge-triggered — one
+    // line per block/unblock, not per parked dispatch); the caller's own
+    // hooks still fire afterwards.
+    onEndpointDependencyBlocked: (info) => {
+      opts.auditLog.append({
+        event: "endpoint_dependency_blocked",
+        endpoint: info.endpoint,
+        dependency: info.dependency,
+        ...(info.tenant !== undefined ? { tenant: info.tenant } : {}),
+      });
+      opts.retry?.onEndpointDependencyBlocked?.(info);
+    },
+    onEndpointDependencyUnblocked: (info) => {
+      opts.auditLog.append({
+        event: "endpoint_dependency_unblocked",
+        endpoint: info.endpoint,
+        dependency: info.dependency,
+        ...(info.tenant !== undefined ? { tenant: info.tenant } : {}),
+      });
+      opts.retry?.onEndpointDependencyUnblocked?.(info);
+    },
     // WR-149: audit replay-idempotency guard decisions; the caller's own
     // hooks still fire afterwards.
     onReplaySkipped: (info) => {

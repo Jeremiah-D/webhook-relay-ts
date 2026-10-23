@@ -3003,6 +3003,62 @@ const server = createRelayServer({
   lists, a standby equal to the primary, duplicates, chained primaries,
   and illegal thresholds.
 
+## Endpoint dependency graph (opt-in)
+
+An endpoint can declare that it *depends on* other endpoints. While any
+(transitive) dependency's circuit breaker is not closed, the dependent
+pauses dispatch — parked deliveries re-check, never fire — and resumes
+automatically when every dependency is healthy again. The use case is a
+fan-out topology where endpoint A is only useful while endpoint B is up:
+sending to A (and burning retries against it) while B is down just
+manufactures downstream noise, so the relay pauses A at the source.
+
+```ts
+const server = createRelayServer({
+  secret, forwardUrl, auditLog,
+  retry: {
+    endpointDependencies: {
+      dependsOn: {
+        "https://enrich/hook": "https://source/hook",          // single dep
+        "https://notify/hook": ["https://source/hook", "https://enrich/hook"], // multi
+      },
+    },
+    dependencyRecheckMs: 1000, // default; recheck cadence when the
+                               // dependency's cooldown is unknown
+  },
+});
+```
+
+- **Blocked condition** — a dependency counts as unhealthy when its
+  circuit state is anything but `closed`: `open` (tripped by consecutive
+  failures or the error-rate window) *or* `half_open` (a probe is in
+  flight but the endpoint has not proven healthy yet). A dependency with
+  no circuit data (no breaker configured, or never observed) counts as
+  healthy — there is no evidence it is down.
+- **Parking is neutral** — a dependency-parked delivery burns no
+  retry-budget token, consumes no attempt, and reports no verdict to the
+  dependent's own circuit breaker. Rechecks land on the dependency's own
+  cooldown horizon when known (the earliest honest moment it could have
+  recovered), else `dependencyRecheckMs`, with a little jitter so many
+  parked dependents do not re-check in lockstep.
+- **Fail-fast config** — a dependency cycle (`A → B → A`, directly or
+  transitively, including self-dependency) throws `RangeError` at
+  startup: a cycle would deadlock every endpoint in it, since nobody
+  could become healthy first. Malformed entries throw `TypeError` /
+  `RangeError` the same way.
+- **Observability** — block/unblock transitions are edge-triggered (one
+  line per transition, not per parked dispatch) and audited as
+  `endpoint_dependency_blocked` / `endpoint_dependency_unblocked`
+  (`endpoint`, `dependency`, optional `tenant`).
+  `queue.getEndpointDependencyStats()` lists currently blocked
+  dependents with their cumulative parked/transition counters.
+- **Orthogonality** — failover (WR-39) switches targets *within* one
+  logical endpoint and quorum (WR-106) confirms M-of-N fan-out *for* one
+  endpoint; the dependency graph decides *whether* an endpoint may
+  dispatch at all, based on *other* endpoints' health. Tenant-scoped
+  breakers are respected: a dependency is evaluated against the same
+  tenant's circuit state as the dependent.
+
 ## Weighted multi-target dispatch (opt-in)
 
 Where failover (above) answers "which target is *up*", weighted mode
