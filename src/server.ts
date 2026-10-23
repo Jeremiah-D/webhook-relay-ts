@@ -297,7 +297,9 @@ import { decompressMessage, WsInflateBombError } from "./deflate.ts";
 import { assertValidCaBundle, assertValidPins, normalizePin, spkiFingerprint, TlsPinMismatchError } from "./pinning.ts";
 import {
   assertValidClientCert,
+  assertValidClientCertTargetKey,
   clientCertIdentity,
+  resolveClientCertTarget,
   type TlsClientCert,
 } from "./mtls.ts";
 import {
@@ -982,8 +984,9 @@ export interface RelayServerOptions {
   chaos?: ChaosConfig;
   /**
    * Outbound mTLS client certificates (see `src/mtls.ts`): per-endpoint
-   * client identity, keyed by exact delivery `targetUrl`. Each entry is a
-   * `{ cert, key, passphrase? }` triple of PEM *strings* held in memory —
+   * client identity, keyed by exact delivery `targetUrl`, `*.hostname`
+   * wildcard, or path-prefix URL (WR-198: exact > wildcard > prefix).
+   * Each entry is a `{ cert, key, passphrase? }` triple of PEM *strings* held in memory —
    * no file paths, so rotation is a config change. During the TLS
    * handshake the relay presents this certificate, proving to the
    * downstream that the request comes from this relay (the downstream
@@ -2479,8 +2482,11 @@ export interface RelayServerOptions {
  *
  * `tlsClientCerts` is the per-endpoint mTLS client identity (see
  * `src/mtls.ts` and the `tlsClientCerts` server option):
- * `{ "<exact targetUrl>": { cert, key, passphrase? } }`, PEM strings held
- * in memory. The relay presents the certificate during the TLS handshake
+ * `{ "<exact targetUrl | *.hostname | path-prefix URL>": { cert, key,
+ * passphrase? } }`, PEM strings held in memory. WR-198: keys may be an
+ * exact `targetUrl`, a `*.hostname` wildcard, or a path-prefix URL (e.g.
+ * `https://api.example.com/v1`); resolution priority is
+ * exact > wildcard > path prefix. The relay presents the certificate during the TLS handshake
  * so the downstream can verify the request really comes from this relay.
  * Off by default; composes with `tlsPins` and the keep-alive pool (agents
  * are keyed per `(origin, cert)`). Invalid values throw `RangeError` at
@@ -3054,6 +3060,13 @@ export function createDefaultSender(
   if (tlsClientCerts !== undefined) {
     for (const [endpoint, cert] of Object.entries(tlsClientCerts)) {
       try {
+        assertValidClientCertTargetKey(endpoint, `tlsClientCerts[${endpoint}]`);
+      } catch (err) {
+        throw new RangeError(
+          `createDefaultSender: invalid TLS client certificate target key for ${endpoint}: ${(err as Error).message}`
+        );
+      }
+      try {
         assertValidClientCert(cert, `tlsClientCerts[${endpoint}]`);
       } catch (err) {
         throw new RangeError(
@@ -3094,7 +3107,14 @@ export function createDefaultSender(
           `createDefaultSender: invalid tlsClientCertRotation for ${endpoint}: expected a RotatingClientCertSet (compile with new RotatingClientCertSet(cfg))`
         );
       }
-      if (tlsClientCerts !== undefined && tlsClientCerts[endpoint] !== undefined) {
+      // WR-198: the exclusion is identity overlap, not key equality — a
+      // rotation endpoint also conflicts when a wildcard or path-prefix
+      // `tlsClientCerts` entry would resolve for it (an endpoint must
+      // present exactly one identity, or none).
+      if (
+        tlsClientCerts !== undefined &&
+        resolveClientCertTarget(tlsClientCerts, endpoint) !== undefined
+      ) {
         throw new RangeError(
           `createDefaultSender: endpoint ${endpoint} configures both tlsClientCerts and tlsClientCertRotation — use one`
         );
@@ -4957,11 +4977,14 @@ export function createDefaultSender(
     // the opt-in HTTP/2 pool does not take the bundle). `undefined` for
     // endpoints without an entry keeps the exact pre-WR-163 behavior.
     const caBundle = url.protocol === "https:" ? tlsCa?.[item.targetUrl] : undefined;
-    // mTLS client identity for this endpoint (exact targetUrl match):
-    // the certificate is presented during the TLS handshake so the
-    // downstream can verify the relay. Off by default — endpoints without
-    // an entry send no client certificate, exactly as before.
-    const clientCert = url.protocol === "https:" ? tlsClientCerts?.[item.targetUrl] : undefined;
+    // mTLS client identity for this endpoint (WR-36 exact targetUrl
+    // match, WR-198 wildcard/path-prefix patterns — see
+    // `resolveClientCertTarget` in `src/mtls.ts`): the certificate is
+    // presented during the TLS handshake so the downstream can verify
+    // the relay. Off by default — endpoints without an entry send no
+    // client certificate, exactly as before.
+    const clientCert =
+      url.protocol === "https:" ? resolveClientCertTarget(tlsClientCerts, item.targetUrl) : undefined;
     // WR-89: rotation set for this endpoint (exact targetUrl match).
     // Mutual exclusion with `tlsClientCerts` is enforced at sender
     // construction, so at most one of the two is ever set here.

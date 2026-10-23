@@ -74,7 +74,8 @@ export interface MeshOptions {
    *   the mesh gate is redundant and skipped.)
    * - outbound: a mesh hop is only forwarded over `https:` and only
    *   with a client identity configured for the peer endpoint (WR-36
-   *   `tlsClientCerts`, exact targetUrl match). A mesh hop to a peer
+   *   `tlsClientCerts`, WR-198 target resolution — exact, wildcard, or
+   *   path-prefix match). A mesh hop to a peer
    *   without one is refused locally instead of being sent
    *   unauthenticated.
    *

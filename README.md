@@ -858,8 +858,10 @@ reliability primitives that matter for any signed-payload pipeline.
   rides the handshake). Invalid bundles throw `RangeError` at startup.
   `https:` targets only — `wss:` targets keep the pinning handshake.
 - `src/mtls.ts` — outbound mTLS client certificates: a per-endpoint client
-  identity (`tlsClientCerts: { "<exact targetUrl>": { cert, key, passphrase? } }`,
-  also exposed as `createRelayServer({ tlsClientCerts })` and the fifth
+  identity (`tlsClientCerts: { "<exact targetUrl | *.hostname | path-prefix URL>":
+  { cert, key, passphrase? } }`, WR-198 target resolution with priority
+  exact > wildcard > path prefix; also exposed as
+  `createRelayServer({ tlsClientCerts })` and the fifth
   `createDefaultSender(pins, keepAlive, outboundSigning, proxies, tlsClientCerts)`
   argument). The `cert`/`key` are PEM *strings* held in memory — no file paths,
   so rotation is a config change. The relay presents the certificate during the
@@ -871,8 +873,9 @@ reliability primitives that matter for any signed-payload pipeline.
   `(origin, cert)`, so a connection authenticated as one identity can never
   serve an endpoint configured with a different one; a handshake that fails
   destroys the socket, and the checkout probe culls it, so it is never handed
-  to another delivery). Empty cert/key, unparseable PEM, and cert/key mismatch
-  throw `RangeError` at startup. Zero dependencies (`node:crypto` + `node:tls`).
+  to another delivery). Empty cert/key, unparseable PEM, cert/key mismatch,
+  and malformed target keys (not `*.hostname` or an `http(s)` URL) throw
+  `RangeError` at startup. Zero dependencies (`node:crypto` + `node:tls`).
 - `src/inbound-mtls.ts` — inbound mTLS client-certificate authentication
   (WR-103): `createRelayServer({ inboundMtls: { key, cert, ca,
   requireCert?, clientFingerprints?, operatorMtls? } })` turns the

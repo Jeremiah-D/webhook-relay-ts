@@ -2,7 +2,7 @@ import type { Socket } from "node:net";
 import type { Agent as HttpAgent } from "node:http";
 import type { TLSSocket } from "node:tls";
 import { OutboundConnectionPool } from "./keepalive.ts";
-import { type TlsClientCert, clientCertIdentity } from "./mtls.ts";
+import { type TlsClientCert, clientCertIdentity, resolveClientCertTarget } from "./mtls.ts";
 import { type RotatingClientCertSet } from "./mtls-rotation.ts";
 import {
   resolveTlsSniOverride,
@@ -167,8 +167,9 @@ function resolveWarmupTarget(
   if (url.protocol !== "http:" && url.protocol !== "https:") {
     return { error: `unsupported_protocol: ${url.protocol} (warm-up covers http:/https: only)` };
   }
-  // Mirrors defaultSender: pins and client certs are exact-targetUrl
-  // matches, SNI overrides resolve per target, proxies fall back to the
+  // Mirrors defaultSender: pins are an exact-targetUrl match; client
+  // certs use WR-198 target resolution (exact, wildcard, path prefix).
+  // SNI overrides resolve per target, proxies fall back to the
   // environment (read now — a proxy rotation after startup only affects
   // deliveries, which re-resolve per attempt).
   const pins = url.protocol === "https:" ? cfg.tlsPins?.[endpoint] : undefined;
@@ -176,7 +177,8 @@ function resolveWarmupTarget(
   // one new handshakes will use — mirroring defaultSender's lookup.
   const clientCert =
     url.protocol === "https:"
-      ? (cfg.tlsClientCertRotations?.get(endpoint)?.primary().cert ?? cfg.tlsClientCerts?.[endpoint])
+      ? (cfg.tlsClientCertRotations?.get(endpoint)?.primary().cert ??
+        resolveClientCertTarget(cfg.tlsClientCerts, endpoint))
       : undefined;
   const tlsSni = url.protocol === "https:" ? resolveTlsSniOverride(endpoint, url, cfg.tlsSniOverrides) : undefined;
   let proxyUrl: string | undefined;
