@@ -28,7 +28,7 @@ import {
   selectSignatureAlgorithmVerifier,
   type SignatureAlgorithmRule,
 } from "./signature-alg.ts";
-import { RetryQueue, errorBudgetBurnAuditEvent, type BurnRateAlertInfo, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type RetryItem, type Sender, type SenderCallOptions, type MaintenanceWindowTransition } from "./retry.ts";
+import { RetryQueue, errorBudgetBurnAuditEvent, type BurnRateAlertInfo, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type RetryItem, type Sender, type SenderCallOptions, type MaintenanceWindowTransition, type WeightsRetunedInfo } from "./retry.ts";
 import { parseDeliverAtHeader, DELIVER_AT_HEADER } from "./retry.ts";
 import type { ShadowDeliveredInfo, ShadowFailedInfo, ShadowTargetConfig, ShadowTargetsConfig } from "./retry.ts";
 import type {
@@ -6200,6 +6200,29 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
             onBurnRateAlert: (info: BurnRateAlertInfo) => {
               opts.auditLog.append(errorBudgetBurnAuditEvent(info));
               opts.retry?.errorBudget?.onBurnRateAlert?.(info);
+            },
+          },
+        }),
+    // WR-201: wrap the caller's `onWeightsRetuned` so every applied
+    // retune is audited as `weight_retuned` with before/after weights,
+    // not just observed.
+    ...(opts.retry?.weightTuning === undefined
+      ? {}
+      : {
+          weightTuning: {
+            ...opts.retry.weightTuning,
+            onWeightsRetuned: (info: WeightsRetunedInfo) => {
+              opts.auditLog.append({
+                event: "weight_retuned",
+                endpoint: info.endpoint,
+                at: info.at,
+                before: info.before,
+                after: info.after,
+                scores: info.scores,
+                smoothed: info.smoothed,
+                ...(activeOperatorKeyId !== undefined ? { keyId: activeOperatorKeyId } : {}),
+              });
+              opts.retry?.weightTuning?.onWeightsRetuned?.(info);
             },
           },
         }),

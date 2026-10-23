@@ -343,6 +343,14 @@ import {
   type WeightedTargetConfig,
 } from "./weighted.ts";
 import {
+  WeightTuner,
+  WeightTuneSweeper,
+  type WeightsRetunedInfo,
+  type WeightTunerOptions,
+  type WeightTuneSweeperOptions,
+  type WeightTuningOptions,
+} from "./weight-tuner.ts";
+import {
   GlobalConcurrencyGate,
   type GlobalConcurrencyStats,
 } from "./global-concurrency.ts";
@@ -489,6 +497,13 @@ export type {
   EndpointHealthOptions,
   EndpointHealthStatsRow,
   EndpointRecoveredInfo,
+};
+export { WeightTuner, WeightTuneSweeper };
+export type {
+  WeightsRetunedInfo,
+  WeightTunerOptions,
+  WeightTuneSweeperOptions,
+  WeightTuningOptions,
 };
 export { PayloadTransformer, PayloadTransformError, TemplateError };
 export type { PayloadTransformRules, TransformContext };
@@ -2293,6 +2308,19 @@ export interface RetryQueueOptions {
    */
   weightedNow?: () => number;
   /**
+   * WR-201: adaptive weight tuning on top of WR-66 weighted dispatch.
+   * Opt-in: periodically retunes each weighted endpoint's per-target
+   * weights against their WR-179 health scores (EWMA-smoothed,
+   * hysteresis-guarded, bounded single-round steps). Requires
+   * `weighted` to be configured — configuring `weightTuning` without
+   * it throws `RangeError` at construction. Every applied retune fires
+   * `onWeightsRetuned` (audited as `weight_retuned` by the server).
+   * Manual weight changes (WR-32 `updateEndpointConfig` `weighted`
+   * patches) always win: they re-baseline the tuner. Defaults:
+   * 60s interval, EWMA 0.3, 25% max step, 5-point hysteresis.
+   */
+  weightTuning?: WeightTuningOptions;
+  /**
    * Delivery completion callbacks (WR-47; see `src/callback.ts`). Opt-in:
    * when a delivery reaches a terminal state (`delivered` or
    * `dead_letter`), the relay POSTs a signed receipt (traceId,
@@ -4012,6 +4040,10 @@ export class RetryQueue {
   /** WR-68: cumulative entries held back by the egress gate. */
   private replayEgressThrottled = 0;
   private readonly prober?: DownstreamProber;
+  /** WR-201: adaptive weight tuner; undefined when `weightTuning` is unset. */
+  private readonly weightTuner?: WeightTuner;
+  /** WR-201: periodic retune sweeper; undefined when `weightTuning` is unset. */
+  private readonly weightTuneSweeper?: WeightTuneSweeper;
   /** WR-83: OTLP delivery-event exporter; undefined when not configured. */
   private readonly otlpExporter?: OtlpExporter;
   /**
@@ -4488,7 +4520,38 @@ export class RetryQueue {
             onSwitch: (event) => this.recordFailoverSwitch(event),
           })
         : undefined;
-    this.onFailoverSwitch = opts.onFailoverSwitch;    this.laneScheduler = new LaneScheduler({
+    this.onFailoverSwitch = opts.onFailoverSwitch;
+    // WR-201: adaptive weight tuning on WR-66 weighted dispatch.
+    // Opt-in; the tuner's `healthOf` reads the WR-179 per-target scores
+    // on the default tenant (health is already recorded per physical
+    // target, leader-only, alongside the breaker verdicts). Without
+    // WR-179 every target scores 100 and the tuner is a steady-state
+    // no-op. Requires `weighted` — tuning without targets to tune is
+    // a configuration error, not a silent no-op.
+    if (opts.weightTuning !== undefined) {
+      if (this.weighted === undefined) {
+        throw new RangeError("weightTuning requires weighted dispatch to be configured");
+      }
+      const tuning = opts.weightTuning;
+      this.weightTuner = new WeightTuner({
+        dispatcher: this.weighted,
+        healthOf: (endpoint, target) => this.endpointHealthFor(undefined)?.score(target) ?? 100,
+        now: tuning.now,
+        ewmaAlpha: tuning.ewmaAlpha,
+        maxStepRatio: tuning.maxStepRatio,
+        hysteresisPoints: tuning.hysteresisPoints,
+        minWeightFloor: tuning.minWeightFloor,
+        retuneEpsilon: tuning.retuneEpsilon,
+        onWeightsRetuned: tuning.onWeightsRetuned,
+      });
+      this.weightTuneSweeper = new WeightTuneSweeper({
+        tuner: this.weightTuner,
+        retuneIntervalMs: tuning.retuneIntervalMs,
+        setTimer: tuning.setTimer,
+        clearTimer: tuning.clearTimer,
+      });
+    }
+    this.laneScheduler = new LaneScheduler({
       minNormalShare: opts.urgent?.minNormalShare ?? 0.2,
       onActivation: (event) => this.onStarvationGuardAudit?.(event),
     });
@@ -6040,6 +6103,25 @@ export class RetryQueue {
   }
 
   /**
+   * Run one adaptive weight-tuning round immediately (WR-201): retune
+   * every weighted endpoint whose targets' smoothed WR-179 scores have
+   * drifted past the hysteresis. The armed sweep timer calls this on
+   * its schedule; calling it directly is safe and does not disturb the
+   * schedule. Returns `[]` when weight tuning is not configured.
+   */
+  retuneWeightedTargets(): WeightsRetunedInfo[] {
+    return this.weightTuneSweeper?.sweepNow() ?? [];
+  }
+
+  /**
+   * The opt-in weight-tuning sweeper, or `undefined` when no
+   * `weightTuning` option was configured.
+   */
+  getWeightTuneSweeper(): WeightTuneSweeper | undefined {
+    return this.weightTuneSweeper;
+  }
+
+  /**
    * The opt-in stale-endpoint auto-pause sweeper, or `undefined` when
    * no `stalePause` option was configured.
    */
@@ -6632,6 +6714,8 @@ export class RetryQueue {
     this.stalePauser?.start();
     // Opt-in only: undefined when `probe` was never configured.
     this.prober?.start();
+    // WR-201: opt-in only — undefined when `weightTuning` was never configured.
+    this.weightTuneSweeper?.start();
     // WR-83: opt-in only — re-arm a pending OTLP export retry timer
     // (cleared by `stop()`) when records are still buffered.
     this.otlpExporter?.resume();
@@ -6651,6 +6735,8 @@ export class RetryQueue {
     this.prober?.stop();
     this.callbacker?.stop();
     this.escalation?.stop();
+    // WR-201: no retune rounds while stopped.
+    this.weightTuneSweeper?.stop();
     // WR-83: opt-in only — clear the export retry timer and kick off one
     // best-effort flush (fire-and-forget; `stop()` is synchronous).
     this.otlpExporter?.stop();
@@ -6727,6 +6813,9 @@ export class RetryQueue {
     this.stalePauser?.stop();
     // Same for the health prober: no new probe rounds mid-shutdown.
     this.prober?.stop();
+    // WR-201: same for the weight tuner — a round must not rewire
+    // weights while the queue is draining.
+    this.weightTuneSweeper?.stop();
     // WR-57: parked-but-not-due deliveries are dropped, exactly like
     // backoff-waiting ones — they were never delivered. (The delay queue
     // is in-memory only; a restart does not recover it either.)
@@ -7221,6 +7310,10 @@ export class RetryQueue {
         patch.weighted.targets.map((t) => ({ targetUrl: t.targetUrl, weight: t.weight }))
       );
       this.weighted.setWeights(endpoint, patch.weighted.targets);
+      // WR-201: the operator's weights are the truth — re-baseline the
+      // tuner so the next automatic round derives from them instead of
+      // fighting the manual edit.
+      this.weightTuner?.noteManualWeights(endpoint, patch.weighted.targets);
     }
     if (patch.retry !== undefined) {
       const r = patch.retry;

@@ -3142,6 +3142,63 @@ const server = createRelayServer({
   lists, empty/duplicate `targetUrl`s, and non-positive or non-finite
   weights.
 
+## Adaptive weight tuning (opt-in)
+
+A closed-loop controller on top of weighted dispatch (WR-201). Static
+weights answer "what share does each target deserve"; the tuner answers
+"how should the shares move while targets drift":
+
+- **Signal** — each target's WR-179 health score (already recorded per
+  physical target, leader-only, like the breaker verdicts). Without
+  WR-179 every target scores 100 and the tuner is a steady-state no-op.
+- **Smoothing** — per-target scores pass through an EWMA
+  (`ewmaAlpha`, default 0.3) so one unlucky delivery cannot swing the
+  traffic share.
+- **Hysteresis** — a round applies only when some target's smoothed
+  score has drifted at least `hysteresisPoints` (default 5) from the
+  score its weights were tuned against; small wiggles move nothing.
+- **Bounded steps** — one round moves a target at most `maxStepRatio`
+  (default 0.25) of its current weight, so a bad signal degrades
+  traffic gradually, never in one jump.
+- **Manual precedence** — any weight change made outside the tuner
+  (the WR-32 `weighted` patch or a direct `setWeights`) wins outright:
+  the tuner re-baselines to it and never fights it.
+
+The target law is relative: each target's new weight derives from its
+*manual baseline* weight scaled by smoothed health — a fully healthy
+target keeps exactly its configured share, so equal health means zero
+drift. A zero-health target keeps a small `minWeightFloor` share
+(default 5% of baseline) so it stays in the rotation for health
+exclusion to observe; weights stay positive, as WR-66 requires.
+
+```ts
+const queue = new RetryQueue({
+  sender,
+  weighted: {
+    "https://api.example.com/hook": {
+      targets: [
+        { targetUrl: "https://a.example.com/hook", weight: 5 },
+        { targetUrl: "https://b.example.com/hook", weight: 3 },
+      ],
+    },
+  },
+  endpointHealth: {}, // WR-179 per-target scores feed the tuner
+  weightTuning: {
+    retuneIntervalMs: 60_000, // default
+    // ewmaAlpha, maxStepRatio, hysteresisPoints, minWeightFloor,
+    // retuneEpsilon, now, setTimer/clearTimer all optional
+  },
+});
+```
+
+Every applied retune fires `onWeightsRetuned` with
+`{ endpoint, at, before, after, scores, smoothed }`; the server audits
+it as `weight_retuned` (before/after weights included). `queue.
+retuneWeightedTargets()` runs one round immediately for tests and
+operator tooling. Configuring `weightTuning` without `weighted`
+throws `RangeError` at startup — tuning with no targets is a
+configuration error, not a silent no-op.
+
 ## Quorum fan-out: M-of-N downstream acknowledgement (opt-in)
 
 Where weighted mode answers "how is traffic *shared*", quorum fan-out
