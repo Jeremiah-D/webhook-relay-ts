@@ -4695,6 +4695,52 @@ const server = createRelayServer({
   throw `RangeError` at startup. Absent by default: with no `dnsCache`
   configured, every connection uses the OS resolver.
 
+## DNS resolution pinning (opt-in)
+
+TLS pinning (WR-21) catches a wrong *key*; it cannot catch a hijacked
+*resolver* answering with attacker-controlled IPs. DNS pinning
+(`src/dns-pin.ts`, `node:dns` only) pins the *resolution result* itself:
+the first successful resolution of a hostname establishes the baseline,
+and any later drift (an address added or removed) is a pin mismatch.
+
+```ts
+const server = createRelayServer({
+  dnsPin: { mode: "enforce" },   // or a compiled `new DnsPin({...})`
+});
+```
+
+- **Fail-closed by default** — in `"enforce"` mode a drifted lookup is
+  refused with `DnsPinMismatchError` before a single payload byte is
+  written; the delivery attempt fails and follows the normal retry /
+  dead-letter path, and the old baseline is kept (the relay never adopts
+  unverified addresses). `"warn"` mode serves the drifted answer, audits
+  once, and adopts the new baseline — for downstreams with legitimate
+  rotations where warn-only is the pragmatic choice.
+- **Audit** — every drift is audited as `dns_pin_mismatch` (hostname,
+  pinned baseline, observed addresses, mode). Operators re-baseline
+  after a verified change with `sender.dnsPin.reset(hostname)` and
+  inspect baselines with `sender.dnsPin.getPinned(hostname)`.
+- **Layering** — the pin wraps the effective lookup (the WR-92 cache when
+  configured, the system resolver otherwise) via `dns.lookup`-compatible
+  `pin.lookup`, so it judges exactly the addresses the connection will
+  use. Orthogonal to the cache (which only caches) and to WR-21 TLS
+  pinning (handshake layer, not resolution layer). A *failed* resolution
+  is not a mismatch — the inner error passes through to the normal
+  DNS-failure path. Round-robin *ordering* never trips the pin (sets are
+  compared sorted); resolvers returning varying *subsets* will read as
+  drift — prefer `"warn"` there.
+- **Pooling note** — with keep-alive pooling (the default), an
+  established connection is reused without re-resolving; drift is
+  detected on the next *new* connection's lookup, which is the correct
+  security semantic (the live connection already went to the pinned
+  address). Per-endpoint DoH bindings (WR-170) resolve through their own
+  DoH caches and are not pin-checked.
+- **Observability** — `GET /metrics` renders `relay_dns_pin_*`
+  (`lookups_total{result="checked"|"refused"|"warned"}`,
+  `mismatches_total`, `hosts` gauge); `sender.dnsPin.getStats()` exposes
+  the counters. Bounded by `maxHosts` (default 1024, longest-pinned
+  evicted); invalid `mode` / `maxHosts` throw `RangeError` at startup.
+
 ## Per-endpoint DNS-over-HTTPS (opt-in)
 
 The outbound DNS cache above still trusts the host's resolver — a single
@@ -6209,6 +6255,16 @@ Requires Node 24+ (runs `.ts` directly via type stripping; zero dependencies).
   policies can select it per endpoint, and unknown strategies throw
   `RangeError` at the constructor, policy registration, and hot-reload patch
   entry points; additive/full math unchanged.
+- `test/dns-pin.test.ts` — DNS resolution pinning (WR-194): first answer
+  establishes the baseline, round-robin ordering is not drift, enforce
+  mode refuses drifted lookups fail-closed (`DnsPinMismatchError`,
+  baseline kept), warn mode serves once and adopts the new baseline,
+  inner failures pass through unjudged, `reset()` re-baselines,
+  maxHosts eviction, `RangeError` on invalid options, activity-gated
+  `relay_dns_pin_*` exposition, wrapping a `DnsCache` lookup, and
+  end-to-end through the relay server (delivery on matching baseline,
+  dead-letter + `dns_pin_mismatch` audit on drift, drifted address never
+  sees a byte).
 - `test/e2e.test.ts` — end-to-end over real HTTP with the default sender: a
   flaky stub (500, 500, then 200) proves retries happen with visibly growing
   backoff and the payload arrives byte-identical (audit records `delivered`

@@ -332,6 +332,7 @@ import {
 } from "./cert-expiry.ts";
 import { OutboundConnectionPool, type KeepAlivePoolOptions } from "./keepalive.ts";
 import { DnsCache, type DnsCacheOptions } from "./dns-cache.ts";
+import { DnsPin, type DnsPinMismatchInfo, type DnsPinOptions } from "./dns-pin.ts";
 import { warmupOutboundPool, resolveWarmupOptions } from "./warmup.ts";
 import { AuditSink, type AuditSinkOptions } from "./audit-sink.ts";
 import { SyslogAuditSink, type SyslogAuditSinkOptions } from "./syslog-sink.ts";
@@ -1343,6 +1344,20 @@ export interface RelayServerOptions {
    * behavior. Invalid values throw `RangeError` at startup.
    */
   dnsCache?: DnsCache | DnsCacheOptions;
+  /**
+   * WR-194: outbound DNS resolution pinning (see `src/dns-pin.ts`) — a
+   * compiled `DnsPin` or options to build one. When set, the default
+   * sender's pooled agents (WR-24) and one-off requests resolve through
+   * the pin, which wraps the `dnsCache` lookup when one is configured
+   * (the system resolver otherwise): the first successful resolution of
+   * a hostname pins the baseline, and a later drift is refused
+   * fail-closed (`mode: "enforce"`, default) or served with a warning
+   * (`mode: "warn"`). Every drift is audited as `dns_pin_mismatch`.
+   * Counters render into `GET /metrics` as `relay_dns_pin_*`.
+   * `undefined` keeps the OS-resolver behavior. Invalid values throw
+   * `RangeError` at startup.
+   */
+  dnsPin?: DnsPin | DnsPinOptions;
   /**
    * Outbound connection warm-up (WR-70, see `src/warmup.ts`): at startup,
    * pre-establish keep-alive connections for the listed endpoint URLs on
@@ -2503,6 +2518,15 @@ export interface PooledSender extends Sender {
    */
   dnsCache: DnsCache | undefined;
   /**
+   * WR-194: the outbound DNS resolution pin, when configured — shared
+   * by the pooled and one-off request paths. `undefined` when the
+   * feature is off. Counters render into `GET /metrics` as
+   * `relay_dns_pin_*` via `render()`; operators read the pinned
+   * baselines via `sender.dnsPin.getPinned(hostname)` and re-baseline
+   * after a verified change with `sender.dnsPin.reset(hostname)`.
+   */
+  dnsPin: DnsPin | undefined;
+  /**
    * WR-170: per-DoH-URL DNS caches for endpoints with a `doh` entry,
    * keyed by DoH URL. Operators read counters via
    * `sender.dohCaches.get(dohUrl)?.getStats()`; the underlying
@@ -2840,7 +2864,24 @@ export function createDefaultSender(
    * rather than accepting webhooks it could never deliver); `undefined`
    * keeps the exact pre-WR-192 wire shape.
    */
-  outboundCredentials?: Record<string, OutboundCredentialConfig[]>
+  outboundCredentials?: Record<string, OutboundCredentialConfig[]>,
+  /**
+   * WR-194: outbound DNS resolution pinning (see `src/dns-pin.ts`) — a
+   * compiled `DnsPin` or options to build one. When set, the pooled
+   * agents (WR-24) and one-off requests resolve through the pin, which
+   * wraps the WR-92 DNS cache lookup when one is configured (the system
+   * resolver otherwise) — a compiled instance keeps its own inner
+   * lookup. `undefined` keeps the exact pre-WR-194 behavior. Validated
+   * at startup.
+   */
+  dnsPin?: DnsPin | DnsPinOptions,
+  /**
+   * WR-194: called once per detected DNS resolution drift (both modes).
+   * `createRelayServer` audits these as `dns_pin_mismatch`; library
+   * users get the hook directly. A compiled `DnsPin` instance keeps its
+   * own `onMismatch`.
+   */
+  onDnsPinMismatch?: (info: DnsPinMismatchInfo) => void
 ): PooledSender {
   if (tlsPins !== undefined) {
     for (const [endpoint, pins] of Object.entries(tlsPins)) {
@@ -3283,6 +3324,31 @@ export function createDefaultSender(
   }
   // Bound arrow property — no `this` context needed downstream.
   const dnsLookup = resolvedDnsCache?.lookup;
+  // WR-194: compile the DNS pin once — it wraps the effective lookup
+  // (the WR-92 cache above when configured, the system resolver
+  // otherwise), so the pin judges exactly the addresses the connection
+  // will use. A caller-supplied compiled instance keeps its own inner
+  // lookup and mismatch hook.
+  let resolvedDnsPin: DnsPin | undefined;
+  if (dnsPin !== undefined) {
+    try {
+      resolvedDnsPin =
+        dnsPin instanceof DnsPin
+          ? dnsPin
+          : new DnsPin({
+              ...dnsPin,
+              // An explicit inner lookup wins; otherwise the pin wraps
+              // the effective lookup (WR-92 cache or system resolver).
+              inner: dnsPin.inner ?? dnsLookup,
+              onMismatch: onDnsPinMismatch ?? dnsPin.onMismatch,
+            });
+    } catch (err) {
+      throw new RangeError(`createDefaultSender: invalid dnsPin: ${(err as Error).message}`);
+    }
+  }
+  // The pin-checked lookup feeds the pool and the one-off request path;
+  // without the pin this is exactly the pre-WR-194 lookup.
+  const pinCheckedLookup = resolvedDnsPin?.lookup ?? dnsLookup;
   // WR-170: fail fast on a misconfigured DoH URL — a typo must not
   // silently leave an endpoint on the system resolver.
   if (doh !== undefined) {
@@ -3324,7 +3390,10 @@ export function createDefaultSender(
     keepAlive === false
       ? undefined
       : new OutboundConnectionPool(
-          dnsLookup === undefined ? keepAlive : { ...(keepAlive ?? {}), lookup: dnsLookup }
+          // WR-194: the pool's agents resolve through the pin-checked
+          // lookup — a drifted answer refuses the connection before a
+          // single payload byte is written.
+          pinCheckedLookup === undefined ? keepAlive : { ...(keepAlive ?? {}), lookup: pinCheckedLookup }
         );
   // WR-89: id of the rotation client certificate most recently used in a
   // handshake attempt, per delivery (queue item id). Written on every
@@ -4022,7 +4091,9 @@ export function createDefaultSender(
                   agent: agent ?? false,
                   // WR-92: one-off (unpooled) requests resolve through the
                   // DNS cache too — same stale-while-revalidate as pooled.
-                  ...(dnsLookup !== undefined ? { lookup: dnsLookup } : {}),
+                  // WR-194: pin-checked — a drifted answer refuses the
+                  // connection before a single payload byte is written.
+                  ...(pinCheckedLookup !== undefined ? { lookup: pinCheckedLookup } : {}),
                   // WR-163: per-endpoint private CA bundle — Node verifies
                   // the chain against it (`rejectUnauthorized` stays on),
                   // so with pins also configured this is chain-first: a
@@ -4083,7 +4154,9 @@ export function createDefaultSender(
                   agent: agent ?? false,
                   // WR-92: one-off (unpooled) requests resolve through the
                   // DNS cache too — same stale-while-revalidate as pooled.
-                  ...(dnsLookup !== undefined ? { lookup: dnsLookup } : {}),
+                  // WR-194: pin-checked — a drifted answer refuses the
+                  // connection before a single payload byte is written.
+                  ...(pinCheckedLookup !== undefined ? { lookup: pinCheckedLookup } : {}),
                 },
                 onResponse
               );
@@ -5076,6 +5149,11 @@ export function createDefaultSender(
   // WR-92: the shared DNS cache instance (undefined when the feature is
   // off) — operators read counters via `sender.dnsCache.getStats()`.
   sender.dnsCache = resolvedDnsCache;
+  // WR-194: the shared DNS pin instance (undefined when the feature is
+  // off) — operators read counters via `sender.dnsPin.getStats()`,
+  // baselines via `sender.dnsPin.getPinned(hostname)`, and re-baseline
+  // after a verified change via `sender.dnsPin.reset(hostname)`.
+  sender.dnsPin = resolvedDnsPin;
   // WR-170: per-DoH-URL DNS caches (empty when the feature is off) —
   // operators read counters via `sender.dohCaches.get(dohUrl)?.getStats()`.
   sender.dohCaches = dohCaches;
@@ -5630,6 +5708,23 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       error: info.error,
     });
   };
+  // WR-194: a pinned hostname's DNS resolution drifted — one audit line
+  // per drift naming the hostname, the pinned baseline, the observed
+  // addresses, and the pin mode. In "enforce" mode the lookup was
+  // refused (the delivery attempt failed and follows the normal retry /
+  // dead-letter path); in "warn" mode the drifted addresses were served
+  // and adopted as the new baseline. Wired into the main sender below;
+  // WR-85 shadow sender copies keep the pre-existing unpinned behavior.
+  const onDnsPinMismatchAudit = (info: DnsPinMismatchInfo) => {
+    opts.auditLog.append({
+      event: "dns_pin_mismatch",
+      hostname: info.hostname,
+      pinned: info.pinned,
+      observed: info.observed,
+      mode: info.mode,
+      at: info.at,
+    });
+  };
   // WR-165: a chaos-drill fault was injected — one audit line per fault
   // naming the endpoint, the fault kind, and the detail (latency or
   // synthetic status). Injected faults are always distinguishable from
@@ -5796,7 +5891,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   }
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, opts.awsSigV4, opts.awsSecretResolver, opts.outboundSchemas, opts.oauth2, undefined, opts.compressBrotli, opts.phaseTimeouts, opts.tlsCa, opts.chaos, onChaosInjectedAudit, opts.responseGuard, opts.doh, onDohFallbackAudit, proxyHealthMonitor, opts.outboundCredentials)
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, opts.awsSigV4, opts.awsSecretResolver, opts.outboundSchemas, opts.oauth2, undefined, opts.compressBrotli, opts.phaseTimeouts, opts.tlsCa, opts.chaos, onChaosInjectedAudit, opts.responseGuard, opts.doh, onDohFallbackAudit, proxyHealthMonitor, opts.outboundCredentials, opts.dnsPin, onDnsPinMismatchAudit)
       : undefined;
   // WR-146: tail-latency hedging for outbound attempts (opt-in). The
   // wrapper sits around whichever sender the queue uses — the default
@@ -7937,7 +8032,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       // new series. Absent entirely with a custom sender (no pool).
       res
         .writeHead(200, { "content-type": "text/plain; version=0.0.4" })
-        .end(queue.renderMetrics() + versionMetrics.render() + schemaMetrics.render() + (schemaRegistry?.renderMetrics() ?? "") + ipAclMetrics.render() + fail2banMetrics.render() + inboundTenantRateLimitMetrics.render() + operatorRateLimitMetrics.render() + (proxyHealthMonitor?.renderMetrics() ?? "") + certExpiryMonitor.render() + tlsVersionMonitor.render() + (ocspMonitor?.render() ?? "") + (usageMeter?.render() ?? "") + (defaultSender?.compressionStats.render() ?? "") + (defaultSender?.dnsCache?.render() ?? "") + (defaultSender?.wsPool.renderMetrics() ?? "") + meshMetrics.render() + (defaultSender?.outboundSchemaMetrics?.render() ?? "") + (defaultSender?.chaosMetrics?.render() ?? "") + (reputation?.renderMetrics() ?? "") + hedgeMetrics.render() + (queue.getErrorBudgetMonitor()?.render() ?? ""));
+        .end(queue.renderMetrics() + versionMetrics.render() + schemaMetrics.render() + (schemaRegistry?.renderMetrics() ?? "") + ipAclMetrics.render() + fail2banMetrics.render() + inboundTenantRateLimitMetrics.render() + operatorRateLimitMetrics.render() + (proxyHealthMonitor?.renderMetrics() ?? "") + certExpiryMonitor.render() + tlsVersionMonitor.render() + (ocspMonitor?.render() ?? "") + (usageMeter?.render() ?? "") + (defaultSender?.compressionStats.render() ?? "") + (defaultSender?.dnsCache?.render() ?? "") + (defaultSender?.dnsPin?.render() ?? "") + (defaultSender?.wsPool.renderMetrics() ?? "") + meshMetrics.render() + (defaultSender?.outboundSchemaMetrics?.render() ?? "") + (defaultSender?.chaosMetrics?.render() ?? "") + (reputation?.renderMetrics() ?? "") + hedgeMetrics.render() + (queue.getErrorBudgetMonitor()?.render() ?? ""));
       return;
     }
     if (isEvents) {
