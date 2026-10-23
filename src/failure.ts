@@ -52,6 +52,7 @@
 import { PayloadTransformError } from "./transform.ts";
 import { OutboundSchemaViolationError } from "./outbound-schema.ts";
 import { SigV4SigningError } from "./sigv4.ts";
+import { CredentialSecretUnavailableError } from "./outbound-credentials.ts";
 import { AssertionFailedError } from "./response-assertions.ts";
 import { IntegrityMismatchError } from "./response-integrity.ts";
 import { ResponseTooLargeError } from "./response-limit.ts";
@@ -187,6 +188,15 @@ export function classifyFailure(err: unknown): ClassifiedFailure {
   // item, so dead-letter immediately instead of burning the retry
   // budget and the backoff clock.
   if (err instanceof SigV4SigningError) {
+    return { failureClass: "non_retryable" };
+  }
+  // WR-192: an unresolvable static-credential reference is a local
+  // config problem (the relay refused to boot with a missing secret, so
+  // this only fires when a resolver breaks mid-run) — the wire request
+  // was never built, let alone sent. Retrying can never succeed for
+  // this item, so dead-letter immediately instead of burning the retry
+  // budget and the backoff clock.
+  if (err instanceof CredentialSecretUnavailableError) {
     return { failureClass: "non_retryable" };
   }
   // WR-117: an outbound schema violation is a local config/payload

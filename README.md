@@ -4037,6 +4037,61 @@ oauth2: {
 },
 ```
 
+## Outbound static credentials (opt-in)
+
+Some downstreams gate webhooks on a static secret — an `x-api-key`
+header, a shared `Authorization` token — rather than on a fetched
+OAuth2 token or anything the relay computes per request.
+`outboundCredentials` (off by default, WR-192;
+`src/outbound-credentials.ts`, zero new dependencies) injects such
+credentials into the outbound request, per endpoint:
+
+```ts
+createRelayServer({
+  // ...
+  outboundCredentials: {
+    "https://partner.example.com/hook": [
+      {
+        id: "partner-x-api-key", // audited (ids only — never the value)
+        header: "x-api-key",
+        secretRef: "PARTNER_API_KEY", // a reference, never the raw secret
+        secretResolver: (ref) => process.env[ref], // optional: vault/KMS lookup
+      },
+    ],
+  },
+});
+```
+
+Every delivery to a configured endpoint carries the credential value
+under the named header, resolved per attempt through `secretResolver`
+(default: `process.env[ref]`) — the WR-116 / `archive-s3.ts`
+reference-not-value convention, so config snapshots, audit events, and
+stats can never leak key material. A reference that does not resolve
+*at startup* throws `RangeError` — the relay refuses to boot rather
+than accepting webhooks it could never deliver.
+
+- **Anti-forgery** — any inbound header with a credential's name is
+  stripped before stamping (the WR-26 pattern), so a sender can never
+  smuggle a forged credential downstream; the relay's own value always
+  wins.
+- **Deterministic conflict rule** — credentials stamp *after* the
+  WR-129 OAuth2 bearer token, so when both configure the same header
+  (e.g. `Authorization`) the static credential wins deterministically
+  (operators should avoid that overlap). They also survive the WR-69
+  forwarding gate (a relay-forced stamp, like `x-trace-id`), and are
+  orthogonal to WR-26/WR-124/WR-116 signing and WR-36 mTLS — all may
+  coexist on one delivery.
+- **Auditing** — `accepted` events carry `credentialIds` (the
+  configured ids for the endpoint) so operators can see which
+  credential a delivery will stamp; the values never enter the audit
+  trail.
+- A `secretRef` that stops resolving mid-run (rotated away) fails the
+  delivery with `CredentialSecretUnavailableError` (classified
+  `non_retryable`, dead-lettered on the first attempt).
+- Invalid configs (bad shape, duplicate `id`/`header` within an
+  endpoint, unresolvable `secretRef`) throw `RangeError` at startup —
+  never mid-delivery.
+
 ## W3C trace-context propagation (opt-in)
 
 Distributed-tracing glue between the relay's own end-to-end trace IDs

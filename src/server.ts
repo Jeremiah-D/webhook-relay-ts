@@ -470,6 +470,12 @@ import {
   type CompiledForwardHeadersRule,
   type ForwardHeadersRuleConfig,
 } from "./forward-headers.ts";
+import {
+  applyOutboundCredentials,
+  resolveOutboundCredentialsConfig,
+  type CompiledOutboundCredential,
+  type OutboundCredentialConfig,
+} from "./outbound-credentials.ts";
 
 /**
  * WR-123: cap on how many archived events one `Last-Event-ID` reconnect
@@ -1599,6 +1605,26 @@ export interface RelayServerOptions {
    * vault/KMS-backed function to keep secrets out of the environment.
    */
   awsSecretResolver?: SecretResolver;
+  /**
+   * WR-192: per-endpoint outbound *static* credentials (opt-in, see
+   * `src/outbound-credentials.ts`): `{ "<exact targetUrl>":
+   * OutboundCredentialConfig[] }` — a downstream that gates webhooks on
+   * a static secret (`x-api-key`, a shared `Authorization` token)
+   * rather than on anything the relay computes. Each entry names the
+   * outbound header, a credential `id` (audited, never the value), and
+   * a `secretRef` resolved per delivery attempt through
+   * `secretResolver` (default: `process.env[ref]`) — the WR-116 /
+   * `archive-s3.ts` reference-not-value convention. An unresolvable
+   * reference throws `RangeError` at startup (fail-fast), never
+   * mid-delivery. Any inbound header with a credential's name is
+   * stripped before stamping (WR-26 anti-forgery), so a sender can
+   * never smuggle a forged credential downstream; when both `oauth2`
+   * and a credential configure the same header, the static credential
+   * wins deterministically. Orthogonal to WR-69 (forwarding gate),
+   * WR-129 (OAuth2), and WR-36 (mTLS). Applies to the default sender
+   * only. `undefined` keeps the exact pre-WR-192 wire shape.
+   */
+  outboundCredentials?: Record<string, OutboundCredentialConfig[]>;
   /**
    * Outbound idempotency-key stamping (WR-44, see `IdempotencyKeyOptions`
    * in `src/idempotency-key.ts`): when `enabled`, every delivery made by
@@ -2805,7 +2831,16 @@ export function createDefaultSender(
    * monitor's own `onAudit` carries the `proxy_degraded` events.
    * `undefined` keeps the exact pre-WR-181 behavior.
    */
-  proxyHealthMonitor?: ProxyHealthMonitor
+  proxyHealthMonitor?: ProxyHealthMonitor,
+  /**
+   * WR-192: per-endpoint outbound static credentials (opt-in, see
+   * `src/outbound-credentials.ts`): `{ "<exact targetUrl>":
+   * OutboundCredentialConfig[] }`. Validated at startup (`RangeError`
+   * — including an unresolvable `secretRef`: the relay refuses to boot
+   * rather than accepting webhooks it could never deliver); `undefined`
+   * keeps the exact pre-WR-192 wire shape.
+   */
+  outboundCredentials?: Record<string, OutboundCredentialConfig[]>
 ): PooledSender {
   if (tlsPins !== undefined) {
     for (const [endpoint, pins] of Object.entries(tlsPins)) {
@@ -2867,6 +2902,19 @@ export function createDefaultSender(
     }
   }
   const oauthTokenCache = oauth2 !== undefined ? (oauth2TokenCache ?? new OAuth2TokenCache()) : undefined;
+  // WR-192: fail fast on a misconfigured credential — a bad header, a
+  // duplicate id/header, or an unresolvable `secretRef` must refuse to
+  // boot, never surface as a delivery that stamps nothing.
+  let outboundCredentialMap: Map<string, CompiledOutboundCredential[]> | undefined;
+  if (outboundCredentials !== undefined) {
+    try {
+      outboundCredentialMap = resolveOutboundCredentialsConfig(outboundCredentials);
+    } catch (err) {
+      throw new RangeError(
+        `createDefaultSender: invalid outboundCredentials config: ${(err as Error).message}`
+      );
+    }
+  }
   // WR-143: fail fast on a misconfigured phase budget — a typo'd phase
   // name or a non-positive budget must not silently leave an endpoint
   // unbudgeted (or budgeted against a phase that can never complete).
@@ -3570,6 +3618,20 @@ export function createDefaultSender(
         if (k.toLowerCase() === AUTHORIZATION_HEADER) delete headers[k];
       }
       headers[AUTHORIZATION_HEADER] = `Bearer ${wireOpts.oauthToken}`;
+    }
+    // WR-192: per-endpoint outbound static credentials (opt-in). Stamped
+    // after the OAuth2 bearer token: when both configure the same header
+    // (e.g. `Authorization`), the explicit static credential wins
+    // deterministically — operators should avoid that overlap. The
+    // helper strips any inbound header with the same name first (the
+    // WR-26 anti-forgery pattern), so a sender can never smuggle a
+    // forged credential downstream. Orthogonal to the WR-26/WR-124/WR-116
+    // request signatures, WR-69 (the gate applies to passthrough headers
+    // only), and WR-36 (mTLS is transport-level): all may coexist on one
+    // delivery. An unresolvable `secretRef` throws
+    // `CredentialSecretUnavailableError` (classified `non_retryable`).
+    if (outboundCredentialMap !== undefined) {
+      applyOutboundCredentials(headers, item.targetUrl, outboundCredentialMap.get(item.targetUrl));
     }
     if (idempotencyKeyCfg !== undefined) {
       // WR-44: derive from (event id, 1-based attempt). The queue stamps
@@ -5713,9 +5775,28 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
           },
         })
       : undefined;
+  // WR-192: resolve the outbound static credentials once at startup so
+  // the `accepted` audit events can name the credential ids for the
+  // endpoint (ids only, never values). The sender re-validates the
+  // same record internally (see `createDefaultSender`) — a bad record
+  // refuses to boot from either path.
+  let outboundCredentialIds: Map<string, string[]> | undefined;
+  if (opts.outboundCredentials !== undefined) {
+    try {
+      outboundCredentialIds = new Map(
+        [...resolveOutboundCredentialsConfig(opts.outboundCredentials)].map(
+          ([endpoint, creds]) => [endpoint, creds.map((c) => c.id)]
+        )
+      );
+    } catch (err) {
+      throw new RangeError(
+        `createRelayServer: invalid outboundCredentials config: ${(err as Error).message}`
+      );
+    }
+  }
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, opts.awsSigV4, opts.awsSecretResolver, opts.outboundSchemas, opts.oauth2, undefined, opts.compressBrotli, opts.phaseTimeouts, opts.tlsCa, opts.chaos, onChaosInjectedAudit, opts.responseGuard, opts.doh, onDohFallbackAudit, proxyHealthMonitor)
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, opts.awsSigV4, opts.awsSecretResolver, opts.outboundSchemas, opts.oauth2, undefined, opts.compressBrotli, opts.phaseTimeouts, opts.tlsCa, opts.chaos, onChaosInjectedAudit, opts.responseGuard, opts.doh, onDohFallbackAudit, proxyHealthMonitor, opts.outboundCredentials)
       : undefined;
   // WR-146: tail-latency hedging for outbound attempts (opt-in). The
   // wrapper sits around whichever sender the queue uses — the default
@@ -10502,6 +10583,13 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // credential, so it wins over the signing key id when both factors
     // are in play.
     if (apiKey !== undefined) acceptedEvent.keyId = apiKey.keyId;
+    // WR-192: the static outbound credentials this endpoint's deliveries
+    // will stamp — ids only, never the secret values (those resolve per
+    // delivery attempt and stay in memory).
+    if (outboundCredentialIds !== undefined) {
+      const credIds = outboundCredentialIds.get(targetUrl);
+      if (credIds !== undefined) acceptedEvent.credentialIds = credIds;
+    }
     if (perEndpointVerifier) acceptedEvent.verifier = activeVerifier.name;
     // WR-138: the negotiated algorithm, so operators can see which
     // algorithm each accepted webhook verified under.
