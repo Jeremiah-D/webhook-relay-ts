@@ -43,6 +43,10 @@
  * - `relay_failover_switches_total{endpoint,from,to}`: counter of
  *   active/standby failover switches (WR-39) by logical endpoint,
  *   present only for (endpoint, from, to) triples that actually switched.
+ * - `relay_canary_rollout_events_total{endpoint,candidate,event}`:
+ *   counter of canary rollout transitions (WR-214) by logical endpoint,
+ *   candidate, and event, present only for triples that actually
+ *   transitioned.
  * - `relay_weighted_dispatch_total{endpoint,target}`: counter of
  *   dispatches routed to each physical target by logical endpoint
  *   (WR-66 weighted multi-target dispatch), present only when weighted
@@ -346,6 +350,11 @@ export interface MetricsInput {
   /** Present only for (endpoint, from, to) triples that actually switched. */
   failover?: FailoverMetricsInput[];
   /**
+   * WR-214: present only for (endpoint, candidate, event) triples that
+   * actually transitioned.
+   */
+  canary?: CanaryRolloutMetricsInput[];
+  /**
    * Present only when weighted multi-target dispatch (WR-66) is in use;
    * one series per (endpoint, target) pair that actually received a
    * dispatch.
@@ -554,6 +563,17 @@ export interface FailoverMetricsInput {
   /** Target deliveries go to after the switch. */
   to: string;
   switches: number;
+}
+
+/** One canary rollout transition count, in Prometheus label order. */
+export interface CanaryRolloutMetricsInput {
+  /** Logical endpoint (the configured primary `targetUrl`). */
+  endpoint: string;
+  /** The candidate target being ramped toward. */
+  candidate: string;
+  /** One of `canary_step_advanced` / `canary_rolled_back` / `canary_promoted`. */
+  event: string;
+  count: number;
 }
 
 /** One weighted-dispatch count, in Prometheus label order. */
@@ -1175,6 +1195,17 @@ export function renderPrometheus(input: MetricsInput): string {
     for (const f of input.failover) {
       lines.push(
         `relay_failover_switches_total{endpoint="${escapeLabelValue(f.endpoint)}",from="${escapeLabelValue(f.from)}",to="${escapeLabelValue(f.to)}"} ${f.switches}`
+      );
+    }
+  }
+  if (input.canary !== undefined && input.canary.length > 0) {
+    lines.push(
+      "# HELP relay_canary_rollout_events_total Canary rollout transitions by logical endpoint, candidate, and event."
+    );
+    lines.push("# TYPE relay_canary_rollout_events_total counter");
+    for (const c of input.canary) {
+      lines.push(
+        `relay_canary_rollout_events_total{endpoint="${escapeLabelValue(c.endpoint)}",candidate="${escapeLabelValue(c.candidate)}",event="${escapeLabelValue(c.event)}"} ${c.count}`
       );
     }
   }

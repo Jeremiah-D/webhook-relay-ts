@@ -6185,6 +6185,14 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         for (const target of cfg.targets ?? []) knownEndpoints.add(target.targetUrl);
       }
     }
+    // WR-214: canary candidates are real delivery destinations too.
+    const canaryCfg = opts.retry?.canaryRollouts;
+    if (canaryCfg) {
+      for (const [endpoint, cfg] of Object.entries(canaryCfg)) {
+        knownEndpoints.add(endpoint);
+        knownEndpoints.add(cfg.candidate);
+      }
+    }
     const validators = opts.retry?.responseValidators;
     if (validators !== undefined && typeof validators === "object") {
       for (const endpoint of Object.keys(validators)) knownEndpoints.add(endpoint);
@@ -6764,6 +6772,22 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         at: event.at,
       });
       opts.retry?.onFailoverSwitch?.(event);
+    },
+    // Wrap the caller's hook so every canary rollout transition is
+    // audited, not just observed.
+    onCanaryRolloutEvent: (event) => {
+      opts.auditLog.append({
+        event: event.event,
+        endpoint: event.endpoint,
+        candidate: event.candidate,
+        step: event.step,
+        percent: event.percent,
+        ...(event.reason !== undefined ? { reason: event.reason } : {}),
+        ...(event.stepSamples !== undefined ? { stepSamples: event.stepSamples } : {}),
+        ...(event.stepFailures !== undefined ? { stepFailures: event.stepFailures } : {}),
+        at: event.at,
+      });
+      opts.retry?.onCanaryRolloutEvent?.(event);
     },
     // An explicit server-level `completionCallback` wins over the nested
     // `retry.completionCallback`; either way the queue owns the sender.

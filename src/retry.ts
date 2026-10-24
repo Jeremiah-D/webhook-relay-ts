@@ -320,6 +320,12 @@ import {
   type FailoverSwitchEvent,
 } from "./failover.ts";
 import {
+  CanaryRolloutManager,
+  type CanaryRolloutConfig,
+  type CanaryRolloutEndpointStats,
+  type CanaryRolloutEvent,
+} from "./canary-rollout.ts";
+import {
   QuorumFanoutSet,
   assertValidQuorumConfig,
   assertValidQuorumRetentionOptions,
@@ -373,6 +379,7 @@ import {
   type DeliveryCountersInput,
   type DeliveryDeadlineExceededInput,
   type FailoverMetricsInput,
+  type CanaryRolloutMetricsInput,
   type LatencyHistogramInput,
   type ProbeMetricsInput,
   type QuorumMetricsInput,
@@ -457,6 +464,14 @@ export type {
 } from "./response-assertions.ts";
 export type { DownstreamResponseSummary };
 export type { FailoverConfig, FailoverEndpointStats, FailoverSwitchEvent };
+export type {
+  CanaryRolloutConfig,
+  CanaryRolloutEndpointConfig,
+  CanaryRolloutEndpointStats,
+  CanaryRolloutEvent,
+  CanaryRollbackReason,
+  CanaryRolloutState,
+} from "./canary-rollout.ts";
 export type { WeightedConfig, WeightedEndpointStats, WeightedTargetConfig };
 export type { WeightedMetricsInput };
 export type {
@@ -2301,6 +2316,40 @@ export interface RetryQueueOptions {
    */
   onFailoverSwitch?: (event: FailoverSwitchEvent) => void;
   /**
+   * Endpoint canary rollout (see `src/canary-rollout.ts`), opt-in per
+   * endpoint: a record of primary `targetUrl` -> `{ candidate, steps?,
+   * dwellMs?, maxConsecutiveStepFailures?, maxStepFailureRate?,
+   * minStepSamples? }`. Traffic ramps to the candidate in percentage
+   * steps (default [1, 5, 25, 50, 100], each held `dwellMs`); the
+   * candidate promotes permanently after the final step's dwell, and
+   * rolls back to the primary immediately when its per-step error
+   * budget burns (consecutive failures or failure rate). Transitions
+   * are audited as `canary_step_advanced` / `canary_rolled_back` /
+   * `canary_promoted` and counted in
+   * `relay_canary_rollout_events_total`. Mutually exclusive with
+   * `weighted`, `failover`, and `consistentHash` per endpoint:
+   * configuring two routers for the same endpoint throws `RangeError`
+   * at construction. Invalid configs throw `RangeError` at construction.
+   */
+  canaryRollouts?: CanaryRolloutConfig;
+  /**
+   * Canary rollout clock in ms; defaults to `Date.now`. Injectable for
+   * deterministic tests (drives the per-step dwell).
+   */
+  canaryNow?: () => number;
+  /**
+   * Canary rollout sampling source in [0, 1); defaults to
+   * `Math.random`. Injectable for deterministic tests.
+   */
+  canaryRandom?: () => number;
+  /**
+   * Called on every canary rollout transition (step advance, rollback,
+   * promotion). Edge-triggered — one call per transition, not one per
+   * dispatch. The server audits these; library users get the hook
+   * directly.
+   */
+  onCanaryRolloutEvent?: (event: CanaryRolloutEvent) => void;
+  /**
    * Weighted multi-target outbound dispatch (see `src/weighted.ts`),
    * opt-in per endpoint: a record of logical endpoint -> `{ targets: [{
    * targetUrl, weight }], failureThreshold?, recoveryIntervalMs? }`.
@@ -4104,6 +4153,11 @@ export class RetryQueue {
     string,
     { endpoint: string; from: string; to: string; switches: number }
   >();
+  /** WR-214: staged candidate promotion; undefined when not configured. */
+  private readonly canary?: CanaryRolloutManager;
+  private readonly onCanaryRolloutEvent?: (event: CanaryRolloutEvent) => void;
+  /** `relay_canary_rollout_events_total`, one counter per (endpoint, candidate, event). */
+  private readonly canaryEventCounts = new Map<string, CanaryRolloutMetricsInput>();
   /** WR-66: smooth weighted round-robin routing; undefined when not configured. */
   private readonly weighted?: WeightedDispatcher;
   /** WR-202: consistent-hash sticky routing; undefined when not configured. */
@@ -4580,6 +4634,26 @@ export class RetryQueue {
         }
       }
     }
+    // WR-214: canary rollout is mutually exclusive with WR-66 weighted,
+    // WR-39 failover, and WR-202 consistent-hash per endpoint —
+    // "ramp to a candidate", "share traffic", "ordered standby", and
+    // "own this key" must never all claim the same endpoint. Fail-fast
+    // at construction, house style.
+    if (opts.canaryRollouts !== undefined) {
+      for (const endpoint of Object.keys(opts.canaryRollouts)) {
+        for (const [name, cfg] of [
+          ["weighted", opts.weighted],
+          ["failover", opts.failover],
+          ["consistent-hash", opts.consistentHash],
+        ] as const) {
+          if (cfg !== undefined && Object.prototype.hasOwnProperty.call(cfg, endpoint)) {
+            throw new RangeError(
+              `canaryRollouts and ${name} are mutually exclusive for endpoint ${JSON.stringify(endpoint)}: configure only one`
+            );
+          }
+        }
+      }
+    }
     this.weighted =
       opts.weighted !== undefined
         ? new WeightedDispatcher(opts.weighted, {
@@ -4607,6 +4681,15 @@ export class RetryQueue {
           })
         : undefined;
     this.onFailoverSwitch = opts.onFailoverSwitch;
+    this.canary =
+      opts.canaryRollouts !== undefined
+        ? new CanaryRolloutManager(opts.canaryRollouts, {
+            now: opts.canaryNow ?? Date.now,
+            random: opts.canaryRandom ?? Math.random,
+            onEvent: (event) => this.recordCanaryEvent(event),
+          })
+        : undefined;
+    this.onCanaryRolloutEvent = opts.onCanaryRolloutEvent;
     // WR-201: adaptive weight tuning on WR-66 weighted dispatch.
     // Opt-in; the tuner's `healthOf` reads the WR-179 per-target scores
     // on the default tenant (health is already recorded per physical
@@ -5619,6 +5702,21 @@ export class RetryQueue {
   private recordAssertionFailure(tenant: string | undefined, endpoint: string): void {
     const inner = innerFor(this.assertionFailureCounts, tenant);
     inner.set(endpoint, (inner.get(endpoint) ?? 0) + 1);
+  }
+
+  /** Count one canary rollout transition for `relay_canary_rollout_events_total{endpoint,candidate,event}` and fan out the hook. */
+  private recordCanaryEvent(event: CanaryRolloutEvent): void {
+    const key = JSON.stringify([event.endpoint, event.candidate, event.event]);
+    const prev = this.canaryEventCounts.get(key);
+    if (prev) prev.count += 1;
+    else
+      this.canaryEventCounts.set(key, {
+        endpoint: event.endpoint,
+        candidate: event.candidate,
+        event: event.event,
+        count: 1,
+      });
+    this.onCanaryRolloutEvent?.(event);
   }
 
   /** Count one failover switch for `relay_failover_switches_total{endpoint,from,to}` and fan out the hook. */
@@ -7733,9 +7831,19 @@ export class RetryQueue {
       consistentHashTarget === undefined
         ? this.weighted?.resolveTarget(logicalEndpoint)
         : undefined;
+    // WR-214: canary rollout resolves before failover — the canary
+    // manager returns undefined when the endpoint has no rollout
+    // config, while the failover manager always returns a string, so
+    // failover stays last. Mutual exclusion guarantees at most one
+    // router ever claims an endpoint.
+    const canaryTarget =
+      consistentHashTarget === undefined && weightedTarget === undefined
+        ? this.canary?.resolveTarget(logicalEndpoint)
+        : undefined;
     const target =
       consistentHashTarget ??
       weightedTarget ??
+      canaryTarget ??
       this.failover?.resolveTarget(logicalEndpoint) ??
       logicalEndpoint;
     // WR-76: the end-to-end delivery deadline is checked before every
@@ -8326,6 +8434,7 @@ export class RetryQueue {
           // lost-response payment-callback case).
           this.replayIdempotencyFor(tenant)?.recordDelivered(target, entry.payload);
           this.failover?.recordOutcome(logicalEndpoint, target, true);
+          this.canary?.recordOutcome(logicalEndpoint, target, true);
           // WR-66: an answering target is a healthy target — same rule as
           // failover; non_retryable delivery outcomes feed both routers so
           // their per-target health counters agree.
@@ -8582,6 +8691,7 @@ export class RetryQueue {
             // a sick endpoint, even when the payload was rejected.
             this.slowStartFor(tenant)?.recordOutcome(target, true);
             this.failover?.recordOutcome(logicalEndpoint, target, true);
+          this.canary?.recordOutcome(logicalEndpoint, target, true);
             this.weighted?.recordOutcome(logicalEndpoint, target, true);
             this.consistentHash?.recordOutcome(logicalEndpoint, target, true);
           }
@@ -8637,6 +8747,7 @@ export class RetryQueue {
           // restarts. A no-op when no ramp is active.
           this.slowStartFor(tenant)?.recordOutcome(target, false);
           this.failover?.recordOutcome(logicalEndpoint, target, false);
+          this.canary?.recordOutcome(logicalEndpoint, target, false);
           this.weighted?.recordOutcome(logicalEndpoint, target, false);
           this.consistentHash?.recordOutcome(logicalEndpoint, target, false);
         }
@@ -9397,6 +9508,10 @@ export class RetryQueue {
     // switched; absent entirely when failover is unconfigured or never
     // fired.
     const failover: FailoverMetricsInput[] = [...this.failoverSwitchCounts.values()];
+    // WR-214: one series per (endpoint, candidate, event) triple that
+    // actually transitioned; absent entirely when canary rollout is
+    // unconfigured or never fired.
+    const canary: CanaryRolloutMetricsInput[] = [...this.canaryEventCounts.values()];
     // WR-66: one series per (endpoint, target) pair that actually
     // received a dispatch; absent entirely when weighted mode is not in
     // use. The dispatcher's own cumulative counts are the source — the
@@ -9582,6 +9697,7 @@ export class RetryQueue {
       starvationGuard,
       ...(dryRun.length > 0 ? { dryRun } : {}),
       failover,
+      canary,
       // WR-66: activity-gated (see above) — weighted mode's series stay
       // absent until a dispatch has actually been weighted.
       ...(weighted.length > 0 ? { weighted } : {}),
@@ -9804,6 +9920,15 @@ export class RetryQueue {
    */
   getFailoverStats(): FailoverEndpointStats[] {
     return this.failover?.stats() ?? [];
+  }
+
+  /**
+   * WR-214: per-endpoint canary rollout state (`candidate`, `state`,
+   * `step`, `percent`, step budget counters, `candidateDispatched`).
+   * Empty when canary rollout is not configured.
+   */
+  getCanaryStats(): CanaryRolloutEndpointStats[] {
+    return this.canary?.stats() ?? [];
   }
 
   /**

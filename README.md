@@ -3095,6 +3095,60 @@ const server = createRelayServer({
   lists, a standby equal to the primary, duplicates, chained primaries,
   and illegal thresholds.
 
+## Endpoint canary rollout (opt-in)
+
+A staged, self-rollbacking promotion of one candidate target for a
+logical endpoint — the proactive counterpart to failover's reactive
+standby switch. Traffic ramps to the candidate in percentage steps,
+each held for `dwellMs`, and the candidate promotes permanently only
+after the final 100% step's dwell elapses; a ramp capped below 100%
+holds its split instead of promoting. While a step runs, the
+candidate's own outcomes spend a per-step error budget: too many
+consecutive failures, or a failure rate above `maxStepFailureRate`
+once `minStepSamples` outcomes exist, rolls the endpoint back to the
+primary immediately. A rollback is terminal until the operator
+reconfigures — a sick candidate is never silently retried. In-flight
+deliveries keep the target they were dispatched with across a
+mid-flight promotion or rollback, exactly like failover:
+
+```ts
+const server = createRelayServer({
+  secret, forwardUrl, auditLog,
+  retry: {
+    canaryRollouts: {
+      "https://primary/hook": {
+        candidate: "https://candidate/hook",
+        steps: [1, 5, 25, 50, 100], // default; strictly increasing, each in (0, 100]
+        dwellMs: 60_000,            // default 60s per step
+        maxConsecutiveStepFailures: 5, // default 5
+        maxStepFailureRate: 0.1,    // default 10%
+        minStepSamples: 10,         // default 10
+      },
+    },
+  },
+});
+```
+
+- **Sampling is per dispatch, not per delivery** — each attempt flips
+  its own coin against the current step's percentage (injectable via
+  `canaryRandom`, `canaryNow` drives the dwell, both for deterministic
+  tests). Only candidate outcomes spend the step budget; primary
+  outcomes are the safe baseline and neither spend nor reset it.
+- **Observability** — every transition is audited as
+  `canary_step_advanced` / `canary_rolled_back` (with `reason` =
+  `consecutive_failures`/`failure_rate` plus the step's sample counts)
+  / `canary_promoted`, and counted in
+  `relay_canary_rollout_events_total{endpoint,candidate,event}`.
+  `queue.getCanaryStats()` shows each endpoint's state, step,
+  percent, and step budget counters.
+- **Orthogonality** — failover's probationary failback canary is a
+  single-probe trust check, not a stepped ramp with a budget; weighted
+  dispatch is static traffic sharing, never a promotion; error-budget
+  burn-rate alerting (WR-147) only notifies and never reroutes. Canary
+  rollout is mutually exclusive with failover, weighted, and
+  consistent-hash routing per endpoint, and invalid configs throw
+  `RangeError` at construction.
+
 ## Endpoint dependency graph (opt-in)
 
 An endpoint can declare that it *depends on* other endpoints. While any
