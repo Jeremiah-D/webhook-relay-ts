@@ -5358,6 +5358,46 @@ const server = createRelayServer({
   the counters. Bounded by `maxHosts` (default 1024, longest-pinned
   evicted); invalid `mode` / `maxHosts` throw `RangeError` at startup.
 
+## DNS SRV endpoint discovery (opt-in, RFC 2782)
+
+An endpoint's `targetUrl` names a logical service, not necessarily a
+host that answers directly: in service-discovery deployments the real
+host and port come from DNS SRV records. `src/srv-discovery.ts`
+(WR-211) resolves the SRV set for a service and rewrites the target
+URL to the selected record, preserving scheme, path, and query.
+
+```ts
+const discovery = new SrvDiscovery({ ttlMs: 60_000 });
+const url = await discovery.resolveTargetUrl("https://events.example.com/hook", {
+  service: "https",
+  proto: "tcp",
+});
+// -> "https://receiver.example.com:8443/hook" (from the SRV record)
+```
+
+- **RFC 2782 selection** — only the lowest-priority group is
+  eligible; inside the group the draw is weight-proportional (uniform
+  when every weight in the group is zero). The record set is cached
+  for `ttlMs` and re-selected per call, so weighted targets still
+  spread inside the TTL; the cache is bounded (`maxEntries`, default
+  1024, soonest-expiring evicted).
+- **Fail-closed, no stale fallback** — unlike the WR-92 cache, an
+  expired SRV set is never served while a refresh runs: a stale SRV
+  answer can point at a decommissioned receiver. No records, a `.`
+  target (the service is decidedly not available), or a resolver error
+  all throw `SrvDiscoveryError` — the original URL host is never
+  returned as a fallback, because guessing a delivery target is worse
+  than failing the attempt.
+- **Layering** — this is discovery (which host:port), orthogonal to
+  DNS pinning (whether the resolved addresses are the pinned ones)
+  and to the WR-92 cache (A-record answers for the connection
+  itself). A discovered target still goes through the normal
+  connection path — pin and cache included — once the URL is
+  rewritten. `getStats()` / `render()` expose lookups, cache hits,
+  resolver calls and failures as `relay_srv_discovery_*` (empty until
+  the first lookup, the activity-gated convention).
+
+
 ## Per-endpoint DNS-over-HTTPS (opt-in)
 
 The outbound DNS cache above still trusts the host's resolver — a single
