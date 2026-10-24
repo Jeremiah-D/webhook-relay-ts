@@ -1175,6 +1175,40 @@ reliability primitives that matter for any signed-payload pipeline.
   kills the fresh connection instead of leaking an orphan socket (the
   handshake future resolves after the pool is gone, so `checkout`
   re-checks `destroyed` before the connection can enter the pool).
+  WR-204 adds opt-in single-connection multiplexing (`websocket:
+  { multiplex: true | { maxInFlight? } }`, default off — the exclusive
+  model above is unchanged when off): concurrent deliveries share ONE
+  connection per pool key, each sent as a JSON envelope text frame
+  `{"cid":"<32-hex>","v":1,"body":"<base64 payload>","headers":{...}}`
+  and answered by a correlated envelope `{"v":1,"cid":"<same>",
+  "body":"<base64 reply>"}` — replies may arrive in any order and are
+  routed back by `cid`. Downstreams that want multiplexing must speak
+  this envelope contract; it is a deliberate wire change from the
+  exclusive path's raw-text frames. The envelope's `headers` carry that
+  delivery's own `x-relay-*` values (idempotency key, trace, signature)
+  — the upgrade handshake still only carries the connection's first
+  delivery's headers, so multiplexed downstreams must read per-delivery
+  metadata from the envelope, not the handshake. Connection-level
+  backpressure: at most `maxInFlight` (default 32) deliveries are in
+  flight per connection; beyond that deliveries park FIFO on the
+  connection — the pool never opens a second connection for the same
+  key. Ping/pong keep-alive interleaves with in-flight deliveries, and
+  WR-46 permessage-deflate applies to the envelope when negotiated
+  (RSV1, opportunistic). Failure semantics: a disconnect fails every
+  in-flight and queued delivery with a plain retryable `Error`, so the
+  retry queue re-attempts them (at-least-once); downstream dedup rides
+  the WR-44 `x-relay-idempotency-key`, which is per (event id, attempt)
+  and therefore stable across the re-attempt. Any protocol violation
+  (bad envelope, unknown `cid`, message over 4x `maxMessageBytes`,
+  stray continuation, RSV1 misuse) fails the whole connection — a
+  misattributed reply is worse than a retryable failure. Observability:
+  `getStats()` gains `muxOut` / `muxIn` / `muxQueued` /
+  `muxInFlight`, per-origin rows gain `muxOut` / `muxIn`, and
+  `GET /metrics` renders
+  `relay_websocket_multiplexed_total{origin,direction}` only for
+  origins that multiplexed (everyone else stays byte-identical).
+  Covered by `test/ws-multiplex.test.ts` (10 tests) against a
+  raw-socket envelope-speaking server.
 - `src/inbound-ws.ts` — inbound WebSocket event intake (WR-130): a
   `ws(s)://` upgrade endpoint (opt-in via `RelayServerOptions.inboundWs`,
   default path `/ingest/ws`) so producers can push events over one

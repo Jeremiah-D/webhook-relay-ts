@@ -99,6 +99,40 @@ export interface WebSocketPoolOptions {
    */
   permessageDeflate?: boolean | PerMessageDeflateOptions;
   /**
+   * WebSocket downstream multiplexing (WR-204): `true` enables with
+   * defaults, `{ maxInFlight? }` tunes the per-connection in-flight cap.
+   * Disabled by default — when off, each delivery borrows a pooled
+   * connection exclusively (the WR-45 model).
+   *
+   * When enabled, concurrent deliveries share ONE connection per pool
+   * key: each delivery is sent as a JSON envelope text frame
+   * `{"cid":"<32-hex>","body":"<base64 payload>","headers":{...}}` and the
+   * downstream replies per delivery with `{"cid":"<same>","body":"<base64
+   * reply>"}` — out-of-order replies are routed back by correlation ID.
+   * The envelope's `headers` carry that delivery's own `x-relay-*`
+   * values (upgrade handshake headers stay those of the connection's
+   * first delivery — inherent to WebSocket, there are no per-message
+   * headers on the wire). Downstreams that want multiplexing must speak
+   * this envelope contract; the exclusive path keeps the old raw-text
+   * contract.
+   *
+   * Connection-level backpressure: at most `maxInFlight` deliveries are
+   * in flight per connection (default 32); beyond that, deliveries queue
+   * FIFO on the connection — the pool never opens a second connection
+   * for the same key while one is alive. A disconnect fails every
+   * in-flight and queued delivery with a plain retryable `Error`, so the
+   * retry queue re-attempts them (at-least-once); downstream dedup rides
+   * the WR-44 `x-relay-idempotency-key`, which is per (event id, attempt)
+   * and therefore stable across the re-attempt.
+   *
+   * Protocol hygiene mirrors the exclusive path: ping/pong keep-alive
+   * interleaves, RSV1 is only legal with negotiated permessage-deflate
+   * (WR-46, applied to the envelope), and any protocol violation (bad
+   * envelope, unknown `cid`, oversized message) fails the whole
+   * connection — misattribution is worse than a retryable failure.
+   */
+  multiplex?: boolean | WsMultiplexOptions;
+  /**
    * WR-73 downstream TLS certificate expiry monitoring (see
    * `src/cert-expiry.ts`): called with the TLS socket and the delivery
    * `targetUrl` right after the TLS handshake — the same moment the pin
@@ -109,6 +143,21 @@ export interface WebSocketPoolOptions {
   onTlsPeerCertificate?: (socket: TLSSocket, targetUrl: string) => void;
 }
 
+/** Tuning for multiplexed WebSocket deliveries (WR-204). */
+export interface WsMultiplexOptions {
+  /**
+   * Max concurrent in-flight deliveries per connection. Default 32.
+   * Must be a positive integer. Beyond the cap, deliveries queue FIFO
+   * on the connection instead of opening a new one.
+   */
+  maxInFlight?: number;
+}
+
+/** Validated {@link WsMultiplexOptions} with defaults applied. */
+export interface ResolvedWsMultiplexOptions {
+  maxInFlight: number;
+}
+
 /** Validated {@link WebSocketPoolOptions} with defaults applied. */
 export interface ResolvedWebSocketPoolOptions {
   timeoutMs: number;
@@ -116,6 +165,7 @@ export interface ResolvedWebSocketPoolOptions {
   pingIntervalMs: number;
   idleTimeoutMs: number;
   permessageDeflate: ResolvedPerMessageDeflate | undefined;
+  multiplex: ResolvedWsMultiplexOptions | undefined;
   onTlsPeerCertificate: ((socket: TLSSocket, targetUrl: string) => void) | undefined;
 }
 
@@ -141,6 +191,19 @@ export function resolveWebSocketOptions(opts: WebSocketPoolOptions = {}): Resolv
   } catch (err) {
     fail((err as Error).message);
   }
+  let multiplex: ResolvedWsMultiplexOptions | undefined;
+  if (opts.multiplex !== undefined && opts.multiplex !== false) {
+    const muxOpts: WsMultiplexOptions =
+      opts.multiplex === true ? {} : (opts.multiplex as WsMultiplexOptions);
+    if (muxOpts === null || typeof muxOpts !== "object") {
+      fail("multiplex must be a boolean or an options object");
+    }
+    const maxInFlight = muxOpts.maxInFlight ?? 32;
+    if (!Number.isInteger(maxInFlight) || maxInFlight <= 0) {
+      fail("multiplex.maxInFlight must be a positive integer");
+    }
+    multiplex = { maxInFlight };
+  }
   const onTlsPeerCertificate = opts.onTlsPeerCertificate;
   if (onTlsPeerCertificate !== undefined && typeof onTlsPeerCertificate !== "function") {
     fail("onTlsPeerCertificate must be a function");
@@ -151,6 +214,7 @@ export function resolveWebSocketOptions(opts: WebSocketPoolOptions = {}): Resolv
     pingIntervalMs,
     idleTimeoutMs,
     permessageDeflate,
+    multiplex,
     onTlsPeerCertificate,
   };
 }
@@ -287,7 +351,80 @@ interface PooledWsConnection {
    * extension — the connection then carries plain text frames.
    */
   deflate: NegotiatedDeflate | null;
+  /**
+   * Multiplexing state (WR-204). Present only on connections opened while
+   * the pool's `multiplex` option is enabled: such a connection is
+   * shared by concurrent deliveries and never marked `busy`.
+   */
+  mux?: MuxConnectionState;
 }
+
+/**
+ * Per-connection multiplexing state (WR-204): the correlation table,
+ * the in-flight backpressure queue, and the reassembly buffer for the
+ * shared frame pump.
+ */
+interface MuxConnectionState {
+  /** Deliveries awaiting their correlated reply, keyed by `cid`. */
+  inFlight: Map<string, MuxDelivery>;
+  /** Deliveries parked FIFO while `inFlight.size >= maxInFlight`. */
+  queue: MuxQueuedDelivery[];
+  /** Shared handshake promise: concurrent first deliveries await one open. */
+  opening: Promise<void> | null;
+  /** Inbound message reassembly (the shared pump owns the socket). */
+  text: Buffer[];
+  textLen: number;
+  /** First frame of the pending message carried RSV1 (WR-46). */
+  replyCompressed: boolean;
+  /** The pump's `data` handler, so it can be detached on teardown. */
+  pump?: (chunk: Buffer) => void;
+}
+
+/** One in-flight multiplexed delivery (WR-204). */
+interface MuxDelivery {
+  /** Correlation ID: 32 lowercase hex chars. */
+  cid: string;
+  targetUrl: string;
+  resolve: (res: DownstreamResponse) => void;
+  reject: (err: Error) => void;
+  /** Reply timer: armed when the envelope hits the wire. */
+  timer: NodeJS.Timeout;
+}
+
+/** A delivery parked on a connection's backpressure queue (WR-204). */
+interface MuxQueuedDelivery {
+  body: Buffer;
+  relayHeaders: Record<string, string>;
+  targetUrl: string;
+  resolve: (res: DownstreamResponse) => void;
+  reject: (err: Error) => void;
+}
+
+/**
+ * Multiplexed envelope on the wire (WR-204). `cid` is the correlation
+ * ID, `body` the base64 payload (request) or base64 reply, `headers`
+ * the delivery's own `x-relay-*` values — the upgrade handshake only
+ * carries the connection's first delivery's headers, so per-delivery
+ * metadata rides here instead.
+ */
+interface MuxEnvelope {
+  v: 1;
+  cid: string;
+  body: string;
+  headers?: Record<string, string>;
+}
+
+/** 32 lowercase hex chars. */
+const MUX_CID_RE = /^[0-9a-f]{32}$/;
+/**
+ * Hard cap on one inbound multiplexed message in multiples of
+ * `maxMessageBytes` (WR-204). The decoded body is still truncated at
+ * `maxMessageBytes` with `truncated: true` (mirroring the exclusive
+ * path); the 4x wire headroom covers base64 expansion plus envelope
+ * overhead, and anything beyond it is a protocol violation, not a
+ * truncation — unbounded accumulation is not an option.
+ */
+const MUX_WIRE_CAP_MULTIPLE = 4;
 
 /** Observable pool counters. */
 export interface WebSocketPoolStats {
@@ -301,6 +438,14 @@ export interface WebSocketPoolStats {
   deflatedOut: number;
   /** Deliveries whose reply arrived RSV1-compressed and was inflated. */
   deflatedIn: number;
+  /** Deliveries sent as multiplexed envelope frames (WR-204). */
+  muxOut: number;
+  /** Multiplexed replies routed back by correlation ID (WR-204). */
+  muxIn: number;
+  /** Deliveries that waited in a connection's in-flight queue (WR-204). */
+  muxQueued: number;
+  /** Deliveries currently in flight on multiplexed connections (WR-204). */
+  muxInFlight: number;
   /** Per-origin breakdown (WR-105), sorted by origin. */
   origins: WebSocketOriginStats[];
 }
@@ -339,6 +484,17 @@ export interface WebSocketOriginStats {
    * Absent when nothing was compressed for this origin yet.
    */
   compressionRatio?: number;
+  /**
+   * Deliveries sent as multiplexed envelope frames on this origin's
+   * connections (WR-204). Absent (not zero) when multiplexing never ran
+   * here, so untouched origins keep their old shape.
+   */
+  muxOut?: number;
+  /**
+   * Multiplexed replies routed back by correlation ID (WR-204).
+   * Absent when multiplexing never ran here.
+   */
+  muxIn?: number;
 }
 
 /** Cumulative per-origin counters behind {@link WebSocketOriginStats}. */
@@ -355,6 +511,10 @@ interface OriginCounters {
   deflateWireBytes: number;
   /** Recent keep-alive ping RTTs in ms, oldest-first, bounded. */
   pingRtts: number[];
+  /** Deliveries sent as multiplexed envelope frames (WR-204). */
+  muxOut: number;
+  /** Multiplexed replies routed back by correlation ID (WR-204). */
+  muxIn: number;
 }
 
 /** Recent ping RTT samples kept per origin (WR-105). */
@@ -363,15 +523,31 @@ const MAX_PING_RTT_SAMPLES = 32;
 /**
  * Pooled RFC 6455 connections (WR-24 combo for the WebSocket path).
  *
- * `deliver()` borrows one connection *exclusively*: the text frame goes
- * out, the next inbound text frame (or a clean close) is the response,
- * and the connection is checked back in. Exclusivity is what makes the
- * correlation sound — no message IDs are needed because only one
- * delivery is ever in flight on a connection.
+ * Default (exclusive) mode: `deliver()` borrows one connection
+ * *exclusively*: the text frame goes out, the next inbound text frame
+ * (or a clean close) is the response, and the connection is checked back
+ * in. Exclusivity is what makes the correlation sound — no message IDs
+ * are needed because only one delivery is ever in flight on a
+ * connection.
+ *
+ * Multiplexed mode (WR-204, opt-in via `multiplex`): one connection per
+ * pool key is shared by concurrent deliveries, each carried in a JSON
+ * envelope text frame with a correlation ID (`cid`) and answered by a
+ * correlated envelope. Replies may arrive in any order. At most
+ * `maxInFlight` deliveries are in flight per connection; the rest queue
+ * FIFO on the connection — the pool never opens a second connection for
+ * the same key while one is alive. See the `multiplex` option docs for
+ * the envelope contract and failure semantics.
  */
 export class WebSocketPool {
   private readonly opts: ResolvedWebSocketPoolOptions;
   private readonly conns = new Map<string, PooledWsConnection[]>();
+  /**
+   * In-progress multiplexed handshakes by pool key (WR-204): concurrent
+   * first deliveries on a key await the same promise, so exactly one
+   * socket is ever opened per key.
+   */
+  private readonly muxOpening = new Map<string, Promise<PooledWsConnection>>();
   private readonly stats = {
     created: 0,
     reused: 0,
@@ -379,6 +555,9 @@ export class WebSocketPool {
     pingTimeouts: 0,
     deflatedOut: 0,
     deflatedIn: 0,
+    muxOut: 0,
+    muxIn: 0,
+    muxQueued: 0,
   };
   /** Cumulative per-origin counters (WR-105); rows survive connection churn. */
   private readonly originCounters = new Map<string, OriginCounters>();
@@ -396,13 +575,20 @@ export class WebSocketPool {
   getStats(): WebSocketPoolStats {
     let idle = 0;
     let busy = 0;
+    let muxInFlight = 0;
     for (const list of this.conns.values()) {
       for (const c of list) {
-        if (c.busy) busy++;
+        // WR-204: a multiplexed connection is "busy" while it carries
+        // in-flight deliveries or a parked queue — it is never
+        // exclusively held, but it is not idle either.
+        const muxLoad =
+          c.mux === undefined ? 0 : c.mux.inFlight.size + c.mux.queue.length;
+        muxInFlight += c.mux === undefined ? 0 : c.mux.inFlight.size;
+        if (c.busy || muxLoad > 0) busy++;
         else idle++;
       }
     }
-    return { ...this.stats, idle, busy, origins: this.getOriginStats() };
+    return { ...this.stats, idle, busy, muxInFlight, origins: this.getOriginStats() };
   }
 
   /**
@@ -434,6 +620,8 @@ export class WebSocketPool {
         ...(row.deflatePlainBytes > 0
           ? { compressionRatio: row.deflateWireBytes / row.deflatePlainBytes }
           : {}),
+        ...(row.muxOut > 0 ? { muxOut: row.muxOut } : {}),
+        ...(row.muxIn > 0 ? { muxIn: row.muxIn } : {}),
       });
     }
     out.sort((a, b) => (a.origin < b.origin ? -1 : a.origin > b.origin ? 1 : 0));
@@ -457,6 +645,9 @@ export class WebSocketPool {
       reused: s.reused,
       ...(s.pingRttMs !== undefined ? { pingRttSeconds: s.pingRttMs / 1000 } : {}),
       ...(s.compressionRatio !== undefined ? { compressionRatio: s.compressionRatio } : {}),
+      // WR-204: pass through only when multiplexing ran on this origin.
+      ...(s.muxOut !== undefined ? { muxOut: s.muxOut } : {}),
+      ...(s.muxIn !== undefined ? { muxIn: s.muxIn } : {}),
     }));
     const lines = renderWebSocketBlock(series);
     return lines.length === 0 ? "" : lines.join("\n") + "\n";
@@ -481,6 +672,8 @@ export class WebSocketPool {
         deflatePlainBytes: 0,
         deflateWireBytes: 0,
         pingRtts: [],
+        muxOut: 0,
+        muxIn: 0,
       };
       this.originCounters.set(origin, row);
     }
@@ -512,7 +705,8 @@ export class WebSocketPool {
    * inherent to WebSocket (there are no per-message headers on the
    * wire) and is documented here so downstream contracts can rely on
    * it: read per-delivery metadata from the handshake, per-message
-   * bytes from the text frames.
+   * bytes from the text frames. (In WR-204 multiplexed mode the
+   * envelope's `headers` carry each delivery's own values instead.)
    */
   async deliver(
     url: URL,
@@ -522,12 +716,471 @@ export class WebSocketPool {
     targetUrl: string
   ): Promise<DownstreamResponse> {
     if (this.destroyed) throw new Error("websocket: pool destroyed");
+    if (this.opts.multiplex !== undefined) {
+      return this.deliverMux(url, body, relayHeaders, pins, targetUrl);
+    }
     const conn = await this.checkout(url, relayHeaders, pins, targetUrl);
     try {
       return await this.roundTrip(conn, body, targetUrl);
     } finally {
       this.checkin(url, pins, conn);
     }
+  }
+
+  // --- WR-204 multiplexed delivery -----------------------------------------
+
+  /**
+   * Deliver one payload on a shared multiplexed connection: the payload
+   * goes out as a correlated envelope text frame and the reply is
+   * routed back when the downstream's envelope with the same `cid`
+   * arrives — replies may arrive in any order.
+   *
+   * Exactly one connection exists per pool key while multiplexing: a
+   * fresh delivery either joins its in-flight table, parks FIFO on its
+   * backpressure queue (at `maxInFlight`), or — when no live connection
+   * exists — awaits the same shared handshake as any concurrent first
+   * deliveries. The pool never opens a second connection for the key.
+   */
+  private async deliverMux(
+    url: URL,
+    body: Buffer,
+    relayHeaders: Record<string, string>,
+    pins: string[] | undefined,
+    targetUrl: string
+  ): Promise<DownstreamResponse> {
+    const conn = await this.checkoutMux(url, relayHeaders, pins, targetUrl);
+    const mux = conn.mux;
+    if (mux === undefined || conn.dead || conn.socket.destroyed) {
+      // Lost the race with a teardown: fail retryable, the retry queue
+      // re-attempts (at-least-once) on a fresh connection.
+      throw new Error(`websocket: multiplexed connection unavailable for ${targetUrl}`);
+    }
+    return new Promise<DownstreamResponse>((resolve, reject) => {
+      const queued: MuxQueuedDelivery = { body, relayHeaders, targetUrl, resolve, reject };
+      if (mux.inFlight.size < this.opts.multiplex!.maxInFlight && mux.queue.length === 0) {
+        this.sendMuxEnvelope(conn, queued);
+      } else {
+        // Connection-level backpressure: park FIFO, never open another
+        // connection. The slot is taken when a delivery settles.
+        mux.queue.push(queued);
+        this.stats.muxQueued++;
+      }
+    });
+  }
+
+  /**
+   * Get the shared multiplexed connection for the pool key, opening it
+   * (once) when none is alive. Concurrent first deliveries share the
+   * same handshake promise — exactly one socket is ever opened.
+   */
+  private async checkoutMux(
+    url: URL,
+    relayHeaders: Record<string, string>,
+    pins: string[] | undefined,
+    targetUrl: string
+  ): Promise<PooledWsConnection> {
+    const key = poolKey(url, pins);
+    const list = this.conns.get(key);
+    if (list !== undefined) {
+      for (const c of list) {
+        if (c.mux !== undefined && !c.dead && !c.socket.destroyed) {
+          this.stats.reused++;
+          this.originRow(WebSocketPool.originOf(url)).reused++;
+          return c;
+        }
+      }
+    }
+    // No live multiplexed connection: open exactly one and share the
+    // handshake. A second concurrent caller must not open another.
+    let opening = this.muxOpening.get(key);
+    if (opening === undefined) {
+      opening = (async (): Promise<PooledWsConnection> => {
+        const conn = await this.open(url, relayHeaders, pins, targetUrl);
+        if (this.destroyed) {
+          // Same orphan-socket guard as the exclusive checkout path:
+          // the fresh connection never entered `this.conns`, so
+          // `destroy()` could not kill it — do it here.
+          this.kill(conn);
+          throw new Error("websocket: pool destroyed");
+        }
+        conn.mux = {
+          inFlight: new Map(),
+          queue: [],
+          opening: null,
+          text: [],
+          textLen: 0,
+          replyCompressed: false,
+        };
+        this.attachMuxPump(url, pins, conn);
+        const arr = this.conns.get(key) ?? [];
+        arr.push(conn);
+        this.conns.set(key, arr);
+        this.stats.created++;
+        this.originRow(conn.origin).created++;
+        return conn;
+      })();
+      this.muxOpening.set(key, opening);
+      try {
+        return await opening;
+      } finally {
+        this.muxOpening.delete(key);
+      }
+    }
+    const conn = await opening;
+    this.stats.reused++;
+    this.originRow(WebSocketPool.originOf(url)).reused++;
+    return conn;
+  }
+
+  /**
+   * Serialize and send one multiplexed envelope: `cid` first in the
+   * JSON so a truncated read could still identify it, then base64 body
+   * and the delivery's own `x-relay-*` headers. Registers the delivery
+   * in the correlation table and arms its reply timer when the frame
+   * hits the wire.
+   */
+  private sendMuxEnvelope(conn: PooledWsConnection, queued: MuxQueuedDelivery): void {
+    const mux = conn.mux;
+    if (mux === undefined) {
+      queued.reject(new Error(`websocket: multiplexed connection unavailable for ${queued.targetUrl}`));
+      return;
+    }
+    const cid = randomBytes(16).toString("hex");
+    const envelope: MuxEnvelope = {
+      cid,
+      v: 1,
+      body: queued.body.toString("base64"),
+      ...(Object.keys(queued.relayHeaders).length > 0 ? { headers: queued.relayHeaders } : {}),
+    };
+    const plain = Buffer.from(JSON.stringify(envelope), "utf8");
+    const send = (wire: Buffer, rsv1: boolean): void => {
+      const delivery: MuxDelivery = {
+        cid,
+        targetUrl: queued.targetUrl,
+        resolve: queued.resolve,
+        reject: queued.reject,
+        timer: setTimeout(() => {
+          this.failMuxDelivery(conn, cid, new Error(
+            `websocket: multiplexed reply timeout after ${this.opts.timeoutMs}ms for ${queued.targetUrl}`
+          ));
+        }, this.opts.timeoutMs),
+      };
+      mux.inFlight.set(cid, delivery);
+      conn.socket.write(encodeWsFrame(OP_TEXT, wire, true, rsv1), (err) => {
+        if (err) {
+          this.failMuxDelivery(conn, cid, err);
+          return;
+        }
+        this.stats.muxOut++;
+        const row = this.originRow(conn.origin);
+        row.muxOut++;
+        row.messagesOut++;
+        if (rsv1) {
+          this.stats.deflatedOut++;
+          row.deflatedOut++;
+          row.deflatePlainBytes += plain.length;
+          row.deflateWireBytes += wire.length;
+        }
+      });
+    };
+    // WR-46: opportunistic permessage-deflate on the envelope when the
+    // connection negotiated it — maybeCompressMessage never expands.
+    // The compression is async: re-check liveness before registering,
+    // or a delivery compressed across a disconnect would never settle
+    // (failAllMux only knows deliveries already in the table/queue).
+    if (conn.deflate !== null && this.opts.permessageDeflate !== undefined) {
+      void maybeCompressMessage(plain, this.opts.permessageDeflate.thresholdBytes, conn.deflate.windowBits).then(
+        (out) => {
+          if (conn.dead || conn.socket.destroyed) {
+            queued.reject(
+              new Error(`websocket: multiplexed connection unavailable for ${queued.targetUrl}`)
+            );
+            return;
+          }
+          send(out.bytes, out.compressed);
+        },
+        (err) => queued.reject(err as Error)
+      );
+    } else {
+      send(plain, false);
+    }
+  }
+
+  /** Settle one delivery's waiters and pump the backpressure queue. */
+  private settleMuxDelivery(conn: PooledWsConnection, cid: string, res: DownstreamResponse): void {
+    const mux = conn.mux;
+    if (mux === undefined) return;
+    const delivery = mux.inFlight.get(cid);
+    if (delivery === undefined) return;
+    mux.inFlight.delete(cid);
+    clearTimeout(delivery.timer);
+    delivery.resolve(res);
+    this.afterMuxSlotFreed(conn);
+  }
+
+  /** Fail one delivery (retryable) and pump the backpressure queue. */
+  private failMuxDelivery(conn: PooledWsConnection, cid: string, err: Error): void {
+    const mux = conn.mux;
+    if (mux === undefined) return;
+    const delivery = mux.inFlight.get(cid);
+    if (delivery === undefined) return;
+    mux.inFlight.delete(cid);
+    clearTimeout(delivery.timer);
+    delivery.reject(err);
+    this.afterMuxSlotFreed(conn);
+  }
+
+  /**
+   * After a multiplexed slot frees: pump the backpressure queue, and
+   * when the connection is fully drained mark it idle so the
+   * keep-alive reaper treats it like any other idle connection.
+   */
+  private afterMuxSlotFreed(conn: PooledWsConnection): void {
+    this.pumpMuxQueue(conn);
+    const mux = conn.mux;
+    if (mux !== undefined && mux.inFlight.size === 0 && mux.queue.length === 0) {
+      conn.idleSince = Date.now();
+    }
+  }
+
+  /**
+   * Move queued deliveries into freed in-flight slots, FIFO. Slots open
+   * when a delivery settles or fails; the queue never jumps the line.
+   */
+  private pumpMuxQueue(conn: PooledWsConnection): void {
+    const mux = conn.mux;
+    if (mux === undefined || conn.dead || conn.socket.destroyed) return;
+    const maxInFlight = this.opts.multiplex?.maxInFlight ?? 32;
+    while (mux.queue.length > 0 && mux.inFlight.size < maxInFlight) {
+      const next = mux.queue.shift();
+      if (next === undefined) break;
+      this.sendMuxEnvelope(conn, next);
+    }
+  }
+
+  /**
+   * Fail every in-flight and queued delivery on a dead multiplexed
+   * connection with a plain retryable `Error`. The retry queue
+   * re-attempts them (at-least-once); downstream dedup rides the WR-44
+   * `x-relay-idempotency-key`, which is stable across the re-attempt
+   * because it derives from (event id, attempt).
+   */
+  private failAllMux(conn: PooledWsConnection, reason: string): void {
+    const mux = conn.mux;
+    if (mux === undefined) return;
+    const err = new Error(`websocket: ${reason}`);
+    for (const [, delivery] of [...mux.inFlight]) {
+      clearTimeout(delivery.timer);
+      delivery.reject(err);
+    }
+    mux.inFlight.clear();
+    for (const queued of mux.queue.splice(0)) {
+      queued.reject(err);
+    }
+  }
+
+  /**
+   * The shared frame pump for a multiplexed connection: reassembles one
+   * inbound message at a time, parses the correlated envelope, and
+   * routes the reply to the waiting delivery. Control frames stay
+   * connection-scoped (ping → pong, pong → the keep-alive waiter).
+   *
+   * Protocol violations (bad envelope, unknown `cid`, oversized
+   * message, stray continuation, RSV1 misuse) fail the whole
+   * connection: a misattributed reply is worse than a retryable
+   * failure, and every pending delivery fails retryable so the retry
+   * queue re-attempts them.
+   */
+  private attachMuxPump(url: URL, pins: string[] | undefined, conn: PooledWsConnection): void {
+    const mux = conn.mux;
+    if (mux === undefined) return;
+    const target = `${url.protocol}//${url.host}${url.pathname}`;
+    const wireCap = this.opts.maxMessageBytes * MUX_WIRE_CAP_MULTIPLE;
+
+    const protocolViolation = (detail: string): void => {
+      if (conn.dead) return;
+      conn.dead = true;
+      this.failAllMux(conn, `multiplexed protocol violation (${detail}) for ${target}`);
+      this.remove(url, pins, conn);
+      this.kill(conn);
+    };
+
+    const onConnError = (err: Error): void => {
+      if (conn.dead) return;
+      conn.dead = true;
+      this.failAllMux(conn, `multiplexed connection error (${err.message}) for ${target}`);
+      this.remove(url, pins, conn);
+      this.kill(conn);
+    };
+
+    const onConnClose = (): void => {
+      if (conn.dead) return;
+      conn.dead = true;
+      this.failAllMux(conn, `multiplexed connection closed with ${mux.inFlight.size} in-flight for ${target}`);
+      this.remove(url, pins, conn);
+      // The socket is already closed — kill() would be a no-op on it —
+      // but the connection is gone, so count it destroyed like the
+      // exclusive path does via checkin → kill.
+      this.stats.destroyed++;
+    };
+
+    /** Route one fully reassembled message to its delivery. */
+    const routeMessage = (payload: Buffer, wasCompressed: boolean): void => {
+      if (wasCompressed) {
+        // WR-46: the reply arrived RSV1-compressed — inflate before
+        // parsing. A deflate stream that will not inflate fails the
+        // connection rather than corrupting a delivery.
+        void decompressMessage(payload).then(
+          (plain) => {
+            this.stats.deflatedIn++;
+            this.originRow(conn.origin).deflatedIn++;
+            routePlain(plain);
+          },
+          () => protocolViolation("compressed reply failed to inflate")
+        );
+        return;
+      }
+      routePlain(payload);
+    };
+
+    const routePlain = (text: Buffer): void => {
+      let env: MuxEnvelope;
+      try {
+        env = JSON.parse(text.toString("utf8")) as MuxEnvelope;
+      } catch {
+        protocolViolation("reply is not a JSON envelope");
+        return;
+      }
+      if (
+        env === null ||
+        typeof env !== "object" ||
+        env.v !== 1 ||
+        typeof env.cid !== "string" ||
+        !MUX_CID_RE.test(env.cid) ||
+        typeof env.body !== "string"
+      ) {
+        protocolViolation("malformed reply envelope");
+        return;
+      }
+      if (!mux.inFlight.has(env.cid)) {
+        protocolViolation(`reply for unknown correlation id ${env.cid}`);
+        return;
+      }
+      let body: Buffer;
+      try {
+        body = Buffer.from(env.body, "base64");
+      } catch {
+        protocolViolation("reply body is not base64");
+        return;
+      }
+      // The cap applies to the decoded reply body (mirroring the
+      // exclusive path's truncation contract on the payload); the wire
+      // cap above already bounded accumulation.
+      let truncated = false;
+      if (body.length > this.opts.maxMessageBytes) {
+        body = body.subarray(0, this.opts.maxMessageBytes);
+        truncated = true;
+      }
+      this.stats.muxIn++;
+      const row = this.originRow(conn.origin);
+      row.muxIn++;
+      row.messagesIn++;
+      this.settleMuxDelivery(conn, env.cid, { statusCode: 200, body, truncated });
+    };
+
+    const onData = (chunk: Buffer): void => {
+      if (conn.dead) return;
+      conn.reader.push(chunk);
+      for (;;) {
+        let frame: WsFrame | undefined;
+        try {
+          frame = conn.reader.next();
+        } catch (err) {
+          protocolViolation(`frame decode failed (${(err as Error).message})`);
+          return;
+        }
+        if (frame === undefined) break;
+        if (frame.opcode === OP_PING) {
+          if (frame.rsv1) {
+            protocolViolation("compressed control frame");
+            return;
+          }
+          conn.socket.write(encodeWsFrame(OP_PONG, frame.payload, true));
+        } else if (frame.opcode === OP_PONG) {
+          if (frame.rsv1) {
+            protocolViolation("compressed control frame");
+            return;
+          }
+          conn.pongWaiter?.();
+          conn.pongWaiter = undefined;
+        } else if (frame.opcode === OP_TEXT || frame.opcode === OP_CONT) {
+          if (frame.opcode === OP_CONT && mux.textLen === 0 && mux.text.length === 0) {
+            protocolViolation("stray continuation frame");
+            return;
+          }
+          if (frame.rsv1) {
+            if (frame.opcode !== OP_TEXT || mux.text.length !== 0 || mux.textLen !== 0) {
+              protocolViolation("RSV1 on non-first frame");
+              return;
+            }
+            if (conn.deflate === null) {
+              protocolViolation("compressed frame without negotiated deflate");
+              return;
+            }
+            mux.replyCompressed = true;
+          }
+          if (mux.textLen + frame.payload.length > wireCap) {
+            protocolViolation(`message exceeded ${wireCap} wire bytes`);
+            return;
+          }
+          mux.text.push(frame.payload);
+          mux.textLen += frame.payload.length;
+          if (frame.fin) {
+            const payload = Buffer.concat(mux.text);
+            const wasCompressed = mux.replyCompressed;
+            mux.text = [];
+            mux.textLen = 0;
+            mux.replyCompressed = false;
+            routeMessage(payload, wasCompressed);
+            if (conn.dead) return;
+          }
+        } else if (frame.opcode === OP_CLOSE) {
+          if (frame.rsv1) {
+            protocolViolation("compressed control frame");
+            return;
+          }
+          // A close frame is the peer hanging up: echo it when the
+          // socket is still open, then treat it like a close.
+          if (!conn.socket.destroyed) {
+            conn.socket.write(encodeWsFrame(OP_CLOSE, Buffer.alloc(0), true));
+          }
+          onConnClose();
+          return;
+        }
+        // Other opcodes (binary) are ignored: the multiplexed contract
+        // is envelope text frames, matching the exclusive path.
+      }
+    };
+
+    mux.pump = onData;
+    conn.socket.on("data", onData);
+    conn.socket.once("error", onConnError);
+    conn.socket.once("close", onConnClose);
+  }
+
+  /**
+   * Detach the multiplexed pump and fail anything still waiting. Called
+   * from `destroy()` and before a multiplexed connection is torn down
+   * any other way, so no waiter is ever left hanging.
+   */
+  private detachMuxPump(conn: PooledWsConnection): void {
+    const mux = conn.mux;
+    if (mux === undefined) return;
+    if (mux.pump !== undefined) {
+      conn.socket.off("data", mux.pump);
+      mux.pump = undefined;
+    }
+    this.failAllMux(conn, "multiplexed connection torn down");
   }
 
   // --- pool internals -------------------------------------------------------
@@ -594,6 +1247,11 @@ export class WebSocketPool {
   }
 
   private kill(conn: PooledWsConnection): void {
+    // WR-204: detach the multiplexed pump first — failAllMux rejects
+    // every in-flight/queued waiter immediately instead of leaving them
+    // hanging until their reply timers fire. No-op for exclusive
+    // connections (mux === undefined).
+    this.detachMuxPump(conn);
     if (!conn.dead) {
       conn.dead = true;
       this.stats.destroyed++;
@@ -847,6 +1505,13 @@ export class WebSocketPool {
     for (const [key, list] of this.conns) {
       for (const conn of [...list]) {
         if (conn.busy || conn.dead) continue;
+        // WR-204: a multiplexed connection carrying in-flight
+        // deliveries or a parked queue is not idle — never reap or
+        // probe-ping it out from under its deliveries. (Pinging is
+        // fine — control frames interleave — but reaping is not.)
+        const muxLoad =
+          conn.mux === undefined ? 0 : conn.mux.inFlight.size + conn.mux.queue.length;
+        if (muxLoad > 0) continue;
         if (now - conn.idleSince > this.opts.idleTimeoutMs) {
           this.removeByKey(key, conn);
           this.kill(conn);

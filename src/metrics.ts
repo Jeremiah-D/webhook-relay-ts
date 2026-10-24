@@ -961,6 +961,17 @@ export interface WebSocketOriginMetricsInput {
    * nothing was compressed for this origin yet.
    */
   compressionRatio?: number;
+  /**
+   * Multiplexed deliveries sent on this origin's connections (WR-204);
+   * absent when multiplexing never ran here, so untouched origins keep
+   * their old shape.
+   */
+  muxOut?: number;
+  /**
+   * Multiplexed replies routed back by correlation ID (WR-204); absent
+   * when multiplexing never ran here.
+   */
+  muxIn?: number;
 }
 
 /**
@@ -1019,6 +1030,24 @@ export function renderWebSocketBlock(series: WebSocketOriginMetricsInput[]): str
     lines.push("# TYPE relay_websocket_deflate_ratio gauge");
     for (const s of withRatio) {
       lines.push(`relay_websocket_deflate_ratio{${originOf(s)}} ${s.compressionRatio}`);
+    }
+  }
+  // WR-204: multiplexed delivery/reply counters — only rendered for
+  // origins that actually multiplexed, so everyone else stays
+  // byte-identical.
+  const withMux = series.filter((s) => s.muxOut !== undefined || s.muxIn !== undefined);
+  if (withMux.length > 0) {
+    lines.push(
+      "# HELP relay_websocket_multiplexed_total WebSocket deliveries sent as multiplexed envelope frames and replies routed back by correlation ID, by origin and direction."
+    );
+    lines.push("# TYPE relay_websocket_multiplexed_total counter");
+    for (const s of withMux) {
+      lines.push(
+        `relay_websocket_multiplexed_total{${originOf(s)},direction="out"} ${s.muxOut ?? 0}`
+      );
+      lines.push(
+        `relay_websocket_multiplexed_total{${originOf(s)},direction="in"} ${s.muxIn ?? 0}`
+      );
     }
   }
   return lines;
