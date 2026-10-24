@@ -5121,6 +5121,53 @@ await sink.send({
   compliance) — neither re-sends through this sink, and a queue
   delivery can still be archived by either.
 
+## Kinesis Data Streams delivery sink (opt-in)
+
+Where the SQS sink delivers to an unordered queue, `src/kinesis-sink.ts`
+(WR-213) delivers to a partition-ordered stream: records sharing a
+partition key land on the same shard in order, so a consumer can
+replay one key's events exactly.
+
+```ts
+const sink = new KinesisSink({
+  endpointUrl: "https://kinesis.us-east-1.amazonaws.com/",
+  streamName: "events-stream",
+  region: "us-east-1",
+  accessKeyId: "AKIDEXAMPLE",
+  secretRef: "RELAY_KINESIS_SECRET", // a reference, never the raw secret
+});
+await sink.putRecords([
+  { data: JSON.stringify(event), key: "order-9" }, // key → partition key
+  { data: JSON.stringify(other), traceId: "trace-1" }, // trace → partition key
+]);
+```
+
+- **Wire format** — one `PutRecords` JSON API POST per batch
+  (`application/x-amz-json-1.1`, `X-Amz-Target:
+  Kinesis_20131202.PutRecords`): `Data` is the base64 event JSON,
+  `PartitionKey` the resolved key. Inputs split greedily into
+  consecutive chunks of at most 500 records / 1 MiB (WR-213 spec,
+  stricter than the service's 5 MiB ceiling); a single record over
+  1 MiB is rejected, never truncated.
+- **Partition keys** — explicit `partitionKey`, then event `key`, then
+  `traceId`. A record with none of the three is rejected at build
+  time: the sink never invents a key, for the same reason the SQS
+  sink refuses to invent a FIFO `MessageGroupId`.
+- **Signing** — the WR-116 SigV4 pipeline with service `kinesis`,
+  covering the exact JSON body; `secretRef` resolves per send, so
+  rotation needs no restart and key material never enters snapshots,
+  audit logs, or error messages.
+- **Failure handling** — a non-2xx response throws `KinesisSinkError`
+  with its numeric status, so the existing classification applies
+  unchanged (4xx except 408/429 → dead-letter immediately, 429/5xx →
+  retry lane, honouring `Retry-After`); a missing secret throws
+  `KinesisSinkConfigError` → `non_retryable`, the WR-116 rule.
+  Per-record failures do *not* throw: the result carries each failed
+  record with its original index and retry lane —
+  `ProvisionedThroughputExceededException` (the 429 analog) and
+  `InternalFailure` (the 5xx analog) are retryable, any other
+  `ErrorCode` is not — so the caller retries exactly the failed
+  records. `dryRun` validates and splits with zero network I/O.
 
 ## In-flight request coalescing (opt-in)
 

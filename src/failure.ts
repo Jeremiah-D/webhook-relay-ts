@@ -53,6 +53,7 @@ import { PayloadTransformError } from "./transform.ts";
 import { OutboundSchemaViolationError } from "./outbound-schema.ts";
 import { SigV4SigningError } from "./sigv4.ts";
 import { SqsSinkConfigError } from "./sqs-sink.ts";
+import { KinesisSinkConfigError } from "./kinesis-sink.ts";
 import { DigestAuthError } from "./digest-auth.ts";
 import { CredentialSecretUnavailableError } from "./outbound-credentials.ts";
 import { AssertionFailedError } from "./response-assertions.ts";
@@ -198,6 +199,15 @@ export function classifyFailure(err: unknown): ClassifiedFailure {
   // immediately instead of burning the retry budget and the backoff
   // clock (the WR-116 rule, applied to the SQS sink).
   if (err instanceof SqsSinkConfigError) {
+    return { failureClass: "non_retryable" };
+  }
+  // WR-213: an unresolvable Kinesis secret reference is a local config
+  // problem — the wire request was never built, let alone sent.
+  // Retrying can never succeed for this item, so dead-letter
+  // immediately instead of burning the retry budget and the backoff
+  // clock (the WR-116 rule, applied to the Kinesis sink like the SQS
+  // sink above).
+  if (err instanceof KinesisSinkConfigError) {
     return { failureClass: "non_retryable" };
   }
   // WR-212: a Digest challenge this client cannot answer (unsupported
