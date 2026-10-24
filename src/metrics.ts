@@ -351,6 +351,12 @@ export interface MetricsInput {
    * dispatch.
    */
   weighted?: WeightedMetricsInput[];
+  /**
+   * Present only when consistent-hash sticky routing (WR-202) is in use;
+   * one series per (endpoint, target) pair that actually received a
+   * dispatch.
+   */
+  consistentHash?: ConsistentHashMetricsInput[];
   /** Present only when the global retry budget (WR-38) is enabled. */
   retryBudgetDepleted?: number;
   /**
@@ -555,6 +561,16 @@ export interface WeightedMetricsInput {
   /** Logical endpoint. */
   endpoint: string;
   /** Physical target the dispatch was routed to. */
+  target: string;
+  /** Cumulative dispatches to this target. */
+  dispatched: number;
+}
+
+/** One consistent-hash dispatch count, in Prometheus label order. */
+export interface ConsistentHashMetricsInput {
+  /** Logical endpoint. */
+  endpoint: string;
+  /** Physical target the sticky key was routed to. */
   target: string;
   /** Cumulative dispatches to this target. */
   dispatched: number;
@@ -1141,6 +1157,17 @@ export function renderPrometheus(input: MetricsInput): string {
     for (const w of input.weighted) {
       lines.push(
         `relay_weighted_dispatch_total{endpoint="${escapeLabelValue(w.endpoint)}",target="${escapeLabelValue(w.target)}"} ${w.dispatched}`
+      );
+    }
+  }
+  if (input.consistentHash !== undefined && input.consistentHash.length > 0) {
+    lines.push(
+      "# HELP relay_consistent_hash_dispatch_total Consistent-hash sticky-routing dispatches by logical endpoint and physical target."
+    );
+    lines.push("# TYPE relay_consistent_hash_dispatch_total counter");
+    for (const c of input.consistentHash) {
+      lines.push(
+        `relay_consistent_hash_dispatch_total{endpoint="${escapeLabelValue(c.endpoint)}",target="${escapeLabelValue(c.target)}"} ${c.dispatched}`
       );
     }
   }

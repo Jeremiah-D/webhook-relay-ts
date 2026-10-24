@@ -343,6 +343,13 @@ import {
   type WeightedTargetConfig,
 } from "./weighted.ts";
 import {
+  ConsistentHashDispatcher,
+  type ConsistentHashConfig,
+  type ConsistentHashEndpointStats,
+  type ConsistentHashKey,
+  type ConsistentHashTargetConfig,
+} from "./consistent-hash.ts";
+import {
   WeightTuner,
   WeightTuneSweeper,
   type WeightsRetunedInfo,
@@ -374,6 +381,7 @@ import {
   type StarvationGuardMetricsInput,
   type DryRunMetricsInput,
   type WeightedMetricsInput,
+  type ConsistentHashMetricsInput,
   type DeadLetterEscalationMetricsInput,
   type EndpointHealthMetricsInput,
   type StalePauseMetricsInput,
@@ -451,6 +459,13 @@ export type { DownstreamResponseSummary };
 export type { FailoverConfig, FailoverEndpointStats, FailoverSwitchEvent };
 export type { WeightedConfig, WeightedEndpointStats, WeightedTargetConfig };
 export type { WeightedMetricsInput };
+export type {
+  ConsistentHashConfig,
+  ConsistentHashEndpointStats,
+  ConsistentHashKey,
+  ConsistentHashTargetConfig,
+};
+export type { ConsistentHashMetricsInput };
 export { CompletionCallbacker, createBoundAddressSelfCheck, isSelfCallbackTarget, resolveCompletionCallbackConfig };
 export { GlobalConcurrencyGate };
 export type { GlobalConcurrencyStats };
@@ -2308,6 +2323,33 @@ export interface RetryQueueOptions {
    */
   weightedNow?: () => number;
   /**
+   * Consistent-hash sticky routing (see `src/consistent-hash.ts`),
+   * opt-in per endpoint: a record of logical endpoint -> `{ targets: [{
+   * targetUrl }], virtualNodes?, stickyKey?, failureThreshold?,
+   * recoveryIntervalMs? }`. Every dispatch for a configured endpoint is
+   * routed to the physical target owning its sticky key (default
+   * `["tenant", "endpoint"]`; also supports `"event"`), so the same
+   * tenant keeps landing on the same target — for stateful downstreams
+   * (session affinity, sharded consumers). Only healthy targets join the
+   * ring (circuit breaker state plus the dispatcher's own
+   * consecutive-failure counter, so it works with the breaker disabled);
+   * adding or removing a target only remigrates the keys on the changed
+   * arcs. When every target is unhealthy the first configured target is
+   * pinned and the normal retry / dead-letter machinery owns the
+   * outcome. Target lists are replaceable at runtime through
+   * `updateEndpointConfig` (`consistentHash` patch). Mutually exclusive
+   * with `weighted`, `failover`, and `weightTuning` per endpoint:
+   * configuring more than one routing mode for the same endpoint throws
+   * `RangeError` at construction. Invalid configs throw `RangeError` at
+   * construction.
+   */
+  consistentHash?: ConsistentHashConfig;
+  /**
+   * Consistent-hash clock in ms; defaults to `Date.now`. Injectable for
+   * deterministic tests (drives the recovery interval).
+   */
+  consistentHashNow?: () => number;
+  /**
    * WR-201: adaptive weight tuning on top of WR-66 weighted dispatch.
    * Opt-in: periodically retunes each weighted endpoint's per-target
    * weights against their WR-179 health scores (EWMA-smoothed,
@@ -2960,6 +3002,8 @@ export interface EndpointConfigState {
   quota?: { deliveriesPerMinute: number };
   /** Weighted target list; present only when weighted dispatch is on. */
   weighted?: { targets: Array<{ targetUrl: string; weight: number }> };
+  /** Consistent-hash target list; present only when consistent-hash routing is on. */
+  consistentHash?: { targets: Array<{ targetUrl: string }> };
 }
 
 interface Scheduled {
@@ -4062,6 +4106,8 @@ export class RetryQueue {
   >();
   /** WR-66: smooth weighted round-robin routing; undefined when not configured. */
   private readonly weighted?: WeightedDispatcher;
+  /** WR-202: consistent-hash sticky routing; undefined when not configured. */
+  private readonly consistentHash?: ConsistentHashDispatcher;
   /** WR-47: completion-receipt sender; undefined when the feature is off. */
   private readonly callbacker?: CompletionCallbacker;
   /** WR-93: dead-letter storm escalator; undefined when the feature is off. */
@@ -4505,10 +4551,50 @@ export class RetryQueue {
         }
       }
     }
+    // WR-202: consistent-hash sticky routing is mutually exclusive with
+    // WR-66 weighted, WR-39 failover, and WR-201 weight tuning —
+    // "own this key", "share traffic", and "ordered standby" must never
+    // all claim the same endpoint. Fail-fast at construction.
+    if (opts.consistentHash !== undefined && opts.weightTuning !== undefined) {
+      throw new RangeError(
+        "consistent-hash and weightTuning are mutually exclusive: weight tuning requires weighted dispatch"
+      );
+    }
+    if (opts.consistentHash !== undefined) {
+      for (const endpoint of Object.keys(opts.consistentHash)) {
+        if (
+          opts.weighted !== undefined &&
+          Object.prototype.hasOwnProperty.call(opts.weighted, endpoint)
+        ) {
+          throw new RangeError(
+            `consistent-hash and weighted are mutually exclusive for endpoint ${JSON.stringify(endpoint)}: configure only one`
+          );
+        }
+        if (
+          opts.failover !== undefined &&
+          Object.prototype.hasOwnProperty.call(opts.failover, endpoint)
+        ) {
+          throw new RangeError(
+            `consistent-hash and failover are mutually exclusive for endpoint ${JSON.stringify(endpoint)}: configure only one`
+          );
+        }
+      }
+    }
     this.weighted =
       opts.weighted !== undefined
         ? new WeightedDispatcher(opts.weighted, {
             now: opts.weightedNow ?? Date.now,
+            circuitState: routingCircuitState,
+          })
+        : undefined;
+    // WR-202: consistent-hash sticky routing; undefined when not
+    // configured. Built after the breaker so the dispatcher can read
+    // live circuit state for its health filtering (open = excluded,
+    // half_open = retained).
+    this.consistentHash =
+      opts.consistentHash !== undefined
+        ? new ConsistentHashDispatcher(opts.consistentHash, {
+            now: opts.consistentHashNow ?? Date.now,
             circuitState: routingCircuitState,
           })
         : undefined;
@@ -7152,6 +7238,12 @@ export class RetryQueue {
         targets: w.targets.map((t) => ({ targetUrl: t.targetUrl, weight: t.weight })),
       };
     }
+    const ch = this.consistentHash?.getConsistentHashStats().find((s) => s.endpoint === endpoint);
+    if (ch !== undefined) {
+      state.consistentHash = {
+        targets: ch.targets.map((t) => ({ targetUrl: t.targetUrl })),
+      };
+    }
     return state;
   }
 
@@ -7181,6 +7273,9 @@ export class RetryQueue {
     }
     if (this.weighted !== undefined) {
       for (const s of this.weighted.stats()) add(undefined, s.endpoint);
+    }
+    if (this.consistentHash !== undefined) {
+      for (const s of this.consistentHash.getConsistentHashStats()) add(undefined, s.endpoint);
     }
     return out;
   }
@@ -7314,6 +7409,29 @@ export class RetryQueue {
       // tuner so the next automatic round derives from them instead of
       // fighting the manual edit.
       this.weightTuner?.noteManualWeights(endpoint, patch.weighted.targets);
+    }
+    if (patch.consistentHash !== undefined) {
+      // WR-202: runtime ring-membership change. The patch was validated
+      // structurally by assertValidEndpointConfigPatch; setTargets
+      // re-validates the full target list before applying, so an illegal
+      // list throws RangeError and leaves the running ring completely
+      // intact — zero partial application. The ring rebuilds atomically,
+      // the ring version bumps, and only keys on the changed arcs
+      // remigrate.
+      if (this.consistentHash === undefined || !this.consistentHash.hasEndpoint(endpoint)) {
+        throw new RangeError(
+          "updateEndpointConfig: consistent-hash routing is not enabled for this endpoint; cannot patch targets"
+        );
+      }
+      const before = this.consistentHash
+        .getConsistentHashStats()
+        .find((s) => s.endpoint === endpoint);
+      rec(
+        "consistentHash.targets",
+        before?.targets.map((t) => ({ targetUrl: t.targetUrl })) ?? [],
+        patch.consistentHash.targets.map((t) => ({ targetUrl: t.targetUrl }))
+      );
+      this.consistentHash.setTargets(endpoint, patch.consistentHash.targets);
     }
     if (patch.retry !== undefined) {
       const r = patch.retry;
@@ -7599,8 +7717,27 @@ export class RetryQueue {
       const gate = this.orderedGate(entry, traceId, tenant, logicalEndpoint);
       if (gate !== "dispatch") return;
     }
-    const weightedTarget = this.weighted?.resolveTarget(logicalEndpoint);
-    const target = weightedTarget ?? this.failover?.resolveTarget(logicalEndpoint) ?? logicalEndpoint;
+    // WR-202: consistent-hash sticky routing resolves before weighted —
+    // the sticky key (tenant / endpoint / event per the endpoint's
+    // `stickyKey`) owns the delivery while the ring is stable; it returns
+    // undefined when the endpoint has no consistent-hash config, falling
+    // through to weighted / failover / the endpoint itself.
+    // Consistent-hash, weighted, and failover are mutually exclusive per
+    // endpoint (construction-time RangeError), so at most one of the
+    // three ever resolves here.
+    const consistentHashTarget = this.consistentHash?.resolveTarget(logicalEndpoint, {
+      tenant,
+      eventId: entry.id,
+    });
+    const weightedTarget =
+      consistentHashTarget === undefined
+        ? this.weighted?.resolveTarget(logicalEndpoint)
+        : undefined;
+    const target =
+      consistentHashTarget ??
+      weightedTarget ??
+      this.failover?.resolveTarget(logicalEndpoint) ??
+      logicalEndpoint;
     // WR-76: the end-to-end delivery deadline is checked before every
     // dispatch — ahead of the pause/window/quota/circuit gates, because
     // time parked behind any of them still counts toward the SLO (the
@@ -8193,6 +8330,9 @@ export class RetryQueue {
           // failover; non_retryable delivery outcomes feed both routers so
           // their per-target health counters agree.
           this.weighted?.recordOutcome(logicalEndpoint, target, true);
+          // WR-202: the same verdict rule feeds the consistent-hash
+          // ring's per-target health counters.
+          this.consistentHash?.recordOutcome(logicalEndpoint, target, true);
         }
         // WR-49: journal before the in-memory delete — a crash between the
         // two redelivers (at-least-once), never loses.
@@ -8443,6 +8583,7 @@ export class RetryQueue {
             this.slowStartFor(tenant)?.recordOutcome(target, true);
             this.failover?.recordOutcome(logicalEndpoint, target, true);
             this.weighted?.recordOutcome(logicalEndpoint, target, true);
+            this.consistentHash?.recordOutcome(logicalEndpoint, target, true);
           }
           this.recordDelivery(tenant, target, "failed");
           entry.attempt += 1;
@@ -8497,6 +8638,7 @@ export class RetryQueue {
           this.slowStartFor(tenant)?.recordOutcome(target, false);
           this.failover?.recordOutcome(logicalEndpoint, target, false);
           this.weighted?.recordOutcome(logicalEndpoint, target, false);
+          this.consistentHash?.recordOutcome(logicalEndpoint, target, false);
         }
         this.recordDelivery(tenant, target, "failed");
         entry.attempt += 1;
@@ -9264,6 +9406,17 @@ export class RetryQueue {
         .filter((t) => t.dispatched > 0)
         .map((t) => ({ endpoint: s.endpoint, target: t.targetUrl, dispatched: t.dispatched }))
     );
+    // WR-202: one series per (endpoint, target) pair that actually
+    // received a dispatch; absent entirely when consistent-hash mode is
+    // not in use. The dispatcher's own cumulative counts are the source —
+    // the queue does not keep a parallel counter.
+    const consistentHash: ConsistentHashMetricsInput[] = (
+      this.consistentHash?.getConsistentHashStats() ?? []
+    ).flatMap((s) =>
+      s.targets
+        .filter((t) => t.dispatched > 0)
+        .map((t) => ({ endpoint: s.endpoint, target: t.targetUrl, dispatched: t.dispatched }))
+    );
     // WR-57: the scheduled-delivery counters appear once a delivery has
     // actually been parked — activity-gated, like the starvation-guard
     // series, so an untouched relay's exposition is unchanged.
@@ -9432,6 +9585,10 @@ export class RetryQueue {
       // WR-66: activity-gated (see above) — weighted mode's series stay
       // absent until a dispatch has actually been weighted.
       ...(weighted.length > 0 ? { weighted } : {}),
+      // WR-202: activity-gated like weighted — consistent-hash series
+      // stay absent until a dispatch has actually been routed by the
+      // ring.
+      ...(consistentHash.length > 0 ? { consistentHash } : {}),
       ...(this.retryBudget !== undefined ? { retryBudgetDepleted: this.retryBudgetDepleted } : {}),
       // WR-125: activity-gated — the per-endpoint split stays absent
       // until a retry has actually been parked for an endpoint, so a
@@ -10240,6 +10397,16 @@ export class RetryQueue {
    */
   getOutboundRateLimitStats(): OutboundRateLimitStats[] | undefined {
     return this.outboundRateLimiter?.stats();
+  }
+
+  /**
+   * WR-202: consistent-hash ring state — one row per endpoint with
+   * consistent-hash routing configured, carrying the ring version and
+   * cumulative migration count plus per-target dispatch / health
+   * counters. Empty when consistent-hash routing is not configured.
+   */
+  getConsistentHashStats(): ConsistentHashEndpointStats[] {
+    return this.consistentHash?.getConsistentHashStats() ?? [];
   }
 
   /**

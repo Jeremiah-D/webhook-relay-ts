@@ -28,6 +28,10 @@
 
 import type { JitterStrategy } from "./retry.ts";
 import { assertValidWeightedTargets, type WeightedTargetConfig } from "./weighted.ts";
+import {
+  assertValidConsistentHashTargets,
+  type ConsistentHashTargetConfig,
+} from "./consistent-hash.ts";
 import type { CircuitTripMode } from "./circuit.ts";
 import {
   assertValidStatusRetryPolicy,
@@ -90,6 +94,18 @@ export interface WeightedPatch {
 }
 
 /**
+ * Patch for one endpoint's consistent-hash ring membership (WR-202).
+ * Replaces the endpoint's whole target list atomically — the ring is
+ * rebuilt, the ring version is bumped, and only the keys on the changed
+ * arcs remigrate. Requires consistent-hash routing to be enabled for
+ * the endpoint.
+ */
+export interface ConsistentHashPatch {
+  /** The endpoint's new target list (validated before apply). */
+  targets: ConsistentHashTargetConfig[];
+}
+
+/**
  * Partial endpoint configuration update accepted by
  * `RetryQueue.updateEndpointConfig`. Every field is optional; omitted
  * fields keep their current value.
@@ -112,6 +128,13 @@ export interface EndpointConfigPatch {
    * survive.
    */
   weighted?: WeightedPatch;
+  /**
+   * Per-endpoint consistent-hash target list (requires consistent-hash
+   * routing enabled for the endpoint). Replaces the whole list
+   * atomically; the ring is rebuilt and the ring version bumped, health
+   * counters and dispatch counts survive for targets still present.
+   */
+  consistentHash?: ConsistentHashPatch;
   /** Queue-global backoff parameters. */
   retry?: RetryPatch;
   /**
@@ -236,6 +259,22 @@ export function assertValidEndpointConfigPatch(patch: EndpointConfigPatch): void
     } catch (err) {
       throw new RangeError(
         `updateEndpointConfig: \`weighted.targets\` is invalid: ${(err as Error).message}`
+      );
+    }
+  }
+  if (p.consistentHash !== undefined) {
+    if (
+      typeof p.consistentHash !== "object" ||
+      p.consistentHash === null ||
+      Array.isArray(p.consistentHash)
+    ) {
+      throw new RangeError("updateEndpointConfig: `consistentHash` must be an object");
+    }
+    try {
+      assertValidConsistentHashTargets(p.consistentHash.targets);
+    } catch (err) {
+      throw new RangeError(
+        `updateEndpointConfig: \`consistentHash.targets\` is invalid: ${(err as Error).message}`
       );
     }
   }

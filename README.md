@@ -3142,6 +3142,86 @@ const server = createRelayServer({
   lists, empty/duplicate `targetUrl`s, and non-positive or non-finite
   weights.
 
+## Consistent-hash sticky routing (opt-in)
+
+Where failover answers "which target is *up*" and weighted mode answers
+"how is traffic *shared*", consistent-hash routing answers "which target
+*owns this sticky key*": for stateful downstreams — session affinity,
+sharded consumers — where the same tenant must keep landing on the same
+physical target. A hand-written ketama-style ring (SHA-256, zero
+dependencies): every target owns `virtualNodes` points on the ring
+(default 128), a key walks clockwise to the first point at or past its
+own hash, and adding or removing a target only remigrates the keys on the
+changed arcs:
+
+```ts
+const server = createRelayServer({
+  secret, forwardUrl, auditLog,
+  retry: {
+    consistentHash: {
+      "https://api/hook": {
+        targets: [
+          { targetUrl: "https://ingest-1/hook" },
+          { targetUrl: "https://ingest-2/hook" },
+          { targetUrl: "https://ingest-3/hook" },
+        ],
+        virtualNodes: 128,            // default 128, integer 1..4096
+        stickyKey: ["tenant", "endpoint"], // default; also supports "event"
+        failureThreshold: 5,          // default 5; consecutive failures → excluded
+        recoveryIntervalMs: 30_000,   // default 30s; quiet period before rejoining
+      },
+    },
+  },
+});
+```
+
+- **Sticky key** — composed from the configured parts (`tenant` /
+  `endpoint` / `event`, each namespaced so parts cannot collide). The
+  default `["tenant", "endpoint"]` pins every tenant to one target; the
+  default tenant hashes as a stable empty key. `["event"]` keys on the
+  delivery id instead — every retry of the same event returns to the same
+  target. Same key → same target while the ring is stable, deterministic
+  across restarts (no randomness anywhere).
+- **Minimal migration** — removing a target moves exactly the keys it
+  owned, survivors keep every key; adding a target only steals keys from
+  its own ring arcs. `queue.getConsistentHashStats()` reports
+  `ringVersion` (bumped on every membership change) and `migrations`
+  (cumulative membership changes), so an operator can tell whether a
+  stickiness complaint predates the latest change.
+- **Only healthy targets join the ring** — same signals as weighted:
+  an open circuit breaker excludes, a half-open breaker re-includes so
+  the probe delivery can settle, and the dispatcher's own
+  consecutive-failure counter excludes sick targets even with the breaker
+  disabled. A downstream that *answers* — even with a 4xx — counts as
+  healthy; an excluded target rejoins after the recovery interval and its
+  next outcome alone decides. When *every* target is unhealthy the first
+  configured target is pinned and the normal retry / dead-letter
+  machinery owns the outcome.
+- **Mutually exclusive with weighted, failover, and weight tuning** —
+  configuring `consistentHash` together with `weighted` / `failover` for
+  the same endpoint, or with `weightTuning` at all, throws `RangeError` at
+  startup ("own this key", "share traffic", and "ordered standby" must
+  never all claim an endpoint). Different endpoints may use different
+  modes.
+- **Runtime membership changes** — `queue.updateEndpointConfig(endpoint,
+  { consistentHash: { targets: [...] } })` replaces the whole target list
+  atomically (validated before apply, zero partial application), rebuilds
+  the ring, bumps the ring version, and keeps health counters and
+  cumulative dispatch counts for surviving targets. It fires
+  `onConfigChange` like any hot-reload patch, so the server audits it as
+  `endpoint_config_updated`.
+- **Observability** —
+  `relay_consistent_hash_dispatch_total{endpoint,target}` counts
+  dispatches per physical target (present only when the mode is in use);
+  delivery counters, latency histograms, and circuit gauges are keyed by
+  the physical target that served the attempt;
+  `queue.getConsistentHashStats()` shows per-endpoint
+  `{ ringVersion, migrations, targets: [{ targetUrl, virtualNodes,
+  dispatched, consecutiveFailures, healthy }] }`.
+- **Invalid configs throw `RangeError` at startup** — empty target
+  lists, empty/duplicate `targetUrl`s, `virtualNodes` outside 1..4096, and
+  empty/duplicate/unknown `stickyKey` parts.
+
 ## Adaptive weight tuning (opt-in)
 
 A closed-loop controller on top of weighted dispatch (WR-201). Static
