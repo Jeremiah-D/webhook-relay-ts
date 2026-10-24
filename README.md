@@ -4446,6 +4446,68 @@ oauth2: {
 },
 ```
 
+### DPoP sender-constrained access tokens (opt-in, WR-205)
+
+A bearer token is a password: anyone who copies it can use it. DPoP
+(RFC 9449) turns the access token into a key-bound token instead. Set
+`dpop` and the relay proves possession of a DPoP key on *every token
+use*:
+
+- the token request itself carries a fresh DPoP proof JWT in the
+  `DPoP` header (header `{typ:"dpop+jwt", alg, jwk}` with the public
+  key embedded; payload `{htm, htu, iat, jti}` — no `ath` yet, since no
+  token exists);
+- every downstream delivery stamps `Authorization: DPoP <token>` plus
+  a per-request proof binding the HTTP method, the target URI, and the
+  token (`ath` = base64url(SHA-256(access_token))), with a fresh `jti`
+  each time.
+
+A leaked token is useless without the DPoP private key — it cannot be
+replayed from another machine. This is what bank-grade downstream
+authentication looks like, and it is **orthogonal to
+`private_key_jwt`**: the assertion proves *who* asks the token endpoint
+(client authentication), the DPoP proof proves *the asker holds the
+key* on every use of the issued token (proof of possession). The two
+compose — assertion in the form body *and* proof in the `DPoP` header
+on the token request — or `dpop` works alone over `client_secret`.
+
+```ts
+oauth2: {
+  "https://bank.example.com/hook": {
+    token_endpoint: "https://auth.bank.example.com/oauth/token",
+    client_id: "relay-client",
+    client_secret: process.env.BANK_OAUTH_SECRET!, // or private_key_jwt
+    dpop: {
+      privateKey: "<PEM Ed25519 or P-256 EC private key>",
+      keyId: "dpop-2026-10", // optional, cache bookkeeping only
+      alg: "Ed25519",        // or "ES256"
+    },
+  },
+},
+```
+
+Details (`src/oauth-client.ts`, `node:crypto` only, zero new dependencies):
+
+- **Key management** — Ed25519 keys reuse the outbound-Ed25519 key
+  management (`compileEd25519OutboundKey`); ES256 keys must be P-256
+  EC keys. The key is parsed once at startup, fail-fast; the public
+  JWK and its RFC 7638 thumbprint (`jkt`) are precomputed. Proofs sign
+  with EdDSA / ES256 (raw `R‖S`) respectively.
+- **Binding confirmation** — a DPoP proof was presented, so the token
+  endpoint must answer `token_type: "DPoP"` (RFC 9449 §6.1): the
+  server confirms the token is bound to the proof's `jkt`. A `Bearer`
+  answer fails closed — the relay refuses to stamp a token whose
+  stolen copy could be replayed.
+- **Nonce challenges** — an RFC 9449 §4.3 `use_dpop_nonce` rejection
+  is retried exactly once with a fresh proof carrying the server's
+  `DPoP-Nonce`; the nonce is then sent proactively on later fetches.
+- **Anti-forgery** — an inbound `dpop` header is stripped before
+  stamping (the WR-26 pattern), so a sender can never smuggle a forged
+  proof downstream.
+- **Never logged, never audited** — proofs, like the secret and the
+  assertion, never enter logs, audit events, or error messages
+  (covered by `test/oauth-dpop.test.ts`).
+
 ## Outbound static credentials (opt-in)
 
 Some downstreams gate webhooks on a static secret — an `x-api-key`

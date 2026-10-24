@@ -96,9 +96,12 @@ import {
   type DeadLetterExportPlan,
 } from "./deadletter-export.ts";
 import {
+  buildDpopProofJwt,
+  DPOP_PROOF_HEADER,
   OAuth2TokenCache,
   resolveOAuth2ClientConfig,
   type OAuth2ClientCredentialsConfig,
+  type ResolvedOAuth2ClientConfig,
 } from "./oauth-client.ts";
 import type { ReplayEgressOptions } from "./replay-egress.ts";
 import { ReplayApprovalError, type ReplayApprovalDenyReason, type ReplayApprovalOptions } from "./replay-approval.ts";
@@ -3010,6 +3013,10 @@ export function createDefaultSender(
   // WR-129: fail fast on a misconfigured OAuth2 entry — a bad token
   // endpoint or an empty credential must never surface as a mid-delivery
   // 401 storm. The secret is validated, never logged.
+  // WR-205: keep the resolved configs — the DPoP proof key rides each
+  // delivery's resource proof, so the wire path needs the compiled key,
+  // not just the validated shape.
+  const resolvedOauth2 = new Map<string, ResolvedOAuth2ClientConfig>();
   if (oauth2 !== undefined) {
     if (oauth2 === null || typeof oauth2 !== "object" || Array.isArray(oauth2)) {
       throw new RangeError(
@@ -3022,7 +3029,10 @@ export function createDefaultSender(
           "createDefaultSender: `oauth2` keys must be non-empty endpoint strings"
         );
       }
-      resolveOAuth2ClientConfig(cfg, `createDefaultSender: \`oauth2["${endpoint}"]\``);
+      resolvedOauth2.set(
+        endpoint,
+        resolveOAuth2ClientConfig(cfg, `createDefaultSender: \`oauth2["${endpoint}"]\``)
+      );
     }
   }
   const oauthTokenCache = oauth2 !== undefined ? (oauth2TokenCache ?? new OAuth2TokenCache()) : undefined;
@@ -3536,7 +3546,13 @@ export function createDefaultSender(
    */
   const buildWireRequest = (
     item: RetryItem,
-    wireOpts?: { forcePlaintext?: boolean; httpTransport?: boolean; oauthToken?: string }
+    wireOpts?: {
+      forcePlaintext?: boolean;
+      httpTransport?: boolean;
+      oauthToken?: string;
+      /** WR-205: a fresh DPoP resource proof for this delivery (`undefined` for non-DPoP endpoints). */
+      oauthDpopProof?: string;
+    }
   ): {
     headers: Record<string, string | string[]>;
     body: Buffer;
@@ -3781,9 +3797,23 @@ export function createDefaultSender(
     // rule as the SigV4 Authorization handling above).
     if (wireOpts?.oauthToken !== undefined) {
       for (const k of Object.keys(headers)) {
-        if (k.toLowerCase() === AUTHORIZATION_HEADER) delete headers[k];
+        const lower = k.toLowerCase();
+        // WR-205: an inbound `dpop` header is stripped too — a sender
+        // can never smuggle a forged DPoP proof downstream (the same
+        // WR-26 anti-forgery rule as `authorization`).
+        if (lower === AUTHORIZATION_HEADER || lower === DPOP_PROOF_HEADER.toLowerCase()) {
+          delete headers[k];
+        }
       }
-      headers[AUTHORIZATION_HEADER] = `Bearer ${wireOpts.oauthToken}`;
+      if (wireOpts.oauthDpopProof !== undefined) {
+        // WR-205: DPoP-bound token — `Authorization: DPoP <token>`
+        // plus the fresh per-request proof. Orthogonal to the relay's
+        // own request signatures (WR-26/WR-124/WR-116): all may coexist.
+        headers[AUTHORIZATION_HEADER] = `DPoP ${wireOpts.oauthToken}`;
+        headers[DPOP_PROOF_HEADER] = wireOpts.oauthDpopProof;
+      } else {
+        headers[AUTHORIZATION_HEADER] = `Bearer ${wireOpts.oauthToken}`;
+      }
     }
     // WR-192: per-endpoint outbound static credentials (opt-in). Stamped
     // after the OAuth2 bearer token: when both configure the same header
@@ -3865,6 +3895,12 @@ export function createDefaultSender(
      */
     oauthToken?: string,
     /**
+     * WR-205: a fresh DPoP resource proof for this delivery
+     * (`undefined` for non-DPoP endpoints). Built once per attempt in
+     * `defaultSender`, alongside the token.
+     */
+    oauthDpopProof?: string,
+    /**
      * WR-143: per-endpoint phase timeout budgets for this delivery
      * (`undefined` when the endpoint has no `phaseTimeouts` entry).
      * Enforced on the HTTP/1.1 path only — see the arming block in
@@ -3940,7 +3976,7 @@ export function createDefaultSender(
         // the same answer the wire builder used — without compressing
         // twice. The byte savings are noted per guarded-compressed
         // dispatch (the sender committed to sending it compressed).
-        const wire = buildWireRequest(item, { forcePlaintext, httpTransport: true, oauthToken });
+        const wire = buildWireRequest(item, { forcePlaintext, httpTransport: true, oauthToken, oauthDpopProof });
         if (!forcePlaintext && wire.guardedCompressed) {
           guardedApplied = true;
           guardedBytesSaved = wire.guardedBytesSaved;
@@ -4807,7 +4843,12 @@ export function createDefaultSender(
      * WR-129: resolved OAuth2 bearer value for this delivery
      * (`undefined` when the endpoint has no `oauth2` entry).
      */
-    oauthToken?: string
+    oauthToken?: string,
+    /**
+     * WR-205: a fresh DPoP resource proof for this delivery
+     * (`undefined` for non-DPoP endpoints).
+     */
+    oauthDpopProof?: string
   ): Promise<DownstreamResponse> => {
     // WR-75: same guarded 415→plaintext fallback as the HTTP/1.1 path —
     // the resend rides a fresh H2 stream inside the same delivery
@@ -4861,7 +4902,7 @@ export function createDefaultSender(
           if (sock !== undefined) certExpiryMonitor.observePeerCertificate(sock, item.targetUrl);
         }
         try {
-          const wire = buildWireRequest(item, { forcePlaintext, httpTransport: true, oauthToken });
+          const wire = buildWireRequest(item, { forcePlaintext, httpTransport: true, oauthToken, oauthDpopProof });
           if (!forcePlaintext && wire.guardedCompressed) {
             guardedApplied = true;
             guardedBytesSaved = wire.guardedBytesSaved;
@@ -5109,9 +5150,20 @@ export function createDefaultSender(
       url.protocol === "http:" || url.protocol === "https:"
         ? oauth2?.[item.targetUrl]
         : undefined;
+    // WR-205: the resolved config for this endpoint — `undefined`
+    // unless the endpoint has an `oauth2` entry, in which case the
+    // startup loop already resolved (and compiled the DPoP key for)
+    // it under the same key.
+    const oauthResolved = oauthCfg !== undefined ? resolvedOauth2.get(item.targetUrl) : undefined;
     // WR-99: the physical attempt dispatch, wrapped below with the
     // deadline-budget race when the queue stamped a remaining budget.
-    const dispatch = (oauthToken: string | undefined): Promise<DownstreamResponse | void> => {
+    // WR-205: `oauthDpopProof` is a fresh per-attempt DPoP resource
+    // proof (`undefined` for non-DPoP endpoints) — built in
+    // `attemptWithOAuth` so every delivery carries a unique `jti`.
+    const dispatch = (
+      oauthToken: string | undefined,
+      oauthDpopProof?: string
+    ): Promise<DownstreamResponse | void> => {
       // WebSocket (WR-45): ws:/wss: targets ride the pooled RFC 6455 path.
       // Proxied ws: is rejected above (explicit proxy + non-HTTP(S)
       // target), same as any other non-HTTP scheme.
@@ -5133,15 +5185,15 @@ export function createDefaultSender(
       // would fail the chain it was configured to trust. HTTP/1.1
       // instead, where the bundle rides the handshake.
       if (h2pool !== undefined && proxyUrl === undefined && ocsp === undefined && phaseTimeout === undefined && caBundle === undefined && h2pool.eligibleFor(url)) {
-        return deliverViaHttp2(item, url, pins, clientCert, tlsSni, minTlsVersion, clientCertRotation, oauthToken).catch((err) => {
+        return deliverViaHttp2(item, url, pins, clientCert, tlsSni, minTlsVersion, clientCertRotation, oauthToken, oauthDpopProof).catch((err) => {
           if (err instanceof Http2UnavailableError) {
             h2pool!.noteFallback();
-            return deliverViaHttp1(item, url, pins, clientCert, proxyUrl, tlsSni, minTlsVersion, clientCertRotation, ocsp, oauthToken, phaseTimeout, callOpts?.signal, caBundle);
+            return deliverViaHttp1(item, url, pins, clientCert, proxyUrl, tlsSni, minTlsVersion, clientCertRotation, ocsp, oauthToken, oauthDpopProof, phaseTimeout, callOpts?.signal, caBundle);
           }
           throw err;
         });
       }
-      return deliverViaHttp1(item, url, pins, clientCert, proxyUrl, tlsSni, minTlsVersion, clientCertRotation, ocsp, oauthToken, phaseTimeout, callOpts?.signal, caBundle);
+      return deliverViaHttp1(item, url, pins, clientCert, proxyUrl, tlsSni, minTlsVersion, clientCertRotation, ocsp, oauthToken, oauthDpopProof, phaseTimeout, callOpts?.signal, caBundle);
     };
     // WR-129: resolve the bearer value once per delivery attempt
     // (cached); a 401 forces exactly one refresh + redelivery inside the
@@ -5149,12 +5201,22 @@ export function createDefaultSender(
     // refresh consumes no retry budget. A second 401 follows the normal
     // classify → retry / dead-letter path. A token-endpoint failure
     // (OAuth2TokenError) is not a 401 and fails the delivery directly.
+    // WR-205: for DPoP endpoints a fresh resource proof is built per
+    // attempt alongside the token — the second of the two proofs, with
+    // `ath` binding it to this attempt's token.
     const attemptWithOAuth = (forceRefresh: boolean): Promise<DownstreamResponse | void> => {
       if (oauthCfg === undefined || oauthTokenCache === undefined) return dispatch(undefined);
       const tokenP = forceRefresh
         ? oauthTokenCache.refreshFor(oauthCfg)
         : oauthTokenCache.tokenFor(oauthCfg);
-      return tokenP.then((token) => dispatch(token));
+      return tokenP.then((token) => {
+        const dpop = oauthResolved?.dpop;
+        const proof =
+          dpop !== undefined
+            ? buildDpopProofJwt({ dpop, htm: "POST", htu: item.targetUrl, accessToken: token })
+            : undefined;
+        return dispatch(token, proof);
+      });
     };
     const dispatchWithOAuth = (): Promise<DownstreamResponse | void> =>
       attemptWithOAuth(false).catch((err) => {

@@ -38,12 +38,28 @@
  * token fetch. The assertion cache, single-flight, and 401-refresh
  * mechanics are the token cache's and are unchanged: they operate on
  * the access token, never the assertion.
+ *
+ * WR-205: DPoP sender-constrained access tokens (RFC 9449) — a second,
+ * orthogonal proof. The WR-189 assertion (or the `client_secret`)
+ * authenticates the *client* to the token endpoint; the DPoP proof
+ * proves *possession of the DPoP key* on every token use: a fresh proof
+ * JWT rides the `DPoP` header of the token request itself (no `ath`
+ * yet), and each downstream delivery stamps `Authorization: DPoP
+ * <token>` plus a per-request proof binding method, target URI, and
+ * the token (`ath`). A leaked token cannot be replayed from another
+ * machine. The endpoint must answer `token_type: "DPoP"` — anything
+ * else fails closed (the client-side binding confirmation) — and an
+ * RFC 9449 §4.3 `use_dpop_nonce` challenge is retried once with a
+ * fresh proof carrying the server nonce. Proofs, like secrets and
+ * assertions, are never logged or audited.
  */
 
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import {
+  createHash,
   createPrivateKey,
+  createPublicKey,
   randomBytes,
   sign as cryptoSign,
   type KeyObject,
@@ -57,6 +73,15 @@ export const PRIVATE_KEY_JWT_ASSERTION_TYPE =
 /** How long a `private_key_jwt` assertion is valid (RFC 7523: keep it short). */
 export const PRIVATE_KEY_JWT_EXPIRY_SECONDS = 300;
 
+/** HTTP header carrying a DPoP proof JWT (RFC 9449 §4.2 / §7.1). */
+export const DPOP_PROOF_HEADER = "DPoP";
+
+/** HTTP header carrying the authorization server's DPoP nonce (RFC 9449 §4.3). */
+export const DPOP_NONCE_HEADER = "DPoP-Nonce";
+
+/** `token_type` a DPoP-capable token endpoint must return (RFC 9449 §6.1). */
+export const DPOP_TOKEN_TYPE = "DPoP";
+
 /** Safety margin: a token counts as expired this early (clock-skew reserve). */
 export const OAUTH2_CLOCK_SKEW_MS = 30_000;
 
@@ -65,6 +90,38 @@ export const OAUTH2_DEFAULT_EXPIRES_IN_MS = 300_000;
 
 /** Default timeout for one token request. */
 export const OAUTH2_TOKEN_REQUEST_TIMEOUT_MS = 10_000;
+
+/**
+ * WR-205: DPoP proof key configuration (RFC 9449). When set, the relay
+ * proves possession of this key on every token use: a fresh DPoP proof
+ * JWT rides the `DPoP` header of the token request itself, and every
+ * downstream delivery stamps `Authorization: DPoP <token>` plus a
+ * per-request proof binding the HTTP method, the target URI, and the
+ * access token (`ath` — the token's SHA-256 thumbprint). A leaked
+ * token is useless without the key: it cannot be replayed from another
+ * machine.
+ *
+ * Orthogonal to the client-authentication method: `dpop` composes with
+ * either `client_secret` or WR-189 `private_key_jwt`. The assertion
+ * proves *who* asks the token endpoint; the DPoP proof proves *the
+ * asker holds the key* on every use of the issued token.
+ */
+export interface DpopKeyConfig {
+  /**
+   * PEM-encoded private key: Ed25519 or P-256 EC (`alg` selects).
+   * Parsed once at startup, fail-fast. Ed25519 keys reuse the
+   * outbound-Ed25519 key management (`compileEd25519OutboundKey`).
+   */
+  privateKey: string;
+  /**
+   * Stable key id. DPoP identifies the key by its embedded JWK (not
+   * `kid`), so this is bookkeeping only — used to isolate the token
+   * cache between keys. Optional.
+   */
+  keyId?: string;
+  /** Signing algorithm: Ed25519 (EdDSA) or ES256 (P-256). */
+  alg: "Ed25519" | "ES256";
+}
 
 /**
  * Per-endpoint OAuth2 `client_credentials` configuration, as given in
@@ -109,6 +166,35 @@ export interface OAuth2ClientCredentialsConfig {
   };
   /** Optional space-delimited `scope`. Non-empty when set. */
   scope?: string;
+  /**
+   * WR-205: DPoP sender-constrained access tokens (RFC 9449). Optional;
+   * composes with either `client_secret` or `private_key_jwt`
+   * authentication. The DPoP key is memory-only: never logged, never
+   * audited, exactly like the secret and the assertion.
+   */
+  dpop?: DpopKeyConfig;
+}
+
+/**
+ * WR-205: a validated DPoP key — the private key parsed once at
+ * startup, the public JWK and its RFC 7638 thumbprint (`jkt`)
+ * precomputed so proof construction never touches key parsing.
+ */
+export interface ResolvedDpopKey {
+  privateKey: KeyObject;
+  keyId?: string;
+  alg: "Ed25519" | "ES256";
+  /**
+   * Public JWK embedded in every proof's header (`jwk`) — public
+   * material only, never the private key.
+   */
+  jwk: { kty: string; crv: string; x: string; y?: string };
+  /**
+   * RFC 7638 JWK SHA-256 thumbprint — the `jkt` the authorization
+   * server binds the access token to. Compare against the AS's token
+   * introspection to confirm the binding out of band.
+   */
+  jkt: string;
 }
 
 /** A validated OAuth2 config: the endpoint parsed once at startup. */
@@ -125,6 +211,11 @@ export interface ResolvedOAuth2ClientConfig {
     keyId?: string;
     alg: "Ed25519" | "RS256";
   };
+  /**
+   * WR-205: compiled DPoP proof key — the private key parsed once at
+   * startup, the public JWK and `jkt` precomputed.
+   */
+  dpop?: ResolvedDpopKey;
   scope?: string;
 }
 
@@ -177,11 +268,19 @@ export function resolveOAuth2ClientConfig(
   if (cfg.scope !== undefined && (typeof cfg.scope !== "string" || cfg.scope.trim() === "")) {
     throw new RangeError(`${where}: \`scope\` must be a non-empty string when set`);
   }
+  // WR-205: the DPoP proof key is validated and parsed once here, at
+  // startup — a missing or malformed key refuses to boot, never
+  // surfaces as a mid-delivery failure.
+  let dpop: ResolvedDpopKey | undefined;
+  if (cfg.dpop !== undefined) {
+    dpop = compileDpopKey(cfg.dpop, `${where}: \`dpop\``);
+  }
   return {
     tokenEndpoint,
     clientId: cfg.client_id,
     ...(hasSecret ? { clientSecret: cfg.client_secret as string } : {}),
     ...(assertion !== undefined ? { assertion } : {}),
+    ...(dpop !== undefined ? { dpop } : {}),
     ...(cfg.scope !== undefined ? { scope: cfg.scope } : {}),
   };
 }
@@ -291,14 +390,298 @@ export interface OAuth2TokenResponse {
 }
 
 /**
+ * WR-205: validate a DPoP key config and parse the private key once at
+ * startup. Ed25519 keys reuse the outbound-Ed25519 key management
+ * (`compileEd25519OutboundKey` — WR-124); ES256 keys must be P-256 EC
+ * keys. The public JWK and its RFC 7638 thumbprint are precomputed
+ * here, so proof construction never parses keys. Throws `RangeError`
+ * on any bad shape — call at startup, never mid-delivery.
+ */
+function compileDpopKey(cfg: DpopKeyConfig, where: string): ResolvedDpopKey {
+  if (cfg === null || typeof cfg !== "object" || Array.isArray(cfg)) {
+    throw new RangeError(`${where} must be an object`);
+  }
+  if (cfg.alg !== "Ed25519" && cfg.alg !== "ES256") {
+    throw new RangeError(`${where}: \`alg\` must be "Ed25519" or "ES256"`);
+  }
+  if (cfg.keyId !== undefined && (typeof cfg.keyId !== "string" || cfg.keyId === "")) {
+    throw new RangeError(`${where}: \`keyId\` must be a non-empty string when set`);
+  }
+  let privateKey: KeyObject;
+  if (cfg.alg === "Ed25519") {
+    privateKey = compileEd25519OutboundKey(
+      {
+        privateKey: cfg.privateKey,
+        ...(cfg.keyId !== undefined ? { keyId: cfg.keyId } : {}),
+      },
+      where
+    ).privateKey;
+  } else {
+    if (typeof cfg.privateKey !== "string" || cfg.privateKey.trim() === "") {
+      throw new RangeError(`${where}: \`privateKey\` must be a non-empty PEM string`);
+    }
+    try {
+      privateKey = createPrivateKey(cfg.privateKey);
+    } catch {
+      throw new RangeError(`${where}: \`privateKey\` is not a valid PEM private key`);
+    }
+    const namedCurve = privateKey.asymmetricKeyDetails?.namedCurve;
+    // Node reports the OpenSSL curve name (`prime256v1`); accept the
+    // JWA name (`P-256`) too.
+    if (
+      privateKey.asymmetricKeyType !== "ec" ||
+      (namedCurve !== "P-256" && namedCurve !== "prime256v1")
+    ) {
+      throw new RangeError(
+        `${where}: \`privateKey\` must be a P-256 EC private key for ES256, got ` +
+          `${privateKey.asymmetricKeyType ?? "unknown"}${namedCurve !== undefined ? `/${namedCurve}` : ""}`
+      );
+    }
+  }
+  const jwk = exportDpopPublicJwk(privateKey, where);
+  return {
+    privateKey,
+    keyId: cfg.keyId,
+    alg: cfg.alg,
+    jwk,
+    jkt: dpopJwkThumbprint(jwk),
+  };
+}
+
+/**
+ * Export the public half of a compiled DPoP key as a minimal JWK —
+ * public material only. Throws `RangeError` when the key does not
+ * export the expected shape (an internal invariant: the key was just
+ * validated above).
+ */
+function exportDpopPublicJwk(
+  privateKey: KeyObject,
+  where: string
+): ResolvedDpopKey["jwk"] {
+  let exported: unknown;
+  try {
+    exported = createPublicKey(privateKey).export({ format: "jwk" });
+  } catch {
+    throw new RangeError(`${where}: cannot export the DPoP public key`);
+  }
+  const jwk = exported as Record<string, unknown>;
+  if (jwk["kty"] === "OKP" && jwk["crv"] === "Ed25519" && typeof jwk["x"] === "string") {
+    return { kty: "OKP", crv: "Ed25519", x: jwk["x"] };
+  }
+  if (
+    jwk["kty"] === "EC" &&
+    jwk["crv"] === "P-256" &&
+    typeof jwk["x"] === "string" &&
+    typeof jwk["y"] === "string"
+  ) {
+    return { kty: "EC", crv: "P-256", x: jwk["x"], y: jwk["y"] };
+  }
+  throw new RangeError(`${where}: the DPoP key exported an unexpected public JWK`);
+}
+
+/**
+ * WR-205: RFC 7638 JWK SHA-256 thumbprint of a DPoP public key — the
+ * `jkt` the authorization server binds the access token to. The
+ * canonical member order is fixed by the RFC (lexicographic), so the
+ * thumbprint is stable across implementations.
+ */
+export function dpopJwkThumbprint(jwk: ResolvedDpopKey["jwk"]): string {
+  const canonical =
+    jwk.kty === "OKP"
+      ? `{"crv":"${jwk.crv}","kty":"${jwk.kty}","x":"${jwk.x}"}`
+      : `{"crv":"${jwk.crv}","kty":"${jwk.kty}","x":"${jwk.x}","y":"${jwk.y}"}`;
+  return createHash("sha256").update(canonical, "utf8").digest().toString("base64url");
+}
+
+/**
+ * Convert a DER-encoded ECDSA signature (what `node:crypto` returns)
+ * to the raw fixed-width `R || S` form JWS ES256 requires (RFC 7518
+ * §3.4). `node:crypto` always emits valid DER for its own signatures,
+ * so a malformed input here is an internal invariant violation.
+ */
+function derToRawEcdsaSignature(der: Buffer): Buffer {
+  let off = 0;
+  const fail = (): RangeError => new RangeError("DPoP: malformed DER ECDSA signature");
+  if (der[off++] !== 0x30) throw fail();
+  let len = der[off++];
+  if (len & 0x80) {
+    const n = len & 0x7f;
+    if (n === 0 || n > 2) throw fail();
+    len = 0;
+    for (let i = 0; i < n; i++) len = (len << 8) | (der[off++] ?? 0);
+  }
+  void len;
+  const takeInt = (): Buffer => {
+    if (der[off++] !== 0x02) throw fail();
+    const intLen = der[off++] ?? 0;
+    if (intLen === 0 || intLen > 33) throw fail();
+    let v = der.subarray(off, off + intLen);
+    off += intLen;
+    while (v.length > 1 && v[0] === 0x00) v = v.subarray(1);
+    if (v.length > 32) throw fail();
+    const out = Buffer.alloc(32);
+    v.copy(out, 32 - v.length);
+    return out;
+  };
+  const r = takeInt();
+  const s = takeInt();
+  if (off !== der.length) throw fail();
+  return Buffer.concat([r, s]);
+}
+
+/**
+ * Normalize a DPoP `htu` claim per RFC 9449 §4.2: the HTTP URI
+ * *without* query and fragment parts — the proof binds the endpoint,
+ * not one request's parameters.
+ */
+function normalizeDpopHtu(raw: string): string {
+  if (typeof raw !== "string" || raw === "") {
+    throw new RangeError("DPoP proof: `htu` must be a non-empty URL string");
+  }
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new RangeError("DPoP proof: `htu` is not a valid URL");
+  }
+  if (url.protocol !== "https:" && url.protocol !== "http:") {
+    throw new RangeError(`DPoP proof: \`htu\` must be an http(s) URL, got ${url.protocol}`);
+  }
+  url.hash = "";
+  url.search = "";
+  return url.toString();
+}
+
+/** Input for {@link buildDpopProofJwt}. */
+export interface DpopProofInput {
+  /** Compiled DPoP key (from {@link resolveOAuth2ClientConfig}). */
+  dpop: ResolvedDpopKey;
+  /** HTTP method of the request the proof is attached to (e.g. `"POST"`). Non-empty. */
+  htm: string;
+  /**
+   * HTTP URI of the request the proof is attached to — normalized
+   * inside (query and fragment stripped, RFC 9449 §4.2).
+   */
+  htu: string;
+  /**
+   * Access token the proof is bound to: stamped as `ath`
+   * (base64url(SHA-256(token)), RFC 9449 §4.2). Set for resource
+   * requests; omitted for the token request itself, where no token
+   * exists yet.
+   */
+  accessToken?: string;
+  /**
+   * Server `DPoP-Nonce` challenge value (RFC 9449 §4.3): set after a
+   * `use_dpop_nonce` rejection. Non-empty when set.
+   */
+  nonce?: string;
+  /** Signing instant; defaults to now. Inject for deterministic tests. */
+  nowMs?: number;
+  /** `jti` nonce; defaults to 16 random bytes (hex) — unique per proof. */
+  jti?: string;
+}
+
+/**
+ * WR-205: build a DPoP proof JWT (RFC 9449 §4.2): header
+ * `{typ:"dpop+jwt", alg, jwk}` with the public key embedded, payload
+ * `{htm, htu, iat, jti}` plus `ath` when the proof accompanies an
+ * access token and `nonce` after a server challenge. Ed25519 signs
+ * with EdDSA, P-256 with ES256 — `node:crypto` only, zero new
+ * dependencies.
+ *
+ * The proof is a short-lived bearer of key possession: it
+ * authenticates as the relay. Like the `client_secret` and the WR-189
+ * assertion, it must never be logged or audited — the token fetcher
+ * names the endpoint and status only.
+ */
+export function buildDpopProofJwt(input: DpopProofInput): string {
+  if (input === null || typeof input !== "object" || Array.isArray(input)) {
+    throw new TypeError("DPoP proof input must be an object");
+  }
+  const dpop = input.dpop;
+  // `KeyObject` is a type-only import (erased by type stripping), so
+  // this is a structural check, not `instanceof`.
+  if (
+    dpop === null ||
+    typeof dpop !== "object" ||
+    (dpop.alg !== "Ed25519" && dpop.alg !== "ES256") ||
+    dpop.privateKey === null ||
+    typeof dpop.privateKey !== "object"
+  ) {
+    throw new TypeError("DPoP proof input: `dpop` must be a compiled DPoP key");
+  }
+  if (typeof input.htm !== "string" || input.htm.trim() === "") {
+    throw new RangeError("DPoP proof: `htm` must be a non-empty HTTP method");
+  }
+  const htu = normalizeDpopHtu(input.htu);
+  if (
+    input.accessToken !== undefined &&
+    (typeof input.accessToken !== "string" || input.accessToken === "")
+  ) {
+    throw new RangeError("DPoP proof: `accessToken` must be a non-empty string when set");
+  }
+  if (input.nonce !== undefined && (typeof input.nonce !== "string" || input.nonce === "")) {
+    throw new RangeError("DPoP proof: `nonce` must be a non-empty string when set");
+  }
+  if (input.jti !== undefined && (typeof input.jti !== "string" || input.jti === "")) {
+    throw new RangeError("DPoP proof: `jti` must be a non-empty string when set");
+  }
+  const nowSec = Math.floor((input.nowMs ?? Date.now()) / 1000);
+  const header = {
+    typ: "dpop+jwt",
+    alg: dpop.alg === "Ed25519" ? "EdDSA" : "ES256",
+    jwk:
+      dpop.alg === "Ed25519"
+        ? { kty: dpop.jwk.kty, crv: dpop.jwk.crv, x: dpop.jwk.x }
+        : { kty: dpop.jwk.kty, crv: dpop.jwk.crv, x: dpop.jwk.x, y: dpop.jwk.y },
+  };
+  const payload: Record<string, unknown> = {
+    htm: input.htm,
+    htu,
+    iat: nowSec,
+    jti: input.jti ?? randomBytes(16).toString("hex"),
+  };
+  if (input.accessToken !== undefined) {
+    payload["ath"] = createHash("sha256")
+      .update(input.accessToken, "utf8")
+      .digest()
+      .toString("base64url");
+  }
+  if (input.nonce !== undefined) {
+    payload["nonce"] = input.nonce;
+  }
+  const signingInput = `${base64UrlEncode(JSON.stringify(header))}.${base64UrlEncode(JSON.stringify(payload))}`;
+  const data = Buffer.from(signingInput, "utf8");
+  const signature =
+    dpop.alg === "Ed25519"
+      ? cryptoSign(null, data, dpop.privateKey)
+      : derToRawEcdsaSignature(cryptoSign("SHA256", data, dpop.privateKey));
+  return `${signingInput}.${base64UrlEncode(signature)}`;
+}
+
+/**
  * Thrown for token endpoint failures: unreachable endpoint, non-2xx
  * status, malformed JSON, missing `access_token`. The message never
- * carries the `client_secret`.
+ * carries the `client_secret`, the WR-189 assertion, or a WR-205 DPoP
+ * proof — it names the endpoint and status only.
  */
 export class OAuth2TokenError extends Error {
-  constructor(message: string) {
+  /**
+   * HTTP status of the token endpoint response, when a response was
+   * received (`undefined` for transport failures).
+   */
+  readonly statusCode?: number;
+  /**
+   * WR-205: the authorization server's `DPoP-Nonce` challenge from a
+   * `use_dpop_nonce` rejection (RFC 9449 §4.3). Not sensitive — a
+   * server-issued challenge, safe to surface to the caller.
+   */
+  readonly dpopNonce?: string;
+  constructor(message: string, opts?: { statusCode?: number; dpopNonce?: string }) {
     super(message);
     this.name = "OAuth2TokenError";
+    if (opts?.statusCode !== undefined) this.statusCode = opts.statusCode;
+    if (opts?.dpopNonce !== undefined) this.dpopNonce = opts.dpopNonce;
   }
 }
 
@@ -317,6 +700,12 @@ export interface OAuth2TokenFetchParams {
    * configs, mutually exclusive with `clientSecret`.
    */
   clientAssertionJwt?: string;
+  /**
+   * WR-205: a freshly built DPoP proof JWT for the token request
+   * (RFC 9449 §4.2 — no `ath`, since no token exists yet). Sent as the
+   * `DPoP` header. Like the assertion, it is never logged.
+   */
+  dpopProofJwt?: string;
   scope?: string;
   /** Per-request timeout in ms. */
   timeoutMs: number;
@@ -332,7 +721,8 @@ export type OAuth2TokenFetcher = (
 
 function assertValidTokenResponse(
   parsed: unknown,
-  endpoint: URL
+  endpoint: URL,
+  dpopBound: boolean
 ): OAuth2TokenResponse {
   const where = `oauth2 token response from ${endpoint.host}${endpoint.pathname}`;
   if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
@@ -342,10 +732,25 @@ function assertValidTokenResponse(
   if (typeof p.access_token !== "string" || p.access_token === "") {
     throw new OAuth2TokenError(`${where}: missing \`access_token\``);
   }
-  // Only bearer tokens are supported: the sender stamps
-  // `Authorization: Bearer <token>`, and stamping anything else under
-  // a Bearer scheme would be a lie the downstream cannot verify.
-  if (
+  if (dpopBound) {
+    // WR-205: the client-side binding confirmation. A DPoP proof was
+    // presented, so the issued token must be DPoP-bound (RFC 9449
+    // §6.1) — the authorization server confirms the binding by
+    // returning `token_type: "DPoP"`. A `Bearer` token here would not
+    // be sender-constrained: fail closed instead of stamping a token
+    // whose stolen copy could be replayed from anywhere.
+    if (
+      typeof p.token_type !== "string" ||
+      p.token_type.toLowerCase() !== DPOP_TOKEN_TYPE.toLowerCase()
+    ) {
+      throw new OAuth2TokenError(
+        `${where}: expected \`token_type\` "${DPOP_TOKEN_TYPE}" for a DPoP-bound token`
+      );
+    }
+  } else if (
+    // Only bearer tokens are supported: the sender stamps
+    // `Authorization: Bearer <token>`, and stamping anything else under
+    // a Bearer scheme would be a lie the downstream cannot verify.
     p.token_type !== undefined &&
     (typeof p.token_type !== "string" || p.token_type.toLowerCase() !== "bearer")
   ) {
@@ -376,6 +781,13 @@ function assertValidTokenResponse(
  * endpoints expect the field). The assertion — like the secret —
  * travels in the form body; it is never written to any log, and error
  * messages name the endpoint and status only.
+ *
+ * WR-205: for DPoP configs the request additionally carries the proof
+ * in the `DPoP` header (RFC 9449 §4.2) — composed with either client
+ * authentication method. An RFC 9449 §4.3 `use_dpop_nonce` rejection
+ * surfaces the server's `DPoP-Nonce` challenge on the thrown
+ * `OAuth2TokenError` (as `dpopNonce`, with `statusCode`), so the
+ * caller can retry once with a fresh proof carrying it.
  */
 export function defaultOAuth2TokenFetcher(
   params: OAuth2TokenFetchParams
@@ -418,6 +830,8 @@ export function defaultOAuth2TokenFetcher(
             "content-type": "application/x-www-form-urlencoded",
             "content-length": String(Buffer.byteLength(body)),
             accept: "application/json",
+            // WR-205: the token-request proof rides the `DPoP` header.
+            ...(params.dpopProofJwt !== undefined ? { [DPOP_PROOF_HEADER]: params.dpopProofJwt } : {}),
           },
         },
         (res) => {
@@ -436,7 +850,33 @@ export function defaultOAuth2TokenFetcher(
             }
             const status = res.statusCode ?? 0;
             if (status < 200 || status >= 300) {
-              fail(`${endpoint.host}${endpoint.pathname} -> HTTP ${status}`);
+              // WR-205: surface an RFC 9449 §4.3 nonce challenge so the
+              // caller can retry once with a fresh proof carrying it.
+              // The challenge is a server-issued nonce, not a secret —
+              // safe to surface. The proof itself stays out of the
+              // error, exactly like the secret and the assertion.
+              let dpopNonce: string | undefined;
+              if (status === 400 && params.dpopProofJwt !== undefined) {
+                try {
+                  const bodyText = Buffer.concat(chunks).toString("utf8");
+                  const errCode = (JSON.parse(bodyText) as { error?: unknown }).error;
+                  if (errCode === "use_dpop_nonce") {
+                    const header = res.headers[DPOP_NONCE_HEADER.toLowerCase()];
+                    if (typeof header === "string" && header !== "") dpopNonce = header;
+                  }
+                } catch {
+                  // Not a JSON nonce challenge — a plain failure below.
+                }
+              }
+              reject(
+                new OAuth2TokenError(
+                  `oauth2 token request failed: ${endpoint.host}${endpoint.pathname} -> HTTP ${status}`,
+                  {
+                    statusCode: status,
+                    ...(dpopNonce !== undefined ? { dpopNonce } : {}),
+                  }
+                )
+              );
               return;
             }
             let parsed: unknown;
@@ -447,7 +887,7 @@ export function defaultOAuth2TokenFetcher(
               return;
             }
             try {
-              resolve(assertValidTokenResponse(parsed, endpoint));
+              resolve(assertValidTokenResponse(parsed, endpoint, params.dpopProofJwt !== undefined));
             } catch (err) {
               reject(err);
             }
@@ -501,6 +941,14 @@ export class OAuth2TokenCache {
   private readonly tokenRequestTimeoutMs: number;
   private readonly entries = new Map<string, CachedOAuth2Token>();
   private readonly inflight = new Map<string, Promise<string>>();
+  /**
+   * WR-205: the authorization server's latest `DPoP-Nonce` per cache
+   * key (RFC 9449 §4.3). A nonce learned from a `use_dpop_nonce`
+   * rejection is sent proactively on the next fetch for the same key
+   * instead of paying for another challenge round-trip. Nonces are not
+   * secrets — server-issued challenges.
+   */
+  private readonly dpopNonces = new Map<string, string>();
 
   constructor(opts: OAuth2TokenCacheOptions = {}) {
     this.nowMs = opts.nowMs ?? Date.now;
@@ -520,7 +968,13 @@ export class OAuth2TokenCache {
     // with the same client_id but different signing keys must not
     // share a cached token. Secret-based keys are unchanged
     // (byte-identical to before).
-    return cfg.assertion !== undefined ? `${base}\n${cfg.assertion.keyId ?? ""}` : base;
+    const assertionDim = cfg.assertion !== undefined ? `\n${cfg.assertion.keyId ?? ""}` : "";
+    // WR-205: a DPoP-bound token is bound to the proof key — two
+    // configs sharing a client_id but using different DPoP keys must
+    // not share a cached token. Non-DPoP keys are unchanged
+    // (byte-identical to before).
+    const dpopDim = cfg.dpop !== undefined ? `\n${cfg.dpop.jkt}` : "";
+    return `${base}${assertionDim}${dpopDim}`;
   }
 
   /**
@@ -558,47 +1012,83 @@ export class OAuth2TokenCache {
   private fetchOnce(key: string, cfg: ResolvedOAuth2ClientConfig): Promise<string> {
     const ongoing = this.inflight.get(key);
     if (ongoing !== undefined) return ongoing;
-    // WR-189: the assertion is built fresh per token fetch — a new
-    // `jti` and a fresh `iat`/`exp` every time, so a leaked or replayed
-    // assertion cannot outlive its 5-minute window. Caching,
-    // single-flight, and the 401 refresh path are unchanged: they
-    // operate on the token, not the assertion.
-    const clientAssertionJwt =
-      cfg.assertion !== undefined
-        ? buildPrivateKeyJwtAssertion({
-            clientId: cfg.clientId,
-            tokenEndpoint: cfg.tokenEndpoint.href,
-            assertion: cfg.assertion,
-            nowMs: this.nowMs(),
-          })
-        : undefined;
-    const fetched = this.fetchToken({
-      tokenEndpoint: cfg.tokenEndpoint,
-      clientId: cfg.clientId,
-      ...(cfg.clientSecret !== undefined ? { clientSecret: cfg.clientSecret } : {}),
-      ...(clientAssertionJwt !== undefined ? { clientAssertionJwt } : {}),
-      ...(cfg.scope !== undefined ? { scope: cfg.scope } : {}),
-      timeoutMs: this.tokenRequestTimeoutMs,
-    }).then(
-      (resp) => {
-        const ttlMs =
-          resp.expires_in !== undefined
-            ? resp.expires_in * 1000
-            : OAUTH2_DEFAULT_EXPIRES_IN_MS;
-        // Clock-skew reserve: a token that expires in less than the
-        // skew margin is treated as already expired — the next call
-        // refetches instead of sending a token the downstream may
-        // already consider stale.
-        const expiresAtMs = this.nowMs() + Math.max(0, ttlMs - OAUTH2_CLOCK_SKEW_MS);
-        this.entries.set(key, { token: resp.access_token, expiresAtMs });
-        this.inflight.delete(key);
-        return resp.access_token;
-      },
-      (err) => {
-        this.inflight.delete(key);
+    // WR-205: the token-request proof carries no `ath` — no token
+    // exists yet — and picks up the server nonce learned from a
+    // previous `use_dpop_nonce` challenge for this key.
+    const attempt = (dpopNonce: string | undefined): Promise<OAuth2TokenResponse> => {
+      // WR-189: the assertion is built fresh per token fetch — a new
+      // `jti` and a fresh `iat`/`exp` every time, so a leaked or replayed
+      // assertion cannot outlive its 5-minute window. Caching,
+      // single-flight, and the 401 refresh path are unchanged: they
+      // operate on the token, not the assertion.
+      const clientAssertionJwt =
+        cfg.assertion !== undefined
+          ? buildPrivateKeyJwtAssertion({
+              clientId: cfg.clientId,
+              tokenEndpoint: cfg.tokenEndpoint.href,
+              assertion: cfg.assertion,
+              nowMs: this.nowMs(),
+            })
+          : undefined;
+      const dpopProofJwt =
+        cfg.dpop !== undefined
+          ? buildDpopProofJwt({
+              dpop: cfg.dpop,
+              htm: "POST",
+              htu: cfg.tokenEndpoint.href,
+              ...(dpopNonce !== undefined ? { nonce: dpopNonce } : {}),
+              nowMs: this.nowMs(),
+            })
+          : undefined;
+      return this.fetchToken({
+        tokenEndpoint: cfg.tokenEndpoint,
+        clientId: cfg.clientId,
+        ...(cfg.clientSecret !== undefined ? { clientSecret: cfg.clientSecret } : {}),
+        ...(clientAssertionJwt !== undefined ? { clientAssertionJwt } : {}),
+        ...(dpopProofJwt !== undefined ? { dpopProofJwt } : {}),
+        ...(cfg.scope !== undefined ? { scope: cfg.scope } : {}),
+        timeoutMs: this.tokenRequestTimeoutMs,
+      });
+    };
+    const fetched = attempt(this.dpopNonces.get(key))
+      .catch((err) => {
+        // WR-205 / RFC 9449 §4.3: on a `use_dpop_nonce` rejection,
+        // retry exactly once with a fresh proof carrying the server
+        // nonce (a fresh `jti` too — proofs are never reused). The
+        // nonce is remembered per key, so the next fetch leads with it
+        // instead of paying for another challenge round-trip.
+        if (
+          cfg.dpop !== undefined &&
+          err instanceof OAuth2TokenError &&
+          err.statusCode === 400 &&
+          typeof err.dpopNonce === "string" &&
+          err.dpopNonce !== ""
+        ) {
+          this.dpopNonces.set(key, err.dpopNonce);
+          return attempt(err.dpopNonce);
+        }
         throw err;
-      }
-    );
+      })
+      .then(
+        (resp) => {
+          const ttlMs =
+            resp.expires_in !== undefined
+              ? resp.expires_in * 1000
+              : OAUTH2_DEFAULT_EXPIRES_IN_MS;
+          // Clock-skew reserve: a token that expires in less than the
+          // skew margin is treated as already expired — the next call
+          // refetches instead of sending a token the downstream may
+          // already consider stale.
+          const expiresAtMs = this.nowMs() + Math.max(0, ttlMs - OAUTH2_CLOCK_SKEW_MS);
+          this.entries.set(key, { token: resp.access_token, expiresAtMs });
+          this.inflight.delete(key);
+          return resp.access_token;
+        },
+        (err) => {
+          this.inflight.delete(key);
+          throw err;
+        }
+      );
     this.inflight.set(key, fetched);
     return fetched;
   }
