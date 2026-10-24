@@ -3625,6 +3625,45 @@ const server = createRelayServer({
   non-positive-integer `maxBodyBytes`) throw `RangeError` at startup, so
   a bad config can never fail a request mid-flight.
 
+## Per-tenant inbound body budgets
+
+`tenantBodyLimits` layers per-tenant budgets on top of the global
+`maxBodyBytes` and the per-endpoint rules above — a record of tenant id
+→ max body bytes. When the inbound `x-tenant-id` header claims a tenant
+with a configured budget, that budget governs the request's intake:
+
+```ts
+const server = createRelayServer({
+  maxBodyBytes: 1_048_576, // global budget: 1 MiB
+  tenantBodyLimits: {
+    "noisy-etl": 262_144,  // this tenant's webhooks are capped at 256 KiB
+  },
+});
+```
+
+- **Same checkpoint as WR-25** — the tenant is resolved from the raw
+  header before a single body byte is read and before signature
+  verification, so the tenant budget covers the declared `Content-Length`
+  pre-check, the `readRawBody` streaming cap, and the `gunzipCapped`
+  decompression cap. An absent, invalid, or unconfigured tenant id falls
+  back to the endpoint/global budget, and full WR-48 tenant validation
+  still happens after verification — unauthenticated callers learn
+  nothing new from the budget lookup.
+- **Precedence: tenant budget > endpoint rule > global budget** — the
+  tenant-scoped knob wins when configured, so one tenant's allowance
+  never widens or narrows another tenant's intake.
+- **Answered 413, audited with the tenant dimension** — over-limit bodies
+  get `413` with `connection: close` and are audited as `rejected`
+  (reason `body_too_large`) carrying the *effective* `maxBodyBytes` plus
+  the `tenant`, so the audit trail distinguishes a per-tenant cap from
+  the endpoint/global ones. Requests that fall back to the
+  endpoint/global budget carry no tenant dimension.
+- **Orthogonal to WR-137** — that budgets delivery *volume* per tenant
+  (how many deliveries a tenant may burn); this budgets inbound *size*
+  (how big one webhook may be).
+- Invalid maps (non-record, invalid tenant-id keys, non-positive-integer
+  budgets) throw `RangeError` at startup.
+
 ## Inbound JSON depth limit
 
 `maxJsonDepth` (default `32`) bounds the *shape* of inbound JSON —

@@ -76,6 +76,11 @@ import type {
 } from "./escalation.ts";
 import { TENANT_ID_HEADER, assertValidTenantId, tenantScopeKey } from "./tenant.ts";
 import { TenantKeyStore } from "./tenant-keys.ts";
+import {
+  assertValidTenantBodyLimits,
+  resolveTenantBodyBudget,
+  type TenantBodyLimits,
+} from "./tenant-body-limit.ts";
 import type { AutoReplayOptions } from "./autoreplay.ts";
 import type { DeadLetterRetentionOptions } from "./deadletter-retention.ts";
 import {
@@ -1523,6 +1528,27 @@ export interface RelayServerOptions {
    * startup.
    */
   endpointBodyLimits?: EndpointBodyLimitRule[];
+  /**
+   * Per-tenant inbound body size overrides (WR-203, see
+   * `src/tenant-body-limit.ts`). A record of tenant id -> max body bytes,
+   * layered on top of the WR-25 global `maxBodyBytes` and the WR-102
+   * per-endpoint rules: when the inbound `x-tenant-id` header claims a
+   * tenant with a configured budget, that budget governs the request's
+   * intake instead of the endpoint/global budget. The tenant is resolved
+   * from the raw header at the same checkpoint as WR-25 — before a single
+   * body byte is read and before signature verification — so it covers
+   * the declared Content-Length pre-check, the `readRawBody` streaming
+   * cap, and the WR-40 gzip decompression cap. An absent, invalid, or
+   * unconfigured tenant id falls back to the endpoint/global budget, and
+   * full WR-48 tenant validation still happens after verification, so
+   * unauthenticated callers learn nothing new. Over-limit bodies are
+   * answered 413 with `connection: close` and audited as `rejected`
+   * (reason `body_too_large`) carrying the effective `maxBodyBytes` and
+   * the tenant dimension. Orthogonal to WR-137 (that budgets delivery
+   * *volume* per tenant; this budgets inbound *size*). Unset means exact
+   * current behavior. Invalid maps throw `RangeError` at startup.
+   */
+  tenantBodyLimits?: TenantBodyLimits;
   /**
    * Outbound request signing (WR-26, see `OutboundSigningConfig`): when set,
    * every delivery made by the default sender carries
@@ -7197,6 +7223,11 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // Per-endpoint verifier rules are validated once at startup so a bad
   // pattern or verifier can never fail a request mid-flight.
   assertValidEndpointVerifierRules(opts.endpointVerifiers);
+  // WR-203: per-tenant body budgets are validated once at startup so a
+  // bad tenant id or byte budget can never fail a request mid-flight.
+  if (opts.tenantBodyLimits !== undefined) {
+    assertValidTenantBodyLimits(opts.tenantBodyLimits);
+  }
   // WR-195: the per-tenant key store must be a TenantKeyStore instance —
   // anything else fails fast at startup, never mid-request.
   if (opts.tenantKeys !== undefined && !(opts.tenantKeys instanceof TenantKeyStore)) {
@@ -9993,8 +10024,20 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // the transport layer — it runs before signature verification and
     // before WR-41 schema validation (semantic validation); the two are
     // orthogonal.
+    // WR-203: per-tenant body budget — layered on top of the WR-102
+    // rule. The tenant is resolved from the raw `x-tenant-id` header at
+    // this same checkpoint (before body read, before verification); an
+    // absent, invalid, or unconfigured tenant falls back to the
+    // endpoint/global budget. Precedence: tenant budget > endpoint rule >
+    // global `maxBodyBytes`.
+    const tenantBudget = resolveTenantBodyBudget(req.headers[TENANT_ID_HEADER], opts.tenantBodyLimits);
     const effectiveMaxBodyBytes =
-      selectEndpointBodyLimit(pathname, opts.endpointBodyLimits) ?? maxBodyBytes;
+      tenantBudget?.bytes ??
+      selectEndpointBodyLimit(pathname, opts.endpointBodyLimits) ??
+      maxBodyBytes;
+    // Tenant dimension for the 413 audits below — present only when a
+    // tenant budget actually governed the intake.
+    const tenantAuditLabel = tenantBudget === undefined ? {} : { tenant: tenantBudget.tenant };
 
     // Inbound body size limit (WR-25), first line of defense: the declared
     // Content-Length is checked before a single body byte is read, so a
@@ -10010,6 +10053,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
           traceId,
           reason: "body_too_large",
           maxBodyBytes: effectiveMaxBodyBytes,
+          // WR-203: the tenant dimension — present only when a
+          // per-tenant budget governed the intake.
+          ...tenantAuditLabel,
         });
         // `connection: close` drops the socket after the 413, so the
         // client cannot keep streaming a flood into a dead request.
@@ -10033,6 +10079,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
           traceId,
           reason: "body_too_large",
           maxBodyBytes: effectiveMaxBodyBytes,
+          // WR-203: the tenant dimension — present only when a
+          // per-tenant budget governed the intake.
+          ...tenantAuditLabel,
         });
         res
           .writeHead(413, { "content-type": "text/plain", connection: "close" })
@@ -10369,6 +10418,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
             event: "rejected",
             id,
             traceId,
+            ...tenantLabel,
             reason: "body_too_large",
             maxBodyBytes: bodyBudgetBytes,
           });
