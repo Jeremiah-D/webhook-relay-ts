@@ -97,11 +97,11 @@ import {
   type EndpointHealthStatsRow,
   type EndpointRecoveredInfo,
 } from "./endpoint-health.ts";
-import { EndpointDeliveryWindow, parseDeliveryWindowSpec, type DeliveryWindowOptions, type DeliveryWindowStats, type TimezoneWindowConfig } from "./delivery-window.ts";
+import { EndpointDeliveryWindow, parseDeliveryWindowSpec, type DeliveryWindowOptions, type DeliveryWindowStats, type HolidayCalendarConfig, type TimezoneWindowConfig } from "./delivery-window.ts";
 import { EndpointMaintenanceWindow, type MaintenanceWindowOptions, type MaintenanceWindowStats } from "./maintenance-window.ts";
 export { parseDeliveryWindowSpec, EndpointDeliveryWindow };
 export { EndpointMaintenanceWindow };
-export type { DeliveryWindowOptions, DeliveryWindowStats, TimezoneWindowConfig };
+export type { DeliveryWindowOptions, DeliveryWindowStats, HolidayCalendarConfig, TimezoneWindowConfig };
 export type { MaintenanceWindowOptions, MaintenanceWindowStats };
 import {
   ScheduledDeliveryQueue,
@@ -9840,11 +9840,14 @@ export class RetryQueue {
       for (const [endpoint, delayed] of inner) {
         const spec = this.deliveryWindow?.specFor(endpoint);
         const timezone = this.deliveryWindow?.timezoneFor(endpoint);
+        const hol = this.deliveryWindow?.holidayInfo(endpoint);
         rows.push({
           endpoint,
           ...(tenant === undefined ? {} : { tenant }),
           window: spec?.raw ?? "",
           ...(timezone === undefined ? {} : { timezone }),
+          ...(hol?.region === undefined ? {} : { holidayRegion: hol.region }),
+          ...(hol === undefined ? {} : { holidayStrategy: hol.strategy }),
           delayed,
           open: this.deliveryWindow?.isOpen(endpoint) ?? true,
         });
@@ -9888,6 +9891,28 @@ export class RetryQueue {
    */
   deleteEndpointDeliveryWindow(endpoint: string): boolean {
     return this.deliveryWindow?.deleteEndpointWindow(endpoint) ?? false;
+  }
+
+  /**
+   * WR-208: set (or replace) the holiday calendar for one endpoint at
+   * runtime — the same hot-reload convention as the other per-endpoint
+   * overrides. An invalid config or an endpoint with no window throws
+   * `RangeError` and leaves the current calendar intact. Returns `false`
+   * when the delivery-window feature is disabled.
+   */
+  setEndpointDeliveryHolidays(endpoint: string, cfg: HolidayCalendarConfig): boolean {
+    if (this.deliveryWindow === undefined) return false;
+    this.deliveryWindow.setEndpointHolidays(endpoint, cfg);
+    return true;
+  }
+
+  /**
+   * WR-208: remove the holiday calendar for one endpoint at runtime.
+   * Returns `false` when the delivery-window feature is disabled or no
+   * calendar was configured.
+   */
+  deleteEndpointDeliveryHolidays(endpoint: string): boolean {
+    return this.deliveryWindow?.deleteEndpointHolidays(endpoint) ?? false;
   }
 
   /**

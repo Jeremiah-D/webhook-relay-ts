@@ -295,11 +295,24 @@ reliability primitives that matter for any signed-payload pipeline.
   DST is handled honestly against wall-clock minutes (a spring-forward
   gap hour never matches; a fall-back repeated hour is indistinguishable
   from its first occurrence), via `Intl.DateTimeFormat` with zero new
-  dependencies. `getDeliveryWindowStats()` reports per-endpoint
-  `delayed` counts plus the effective `timezone`; runtime overrides via
+  dependencies. WR-208 adds opt-in per-endpoint holiday calendars —
+  `deliveryWindow: { holidays: { "<targetUrl>": { dates: ["YYYY-MM-DD",
+  ...], region?, strategy?, holidayWindow? } } }` — where the date is
+  the window's own calendar date (the zone's local date for a timezone
+  window, the UTC date for a UTC window). `skip` (default) closes the
+  whole holiday day and jumps `msUntilOpen` to the next non-holiday
+  window opening; `defer` closes the day but parks only to the next
+  window opening, re-evaluating there; `shrink` narrows the holiday
+  window to its first half, or to an explicit `holidayWindow` spec
+  (`holidayWindow` on `skip`/`defer` throws). A calendar on an endpoint
+  with no window throws at construction instead of silently doing
+  nothing. `getDeliveryWindowStats()` reports per-endpoint
+  `delayed` counts plus the effective `timezone` and, when a calendar is
+  set, `holidayRegion` / `holidayStrategy`; runtime overrides via
   `setEndpointDeliveryWindow()` / `setEndpointTzDeliveryWindow()` /
-  `deleteEndpointDeliveryWindow()`. Injectable clock for deterministic
-  tests.
+  `setEndpointDeliveryHolidays()` / `deleteEndpointDeliveryHolidays()` /
+  `deleteEndpointDeliveryWindow()` (deleting the window also deletes its
+  calendar). Injectable clock for deterministic tests.
 - `src/maintenance-window.ts` — per-endpoint one-shot maintenance
   windows (WR-127): `retry: { maintenanceWindow: { windows: {
   "<targetUrl>": [{ start: "2026-11-01T02:00:00Z", end:

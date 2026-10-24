@@ -30,6 +30,23 @@
  * indistinguishable from its first occurrence. All of this uses
  * `Intl.DateTimeFormat` — zero new dependencies.
  *
+ * WR-208 adds opt-in per-endpoint holiday calendars: a set of calendar
+ * dates (plus a `region` label, e.g. `"CN"`) on which the day's window
+ * behaves differently. The date is the window's own calendar date — the
+ * zone's local date for a timezone window, the UTC date for a UTC window
+ * — so a Shanghai holiday is not shifted by UTC. Three strategies:
+ * `skip` closes the whole holiday day and `msUntilOpen` jumps straight
+ * to the next non-holiday window opening; `defer` also closes the day
+ * but parks only to the next window opening, re-evaluating there (so a
+ * multi-day holiday re-parks day by day); `shrink` narrows the holiday
+ * window to its first half by default, or to an explicit `holidayWindow`
+ * spec when one is given (the open edge is shared with the normal
+ * window unless `holidayWindow` says otherwise). Holidays are opt-in
+ * per endpoint and require a window — a calendar on an endpoint with no
+ * window throws `RangeError` at construction instead of silently doing
+ * nothing. Endpoints without a calendar keep the exact pre-WR-208
+ * behavior.
+ *
  * Like `quota.ts` (WR-15) and the WR-50 pause switch, the clock is
  * injectable so tests pin wall-clock time deterministically.
  */
@@ -102,8 +119,49 @@ export interface DeliveryWindowOptions {
    * absent means off (zero behavior change).
    */
   tzWindows?: Record<string, TimezoneWindowConfig>;
+  /**
+   * Per-endpoint holiday calendars (WR-208): exact `targetUrl` →
+   * `{ dates, region?, strategy?, holidayWindow? }`. An endpoint with a
+   * calendar must also have a UTC or timezone window (a calendar alone
+   * throws `RangeError` at construction). Opt-in per endpoint; absent
+   * means off (zero behavior change).
+   */
+  holidays?: Record<string, HolidayCalendarConfig>;
   /** Clock in ms; defaults to `Date.now`. Injectable for deterministic tests. */
   now?: () => number;
+}
+
+/**
+ * How a holiday day treats its endpoint's delivery window (WR-208):
+ * `skip` closes the whole day and jumps to the next non-holiday window
+ * opening; `defer` closes the day but parks only to the next window
+ * opening, re-evaluating there; `shrink` narrows the day's window (first
+ * half of the normal window by default, or `holidayWindow` when given).
+ */
+export type HolidayStrategy = "skip" | "defer" | "shrink";
+
+/** A per-endpoint holiday calendar (WR-208). */
+export interface HolidayCalendarConfig {
+  /**
+   * Holiday dates as `"YYYY-MM-DD"` in the window's calendar (the zone's
+   * local date for a timezone window, the UTC date for a UTC window).
+   * Each date must be a real calendar date; malformed dates throw
+   * `RangeError` at construction. Duplicates are ignored.
+   */
+  dates: string[];
+  /** Region label for the calendar, e.g. `"CN"` — observability only. */
+  region?: string;
+  /** Holiday strategy; defaults to `"skip"`. */
+  strategy?: HolidayStrategy;
+  /**
+   * Only meaningful with `strategy: "shrink"`: the window spec that
+   * replaces the normal window on holidays (`"HH:MM-HH:MM"`, same syntax
+   * as the window itself). Setting it with `skip`/`defer` throws
+   * `RangeError`. When `shrink` has no `holidayWindow`, the holiday
+   * window is the first half of the normal window, starting at its open
+   * edge (a 1-minute window shrinks to nothing — closed all day).
+   */
+  holidayWindow?: string;
 }
 
 /**
@@ -144,10 +202,20 @@ interface TimezoneWindowEntry {
  * is the same injectable `now` everywhere, so a single frozen clock pins
  * both the gate and the schedule math in tests.
  */
+/** A parsed per-endpoint holiday calendar (WR-208). */
+interface HolidayEntry {
+  dates: Set<string>;
+  region?: string;
+  strategy: HolidayStrategy;
+  holidayWindowSpec?: DeliveryWindowSpec;
+}
+
 export class EndpointDeliveryWindow {
   private readonly specs = new Map<string, DeliveryWindowSpec>();
   /** WR-126: timezone-aware windows, keyed by exact `targetUrl`. */
   private readonly tzSpecs = new Map<string, TimezoneWindowEntry>();
+  /** WR-208: holiday calendars, keyed by exact `targetUrl`. */
+  private readonly holidays = new Map<string, HolidayEntry>();
   private readonly delayed = new Map<string, number>();
   private readonly now: () => number;
 
@@ -170,6 +238,103 @@ export class EndpointDeliveryWindow {
       staged.set(endpoint, this.parseTimezoneWindowConfig(endpoint, cfg, "constructor"));
     }
     for (const [endpoint, entry] of staged) this.tzSpecs.set(endpoint, entry);
+    // WR-208: holiday calendars are staged before any is installed, so
+    // an illegal entry throws with zero partial application — and a
+    // calendar on an endpoint with no window throws instead of silently
+    // doing nothing.
+    const stagedHolidays = new Map<string, HolidayEntry>();
+    for (const [endpoint, cfg] of Object.entries(opts.holidays ?? {})) {
+      this.assertValidEndpoint(endpoint, "constructor");
+      if (!this.specs.has(endpoint) && !this.tzSpecs.has(endpoint)) {
+        throw new RangeError(
+          `constructor: endpoint ${JSON.stringify(endpoint)} has a holiday calendar but no delivery window — calendars require a window`
+        );
+      }
+      stagedHolidays.set(endpoint, this.parseHolidayCalendarConfig(endpoint, cfg, "constructor"));
+    }
+    for (const [endpoint, entry] of stagedHolidays) this.holidays.set(endpoint, entry);
+  }
+
+  /**
+   * Validate one holiday calendar config and build its entry.
+   * Throws `RangeError` on a malformed config, an unknown strategy, a
+   * `holidayWindow` on a non-`shrink` strategy, or a non-calendar date.
+   * Parsing happens before any install, so a throw leaves the current
+   * calendar intact (constructor and runtime setters alike).
+   */
+  private parseHolidayCalendarConfig(
+    endpoint: string,
+    cfg: HolidayCalendarConfig,
+    where: string
+  ): HolidayEntry {
+    if (typeof cfg !== "object" || cfg === null || Array.isArray(cfg)) {
+      throw new RangeError(
+        `${where}: holiday calendar for ${JSON.stringify(endpoint)} must be { dates, region?, strategy?, holidayWindow? }`
+      );
+    }
+    const dates = (cfg as { dates?: unknown }).dates;
+    if (!Array.isArray(dates)) {
+      throw new RangeError(
+        `${where}: holiday calendar for ${JSON.stringify(endpoint)} needs a dates array`
+      );
+    }
+    const strategy = (cfg as { strategy?: unknown }).strategy ?? "skip";
+    if (strategy !== "skip" && strategy !== "defer" && strategy !== "shrink") {
+      throw new RangeError(
+        `${where}: holiday strategy for ${JSON.stringify(endpoint)} must be "skip", "defer", or "shrink", got ${JSON.stringify(strategy)}`
+      );
+    }
+    const holidayWindow = (cfg as { holidayWindow?: unknown }).holidayWindow;
+    if (holidayWindow !== undefined && strategy !== "shrink") {
+      throw new RangeError(
+        `${where}: holidayWindow for ${JSON.stringify(endpoint)} is only meaningful with strategy "shrink", got ${JSON.stringify(strategy)}`
+      );
+    }
+    const parsedDates = new Set<string>();
+    for (const d of dates) {
+      parsedDates.add(this.parseHolidayDate(endpoint, d, where));
+    }
+    const region = (cfg as { region?: unknown }).region;
+    if (region !== undefined && (typeof region !== "string" || region.length === 0)) {
+      throw new RangeError(
+        `${where}: holiday region for ${JSON.stringify(endpoint)} must be a non-empty string`
+      );
+    }
+    const entry: HolidayEntry = {
+      dates: parsedDates,
+      ...(region === undefined ? {} : { region: region as string }),
+      strategy,
+    };
+    if (holidayWindow !== undefined) {
+      entry.holidayWindowSpec = parseDeliveryWindowSpec(holidayWindow as string);
+    }
+    return entry;
+  }
+
+  /** Validate one `"YYYY-MM-DD"` holiday date (a real calendar date). */
+  private parseHolidayDate(endpoint: string, date: unknown, where: string): string {
+    if (typeof date !== "string") {
+      throw new RangeError(
+        `${where}: holiday date for ${JSON.stringify(endpoint)} must be a "YYYY-MM-DD" string, got ${typeof date}`
+      );
+    }
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date);
+    if (m === null) {
+      throw new RangeError(
+        `${where}: invalid holiday date ${JSON.stringify(date)} for ${JSON.stringify(endpoint)}: expected "YYYY-MM-DD"`
+      );
+    }
+    const probe = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])));
+    if (
+      probe.getUTCFullYear() !== Number(m[1]) ||
+      probe.getUTCMonth() !== Number(m[2]) - 1 ||
+      probe.getUTCDate() !== Number(m[3])
+    ) {
+      throw new RangeError(
+        `${where}: invalid holiday date ${JSON.stringify(date)} for ${JSON.stringify(endpoint)}: not a real calendar date`
+      );
+    }
+    return date;
   }
 
   /**
@@ -239,6 +404,172 @@ export class EndpointDeliveryWindow {
   }
 
   /**
+   * WR-208: the holiday calendar for `endpoint`, or `undefined` when
+   * none is configured. Dates are returned sorted, in `"YYYY-MM-DD"` form.
+   */
+  holidayInfo(endpoint: string):
+    | { region?: string; strategy: HolidayStrategy; dates: string[] }
+    | undefined {
+    const entry = this.holidays.get(endpoint);
+    if (entry === undefined) return undefined;
+    return {
+      ...(entry.region === undefined ? {} : { region: entry.region }),
+      strategy: entry.strategy,
+      dates: [...entry.dates].sort(),
+    };
+  }
+
+  /** WR-208: true when `endpoint`'s calendar marks `nowMs`'s date a holiday. */
+  isHoliday(endpoint: string, nowMs?: number): boolean {
+    const entry = this.holidays.get(endpoint);
+    if (entry === undefined) return false;
+    return entry.dates.has(this.dateKeyFor(endpoint, nowMs ?? this.now()));
+  }
+
+  /** WR-208: the calendar date key (`"YYYY-MM-DD"`) for `nowMs` in the window's calendar. */
+  private dateKeyFor(endpoint: string, nowMs: number): string {
+    const tz = this.tzSpecs.get(endpoint);
+    if (tz !== undefined) {
+      const parts = this.tzDateParts(tz, nowMs);
+      return this.padDate(parts.year, parts.month, parts.day);
+    }
+    const d = new Date(nowMs);
+    return this.padDate(d.getUTCFullYear(), d.getUTCMonth() + 1, d.getUTCDate());
+  }
+
+  private padDate(year: number, month: number, day: number): string {
+    return `${String(year).padStart(4, "0")}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+  }
+
+  /** WR-208: the zone's local calendar date parts for `nowMs`. */
+  private tzDateParts(entry: TimezoneWindowEntry, nowMs: number): { year: number; month: number; day: number } {
+    let year = 0;
+    let month = 0;
+    let day = 0;
+    for (const part of entry.dtf.formatToParts(new Date(nowMs))) {
+      if (part.type === "year") year = Number(part.value);
+      else if (part.type === "month") month = Number(part.value);
+      else if (part.type === "day") day = Number(part.value);
+    }
+    return { year, month, day };
+  }
+
+  /**
+   * WR-208: the window spec in force on `dateKey` for an endpoint whose
+   * normal spec is `baseSpec`: the base spec on ordinary days, the
+   * shrink spec on a `shrink` holiday, and `null` (closed all day) on a
+   * `skip`/`defer` holiday. A shrink without an explicit `holidayWindow`
+   * keeps the normal open edge and halves the window length (a
+   * midnight-crossing window halves across midnight via `contains`).
+   */
+  private effectiveSpecForDate(
+    endpoint: string,
+    baseSpec: DeliveryWindowSpec,
+    dateKey: string
+  ): DeliveryWindowSpec | null {
+    const entry = this.holidays.get(endpoint);
+    if (entry === undefined || !entry.dates.has(dateKey)) return baseSpec;
+    if (entry.strategy !== "shrink") return null;
+    if (entry.holidayWindowSpec !== undefined) return entry.holidayWindowSpec;
+    const length =
+      baseSpec.openMinutes === baseSpec.closeMinutes
+        ? MINUTES_PER_DAY
+        : (baseSpec.closeMinutes - baseSpec.openMinutes + MINUTES_PER_DAY) % MINUTES_PER_DAY;
+    const half = Math.floor(length / 2);
+    if (half <= 0) return null;
+    return {
+      openMinutes: baseSpec.openMinutes,
+      closeMinutes: (baseSpec.openMinutes + half) % MINUTES_PER_DAY,
+      raw: `shrink:${baseSpec.raw}`,
+    };
+  }
+
+  /** WR-208: the window spec in force at `nowMs` (see `effectiveSpecForDate`). */
+  private effectiveSpecAt(
+    endpoint: string,
+    baseSpec: DeliveryWindowSpec,
+    nowMs: number
+  ): DeliveryWindowSpec | null {
+    return this.effectiveSpecForDate(endpoint, baseSpec, this.dateKeyFor(endpoint, nowMs));
+  }
+
+  /**
+   * WR-208: the epoch instant of the window's opening on the day
+   * `dayOffset` days after `nowMs`'s calendar date, or `null` when that
+   * opening falls in a spring-forward gap (timezone windows) or the
+   * endpoint has no window. With `useEffective` (the default), a
+   * `shrink` holiday contributes its shrink opening; a `skip`/`defer`
+   * holiday contributes its normal opening (the caller filters it out
+   * via `isOpen`). With `useEffective: false` the normal opening is
+   * used regardless of holidays (the `defer` schedule).
+   */
+  private dayWindowOpenInstant(
+    endpoint: string,
+    nowMs: number,
+    dayOffset: number,
+    useEffective = true
+  ): number | null {
+    const tz = this.tzSpecs.get(endpoint);
+    if (tz !== undefined) {
+      const parts = this.tzDateParts(tz, nowMs);
+      const base = Date.UTC(parts.year, parts.month - 1, parts.day) + dayOffset * 86_400_000;
+      const bd = new Date(base);
+      const ly = bd.getUTCFullYear();
+      const lm = bd.getUTCMonth() + 1;
+      const ld = bd.getUTCDate();
+      const key = this.padDate(ly, lm, ld);
+      const eff = useEffective ? this.effectiveSpecForDate(endpoint, tz.spec, key) : tz.spec;
+      const open = (eff ?? tz.spec).openMinutes;
+      const targetLocal = Date.UTC(ly, lm - 1, ld) + open * 60_000;
+      const g = this.tzLocalToEpoch(tz, targetLocal, this.tzOffsetMinutes(tz, nowMs));
+      if (this.tzMinutesOfDay(tz, g) !== open) return null; // spring-forward gap day
+      return g;
+    }
+    const spec = this.specs.get(endpoint);
+    if (spec === undefined) return null;
+    const d = new Date(nowMs);
+    const base = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()) + dayOffset * 86_400_000;
+    const bd = new Date(base);
+    const ly = bd.getUTCFullYear();
+    const lm = bd.getUTCMonth() + 1;
+    const ld = bd.getUTCDate();
+    const key = this.padDate(ly, lm, ld);
+    const eff = useEffective ? this.effectiveSpecForDate(endpoint, spec, key) : spec;
+    const open = (eff ?? spec).openMinutes;
+    return Date.UTC(ly, lm - 1, ld) + open * 60_000;
+  }
+
+  /**
+   * WR-208: milliseconds until the next opening that is actually open
+   * (a `skip` holiday's opening fails the `isOpen` check and is passed
+   * over; a `shrink` holiday's shrink opening passes). The scan is
+   * bounded at 400 days — a calendar longer than that still re-parks
+   * after a day, so the queue re-evaluates instead of busy-looping.
+   */
+  private msUntilHolidayAwareOpen(endpoint: string, nowMs: number): number {
+    for (let d = 0; d < 400; d++) {
+      const g = this.dayWindowOpenInstant(endpoint, nowMs, d);
+      if (g === null || g < nowMs) continue;
+      if (this.isOpen(endpoint, g)) return Math.max(1, g - nowMs);
+    }
+    return 86_400_000;
+  }
+
+  /**
+   * WR-208: milliseconds until the next window opening after `nowMs`,
+   * ignoring holidays (the `defer` schedule: strictly after now, so a
+   * holiday instant that is already passing never returns 0).
+   */
+  private msUntilNextWindowOpen(endpoint: string, nowMs: number): number {
+    for (let d = 0; d < 400; d++) {
+      const g = this.dayWindowOpenInstant(endpoint, nowMs, d, false);
+      if (g === null || g <= nowMs) continue;
+      return Math.max(1, g - nowMs);
+    }
+    return 86_400_000;
+  }
+
+  /**
    * True when `endpoint` may be delivered at `nowMs` (defaults to the
    * injected clock): either it has no configured window, or the time is
    * inside the window (open edge inclusive, close edge exclusive). The
@@ -248,15 +579,18 @@ export class EndpointDeliveryWindow {
    * clock; UTC windows keep the exact pre-WR-126 semantics.
    */
   isOpen(endpoint: string, nowMs?: number): boolean {
+    const at = nowMs ?? this.now();
     const tz = this.tzSpecs.get(endpoint);
     if (tz !== undefined) {
-      const at = this.tzMinutesOfDay(tz, nowMs ?? this.now());
-      return this.contains(tz.spec, at);
+      const eff = this.effectiveSpecAt(endpoint, tz.spec, at);
+      if (eff === null) return false; // WR-208: skip/defer holiday
+      return this.contains(eff, this.tzMinutesOfDay(tz, at));
     }
     const spec = this.specs.get(endpoint);
     if (spec === undefined) return true;
-    const at = this.minutesOfDay(nowMs ?? this.now());
-    return this.contains(spec, at);
+    const eff = this.effectiveSpecAt(endpoint, spec, at);
+    if (eff === null) return false; // WR-208: skip/defer holiday
+    return this.contains(eff, this.minutesOfDay(at));
   }
 
   private contains(spec: DeliveryWindowSpec, minutesOfDay: number): boolean {
@@ -383,9 +717,19 @@ export class EndpointDeliveryWindow {
   msUntilOpen(endpoint: string, nowMs?: number): number {
     const at = nowMs ?? this.now();
     const tz = this.tzSpecs.get(endpoint);
-    if (tz !== undefined) return this.msUntilTzOpen(tz, at);
+    if (tz !== undefined) {
+      if (this.isOpen(endpoint, at)) return 0;
+      const hol = this.holidays.get(endpoint);
+      if (hol?.strategy === "defer") return this.msUntilNextWindowOpen(endpoint, at);
+      if (hol !== undefined) return this.msUntilHolidayAwareOpen(endpoint, at);
+      return this.msUntilTzOpen(tz, at);
+    }
     const spec = this.specs.get(endpoint);
     if (spec === undefined) return 0;
+    if (this.isOpen(endpoint, at)) return 0;
+    const hol = this.holidays.get(endpoint);
+    if (hol?.strategy === "defer") return this.msUntilNextWindowOpen(endpoint, at);
+    if (hol !== undefined) return this.msUntilHolidayAwareOpen(endpoint, at);
     const minutes = this.minutesOfDay(at);
     if (this.contains(spec, minutes)) return 0;
     let deltaMinutes: number;
@@ -444,14 +788,40 @@ export class EndpointDeliveryWindow {
   }
 
   /**
+   * WR-208: set (or replace) the holiday calendar for one endpoint at
+   * runtime. An invalid config throws `RangeError` and leaves the
+   * current calendar intact; an endpoint with no window cannot take a
+   * calendar (delete the window first is not the fix — set a window
+   * first). Follows the WR-32/WR-50 per-endpoint runtime-override
+   * convention.
+   */
+  setEndpointHolidays(endpoint: string, cfg: HolidayCalendarConfig): void {
+    this.assertValidEndpoint(endpoint, "setEndpointHolidays");
+    if (!this.specs.has(endpoint) && !this.tzSpecs.has(endpoint)) {
+      throw new RangeError(
+        `setEndpointHolidays: endpoint ${JSON.stringify(endpoint)} has no delivery window — calendars require a window`
+      );
+    }
+    this.holidays.set(endpoint, this.parseHolidayCalendarConfig(endpoint, cfg, "setEndpointHolidays"));
+  }
+
+  /** WR-208: remove the holiday calendar for one endpoint at runtime. Returns `false` when none was set. */
+  deleteEndpointHolidays(endpoint: string): boolean {
+    this.assertValidEndpoint(endpoint, "deleteEndpointHolidays");
+    return this.holidays.delete(endpoint);
+  }
+
+  /**
    * Remove the delivery window for one endpoint at runtime: the endpoint
-   * becomes always deliverable. Removes a UTC or a timezone window alike.
-   * Returns `false` when no window was set.
+   * becomes always deliverable. Removes a UTC or a timezone window alike,
+   * plus any holiday calendar on it (a calendar without a window cannot
+   * take effect). Returns `false` when no window was set.
    */
   deleteEndpointWindow(endpoint: string): boolean {
     this.assertValidEndpoint(endpoint, "deleteEndpointWindow");
     const utc = this.specs.delete(endpoint);
     const tz = this.tzSpecs.delete(endpoint);
+    this.holidays.delete(endpoint);
     return utc || tz;
   }
 
@@ -478,6 +848,13 @@ export interface DeliveryWindowStats {
    * UTC windows (the pre-WR-126 shape is unchanged).
    */
   timezone?: string;
+  /**
+   * WR-208: the holiday calendar's region label, when one is configured.
+   * Absent when no calendar is set (the pre-WR-208 shape is unchanged).
+   */
+  holidayRegion?: string;
+  /** WR-208: the holiday strategy, when a calendar is configured. */
+  holidayStrategy?: HolidayStrategy;
   /** Deliveries parked outside the window until it opened. */
   delayed: number;
   /** Whether the window is open at the injected clock's current time. */
