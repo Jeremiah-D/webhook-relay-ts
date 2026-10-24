@@ -5397,6 +5397,51 @@ const url = await discovery.resolveTargetUrl("https://events.example.com/hook", 
   resolver calls and failures as `relay_srv_discovery_*` (empty until
   the first lookup, the activity-gated convention).
 
+## Outbound HTTP Digest authentication (opt-in, RFC 7616)
+
+Some legacy enterprise downstreams gate webhooks on Digest auth
+rather than on a bearer token or a static header: the first request
+goes out unauthenticated, the downstream answers `401` with a
+`WWW-Authenticate: Digest ...` challenge, and the relay retries with
+an `Authorization: Digest ...` header computed from that challenge.
+`src/digest-auth.ts` (WR-212) is that challenge/response client.
+
+```ts
+const session = new DigestAuthSession({
+  username: "relay-user",
+  passwordSecretRef: "RELAY_DIGEST_PASSWORD", // a reference, never the raw password
+  passwordResolver: (ref) => process.env[ref] ?? "",
+});
+const response = await session.fetchWithDigestAuth(fetchFn, "https://downstream.example/hook");
+```
+
+- **Supported subset, fail-closed** — algorithms `MD5` and `SHA-256`
+  only (absent means `MD5`); `qop=auth` only (a list offering `auth`
+  picks `auth`, a challenge offering only `auth-int` refuses, and a
+  challenge with no `qop` uses the legacy no-`nc` form). `-sess`
+  variants, other algorithms, and `userhash=true` all throw
+  `DigestAuthError` instead of guessing a response the downstream
+  must reject.
+- **Stale-nonce re-authentication, bounded** — the attempt budget is
+  fixed: plain attempt, one authenticated attempt, and — only when
+  the second `401` carries `stale=true` — one re-authenticated
+  attempt against the fresh nonce (which gets a fresh nonce-count
+  starting at `00000001`). Any other second `401` is returned as-is;
+  this helper authenticates, it does not classify — the delivery
+  layer owns retry / dead-letter decisions for the final status.
+- **Secret discipline** — the config carries `passwordSecretRef`
+  (WR-116 / WR-192 convention), resolved per authorization attempt
+  so rotations land without restart, and validated once at
+  construction (fail-fast: the session refuses to boot with a
+  credential it can never use). No error message in this module ever
+  contains the password, and `DigestAuthError` classifies as
+  `non_retryable` in `src/failure.ts` (a config problem retrying
+  cannot fix). Per-nonce counters start at 1 and are never rewound
+  by a failed attempt — a reused `nc` is a replay.
+- **Orthogonality** — this is challenge/response auth, not the
+  WR-192 static header stamp (same value every attempt) and not the
+  WR-129 OAuth2 bearer token (minted from a token endpoint, never
+  computed from a `401` challenge).
 
 ## Per-endpoint DNS-over-HTTPS (opt-in)
 
