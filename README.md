@@ -4972,6 +4972,43 @@ segment is renamed to `<name>.jsonl.uploaded` (local bytes kept) unless
 `deleteLocalAfterUpload: true` deletes it; `dryRun: true` rehearses by
 recording the intended keys with zero network I/O.
 
+## Dead-letter S3 archive offload (opt-in)
+
+Poisoned deliveries sit in the retry queue's dead-letter list *with
+their payloads* — and for regulated flows those payloads are compliance
+evidence that must survive the process. `src/deadletter-s3.ts` (WR-206)
+offloads them to S3-compatible storage (AWS S3, MinIO, R2, …) as one
+payload-bearing JSON document per entry.
+
+`DeadLetterS3Offloader` reads from the same `DeadLetterExportSource`
+interface the WR-128 local export uses: `entries()` lists the live dead
+letters, `decrypt(entry)` opens WR-11 sealed payloads transparently. The
+document carries the *full* payload (decrypted, never truncated — this is
+cold compliance retention, not a bounded operator download) with the
+WR-128 `payloadEncoding` convention (`"utf8"` / `"base64"`), plus the
+entry's attempts, last error, `deadLetteredAt`, failure class, trace id,
+and whether it was sealed at rest. A sealed payload that cannot be
+opened is archived with `payloadError: "decrypt_failed"` instead of
+failing the whole scan.
+
+Object keys are deterministic — `<prefix><yyyymmdd>/deadletter-<entryId>.json`
+from the entry's `deadLetteredAt` — so a retry uploads to the same key
+(idempotent, never a duplicate object). Signing reuses the WR-116 SigV4
+pipeline: the config carries `secretRef` (an env-var name by default),
+resolved per upload through an injected `SecretResolver`, so key
+material never enters config snapshots, audit logs, or error messages.
+
+`scanAndUpload()` is meant to run fire-and-forget (an operator cron or a
+detached timer): it never throws — failures are counted in
+`stats().uploadFailures` and retried on the next scan. An uploaded entry
+is marked `<entryId>.uploaded` (in memory, plus an optional `markerDir`
+of marker files so the mark survives a restart); `deleteLocalAfterUpload:
+true` additionally purges the entry from the local dead-letter store via
+the source's `purge` hook. `dryRun: true` rehearses by recording the
+intended keys with zero network I/O. Orthogonal to `src/archive-s3.ts`
+(WR-188: payload-free delivery-event metadata) and to the WR-128 local
+CSV/JSONL export.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same
@@ -6595,6 +6632,22 @@ recording the intended keys with zero network I/O. `archiveS3` without
 dead-letter export (WR-128, local CSV/JSONL export *with* payloads) and
 to EB-163 (durable-log segment offload in realtime-event-bus): this
 offloads the *delivery-event archive*, payload-free metadata lines.
+
+**Dead-letter S3 archive offload (WR-206)** — payload-bearing
+compliance cold storage. `DeadLetterS3Offloader(config, source)` (from
+`src/deadletter-s3.ts`) reads the live dead-letter list through the
+WR-128 `DeadLetterExportSource` interface and PUTs one JSON document per
+entry under the deterministic key
+`<prefix><yyyymmdd>/deadletter-<entryId>.json` — full payload
+(decrypted via the source, never truncated), attempts, last error,
+failure class, trace id, and whether it was sealed at rest. Same WR-116
+SigV4 pipeline and the same conventions as the archive offload above:
+`secretRef` reference (never the raw secret), fire-and-forget
+`scanAndUpload()` that never throws (failures counted in
+`uploadFailures`, retried on the next scan), `<entryId>.uploaded`
+markers (in memory + optional `markerDir`), `deleteLocalAfterUpload`
+purge opt-in, `dryRun` rehearsal with zero network I/O. Orthogonal to
+WR-188 (payload-free metadata) and WR-128 (local operator download).
 
 ### Operator/intake plane split
 
