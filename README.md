@@ -439,7 +439,19 @@ reliability primitives that matter for any signed-payload pipeline.
   reports `unknown_key`. `GET /audit/verify` (operator token; 404 when no
   token is configured) returns both verifications — the payment-fintech
   compliance control that makes post-hoc log edits detectable and
-  non-repudiable.
+  non-repudiable. Per-tenant audit retention (WR-209, orthogonal to the
+  WR-64 dead-letter retention, which governs the retry queue, not the
+  log): `new AuditLog(path, { auditRetention: { defaultDays,
+  tenants } })` sets a global default retention in days plus per-tenant
+  overrides (an override always beats the default; a tenant with neither
+  never expires). `pruneExpiredAuditEntries()` drops expired live-file
+  entries — unconfigured by default, so pruning is a no-op unless
+  retention is set — rewrites the survivors re-chained from genesis under
+  the current audit key era (so both verifications stay clean across the
+  cut), and appends an `audit_pruned` event carrying only per-tenant
+  prune counts, never entry content. Sealed segments are immutable
+  compliance archives and are never pruned; pruning is operator-driven
+  (no background sweep timer for the audit log).
 - `src/secret-scan.ts` — payload secret-leak detection and alerting (WR-183):
   `SecretScanner` scans inbound payloads and audit-persisted payloads for
   well-known secret shapes (`AKIA…`/`AKID…`, `ghp_`/`gho_`, `sk_live_`/

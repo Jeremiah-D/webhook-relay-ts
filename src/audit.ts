@@ -80,6 +80,14 @@ export interface AuditLogOptions {
    * `onAuditSegmentSealed()`.
    */
   onAuditSegmentSealed?: (localPath: string) => void;
+  /**
+   * WR-209: per-tenant audit retention (see {@link AuditRetentionOptions}).
+   * When set, `pruneExpiredAuditEntries()` drops live-file entries older
+   * than their tenant's retention (tenant override, else the global
+   * default) and appends an `audit_pruned` event with per-tenant counts.
+   * Unset by default: pruning is a no-op and behavior is unchanged.
+   */
+  auditRetention?: AuditRetentionOptions;
 }
 
 /** Filters for {@link AuditLog.query}. All filters are ANDed together. */
@@ -115,6 +123,108 @@ export interface AuditQuery {
    * `batch_flushed` audit lines.
    */
   traceId?: string;
+}
+
+/**
+ * WR-209: per-tenant audit retention tuning, embedded in
+ * {@link AuditLogOptions}. Retention is expressed in days: an entry is
+ * expired once `now - ts` reaches its tenant's retention. The tenant
+ * override always beats the global default; a tenant with neither an
+ * override nor a default never expires. Sealed segments (WR-190) are
+ * immutable compliance archives and are never pruned — retention covers
+ * the live file only. Orthogonal to dead-letter retention (WR-64), which
+ * governs the retry queue's dead-letter list, not the audit log.
+ */
+export interface AuditRetentionOptions {
+  /**
+   * Global default retention in days. Governs entries with no tenant
+   * field and tenants absent from `tenants`. Unset: such entries never
+   * expire.
+   */
+  defaultDays?: number;
+  /**
+   * Per-tenant retention in days, keyed by exact tenant id (the `tenant`
+   * field delivery-lifecycle and intake audit events carry, WR-48).
+   * A tenant listed here is governed by its override, never the global
+   * default.
+   */
+  tenants?: Record<string, number>;
+}
+
+/** WR-209: per-tenant retention lookup after validation: tenant id → days, or `undefined` when the tenant never expires. */
+export type RetentionDaysFor = (tenant: string | undefined) => number | undefined;
+
+function assertRetentionDays(value: unknown, where: string): asserts value is number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    throw new RangeError(`${where} must be a finite number > 0, got ${String(value)}`);
+  }
+}
+
+/**
+ * WR-209: validate `auditRetention` and build the retention lookup.
+ * Throws `RangeError` on any illegal value — fail-closed: a bad
+ * retention config is a startup bug, never a silent no-prune or a
+ * prune-everything. Returns `undefined` when retention is not
+ * configured at all, so pruning stays a no-op.
+ */
+export function resolveAuditRetention(
+  retention: AuditRetentionOptions | undefined
+): RetentionDaysFor | undefined {
+  if (retention === undefined) return undefined;
+  if (retention === null || Array.isArray(retention) || typeof retention !== "object") {
+    throw new RangeError(`AuditLog: \`auditRetention\` must be an object, got ${String(retention)}`);
+  }
+  if (retention.defaultDays !== undefined) {
+    assertRetentionDays(retention.defaultDays, "auditRetention.defaultDays");
+  }
+  const perTenant = new Map<string, number>();
+  if (retention.tenants !== undefined) {
+    if (
+      retention.tenants === null ||
+      Array.isArray(retention.tenants) ||
+      typeof retention.tenants !== "object"
+    ) {
+      throw new RangeError("auditRetention.tenants must be a Record<string, number>");
+    }
+    for (const [tenant, days] of Object.entries(retention.tenants)) {
+      if (tenant.length === 0) {
+        throw new RangeError("auditRetention.tenants keys must be non-empty tenant ids");
+      }
+      assertRetentionDays(days, `auditRetention.tenants[${JSON.stringify(tenant)}]`);
+      perTenant.set(tenant, days);
+    }
+  }
+  const defaultDays = retention.defaultDays;
+  return (tenant) => {
+    if (tenant !== undefined) {
+      const override = perTenant.get(tenant);
+      if (override !== undefined) return override;
+    }
+    return defaultDays;
+  };
+}
+
+/**
+ * WR-209: payload of the `audit_pruned` audit event, appended by
+ * {@link AuditLog.pruneExpiredAuditEntries} after every pruning run
+ * that drops at least one entry. Counts only — never entry ids,
+ * payloads, endpoints, or any other entry content.
+ */
+export interface AuditPrunedEvent {
+  event: "audit_pruned";
+  /** Total entries pruned by this run. */
+  pruned: number;
+  /** Pruned entries per tenant id (only tenants with at least one prune). */
+  prunedByTenant: Record<string, number>;
+  /** Pruned entries that carried no tenant field. */
+  prunedWithoutTenant: number;
+}
+
+/** WR-209: outcome of {@link AuditLog.pruneExpiredAuditEntries} — the {@link AuditPrunedEvent} payload minus the event name. */
+export interface AuditPruneResult {
+  pruned: number;
+  prunedByTenant: Record<string, number>;
+  prunedWithoutTenant: number;
 }
 
 /**
@@ -382,6 +492,20 @@ function maskablePayload(
  *   its truncate would be dropped. (The server's single injected
  *   `AuditLog` is the intended shape; plain appends from several
  *   instances remain safe, as they always were.)
+ *
+ * WR-209: per-tenant audit retention. `pruneExpiredAuditEntries()` is a
+ * manual, operator-driven API — there is no background sweep timer for
+ * the audit log (unlike the WR-64 dead-letter sweeper, which the queue
+ * owns), so a maintenance job or operator call drives pruning on its own
+ * schedule. Pruning rewrites the live file with only the surviving
+ * lines, re-chained from genesis under the current audit key era: deleting
+ * a prefix would otherwise leave a permanent chain break at the cut, and
+ * re-chaining covers only survivors' bodies (unchanged) — the operation
+ * itself is attested by the `audit_pruned` event appended right after,
+ * which chains onto the re-chained tip. Sealed segments are untouched.
+ * Lines without a parseable `ts` and malformed lines are never pruned
+ * (fail-closed: never purge blind), and a run that prunes nothing neither
+ * rewrites the file nor appends an event.
  */
 
 /** WR-186: a live audit-event listener. Receives the parsed JSONL line. */
@@ -486,6 +610,11 @@ export class AuditLog {
   /** WR-186: in-memory live listeners, fanned out at the end of `append()`. */
   private readonly auditEventListeners = new Set<AuditEventListener>();
   /**
+   * WR-209: per-tenant retention lookup (`undefined` disables pruning
+   * entirely — the default, byte-identical behavior).
+   */
+  private readonly retentionDaysFor?: RetentionDaysFor;
+  /**
    * WR-190: local dir holding sealed audit segments (unset disables
    * sealing entirely); the rolling thresholds; handlers fired with
    * each sealed segment's local path.
@@ -546,6 +675,9 @@ export class AuditLog {
       }
       this.auditSegmentSealedHandlers.add(opts.onAuditSegmentSealed);
     }
+    // WR-209: fail-closed validation — an illegal retention config throws
+    // here, at construction, never mid-prune.
+    this.retentionDaysFor = resolveAuditRetention(opts.auditRetention);
     this.auditSegmentStartMs = this.initialAuditSegmentStartMs();
   }
 
@@ -1245,6 +1377,127 @@ export class AuditLog {
       out.push(this.openPayload(parsed as Record<string, unknown>));
     }
     return out;
+  }
+
+  /**
+   * WR-209: prune live-file entries past their tenant's retention
+   * (tenant override, else the global default). Returns the prune
+   * counts; when at least one entry is pruned, the live file is
+   * rewritten atomically (tmp+rename) with only the surviving lines —
+   * re-chained from genesis under the current audit key era, so
+   * `verifyChain()`/`verifyHmacChain()` stay clean across the cut —
+   * and an `audit_pruned` event carrying only the counts is appended
+   * (it chains onto the re-chained tip). A run that prunes nothing
+   * touches neither the file nor the event stream, and with no
+   * retention configured this is a pure no-op. Lines without a
+   * parseable `ts`, malformed lines, and entries whose tenant has no
+   * retention are always kept. Sealed segments are never touched.
+   * Single-writer assumption, as with sealing: do not prune from two
+   * instances against the same live file concurrently.
+   */
+  pruneExpiredAuditEntries(nowMs: number = Date.now()): AuditPruneResult {
+    const empty: AuditPruneResult = { pruned: 0, prunedByTenant: {}, prunedWithoutTenant: 0 };
+    const retentionDaysFor = this.retentionDaysFor;
+    if (retentionDaysFor === undefined) return empty;
+    let raw: string;
+    try {
+      raw = readFileSync(this.path, "utf8");
+    } catch {
+      return empty; // Missing file: nothing to prune.
+    }
+    const segments = raw.split("\n");
+    if (segments.length > 0 && segments[segments.length - 1].length === 0) {
+      segments.pop(); // trailing newline: not a line
+    }
+    const survivors: string[] = [];
+    const prunedByTenant: Record<string, number> = {};
+    let prunedWithoutTenant = 0;
+    let pruned = 0;
+    for (const line of segments) {
+      let obj: unknown;
+      try {
+        obj = JSON.parse(line);
+      } catch {
+        survivors.push(line); // malformed: kept, never purged blind
+        continue;
+      }
+      if (!obj || typeof obj !== "object" || Array.isArray(obj)) {
+        survivors.push(line);
+        continue;
+      }
+      const rec = obj as Record<string, unknown>;
+      const tsMs = typeof rec.ts === "string" ? Date.parse(rec.ts) : NaN;
+      if (!Number.isFinite(tsMs)) {
+        survivors.push(line); // unparseable timestamp: kept
+        continue;
+      }
+      const tenant = typeof rec.tenant === "string" ? rec.tenant : undefined;
+      const days = retentionDaysFor(tenant);
+      if (days === undefined) {
+        survivors.push(line); // no retention for this tenant: kept
+        continue;
+      }
+      if (nowMs - tsMs < days * 86400_000) {
+        survivors.push(line); // unexpired: kept
+        continue;
+      }
+      pruned++;
+      if (tenant === undefined) {
+        prunedWithoutTenant++;
+      } else {
+        prunedByTenant[tenant] = (prunedByTenant[tenant] ?? 0) + 1;
+      }
+    }
+    if (pruned === 0) return empty;
+
+    // Re-chain the survivors from genesis: deleting the expired prefix
+    // would otherwise strand every survivor's `prevHash`/`hmacPrev` and
+    // leave a permanent chain break. Bodies are untouched; only the
+    // chain fields are recomputed, under the current key era. Malformed
+    // lines ride through verbatim — `verifyChain()` skips them without
+    // breaking continuity, as it always has.
+    const key = this.auditKeys.get(this.currentKeyId);
+    if (key === undefined) throw new Error("AuditLog: current audit key is not registered");
+    let prevHash = CHAIN_GENESIS;
+    let prevHmac = HMAC_CHAIN_GENESIS;
+    const rechained: string[] = [];
+    for (const line of survivors) {
+      let obj: unknown;
+      try {
+        obj = JSON.parse(line);
+      } catch {
+        rechained.push(line);
+        continue;
+      }
+      if (!obj || typeof obj !== "object" || Array.isArray(obj)) {
+        rechained.push(line);
+        continue;
+      }
+      const { prevHash: _p, hash: _h, hmacPrev: _hp, hmac: _hm, hmacKeyId: _k, ...body } =
+        obj as Record<string, unknown>;
+      const canonicalBody = canonicalJson(JSON.parse(JSON.stringify(body)));
+      const thisPrevHash = prevHash;
+      const hash = hashAuditLink(thisPrevHash, canonicalBody);
+      const hmacPrev = prevHmac;
+      const hmac = hmacAuditLink(key, hmacPrev, canonicalBody);
+      prevHash = hash;
+      prevHmac = hmac;
+      rechained.push(
+        JSON.stringify({ ...body, prevHash: thisPrevHash, hash, hmacPrev, hmac, hmacKeyId: this.currentKeyId })
+      );
+    }
+    const tmp = `${this.path}.${process.pid}.tmp`;
+    writeFileSync(tmp, rechained.length > 0 ? rechained.join("\n") + "\n" : "", "utf8");
+    renameSync(tmp, this.path);
+    this.index = [];
+    this.indexedBytes = 0;
+    this.chainHead = null;
+    this.chainFileBytes = 0;
+    this.hmacHead = null;
+    this.hmacFileBytes = 0;
+    const result: AuditPruneResult = { pruned, prunedByTenant, prunedWithoutTenant };
+    this.append({ event: "audit_pruned", ...result });
+    return result;
   }
 
   /**
