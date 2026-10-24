@@ -740,6 +740,18 @@ reliability primitives that matter for any signed-payload pipeline.
   in memory only — never logged or audited. Composes with the HMAC /
   Ed25519 / SigV4 stamps; see *Outbound OAuth2 client_credentials
   (opt-in)*. Invalid values throw `RangeError` at startup.
+- CloudEvents 1.0 structured envelope (`cloudEvents`, off by default,
+  WR-207): per endpoint, `{ "<exact targetUrl>": { source, type,
+  subject?, idPrefix?, datacontenttype?, extensions? } }` wraps each
+  delivery's payload in the standard CloudEvents JSON structured-mode
+  document (`specversion`/`id`/`source`/`type`/`time` + `data` or
+  `data_base64`, `content-type: application/cloudevents+json`), so
+  Knative/EventBridge-style consumers can consume the relay's output
+  directly. `id` defaults to the delivery's `traceId`. Applied after
+  transform/schema and before compression/E2EE/signing, so
+  `x-relay-signature` covers the envelope bytes; see *CloudEvents 1.0
+  structured envelope (opt-in)*. Invalid values throw `RangeError` at
+  startup.
 - Outbound end-to-end encryption (`outboundEncryption`, off by default,
   WR-58; key rotation WR-81): per endpoint, `{ "<exact targetUrl>": { publicKey } }` with the
   downstream's base64 X25519 public key (mint with `generateX25519KeyPair()`
@@ -4507,6 +4519,35 @@ Details (`src/oauth-client.ts`, `node:crypto` only, zero new dependencies):
 - **Never logged, never audited** — proofs, like the secret and the
   assertion, never enter logs, audit events, or error messages
   (covered by `test/oauth-dpop.test.ts`).
+
+## CloudEvents 1.0 structured envelope (opt-in)
+
+Knative/EventBridge-style consumers expect the CloudEvents JSON
+*structured mode*: the whole event rides in the request body as one JSON
+document with `content-type: application/cloudevents+json`. Set the
+server option `cloudEvents: { "<exact targetUrl>": { source, type,
+subject?, idPrefix?, datacontenttype?, extensions?, nowMs?, randomId? }
+}` (`src/cloudevents.ts`, WR-207) and that endpoint's deliveries are
+wrapped in the standard envelope — `specversion: "1.0"`, `id`, `source`,
+`type`, `time`, plus `subject` and extension attributes
+(lowercase-alnum names, max 20 chars, per the spec) when configured.
+
+A JSON payload becomes `data` (parsed, not re-encoded) with
+`datacontenttype: application/json`; any other payload becomes
+`data_base64` with `datacontenttype: application/octet-stream` — the two
+are mutually exclusive per the spec, and a binary payload never corrupts
+into mojibake. `id` defaults to the delivery's `traceId` (already
+propagated as `x-trace-id`), falling back to a generated id — so the
+envelope id correlates with the relay's audit trail for free.
+
+Pipeline order: transform (WR-115) -> schema (WR-117) -> CloudEvents
+wrap -> brotli/gzip (WR-142/WR-40/WR-75) -> E2EE (WR-58) -> sign (WR-26),
+so `x-relay-signature` covers the envelope bytes — exactly what the
+downstream receives and verifies. Orthogonal to the WR-17 batch envelope
+(a batch item wraps as one CloudEvent whose `data` is the batch
+document). A stale inbound `content-type` is stripped first (the WR-26
+anti-forgery pattern). Invalid configs throw `RangeError` at startup —
+never mid-delivery.
 
 ## Outbound static credentials (opt-in)
 

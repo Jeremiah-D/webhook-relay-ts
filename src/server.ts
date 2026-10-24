@@ -409,6 +409,12 @@ import {
   type ArchiveS3OffloadConfig,
 } from "./archive-s3.ts";
 import {
+  assertValidCloudEventsConfig,
+  buildCloudEventEnvelope,
+  CLOUD_EVENTS_STRUCTURED_CONTENT_TYPE,
+  type CloudEventsEndpointConfig,
+} from "./cloudevents.ts";
+import {
   AuditS3Offloader,
   type AuditS3OffloadConfig,
 } from "./audit-s3.ts";
@@ -1648,6 +1654,24 @@ export interface RelayServerOptions {
    * `RangeError` at startup — never mid-delivery.
    */
   outboundSchemas?: Record<string, PayloadSchema>;
+  /**
+   * Per-endpoint CloudEvents 1.0 structured-mode envelope (WR-207, see
+   * `src/cloudevents.ts`): `{ "<exact targetUrl>": CloudEventsEndpointConfig }`
+   * — wraps a single delivery's payload in the standard CloudEvents JSON
+   * structured-mode document (`specversion`/`id`/`source`/`type`/`time`
+   * + `data` or `data_base64`), so Knative/EventBridge-style consumers
+   * can consume the relay's output directly. Pipeline order: transform
+   * (WR-115) → schema (WR-117) → CloudEvents wrap → brotli/gzip
+   * (WR-142/WR-40/WR-75) → E2EE (WR-58) → sign (WR-26), so
+   * `x-relay-signature` always covers the envelope bytes — exactly what
+   * the downstream receives and verifies. Orthogonal to the WR-17 batch
+   * envelope (a batch item wraps as one CloudEvent whose `data` is the
+   * batch document). Opt-in; endpoints without a record keep
+   * byte-exact current behavior. Applies to the default sender only
+   * (shadow mirrors apply the same record). Invalid values throw
+   * `RangeError` at startup — never mid-delivery.
+   */
+  cloudEvents?: Record<string, CloudEventsEndpointConfig>;
   /**
    * Per-endpoint AWS SigV4 request signing (WR-116, see `src/sigv4.ts`):
    * `{ "<exact targetUrl>": AwsSigV4EndpointConfig }` — access key id +
@@ -2967,7 +2991,15 @@ export function createDefaultSender(
    * users get the hook directly. A compiled `DnsPin` instance keeps its
    * own `onMismatch`.
    */
-  onDnsPinMismatch?: (info: DnsPinMismatchInfo) => void
+  onDnsPinMismatch?: (info: DnsPinMismatchInfo) => void,
+  /**
+   * WR-207: per-endpoint CloudEvents 1.0 structured-mode envelope,
+   * keyed by exact `targetUrl`. Applied to the post-transform source
+   * payload before compression/E2EE/signing, so `x-relay-signature`
+   * covers the envelope bytes. `undefined` keeps the exact current
+   * behavior.
+   */
+  cloudEvents?: Record<string, CloudEventsEndpointConfig>
 ): PooledSender {
   if (tlsPins !== undefined) {
     for (const [endpoint, pins] of Object.entries(tlsPins)) {
@@ -2976,6 +3008,19 @@ export function createDefaultSender(
       } catch (err) {
         throw new RangeError(
           `createDefaultSender: invalid TLS pins for ${endpoint}: ${(err as Error).message}`
+        );
+      }
+    }
+  }
+  // WR-207: fail fast on a CloudEvents config a consumer could never
+  // parse — a typo must not silently emit a malformed envelope.
+  if (cloudEvents !== undefined) {
+    for (const [endpoint, cfg] of Object.entries(cloudEvents)) {
+      try {
+        assertValidCloudEventsConfig(cfg, "cloudEvents");
+      } catch (err) {
+        throw new RangeError(
+          `createDefaultSender: invalid CloudEvents config for ${endpoint}: ${(err as Error).message}`
         );
       }
     }
@@ -3624,6 +3669,27 @@ export function createDefaultSender(
     // throwing validator is fail-closed.
     if (outboundSchemaRegistry !== undefined) {
       outboundSchemaRegistry.validatePayload(item.targetUrl, sourcePayload);
+    }
+    // WR-207: per-endpoint opt-in CloudEvents 1.0 structured-mode
+    // envelope. Runs on the post-transform, post-schema-validation
+    // payload, before compression (WR-142/WR-40/WR-75), E2EE sealing
+    // (WR-58) and signing (WR-26) — so `x-relay-signature` covers the
+    // envelope bytes, exactly what a Knative/EventBridge-style consumer
+    // receives and verifies. Opt-in: endpoints without a record keep
+    // byte-exact current behavior. A stale inbound content-type is
+    // stripped first (the WR-26 anti-forgery pattern) and replaced with
+    // the structured-mode content type.
+    const ceConfig = cloudEvents?.[item.targetUrl];
+    if (ceConfig !== undefined) {
+      sourcePayload = buildCloudEventEnvelope(
+        sourcePayload,
+        { id: item.id, traceId: item.traceId },
+        ceConfig
+      );
+      for (const k of Object.keys(headers)) {
+        if (k.toLowerCase() === "content-type") delete headers[k];
+      }
+      headers["content-type"] = CLOUD_EVENTS_STRUCTURED_CONTENT_TYPE;
     }
     // Propagate the trace ID downstream so the next hop can correlate the
     // delivery with this relay's audit trail (overrides a stale inbound
@@ -6055,7 +6121,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   }
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, opts.awsSigV4, opts.awsSecretResolver, opts.outboundSchemas, opts.oauth2, undefined, opts.compressBrotli, opts.phaseTimeouts, opts.tlsCa, opts.chaos, onChaosInjectedAudit, opts.responseGuard, opts.doh, onDohFallbackAudit, proxyHealthMonitor, opts.outboundCredentials, opts.dnsPin, onDnsPinMismatchAudit)
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, opts.awsSigV4, opts.awsSecretResolver, opts.outboundSchemas, opts.oauth2, undefined, opts.compressBrotli, opts.phaseTimeouts, opts.tlsCa, opts.chaos, onChaosInjectedAudit, opts.responseGuard, opts.doh, onDohFallbackAudit, proxyHealthMonitor, opts.outboundCredentials, opts.dnsPin, onDnsPinMismatchAudit, opts.cloudEvents)
       : undefined;
   // WR-146: tail-latency hedging for outbound attempts (opt-in). The
   // wrapper sits around whichever sender the queue uses — the default
@@ -6123,7 +6189,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     if (validators !== undefined && typeof validators === "object") {
       for (const endpoint of Object.keys(validators)) knownEndpoints.add(endpoint);
     }
-    for (const record of [opts.tlsPins, opts.tlsClientCerts, opts.tlsClientCertRotation, opts.compressOutbound, opts.compressThreshold, opts.compressBrotli, opts.proxies, opts.outboundEncryption, opts.responseCompression, opts.responseGuard, opts.forwardHeaders, opts.minTlsVersions, opts.tlsOcsp, opts.payloadTransforms, opts.outboundSchemas]) {
+    for (const record of [opts.tlsPins, opts.tlsClientCerts, opts.tlsClientCertRotation, opts.compressOutbound, opts.compressThreshold, opts.compressBrotli, opts.proxies, opts.outboundEncryption, opts.responseCompression, opts.responseGuard, opts.forwardHeaders, opts.minTlsVersions, opts.tlsOcsp, opts.payloadTransforms, opts.outboundSchemas, opts.cloudEvents]) {
       if (record) for (const endpoint of Object.keys(record)) knownEndpoints.add(endpoint);
     }
     for (const endpoint of opts.retry?.probe?.endpoints ?? []) knownEndpoints.add(endpoint);
@@ -6239,7 +6305,17 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
                   // its own per-DoH-URL cache), with the same
                   // doh_fallback audit line on failure.
                   opts.doh,
-                  onDohFallbackAudit
+                  onDohFallbackAudit,
+                  // proxyHealthMonitor / outboundCredentials / dnsPin /
+                  // onDnsPinMismatch stay off for shadow copies
+                  // (pre-existing); the trailing slots lead to cloudEvents.
+                  undefined,
+                  undefined,
+                  undefined,
+                  undefined,
+                  // WR-207: shadow deliveries mirror the identical wire
+                  // request, so they apply the same CloudEvents envelope.
+                  opts.cloudEvents
                 ),
               })
             ),
