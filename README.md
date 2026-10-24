@@ -5075,6 +5075,53 @@ intended keys with zero network I/O. Orthogonal to `src/archive-s3.ts`
 (WR-188: payload-free delivery-event metadata) and to the WR-128 local
 CSV/JSONL export.
 
+## SQS delivery sink (opt-in)
+
+Some downstreams are not HTTP endpoints at all: they are Amazon SQS
+queues. `src/sqs-sink.ts` (WR-210) lets the relay deliver straight to
+a queue instead of forcing the operator to run a sidecar translator in
+front of every queue consumer.
+
+```ts
+const sink = new SqsSink({
+  queueUrl: "https://sqs.us-east-1.amazonaws.com/123456789012/events",
+  region: "us-east-1",
+  accessKeyId: "AKIDEXAMPLE",
+  secretRef: "RELAY_SQS_SECRET",   // a reference, never the raw secret
+});
+await sink.send({
+  body: JSON.stringify(event),
+  tenantId: "tenant-7",
+  endpoint: "https://downstream.example/hook",
+  traceId: "trace-1",
+});
+```
+
+- **Wire format** — one `SendMessage` Query API POST to the queue URL
+  (`application/x-www-form-urlencoded`): `MessageBody` is the event
+  JSON verbatim, and `tenant` / `endpoint` / `trace` ride as String
+  message attributes (plus any caller-supplied attributes), so the
+  consumer can correlate the queued message with the relay's audit
+  trail without opening the body.
+- **Signing** — the WR-116 SigV4 pipeline with service `sqs`, covering
+  the exact form-encoded body; `secretRef` resolves per send, so
+  rotation needs no restart and key material never enters snapshots,
+  audit logs, or error messages.
+- **Failure handling** — a non-2xx SQS response throws `SqsSinkError`
+  with its numeric status, so the existing classification applies
+  unchanged (4xx except 408/429 → dead-letter immediately, 429/5xx →
+  retry lane, honouring `Retry-After`); a missing secret throws
+  `SqsSinkConfigError` → `non_retryable`, the WR-116 rule. Transport
+  failures and timeouts are retryable.
+- **Scope** — standard queues only: a `.fifo` queue URL is rejected at
+  construction, because FIFO delivery needs a `MessageGroupId` this
+  sink does not invent. Orthogonal to `src/archive-s3.ts` (WR-188:
+  payload-free delivery-event metadata, after the fact) and to
+  `src/deadletter-s3.ts` (WR-206: dead letters archived for
+  compliance) — neither re-sends through this sink, and a queue
+  delivery can still be archived by either.
+
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same

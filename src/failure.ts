@@ -52,6 +52,7 @@
 import { PayloadTransformError } from "./transform.ts";
 import { OutboundSchemaViolationError } from "./outbound-schema.ts";
 import { SigV4SigningError } from "./sigv4.ts";
+import { SqsSinkConfigError } from "./sqs-sink.ts";
 import { CredentialSecretUnavailableError } from "./outbound-credentials.ts";
 import { AssertionFailedError } from "./response-assertions.ts";
 import { IntegrityMismatchError } from "./response-integrity.ts";
@@ -188,6 +189,14 @@ export function classifyFailure(err: unknown): ClassifiedFailure {
   // item, so dead-letter immediately instead of burning the retry
   // budget and the backoff clock.
   if (err instanceof SigV4SigningError) {
+    return { failureClass: "non_retryable" };
+  }
+  // WR-210: an unresolvable SQS secret reference is a local config
+  // problem — the wire request was never built, let alone sent.
+  // Retrying can never succeed for this item, so dead-letter
+  // immediately instead of burning the retry budget and the backoff
+  // clock (the WR-116 rule, applied to the SQS sink).
+  if (err instanceof SqsSinkConfigError) {
     return { failureClass: "non_retryable" };
   }
   // WR-192: an unresolvable static-credential reference is a local
