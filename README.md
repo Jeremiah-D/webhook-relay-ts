@@ -5644,6 +5644,62 @@ await sink.putEvents([
   rule. `dryRun` validates (including DetailType resolution) with
   zero client I/O.
 
+## Apache Pulsar delivery sink (opt-in)
+
+Where the SQS sink delivers to an unordered queue, the Kinesis sink
+delivers to an AWS SigV4 stream, the Kafka sink delivers to a
+partitioned log, the MQTT sink delivers to a pub/sub topic tree, the
+AMQP sink delivers to an exchange, the JetStream sink delivers to a
+durable stream, the Redis sink delivers to a Redis stream with
+XADD, the Pub/Sub sink delivers to a Google Cloud topic, the
+Service Bus sink delivers to an Azure queue or topic, and the
+EventBridge sink delivers to an AWS event bus,
+`src/pulsar-sink.ts` (WR-223) delivers to an Apache Pulsar topic:
+one event is produced as one message, and Pulsar — not the relay —
+owns the message id, the topic's retention, and fan-out to
+subscriptions. No Pulsar client is bundled — the client is injected
+through the config, so the module has zero new dependencies and
+tests never need a Pulsar cluster.
+
+```ts
+const sink = new PulsarSink({
+  topic: "persistent://public/default/events", // or omit: per-record resolution
+  client, // your client adapter implementing PulsarClient
+  // partitionKey: true, // opt-in: record key → partition key
+});
+await sink.produce([
+  { body: JSON.stringify(event), tenant: "t1", traceId: "trace-9", key: "agg-9" },
+]);
+```
+
+- **Topic targeting** — one sink targets one topic when `topic` is
+  configured: every message goes there. When no topic is
+  configured, the topic resolves per record from the event's own
+  values, first non-empty wins: `subject`, then `key`, then
+  `traceId` — the same source chain the EventBridge sink uses for
+  its DetailType. A record with none of the three has no topic
+  source and fails closed with a `RangeError`: inventing a topic
+  would deliver the event to subscribers that never asked for it.
+- **Properties** — a message's properties pass through the record's
+  own tenant, endpoint, and trace id, never invented: a property
+  is present only when the record carries that value. A record
+  with none of the three carries an empty properties object. The
+  trace id rides as `trace`, the Pulsar-idiomatic short name.
+- **Partition keys** — opt-in: when `partitionKey` is set, a
+  record's event `key` becomes the message's partition key; when
+  the flag is absent, or the record has no key, no partition key
+  is attached — the key is ignored, not defaulted.
+- **Failure handling** — a failed message throws
+  `PulsarSinkError` carrying exactly the failed messages with
+  their retry lanes, so the caller retries just those:
+  connection failures, produce failures, timeouts, and codeless
+  transport failures are retryable; permission denied, unknown
+  topics, and malformed messages are fail-closed, non-retryable.
+  A missing client throws `PulsarSinkConfigError` →
+  `non_retryable`, the WR-116 rule; a missing topic is not a
+  config error, it selects per-record resolution. `dryRun`
+  validates (including topic resolution) with zero client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same
