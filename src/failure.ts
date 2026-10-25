@@ -55,6 +55,7 @@ import { SigV4SigningError } from "./sigv4.ts";
 import { SqsSinkConfigError } from "./sqs-sink.ts";
 import { KinesisSinkConfigError } from "./kinesis-sink.ts";
 import { KafkaSinkConfigError } from "./kafka-sink.ts";
+import { MqttSinkConfigError } from "./mqtt-sink.ts";
 import { DigestAuthError } from "./digest-auth.ts";
 import { CredentialSecretUnavailableError } from "./outbound-credentials.ts";
 import { AssertionFailedError } from "./response-assertions.ts";
@@ -218,6 +219,14 @@ export function classifyFailure(err: unknown): ClassifiedFailure {
   // WR-116 rule, applied to the Kafka sink like the SQS and Kinesis
   // sinks above).
   if (err instanceof KafkaSinkConfigError) {
+    return { failureClass: "non_retryable" };
+  }
+  // WR-216: an MQTT sink with no injected client is a local config
+  // problem — the publish was never built, let alone sent. Retrying
+  // can never succeed for this item, so dead-letter immediately
+  // instead of burning the retry budget and the backoff clock (the
+  // WR-116 rule, applied to the MQTT sink like the Kafka sink above).
+  if (err instanceof MqttSinkConfigError) {
     return { failureClass: "non_retryable" };
   }
   // WR-212: a Digest challenge this client cannot answer (unsupported

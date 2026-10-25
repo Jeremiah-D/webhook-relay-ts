@@ -5267,6 +5267,64 @@ await sink.produce([
   producer throws `KafkaSinkConfigError` → `non_retryable`, the
   WR-116 rule. `dryRun` validates with zero producer I/O.
 
+## MQTT delivery sink (opt-in)
+
+Where the SQS sink delivers to an unordered queue, the Kinesis sink
+delivers to an AWS SigV4 stream, and the Kafka sink delivers to a
+partitioned log, `src/mqtt-sink.ts` (WR-216) delivers to a pub/sub
+topic tree over the native MQTT publish protocol: one event fans out
+to every subscriber of its topic, and the broker — not the relay —
+owns fan-out. No MQTT client is bundled — the client is injected
+through the config, so the module has zero new dependencies and
+tests never need a broker. It is orthogonal to the WebSocket
+downstream (WR-45): that is a direct relay-to-client connection,
+this is broker-mediated delivery.
+
+```ts
+const sink = new MqttSink({
+  topicPrefix: "events",
+  qos: 1, // default; 2 for exactly-once, 0 for fire-and-forget
+  retain: false, // opt-in: a retained message greets late subscribers
+  client, // your client adapter implementing MqttClient
+});
+await sink.publish([
+  { payload: JSON.stringify(event), key: "order-9" }, // key → topic segment
+  { payload: JSON.stringify(other), traceId: "trace-1" }, // trace → topic segment
+]);
+```
+
+- **Topics** — explicit `topicKey`, then event `key`, then
+  `traceId`, appended to `topicPrefix` as one level
+  (`events/order-9`). A record with none of the three is rejected
+  at build time: the sink never invents a segment, for the same
+  reason the Kafka sink refuses to invent a partition key. A
+  segment containing `/`, `+`, `#`, or NUL is rejected: one event
+  maps to exactly one topic level, never a silent fan-out into
+  sub-levels.
+- **QoS and downgrade** — configurable per sink (`0` / `1` / `2`),
+  carried on every publish request. When the broker rejects a level
+  with `QOS_NOT_SUPPORTED`, the sink steps down inside the same
+  call (2 → 1 → 0) instead of burning the retry budget: a
+  downgrade is capability negotiation, not a delivery failure. A
+  record that lands lower is counted as sent and reported in
+  `result.downgrades` with the requested and delivered levels.
+- **Disconnect and resend** — a connection failure
+  (`CONNECTION_LOST`, `NOT_CONNECTED`, codeless transport) marks
+  the sink disconnected and maps to the retryable lane, so the
+  caller's retry queue replays exactly those records after the
+  connection is restored — that replay is the resend, not a second
+  mechanism. `reconnect()` re-arms the sink once the client is
+  restored (delegating to the client's `connect` when it provides
+  one).
+- **Failure handling** — a failed record throws `MqttSinkError`
+  carrying exactly the failed records with their retry lanes, so the
+  caller retries just those: transient broker states and codeless
+  transport failures are retryable; oversize payloads, invalid
+  topics, unauthorized publishes, and a QoS floor rejection are
+  poison, non-retryable. A missing client throws
+  `MqttSinkConfigError` → `non_retryable`, the WR-116 rule.
+  `dryRun` validates with zero client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same
