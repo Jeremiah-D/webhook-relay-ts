@@ -5223,6 +5223,50 @@ await sink.putRecords([
   `ErrorCode` is not — so the caller retries exactly the failed
   records. `dryRun` validates and splits with zero network I/O.
 
+## Kafka delivery sink (opt-in)
+
+Where the SQS sink delivers to an unordered queue and the Kinesis
+sink delivers to an AWS SigV4 stream, `src/kafka-sink.ts` (WR-215)
+delivers to a partitioned log over the native Kafka produce
+protocol: records sharing a partition key land on the same partition
+in order, so a consumer can replay one key's events exactly. No
+Kafka client is bundled — the producer is injected through the
+config, so the module has zero new dependencies and tests never
+need a broker.
+
+```ts
+const sink = new KafkaSink({
+  topic: "events-topic",
+  acks: "all", // default; "1" for leader only, "0" for fire-and-forget
+  producer, // your client adapter implementing KafkaProducer
+  dedupWindowMs: 60_000, // skip a repeat key inside the window
+});
+await sink.produce([
+  { value: JSON.stringify(event), key: "order-9" }, // key → partition key
+  { value: JSON.stringify(other), traceId: "trace-1" }, // trace → partition key
+]);
+```
+
+- **Partition keys** — explicit `partitionKey`, then event `key`, then
+  `traceId`. A record with none of the three is rejected at build
+  time: the sink never invents a key, for the same reason the SQS
+  sink refuses to invent a FIFO `MessageGroupId`.
+- **Acks** — configurable per sink (`all` / `1` / `0`), carried on
+  every produce request to the injected producer.
+- **Dedup window** — when `dedupWindowMs` is set, a record whose
+  partition key was already produced inside the window is skipped
+  and reported in `result.duplicates` by original index, instead of
+  being produced twice. In-memory only: it does not survive a
+  restart and is not a substitute for an idempotent consumer.
+- **Failure handling** — a failed record throws `KafkaSinkError`
+  carrying exactly the failed records with their retry lanes, so the
+  caller retries just those: transient broker states (leader /
+  replica churn, request timeouts, metadata propagation) and
+  codeless transport failures are retryable; oversize messages and
+  invalid topics / records are poison, non-retryable. A missing
+  producer throws `KafkaSinkConfigError` → `non_retryable`, the
+  WR-116 rule. `dryRun` validates with zero producer I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same
