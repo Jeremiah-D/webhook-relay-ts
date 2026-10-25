@@ -5325,6 +5325,57 @@ await sink.publish([
   `MqttSinkConfigError` → `non_retryable`, the WR-116 rule.
   `dryRun` validates with zero client I/O.
 
+## AMQP delivery sink (opt-in)
+
+Where the SQS sink delivers to an unordered queue, the Kinesis sink
+delivers to an AWS SigV4 stream, the Kafka sink delivers to a
+partitioned log, and the MQTT sink delivers to a pub/sub topic
+tree, `src/amqp-sink.ts` (WR-217) delivers to an exchange over the
+native AMQP publish protocol: one event is published to a named
+exchange under a routing key, and the broker — not the relay —
+owns routing it to the bound queues. No AMQP client is bundled —
+the client is injected through the config, so the module has zero
+new dependencies and tests never need a broker. The injected
+client is expected to publish with publisher confirms enabled, so
+a publish the broker did not acknowledge surfaces as a failure
+rather than a silent drop.
+
+```ts
+const sink = new AmqpSink({
+  exchange: "events",
+  persistent: false, // opt-in: delivery mode 2, survives a broker restart
+  client, // your client adapter implementing AmqpClient
+});
+await sink.publish([
+  { body: JSON.stringify(event), key: "order-9" }, // key → routing key
+  { body: JSON.stringify(other), traceId: "trace-1" }, // trace → routing key
+]);
+```
+
+- **Routing keys** — explicit `routingKey`, then event `key`, then
+  `traceId`, published to the sink's configured exchange. A record
+  with none of the three is rejected at build time: the sink never
+  invents a key, for the same reason the Kafka sink refuses to
+  invent a partition key and the MQTT sink refuses to invent a
+  topic segment. A resolved key must be 1–255 characters, free of
+  NUL; the exchange must be 1–127 characters, free of NUL.
+- **Persistent delivery** — opt-in (`persistent: true`, default
+  `false`): a persistent message is written to disk by the broker
+  and survives a broker restart, at the cost of a disk write per
+  publish. The flag is carried on every publish request so the
+  injected client can apply it (AMQP delivery mode 2).
+- **Failure handling** — a failed record throws `AmqpSinkError`
+  carrying exactly the failed records with their retry lanes, so the
+  caller retries just those: transient broker states (connection /
+  channel loss, broker unavailability), publisher-confirm
+  failures (`PUBLISH_NACKED`, `CONFIRM_TIMEOUT` — a nack says the
+  broker could not accept the message right now, not that the
+  payload is poison), and codeless transport failures are
+  retryable; oversize bodies and invalid exchanges / routing keys
+  are poison, non-retryable. A missing client throws
+  `AmqpSinkConfigError` → `non_retryable`, the WR-116 rule.
+  `dryRun` validates with zero client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same
