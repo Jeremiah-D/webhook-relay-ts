@@ -5376,6 +5376,64 @@ await sink.publish([
   `AmqpSinkConfigError` → `non_retryable`, the WR-116 rule.
   `dryRun` validates with zero client I/O.
 
+## NATS JetStream delivery sink (opt-in)
+
+Where the SQS sink delivers to an unordered queue, the Kinesis sink
+delivers to an AWS SigV4 stream, the Kafka sink delivers to a
+partitioned log, the MQTT sink delivers to a pub/sub topic tree, and
+the AMQP sink delivers to an exchange, `src/jetstream-sink.ts`
+(WR-218) delivers to a durable stream over the native JetStream
+publish protocol: one event is published to a named stream under a
+subject, and the stream — not the relay — owns persisting it,
+replaying it to later consumers, and expiring it per its retention
+policy. No NATS client is bundled — the client is injected through
+the config, so the module has zero new dependencies and tests never
+need a broker. The injected client is expected to publish with
+acknowledgement enabled, so a publish the stream did not
+acknowledge surfaces as a failure rather than a silent drop.
+
+```ts
+const sink = new JetStreamSink({
+  stream: "events",
+  client, // your client adapter implementing JetStreamClient
+});
+await sink.publish([
+  { body: JSON.stringify(event), key: "order-9", traceId: "trace-9" },
+  { body: JSON.stringify(other), traceId: "trace-1" }, // trace → subject
+]);
+```
+
+- **Subjects** — explicit `subject`, then event `key`, then
+  `traceId`, published to the sink's configured stream. A record
+  with none of the three is rejected at build time: the sink never
+  invents a subject, for the same reason the Kafka sink refuses to
+  invent a partition key, the MQTT sink refuses to invent a topic
+  segment, and the AMQP sink refuses to invent a routing key. A
+  resolved subject must be 1–255 characters, free of NUL and
+  whitespace; the stream must be 1–128 characters, free of NUL and
+  whitespace.
+- **Trace-id headers** — when the record carries a `traceId`, it is
+  passed through verbatim as the `trace-id` message header, so a
+  consumer can correlate the stream message with the relay's audit
+  trail without opening the body. A record with no `traceId`
+  carries no `trace-id` header: the sink never invents one.
+- **Durable-stream semantics** — persistence is a property of the
+  stream, not of the message: unlike the AMQP sink's per-message
+  `persistent` flag, there is no per-publish durability switch
+  here, because a JetStream stream either persists what it accepts
+  or it is not a JetStream stream.
+- **Failure handling** — a failed record throws `JetStreamSinkError`
+  carrying exactly the failed records with their retry lanes, so the
+  caller retries just those: publish failures, publish
+  acknowledgement timeouts (`PUBLISH_TIMEOUT`, `NO_ACK`), stream
+  unavailability, connection loss, and codeless transport failures
+  are retryable; an unknown stream or subject, an invalid subject,
+  and oversize messages are fail-closed, non-retryable — rerouting
+  them elsewhere would break the replay contract the consumer
+  depends on. A missing client throws `JetStreamSinkConfigError` →
+  `non_retryable`, the WR-116 rule. `dryRun` validates with zero
+  client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same

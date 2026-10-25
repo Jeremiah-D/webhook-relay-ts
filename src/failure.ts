@@ -57,6 +57,7 @@ import { KinesisSinkConfigError } from "./kinesis-sink.ts";
 import { KafkaSinkConfigError } from "./kafka-sink.ts";
 import { MqttSinkConfigError } from "./mqtt-sink.ts";
 import { AmqpSinkConfigError } from "./amqp-sink.ts";
+import { JetStreamSinkConfigError } from "./jetstream-sink.ts";
 import { DigestAuthError } from "./digest-auth.ts";
 import { CredentialSecretUnavailableError } from "./outbound-credentials.ts";
 import { AssertionFailedError } from "./response-assertions.ts";
@@ -236,6 +237,15 @@ export function classifyFailure(err: unknown): ClassifiedFailure {
   // instead of burning the retry budget and the backoff clock (the
   // WR-116 rule, applied to the AMQP sink like the MQTT sink above).
   if (err instanceof AmqpSinkConfigError) {
+    return { failureClass: "non_retryable" };
+  }
+  // WR-218: a JetStream sink with no injected client is a local
+  // config problem — the publish was never built, let alone sent.
+  // Retrying can never succeed for this item, so dead-letter
+  // immediately instead of burning the retry budget and the
+  // backoff clock (the WR-116 rule, applied to the JetStream sink
+  // like the AMQP sink above).
+  if (err instanceof JetStreamSinkConfigError) {
     return { failureClass: "non_retryable" };
   }
   // WR-212: a Digest challenge this client cannot answer (unsupported
