@@ -5596,6 +5596,54 @@ await sink.send([
   `ServiceBusSinkConfigError` → `non_retryable`, the WR-116
   rule. `dryRun` validates with zero client I/O.
 
+## AWS EventBridge delivery sink (opt-in)
+
+Where the SQS sink delivers to an unordered queue, the Kinesis sink
+delivers to an AWS SigV4 stream, the Kafka sink delivers to a
+partitioned log, the MQTT sink delivers to a pub/sub topic tree, the
+AMQP sink delivers to an exchange, the JetStream sink delivers to a
+durable stream, the Redis sink delivers to a Redis stream with
+XADD, the Pub/Sub sink delivers to a Google Cloud topic, and the
+Service Bus sink delivers to an Azure queue or topic,
+`src/eventbridge-sink.ts` (WR-222) delivers to an AWS EventBridge
+event bus: one event is sent as one PutEvents entry, and
+EventBridge — not the relay — owns routing to rules, retries to
+targets, and archiving. No EventBridge client is bundled — the
+client is injected through the config, so the module has zero new
+dependencies and tests never need an AWS account.
+
+```ts
+const sink = new EventBridgeSink({
+  eventBusName: "events",
+  client, // your client adapter implementing EventBridgeClient
+});
+await sink.putEvents([
+  { body: JSON.stringify(event), subject: "order.created", traceId: "trace-9" },
+]);
+```
+
+- **Detail** — the event JSON, fixed and verbatim: the sink never
+  templates, wraps, or rewrites it. The trace id rides as an entry
+  field alongside Detail, present only when the record carries one
+  — the sink never invents a trace id, and Detail itself stays
+  untouched. The entry's `Source` is owned by the client adapter:
+  EventBridge requires one, but the relay invents no source value.
+- **DetailType** — resolved per record from the event's own values,
+  first non-empty wins: `subject`, then `key`, then `traceId`. A
+  record with none of the three has no DetailType source and fails
+  closed with a `RangeError`: inventing a DetailType would route
+  the event to rules that never asked for it.
+- **Failure handling** — a failed message throws
+  `EventBridgeSinkError` carrying exactly the failed messages with
+  their retry lanes, so the caller retries just those: throttling,
+  quota exhaustion, internal errors, and codeless transport
+  failures are retryable; permission denied, unknown buses, and
+  malformed details are fail-closed, non-retryable. A missing
+  client or a missing event bus throws
+  `EventBridgeSinkConfigError` → `non_retryable`, the WR-116
+  rule. `dryRun` validates (including DetailType resolution) with
+  zero client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same

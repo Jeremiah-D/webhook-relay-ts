@@ -61,6 +61,7 @@ import { JetStreamSinkConfigError } from "./jetstream-sink.ts";
 import { RedisSinkConfigError } from "./redis-sink.ts";
 import { PubSubSinkConfigError } from "./pubsub-sink.ts";
 import { ServiceBusSinkConfigError } from "./servicebus-sink.ts";
+import { EventBridgeSinkConfigError } from "./eventbridge-sink.ts";
 import { DigestAuthError } from "./digest-auth.ts";
 import { CredentialSecretUnavailableError } from "./outbound-credentials.ts";
 import { AssertionFailedError } from "./response-assertions.ts";
@@ -276,6 +277,16 @@ export function classifyFailure(err: unknown): ClassifiedFailure {
   // retry budget and the backoff clock (the WR-116 rule, applied
   // to the Service Bus sink like the Pub/Sub sink above).
   if (err instanceof ServiceBusSinkConfigError) {
+    return { failureClass: "non_retryable" };
+  }
+  // WR-222: an EventBridge sink with no injected client or no
+  // configured event bus is a local config problem — the PutEvents
+  // entry was never built, let alone sent. Retrying can never
+  // succeed for this item, so dead-letter immediately instead of
+  // burning the retry budget and the backoff clock (the WR-116
+  // rule, applied to the EventBridge sink like the Service Bus
+  // sink above).
+  if (err instanceof EventBridgeSinkConfigError) {
     return { failureClass: "non_retryable" };
   }
   // WR-212: a Digest challenge this client cannot answer (unsupported
