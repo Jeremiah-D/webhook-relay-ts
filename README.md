@@ -5434,6 +5434,65 @@ await sink.publish([
   `non_retryable`, the WR-116 rule. `dryRun` validates with zero
   client I/O.
 
+## Redis Streams delivery sink (opt-in)
+
+Where the SQS sink delivers to an unordered queue, the Kinesis sink
+delivers to an AWS SigV4 stream, the Kafka sink delivers to a
+partitioned log, the MQTT sink delivers to a pub/sub topic tree, the
+AMQP sink delivers to an exchange, and the JetStream sink delivers
+to a durable stream, `src/redis-sink.ts` (WR-219) delivers to a
+Redis stream with XADD: one event is appended as one stream entry,
+and Redis — not the relay — owns the entry id, the stream's
+length, and trimming per the operator's MAXLEN policy. No Redis
+client is bundled — the client is injected through the config, so
+the module has zero new dependencies and tests never need a Redis
+server. The injected client is expected to issue XADD with an
+auto-generated entry id (`*`), so the returned id is the entry
+Redis stored.
+
+```ts
+const sink = new RedisSink({
+  client, // your client adapter implementing RedisStreamsClient
+  // stream: "events", // optional fixed stream: wins over per-record keys
+});
+await sink.publish([
+  { body: JSON.stringify(event), key: "order-9", traceId: "trace-9" },
+  { body: JSON.stringify(other), traceId: "trace-1" }, // trace → stream key
+]);
+```
+
+- **Stream keys** — a record's stream key resolves from the event,
+  never invented: explicit `subject`, then event `key`, then
+  `traceId`. A record with none of the three is rejected at build
+  time: the sink never invents a key, for the same reason the
+  JetStream sink refuses to invent a subject and the Kafka sink
+  refuses to invent a partition key. A resolved key must be 1–255
+  characters, free of NUL and whitespace. When the sink is
+  configured with a fixed `stream`, that stream is the XADD target
+  for every record and per-record resolution is skipped.
+- **Trace-id fields** — when the record carries a `traceId`, it is
+  passed through verbatim as the `trace-id` entry field, so a
+  consumer can correlate the stream entry with the relay's audit
+  trail without opening the body. Redis entries have no headers,
+  so the trace id rides as a field where JetStream carries it as a
+  header. A record with no `traceId` carries no `trace-id` field:
+  the sink never invents one.
+- **Auto-created streams** — a stream that does not exist yet is
+  created by Redis on the first XADD, so there is no "unknown
+  stream" failure lane here: the deliberate difference from the
+  JetStream sink, where an unknown stream is a fail-closed record.
+  A key that already exists with a non-stream type (`WRONGTYPE`)
+  is still fail-closed, non-retryable — retrying it cannot turn a
+  string into a stream.
+- **Failure handling** — a failed record throws `RedisSinkError`
+  carrying exactly the failed records with their retry lanes, so
+  the caller retries just those: XADD failures, connection loss,
+  timeouts, and codeless transport failures are retryable; a wrong
+  key type and oversize messages are fail-closed, non-retryable. A
+  missing client throws `RedisSinkConfigError` →
+  `non_retryable`, the WR-116 rule. `dryRun` validates with zero
+  client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same
