@@ -5493,6 +5493,54 @@ await sink.publish([
   `non_retryable`, the WR-116 rule. `dryRun` validates with zero
   client I/O.
 
+## Google Cloud Pub/Sub delivery sink (opt-in)
+
+Where the SQS sink delivers to an unordered queue, the Kinesis sink
+delivers to an AWS SigV4 stream, the Kafka sink delivers to a
+partitioned log, the MQTT sink delivers to a pub/sub topic tree, the
+AMQP sink delivers to an exchange, the JetStream sink delivers to a
+durable stream, and the Redis sink delivers to a Redis stream with
+XADD, `src/pubsub-sink.ts` (WR-220) delivers to a Google Cloud
+Pub/Sub topic: one event is published as one message, and Pub/Sub —
+not the relay — owns the message id, the topic's retention, and
+fan-out to subscriptions. No Pub/Sub client is bundled — the client
+is injected through the config, so the module has zero new
+dependencies and tests never need a GCP project.
+
+```ts
+const sink = new PubSubSink({
+  topic: "projects/p/topics/events",
+  client, // your client adapter implementing PubSubClient
+  // orderingKey: true, // opt-in: record key → ordering key
+  // orderingEnabled: true, // only together with orderingKey, and
+  // only for topics created with message ordering enabled
+});
+await sink.publish([
+  { body: JSON.stringify(event), tenant: "t1", traceId: "trace-9", key: "order-9" },
+]);
+```
+
+- **Attributes** — a message's attributes pass through the
+  record's own tenant, endpoint, and trace id, never invented: an
+  attribute is present only when the record carries that value. A
+  record with none of the three carries an empty attributes
+  object. The trace id rides as `trace-id`, the same attribute name
+  the Redis sink uses for its entry field.
+- **Ordering keys** — opt-in, and only effective when the topic has
+  ordering enabled. When both `orderingKey` and `orderingEnabled`
+  are set, a record's event `key` becomes the message's ordering
+  key; otherwise the key is ignored, not defaulted, because
+  ordering on a topic that never enabled it is a publish error.
+- **Failure handling** — a failed message throws `PubSubSinkError`
+  carrying exactly the failed messages with their retry lanes, so
+  the caller retries just those: quota exhaustion, unavailability,
+  deadline overruns, internal errors, and codeless transport
+  failures are retryable; permission denied, unknown topic,
+  malformed messages, and ordering on a non-ordering topic are
+  fail-closed, non-retryable. A missing client or a missing topic
+  throws `PubSubSinkConfigError` → `non_retryable`, the WR-116
+  rule. `dryRun` validates with zero client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same

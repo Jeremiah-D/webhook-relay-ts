@@ -59,6 +59,7 @@ import { MqttSinkConfigError } from "./mqtt-sink.ts";
 import { AmqpSinkConfigError } from "./amqp-sink.ts";
 import { JetStreamSinkConfigError } from "./jetstream-sink.ts";
 import { RedisSinkConfigError } from "./redis-sink.ts";
+import { PubSubSinkConfigError } from "./pubsub-sink.ts";
 import { DigestAuthError } from "./digest-auth.ts";
 import { CredentialSecretUnavailableError } from "./outbound-credentials.ts";
 import { AssertionFailedError } from "./response-assertions.ts";
@@ -256,6 +257,15 @@ export function classifyFailure(err: unknown): ClassifiedFailure {
   // (the WR-116 rule, applied to the Redis sink like the JetStream
   // sink above).
   if (err instanceof RedisSinkConfigError) {
+    return { failureClass: "non_retryable" };
+  }
+  // WR-220: a Pub/Sub sink with no injected client or no configured
+  // topic is a local config problem — the publish was never built,
+  // let alone sent. Retrying can never succeed for this item, so
+  // dead-letter immediately instead of burning the retry budget and
+  // the backoff clock (the WR-116 rule, applied to the Pub/Sub sink
+  // like the Redis sink above).
+  if (err instanceof PubSubSinkConfigError) {
     return { failureClass: "non_retryable" };
   }
   // WR-212: a Digest challenge this client cannot answer (unsupported
