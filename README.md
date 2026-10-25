@@ -5541,6 +5541,61 @@ await sink.publish([
   throws `PubSubSinkConfigError` → `non_retryable`, the WR-116
   rule. `dryRun` validates with zero client I/O.
 
+## Azure Service Bus delivery sink (opt-in)
+
+Where the SQS sink delivers to an unordered queue, the Kinesis sink
+delivers to an AWS SigV4 stream, the Kafka sink delivers to a
+partitioned log, the MQTT sink delivers to a pub/sub topic tree, the
+AMQP sink delivers to an exchange, the JetStream sink delivers to a
+durable stream, the Redis sink delivers to a Redis stream with
+XADD, and the Pub/Sub sink delivers to a Google Cloud topic,
+`src/servicebus-sink.ts` (WR-221) delivers to an Azure Service Bus
+queue or topic: one event is sent as one message, and Service Bus —
+not the relay — owns the message id, the entity's retention, and
+fan-out to subscriptions. No Service Bus client is bundled — the
+client is injected through the config, so the module has zero new
+dependencies and tests never need an Azure namespace.
+
+```ts
+const sink = new ServiceBusSink({
+  queue: "events", // or topic: "events" — one sink, one entity
+  client, // your client adapter implementing ServiceBusClient
+  // sessionId: true, // opt-in: record key → session id
+  // sessionEnabled: true, // only together with sessionId, and
+  // only for entities created with sessions enabled
+});
+await sink.send([
+  { body: JSON.stringify(event), tenant: "t1", traceId: "trace-9", key: "session-9" },
+]);
+```
+
+- **Entity targeting** — one sink targets one entity: a queue or a
+  topic, never both (both set is a shape error at construction).
+  When the target is a topic, the relay only publishes to it:
+  subscriptions are built and owned downstream, never created by
+  the relay.
+- **Properties** — a message's application properties pass through
+  the record's own tenant, endpoint, and trace id, never invented:
+  a property is present only when the record carries that value. A
+  record with none of the three carries an empty properties
+  object. The trace id rides as `trace-id`, the same property name
+  the Pub/Sub sink uses for its attribute.
+- **Session ids** — opt-in, and only effective when the entity has
+  sessions enabled. When both `sessionId` and `sessionEnabled`
+  are set, a record's event `key` becomes the message's session
+  id; otherwise the key is ignored, not defaulted, because sending
+  a session id to an entity without sessions enabled is a send
+  error.
+- **Failure handling** — a failed message throws
+  `ServiceBusSinkError` carrying exactly the failed messages with
+  their retry lanes, so the caller retries just those: quota
+  exhaustion, server busy, operation timeouts, and codeless
+  transport failures are retryable; permission denied, unknown or
+  disabled entities, and malformed messages are fail-closed,
+  non-retryable. A missing client or a missing entity throws
+  `ServiceBusSinkConfigError` → `non_retryable`, the WR-116
+  rule. `dryRun` validates with zero client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same

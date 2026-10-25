@@ -60,6 +60,7 @@ import { AmqpSinkConfigError } from "./amqp-sink.ts";
 import { JetStreamSinkConfigError } from "./jetstream-sink.ts";
 import { RedisSinkConfigError } from "./redis-sink.ts";
 import { PubSubSinkConfigError } from "./pubsub-sink.ts";
+import { ServiceBusSinkConfigError } from "./servicebus-sink.ts";
 import { DigestAuthError } from "./digest-auth.ts";
 import { CredentialSecretUnavailableError } from "./outbound-credentials.ts";
 import { AssertionFailedError } from "./response-assertions.ts";
@@ -266,6 +267,15 @@ export function classifyFailure(err: unknown): ClassifiedFailure {
   // the backoff clock (the WR-116 rule, applied to the Pub/Sub sink
   // like the Redis sink above).
   if (err instanceof PubSubSinkConfigError) {
+    return { failureClass: "non_retryable" };
+  }
+  // WR-221: a Service Bus sink with no injected client or no
+  // configured entity is a local config problem — the send was
+  // never built, let alone sent. Retrying can never succeed for
+  // this item, so dead-letter immediately instead of burning the
+  // retry budget and the backoff clock (the WR-116 rule, applied
+  // to the Service Bus sink like the Pub/Sub sink above).
+  if (err instanceof ServiceBusSinkConfigError) {
     return { failureClass: "non_retryable" };
   }
   // WR-212: a Digest challenge this client cannot answer (unsupported
