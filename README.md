@@ -5980,6 +5980,74 @@ await sink.send([
   `non_retryable`, the WR-116 rule. `dryRun` validates
   (including text derivation) with zero client I/O.
 
+## Feishu notification delivery sink (opt-in)
+
+Where the DingTalk sink delivers to a DingTalk group,
+`src/feishu-sink.ts` (WR-229) delivers to a Feishu (Lark)
+group: one event is posted as one text message to a
+configured robot webhook URL, and Feishu — not the relay —
+owns the group, the message id, and the retention of the
+notification. No HTTP client is bundled — the client is
+injected through the config, so the module has zero new
+dependencies (plus Node's built-in `node:crypto` for the
+signature) and tests never need a Feishu group.
+
+```ts
+const sink = new FeishuSink({
+  webhookUrl: "https://open.feishu.cn/open-apis/bot/v2/hook/<id>",
+  // signSecret: "your-robot-signing-secret", // signed robots only
+  client, // your client adapter implementing FeishuWebhookClient
+  // includePayload: true, // opt-in only: body appended, truncated
+});
+await sink.send([
+  { body: JSON.stringify(event), subject: "order.created", traceId: "trace-9" },
+]);
+```
+
+- **Webhook targeting and robot authentication** — one sink
+  targets one robot webhook URL, posted to verbatim: Feishu
+  authenticates robots by the webhook id in the URL path, so
+  unlike DingTalk no token is appended at send time. A
+  missing URL is a config error, not a resolution fallback:
+  there is no per-record channel to resolve to, so the sink
+  fails closed with `FeishuSinkConfigError` at send time.
+  The URL must be a parseable `https:` URL — a notification
+  URL must never travel over plaintext. The host is not
+  pinned to open.feishu.cn: an operator may front the
+  webhook with a proxy or sidecar.
+- **Signed robots** — when `signSecret` is configured, the
+  sink computes `timestamp` (current epoch *seconds* —
+  Feishu counts seconds where DingTalk counts milliseconds)
+  and `sign` per send: `sign` is the base64 of HMAC-SHA256
+  over `"<timestamp>\n<secret>"`, keyed by the secret —
+  Feishu's documented robot-signing scheme. Unlike DingTalk,
+  both ride in the JSON body, not the URL: the client adds
+  them to the envelope. The secret is configured separately
+  from the webhook URL, so rotating it never means
+  re-issuing the robot.
+- **Message text** — one line of summary, derived from the
+  event's own values, first non-empty wins: `subject`, then
+  `key`, then `traceId`. An event with none of the three still
+  notifies, with the generic summary `webhook event`: a
+  notification sink must not silently drop sourceless events.
+- **Payload inclusion** — by default the message carries the
+  summary only, never the full payload: event bodies routinely
+  carry PII, and a chat group is a far wider audience than a
+  queue or a stream. Opting into `includePayload` appends the
+  body verbatim inside a fenced code block, truncated to
+  `payloadMaxChars` characters (default 2000) with a truncation
+  marker — the truncation is unconditional under the opt-in.
+- **Failure handling** — a non-2xx POST throws
+  `FeishuSinkError` carrying exactly the failed messages with
+  their retry lanes, so the caller retries just those. 429 and
+  every 5xx are retryable; every other non-2xx status (400,
+  401, 403, 404: unknown robot, invalid body) is fail-closed,
+  non-retryable, and a codeless transport failure is retryable.
+  A missing client or a missing/invalid webhook URL throws
+  `FeishuSinkConfigError` → `non_retryable`, the WR-116 rule.
+  `dryRun` validates (including text derivation) with zero
+  client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same
