@@ -22,9 +22,10 @@
  *   (POST/PUT/DELETE) need `admin`. The spec records this as the
  *   `x-required-scope` vendor extension on each operation.
  * - Declaration order matters where patterns overlap: `/endpoints/pause`,
- *   `/endpoints/resume`, and `/endpoints/enable` are declared before
- *   `/endpoints/{id}`, whose pattern excludes them with a negative
- *   lookahead anyway, so no pathname matches two routes.
+ *   `/endpoints/resume`, `/endpoints/enable`, and the WR-230 bulk
+ *   routes are declared before `/endpoints/{id}`, whose pattern
+ *   excludes them with a negative lookahead anyway, so no pathname
+ *   matches two routes.
  *
  * Zero dependencies (pure data + string building).
  */
@@ -641,6 +642,46 @@ export const OPERATOR_ROUTES: readonly OperatorRoute[] = [
     },
   },
   {
+    path: "/endpoints/bulk-enable",
+    pattern: exact("/endpoints/bulk-enable"),
+    methods: ["POST"],
+    summary: "Bulk re-enable auto-disabled endpoints",
+    description:
+      "WR-230: apply the WR-150 `enableEndpoint` move to each listed endpoint — clear its auto-disable gate and reset its failure streak. Does not touch the pause set (orthogonal states). The list is deduplicated and validated whole before anything moves (a malformed or empty list answers 400, nothing changed); unknown endpoints are reported per row as `{ endpoint, ok: false, error: \"unknown endpoint\" }` instead of aborting the batch. Each processed endpoint is audited as `endpoint_enabled` on a real transition, like the single route.",
+    okDescription: "`{ results: [{ endpoint, ok, error? }] }`, one row per deduplicated endpoint.",
+    requestBody: {
+      description: "Lists the endpoints to re-enable.",
+      required: ["endpoints"],
+      properties: {
+        endpoints: {
+          type: "array",
+          items: { type: "string" },
+          description: "Target URLs to re-enable; duplicates collapse to the first occurrence.",
+        },
+      },
+    },
+  },
+  {
+    path: "/endpoints/bulk-disable",
+    pattern: exact("/endpoints/bulk-disable"),
+    methods: ["POST"],
+    summary: "Bulk stop endpoints",
+    description:
+      "WR-230: apply the WR-50 `pauseEndpoint` move to each listed endpoint — park its deliveries (queued items stay queued, new events park, nothing is attempted). The manual stop is orthogonal to the WR-150 auto-disable trip and the WR-100 stale-endpoint sweep, neither of which is cleared or fired here. The list is deduplicated and validated whole before anything moves (a malformed or empty list answers 400, nothing changed); unknown endpoints are reported per row as `{ endpoint, ok: false, error: \"unknown endpoint\" }` instead of aborting the batch. Each processed endpoint is audited as `endpoint_paused` on a real transition, like the single route. Resume with `POST /endpoints/resume`.",
+    okDescription: "`{ results: [{ endpoint, ok, error? }] }`, one row per deduplicated endpoint.",
+    requestBody: {
+      description: "Lists the endpoints to stop.",
+      required: ["endpoints"],
+      properties: {
+        endpoints: {
+          type: "array",
+          items: { type: "string" },
+          description: "Target URLs to stop; duplicates collapse to the first occurrence.",
+        },
+      },
+    },
+  },
+  {
     path: "/endpoints",
     pattern: exact("/endpoints"),
     methods: ["GET", "POST"],
@@ -685,7 +726,7 @@ export const OPERATOR_ROUTES: readonly OperatorRoute[] = [
   },
   {
     path: "/endpoints/{id}",
-    pattern: /^\/endpoints\/(?!pause$|resume$|enable$|dry-run$)(.+)$/,
+    pattern: /^\/endpoints\/(?!pause$|resume$|enable$|bulk-enable$|bulk-disable$|dry-run$)(.+)$/,
     methods: ["PUT", "DELETE"],
     summary: "Endpoint registry: update / delete one endpoint",
     description:

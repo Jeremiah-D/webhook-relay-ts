@@ -201,6 +201,10 @@ import {
   findOperatorRoute,
   matchOperatorRoute,
 } from "./operator-routes.ts";
+import {
+  applyBulkEndpointOperation,
+  normalizeBulkEndpoints,
+} from "./endpoint-bulk.ts";
 import { InboundRateLimiter, type InboundRateLimitOptions } from "./ratelimit.ts";
 import {
   checkJsonDepth,
@@ -8015,14 +8019,18 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     const isEndpointsResume = pathname === "/endpoints/resume";
     // WR-150: operator re-enable for an auto-disabled endpoint.
     const isEndpointsEnable = pathname === "/endpoints/enable";
+    // WR-230: bulk endpoint enable/disable.
+    const isEndpointsBulkEnable = pathname === "/endpoints/bulk-enable";
+    const isEndpointsBulkDisable = pathname === "/endpoints/bulk-disable";
     // WR-145: per-endpoint drill-mode toggle.
     const isEndpointsDryRun = pathname === "/endpoints/dry-run";
     // WR-114: dynamic endpoint registry. The negative lookahead keeps
-    // `/endpoints/pause`, `/endpoints/resume`, and `/endpoints/enable`
-    // on their exact routes (mirrors the registry pattern in
-    // `src/operator-routes.ts`).
+    // `/endpoints/pause`, `/endpoints/resume`, `/endpoints/enable`,
+    // and the WR-230 bulk routes on their exact routes (mirrors the
+    // registry pattern in `src/operator-routes.ts`).
     const isEndpointsRegistry = pathname === "/endpoints";
-    const endpointIdMatch = /^\/endpoints\/(?!pause$|resume$|enable$)(.+)$/.exec(pathname);
+    const endpointIdMatch =
+      /^\/endpoints\/(?!pause$|resume$|enable$|bulk-enable$|bulk-disable$)(.+)$/.exec(pathname);
     const isScheduledList = pathname === "/scheduled";
     const scheduleActionMatch = /^\/scheduled\/([^/]+)\/(pause|resume)$/.exec(pathname);
     const deliveryMatch = /^\/deliveries\/([^/]+)$/.exec(pathname);
@@ -9381,6 +9389,81 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         after: { disabled: false },
       });
       respondJson(res, 200, { endpoint, disabled: false, wasDisabled });
+      return;
+    }
+    if (isEndpointsBulkEnable || isEndpointsBulkDisable) {
+      // WR-230: bulk endpoint enable/disable. Body is
+      // `{ endpoints: [...] }`. Bulk-enable applies the WR-150
+      // `enableEndpoint` move per endpoint (clear the auto-disable
+      // gate, reset the failure streak); bulk-disable applies the
+      // WR-50 `pauseEndpoint` move per endpoint (park deliveries).
+      // Operator authentication and the WR-82 admin scope check
+      // above apply exactly like the single routes. The list is
+      // validated whole before anything moves — a malformed list
+      // (non-array, empty, illegal name) answers 400 and means
+      // "nothing changed" — and duplicates collapse to the first
+      // occurrence. Unknown endpoints are reported per row, never
+      // silently skipped, and never abort the remaining rows.
+      // Each successfully processed endpoint lands one WR-197
+      // operator-ledger entry (same before/after shape as the
+      // single route) and, on a real transition, the same audit
+      // event as the single route (`endpoint_enabled` /
+      // `endpoint_paused`) via the queue hooks.
+      let body: Record<string, unknown>;
+      try {
+        const raw = (await readRawBody(req, maxBodyBytes)).toString("utf8");
+        body = raw.trim() === "" ? {} : JSON.parse(raw);
+      } catch (err) {
+        if (err instanceof BodyTooLargeError) {
+          respondJson(res, 413, { error: "request body too large" });
+          return;
+        }
+        respondJson(res, 400, { error: "invalid JSON body" });
+        return;
+      }
+      if (typeof body !== "object" || body === null || Array.isArray(body)) {
+        respondJson(res, 400, { error: "body must be a JSON object" });
+        return;
+      }
+      let endpoints: string[];
+      try {
+        endpoints = normalizeBulkEndpoints(body.endpoints);
+      } catch (err) {
+        respondJson(res, 400, {
+          error: err instanceof Error ? err.message : "invalid endpoints",
+        });
+        return;
+      }
+      const bulkEnable = isEndpointsBulkEnable;
+      const results = applyBulkEndpointOperation(endpoints, {
+        isKnown: (endpoint) => knownEndpoints.has(endpoint),
+        apply: (endpoint) => {
+          if (bulkEnable) {
+            const wasDisabled = queue.isEndpointDisabled(endpoint);
+            const moved = runAsOperator(operatorKeyId, () => queue.enableEndpoint(endpoint));
+            // WR-197: the mutation lands in the centralized operator
+            // ledger with its before/after diff (idempotent re-enable
+            // is still a recorded operator action, with
+            // before == after, like the single route).
+            recordOperatorAction("endpoints.bulk-enable", {
+              target: endpoint,
+              before: { disabled: wasDisabled },
+              after: { disabled: false },
+            });
+            return moved;
+          }
+          const wasPaused = queue.isEndpointPaused(endpoint);
+          const moved = runAsOperator(operatorKeyId, () => queue.pauseEndpoint(endpoint));
+          // WR-197: see above.
+          recordOperatorAction("endpoints.bulk-disable", {
+            target: endpoint,
+            before: { paused: wasPaused },
+            after: { paused: true },
+          });
+          return moved;
+        },
+      });
+      respondJson(res, 200, { results });
       return;
     }
     if (isEndpointsDryRun) {

@@ -60,6 +60,8 @@ const INVENTORY: Array<[string, Array<"GET" | "POST" | "PUT" | "DELETE">]> = [
   ["/endpoints/pause", ["POST"]],
   ["/endpoints/resume", ["POST"]],
   ["/endpoints/enable", ["POST"]],
+  ["/endpoints/bulk-enable", ["POST"]],
+  ["/endpoints/bulk-disable", ["POST"]],
   ["/endpoints", ["GET", "POST"]],
   ["/endpoints/dry-run", ["POST"]],
   ["/endpoints/{id}", ["PUT", "DELETE"]],
@@ -103,6 +105,8 @@ describe("WR-111 operator route registry", () => {
       "/endpoints/pause",
       "/endpoints/resume",
       "/endpoints/enable",
+      "/endpoints/bulk-enable",
+      "/endpoints/bulk-disable",
       "/endpoints/some-id",
       "/openapi.json",
     ];

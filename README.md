@@ -2216,6 +2216,47 @@ curl -X POST http://127.0.0.1:PORT/endpoints/enable \
 - **Off by default** — without the option the tracker is never
   constructed: zero behavior change, zero hot-path cost.
 
+## Bulk endpoint enable/disable (opt-in operator routes)
+
+The single-endpoint switches above move one endpoint per request.
+Bringing a fleet back after an outage, or stopping a set of
+endpoints for maintenance, needs the same moves in bulk:
+`POST /endpoints/bulk-enable` and `POST /endpoints/bulk-disable`
+(`src/endpoint-bulk.ts`, WR-230) — same operator authentication
+and WR-82 admin scope as the single routes.
+
+```sh
+curl -X POST http://127.0.0.1:PORT/endpoints/bulk-enable \
+  -H "Authorization: Bearer $OPERATOR_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"endpoints":["https://a/hook","https://b/hook","https://typo/hook"]}'
+# → 200 { results: [
+#   { endpoint: "https://a/hook", ok: true },
+#   { endpoint: "https://b/hook", ok: true },
+#   { endpoint: "https://typo/hook", ok: false, error: "unknown endpoint" } ] }
+```
+
+- **Batch forms of the existing moves, not a new gate** —
+  bulk-enable applies `enableEndpoint` per endpoint (clears the
+  auto-disable gate, resets the failure streak; it does not touch
+  the pause set), bulk-disable applies `pauseEndpoint` per
+  endpoint (parks deliveries; resume with
+  `POST /endpoints/resume`). No new state machine is introduced.
+- **One row per endpoint, in request order** — duplicates
+  collapse to the first occurrence; unknown endpoints are
+  reported per row, never silently skipped, and never abort the
+  remaining rows; a single endpoint's failure is contained to
+  its row.
+- **Fail-closed list validation** — a non-array, empty, or
+  illegal list answers 400 with zero side effects ("a 400 always
+  means nothing changed", like the registry).
+- **Same audit trail as the single routes** — each processed
+  endpoint lands one operator-ledger entry
+  (`endpoints.bulk-enable` / `endpoints.bulk-disable`) and, on a
+  real transition, the same audit event (`endpoint_enabled` /
+  `endpoint_paused`); idempotent re-ops stay silent, like the
+  single routes' no-op 200s.
+
 ## Queue-depth breach alerting (opt-in)
 
 Pure observation for backlog pressure: when an endpoint's queue depth —
