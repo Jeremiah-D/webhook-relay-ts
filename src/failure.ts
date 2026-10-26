@@ -65,6 +65,7 @@ import { EventBridgeSinkConfigError } from "./eventbridge-sink.ts";
 import { PulsarSinkConfigError } from "./pulsar-sink.ts";
 import { SnsSinkConfigError } from "./sns-sink.ts";
 import { EventHubsSinkConfigError } from "./eventhubs-sink.ts";
+import { SlackSinkConfigError } from "./slack-sink.ts";
 import { DigestAuthError } from "./digest-auth.ts";
 import { CredentialSecretUnavailableError } from "./outbound-credentials.ts";
 import { AssertionFailedError } from "./response-assertions.ts";
@@ -321,6 +322,17 @@ export function classifyFailure(err: unknown): ClassifiedFailure {
   // not a config error: it selects per-event hub resolution
   // instead.
   if (err instanceof EventHubsSinkConfigError) {
+    return { failureClass: "non_retryable" };
+  }
+  // WR-226: a Slack sink with no injected client or no valid
+  // webhook URL is a local config problem — the POST was never
+  // built, let alone sent. Retrying can never succeed for this
+  // item, so dead-letter immediately instead of burning the
+  // retry budget and the backoff clock (the WR-116 rule,
+  // applied to the Slack sink like the Event Hubs sink above).
+  // There is no per-record channel fallback: a missing URL has
+  // nowhere to deliver to.
+  if (err instanceof SlackSinkConfigError) {
     return { failureClass: "non_retryable" };
   }
   // WR-212: a Digest challenge this client cannot answer (unsupported

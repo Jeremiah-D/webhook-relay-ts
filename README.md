@@ -5809,6 +5809,59 @@ await sink.sendBatch([
   per-event resolution. `dryRun` validates (including hub
   resolution) with zero client I/O.
 
+## Slack notification delivery sink (opt-in)
+
+Where the Event Hubs sink delivers to an Azure-managed
+streaming ingest hub, `src/slack-sink.ts` (WR-226) delivers to
+a Slack channel: one event is posted as one message to a
+configured incoming webhook URL, and Slack — not the relay —
+owns the channel, the message id, and the retention of the
+notification. No HTTP client is bundled — the client is
+injected through the config, so the module has zero new
+dependencies and tests never need a Slack workspace.
+
+```ts
+const sink = new SlackSink({
+  webhookUrl: "https://hooks.slack.com/services/T000/B000/xxxx",
+  client, // your client adapter implementing SlackWebhookClient
+  // includePayload: true, // opt-in only: body appended, truncated
+});
+await sink.send([
+  { body: JSON.stringify(event), subject: "order.created", traceId: "trace-9" },
+]);
+```
+
+- **Webhook targeting** — one sink targets one incoming
+  webhook URL: every message goes there. A missing or invalid
+  URL is a config error, not a resolution fallback: there is
+  no per-record channel to resolve to, so the sink fails closed
+  with `SlackSinkConfigError` at send time. The URL must be a
+  parseable `https:` URL — a notification URL must never travel
+  over plaintext. The host is not pinned to hooks.slack.com:
+  an operator may front the webhook with a proxy or sidecar.
+- **Message text** — one line of summary, derived from the
+  event's own values, first non-empty wins: `subject`, then
+  `key`, then `traceId`. An event with none of the three still
+  notifies, with the generic summary `webhook event`: a
+  notification sink must not silently drop sourceless events.
+- **Payload inclusion** — by default the message carries the
+  summary only, never the full payload: event bodies routinely
+  carry PII, and a chat channel is a far wider audience than a
+  queue or a stream. Opting into `includePayload` appends the
+  body verbatim inside a fenced code block, truncated to
+  `payloadMaxChars` characters (default 2000) with a truncation
+  marker — the truncation is unconditional under the opt-in.
+- **Failure handling** — a non-2xx POST throws
+  `SlackSinkError` carrying exactly the failed messages with
+  their retry lanes, so the caller retries just those. 429 and
+  every 5xx are retryable; every other non-2xx status (400,
+  401, 403, 404: unknown webhook, invalid body) is fail-closed,
+  non-retryable, and a codeless transport failure is retryable.
+  A missing client or a missing/invalid webhook URL throws
+  `SlackSinkConfigError` → `non_retryable`, the WR-116 rule.
+  `dryRun` validates (including text derivation) with zero
+  client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same
