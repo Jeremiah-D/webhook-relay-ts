@@ -2824,6 +2824,58 @@ const queue = new RetryQueue({
   first outcome is recorded; a gauge cannot hold Infinity). Invalid
   options throw `RangeError` at construction.
 
+## Per-endpoint bulkhead isolation (WR-227)
+
+The per-endpoint limiter (WR-06) waits unboundedly: when an endpoint
+saturates, excess dispatches queue FIFO forever — a slow downstream
+can accumulate an unbounded backlog behind it. The bulkhead is the
+fail-fast counterpart, per endpoint: an independent in-flight cap plus
+a *bounded* queue. When the cap is hit, at most `maxQueue`
+acquisitions wait; the next one is rejected immediately
+(`queue_full`), and a waiter that sits longer than `queueTimeoutMs`
+is rejected with `queue_timeout`. Both rejections are audited
+(endpoint, reason, queue wait) and classify as `retryable` — transient
+downstream backpressure, so the payload follows the normal backoff
+lane and is never dead-lettered for this reason alone.
+
+```ts
+import { EndpointBulkheads } from "./src/bulkhead.ts";
+const bulkheads = new EndpointBulkheads({
+  maxConcurrent: 8, // in-flight cap per endpoint
+  maxQueue: 16, // bounded FIFO wait; 0 = reject past the cap at once
+  queueTimeoutMs: 5000, // waiter timeout → retryable rejection
+});
+const release = await bulkheads.acquire("https://downstream/hook");
+// ... dispatch ...
+release();
+```
+
+- **Isolation, not a global cap** — each endpoint gets its own
+  bulkhead (created lazily, endpoints that never appear cost
+  nothing), so saturating one downstream can neither block nor reject
+  traffic to another. This is orthogonal to WR-51 (one shared cap
+  across the whole relay) and to WR-140 (one cap per tenant across
+  that tenant's endpoints).
+- **Hard cap, not adaptive tuning** — unlike WR-94 AIMD, which moves
+  the per-endpoint cap from outcomes, the bulkhead cap never moves;
+  its novelty is what happens past the ceiling (bounded queue +
+  fail-fast rejection + audit), not the ceiling itself.
+- **In-flight isolation, not a retry budget** — unlike WR-38, which
+  budgets retry *attempts*, the bulkhead budgets in-flight *slots*;
+  a rejection consumes no retry budget.
+- **Fail-closed config** — a non-positive or non-integer cap, a
+  negative queue bound, or a negative/non-finite timeout throws
+  `RangeError` at construction; an uncapped bulkhead (`Infinity`) is
+  rejected rather than silently accepted.
+- **Release frees the oldest queued waiter** — the slot transfers
+  (in-flight count unchanged) and the granted waiter's timeout is
+  cleared, so it can never time out after being granted. Releases are
+  idempotent.
+- **Observability** — `stats()` reports one row per endpoint seen
+  (cap, queue bound, in-flight, queued depth, waits, rejections);
+  `rejections()` returns the audited trail (oldest first, capped at
+  the 1000 most recent).
+
 ## Slow-start recovery ramp (opt-in)
 
 When a circuit breaker trips, the endpoint is known-down; when it
