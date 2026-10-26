@@ -5754,6 +5754,61 @@ await sink.publish([
   a config error, it selects per-record resolution. `dryRun`
   validates (including topic resolution) with zero client I/O.
 
+## Azure Event Hubs delivery sink (opt-in)
+
+Where the SNS sink delivers to a cloud-managed fan-out topic,
+`src/eventhubs-sink.ts` (WR-225) delivers to an Azure Event Hubs
+event hub: a batch of events is sent as one `sendBatch` call,
+and Event Hubs — not the relay — owns the hub's retention,
+partitioning, and fan-out to consumer groups. No Event Hubs
+client is bundled — the client is injected through the config,
+so the module has zero new dependencies and tests never need an
+Azure namespace.
+
+```ts
+const sink = new EventHubsSink({
+  eventHubName: "events", // or omit: per-event resolution
+  client, // your client adapter implementing EventHubsClient
+  // partitionKey: true, // opt-in: record key → partition key
+});
+await sink.sendBatch([
+  { body: JSON.stringify(event), tenant: "t1", traceId: "trace-9", key: "agg-9" },
+]);
+```
+
+- **Hub targeting** — one sink targets one event hub when
+  `eventHubName` is configured: every event goes there in a
+  single batch. When no hub is configured, the hub resolves per
+  event from the event's own values, first non-empty wins:
+  `subject`, then `key`, then `traceId`. Events are then
+  batched per resolved hub, one `sendBatch` call per hub. An
+  event with none of the three has no hub source and fails
+  closed with a `RangeError`: inventing a hub would deliver the
+  event to consumers that never asked for it.
+- **Event body and properties** — a message's body is the event
+  JSON, fixed and verbatim: the sink never templates, wraps, or
+  rewrites it. A message's properties pass through the event's
+  own tenant, endpoint, and trace id, never invented: a property
+  is present only when the event carries that value. An event
+  with none of the three carries an empty properties object.
+- **Partition keys** — opt-in: when `partitionKey` is set, an
+  event's `key` becomes the event's partition key; when the
+  flag is absent, or the event has no key, no partition key is
+  attached — the key is ignored, not defaulted.
+- **Failure handling** — a failed batch throws
+  `EventHubsSinkError` carrying exactly the failed events with
+  their retry lanes, so the caller retries just those: a failed
+  batch fails every event in it, since the client reports no
+  per-event outcome. Throttling, server busy, service
+  unavailability, operation timeouts, internal errors, and
+  codeless transport failures are retryable; permission denied,
+  unknown hubs, and malformed events are fail-closed,
+  non-retryable. A missing client throws
+  `EventHubsSinkConfigError` → `non_retryable`, the WR-116
+  rule; a missing hub name is not a config error, it selects
+  per-event resolution. `dryRun` validates (including hub
+  resolution) with zero client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same
