@@ -5700,6 +5700,60 @@ await sink.produce([
   config error, it selects per-record resolution. `dryRun`
   validates (including topic resolution) with zero client I/O.
 
+## AWS SNS delivery sink (opt-in)
+
+Where the Pulsar sink delivers to a geo-replicated partitioned
+topic, `src/sns-sink.ts` (WR-224) delivers to an AWS SNS topic:
+one event is published as one message, and SNS — not the relay
+— owns the message id, the topic's retention, and fan-out to
+subscriptions across protocols. No SNS client is bundled — the
+client is injected through the config, so the module has zero
+new dependencies and tests never need an AWS account.
+
+```ts
+const sink = new SnsSink({
+  topicArn: "arn:aws:sns:us-east-1:123456789012:events", // or omit: per-record resolution
+  client, // your client adapter implementing SnsClient
+  // messageGroupId: true, // opt-in: record key → group id, FIFO topics only
+});
+await sink.publish([
+  { body: JSON.stringify(event), tenant: "t1", traceId: "trace-9", key: "agg-9", id: "evt-1" },
+]);
+```
+
+- **Topic targeting** — one sink targets one topic ARN when
+  `topicArn` is configured: every message goes there. When no
+  topic ARN is configured, the topic resolves per record from
+  the event's own values, first non-empty wins: `subject`, then
+  `key`, then `traceId`. A record with none of the three has no
+  topic source and fails closed with a `RangeError`: inventing a
+  topic would deliver the event to subscribers that never asked
+  for it.
+- **Message attributes** — a message's attributes pass through
+  the record's own tenant, endpoint, and trace id, never
+  invented: an attribute is present only when the record
+  carries that value. A record with none of the three carries
+  an empty attributes object.
+- **FIFO fields** — only a topic ending in `.fifo` is a FIFO
+  topic, and only there do the two extra fields ever appear
+  (SNS rejects them on standard topics). `messageGroupId` is
+  opt-in: a record's event `key` becomes the group id; without
+  the flag, without a key, or on a standard topic, no group id
+  is attached. `messageDeduplicationId` needs no opt-in: on a
+  FIFO topic a record's event `id` becomes the deduplication
+  id; without an id, or on a standard topic, none is attached
+  — the sink never invents one.
+- **Failure handling** — a failed message throws `SnsSinkError`
+  carrying exactly the failed messages with their retry lanes,
+  so the caller retries just those: throttling, internal
+  errors, service unavailability, and codeless transport
+  failures are retryable; permission denied, unknown topics,
+  and malformed messages are fail-closed, non-retryable. A
+  missing client throws `SnsSinkConfigError` →
+  `non_retryable`, the WR-116 rule; a missing topic ARN is not
+  a config error, it selects per-record resolution. `dryRun`
+  validates (including topic resolution) with zero client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same
