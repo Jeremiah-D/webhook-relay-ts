@@ -6203,6 +6203,65 @@ await sink.send([
   WR-116 rule. `dryRun` validates (including text derivation)
   with zero client I/O.
 
+`src/email-sink.ts` (WR-233) delivers to a mailbox:
+one event is sent as one email to a configured recipient,
+and the mail server — not the relay — owns the mailbox,
+the message id, and the retention of the notification. No
+SMTP client is bundled — the client is injected through the
+config, so the module has zero new dependencies and tests
+never need a mailbox.
+
+```ts
+const sink = new EmailSink({
+  to: "ops@example.com",
+  client, // your client adapter implementing EmailSmtpClient (holds SMTP credentials)
+  // includePayload: true, // opt-in only: body appended, truncated
+});
+await sink.send([
+  { body: JSON.stringify(event), subject: "order.created", key: "agg-7" },
+]);
+```
+
+- **Recipient targeting and credentials** — one sink
+  targets one recipient. The SMTP credentials are held by
+  the client alone: they never appear in the sink's request
+  objects, the message text, or the sink's config — rotating
+  them is a client-side change, and a credential that never
+  crosses the sink boundary cannot leak through a sink log,
+  a dry run, or a failed-record report. A missing recipient
+  or a missing client fails closed with
+  `EmailSinkConfigError` at send time.
+- **Subject and body** — unlike the chat sinks, which carry
+  one line of text, an email has two fields, and the event's
+  values split across them: the subject is the event's
+  `subject` (falling back to the generic `webhook event` —
+  an email subject must never be empty), and the body is a
+  one-line summary, first non-empty wins: `key`, then
+  `traceId`. An event with neither still notifies, with the
+  generic summary as its body: a notification sink must not
+  silently drop sourceless events.
+- **Payload inclusion** — by default the body carries the
+  summary only, never the full payload: event bodies routinely
+  carry PII, and a mailbox is a far wider audience than a
+  queue or a stream. Opting into `includePayload` appends the
+  body verbatim inside a fenced code block, truncated to
+  `payloadMaxChars` characters (default 2000) with a truncation
+  marker — the truncation is unconditional under the opt-in.
+- **Failure handling** — SMTP reply codes, not HTTP statuses,
+  decide the retry lane: a non-2xx reply throws
+  `EmailSinkError` carrying exactly the failed messages with
+  their retry lanes, so the caller retries just those. Every
+  4xx code (mailbox full, greylisting, temporary failure) is
+  retryable; every 5xx code — including authentication
+  failures (530, 535) and unknown recipients (550, 553) — is
+  fail-closed, non-retryable. A codeless transport failure is
+  retryable, but a throw carrying an SMTP code is classified
+  by that code, so a 535 raised as a throw is still
+  fail-closed. A missing client or recipient throws
+  `EmailSinkConfigError` → `non_retryable`, the WR-116 rule.
+  `dryRun` validates (including subject/body derivation)
+  with zero client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same
