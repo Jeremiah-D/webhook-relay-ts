@@ -6150,6 +6150,59 @@ await sink.send([
   `dryRun` validates (including text derivation) with zero
   client I/O.
 
+`src/discord-sink.ts` (WR-232) delivers to a Discord
+channel: one event is posted as one message to a
+configured webhook URL, and Discord — not the relay — owns
+the channel, the message id, and the retention of the
+notification. No HTTP client is bundled — the client is
+injected through the config, so the module has zero new
+dependencies and tests never need a Discord channel.
+
+```ts
+const sink = new DiscordSink({
+  webhookUrl: "https://discord.com/api/webhooks/<id>/<token>",
+  client, // your client adapter implementing DiscordWebhookClient
+  // includePayload: true, // opt-in only: body appended, truncated
+});
+await sink.send([
+  { body: JSON.stringify(event), subject: "order.created", traceId: "trace-9" },
+]);
+```
+
+- **Webhook targeting and authentication** — one sink
+  targets one webhook URL, posted verbatim: Discord
+  authenticates webhooks by the id/token in the URL path,
+  so no token is ever appended or extracted — the URL is
+  the credential, and rotating the webhook never means
+  changing sink code. The host is not pinned to
+  discord.com (a proxy or sidecar fronting is allowed), but
+  the URL must parse as `https:` — a plaintext or
+  unparseable URL fails closed with
+  `DiscordSinkConfigError` at send time, as does a missing
+  URL or a missing client.
+- **Message text** — one line of summary, derived from the
+  event's own values, first non-empty wins: `subject`, then
+  `key`, then `traceId`. An event with none of the three still
+  notifies, with the generic summary `webhook event`: a
+  notification sink must not silently drop sourceless events.
+- **Payload inclusion** — by default the message carries the
+  summary only, never the full payload: event bodies routinely
+  carry PII, and a channel is a far wider audience than a
+  queue or a stream. Opting into `includePayload` appends the
+  body verbatim inside a fenced code block, truncated to
+  `payloadMaxChars` characters (default 2000) with a truncation
+  marker — the truncation is unconditional under the opt-in.
+- **Failure handling** — a non-2xx POST throws
+  `DiscordSinkError` carrying exactly the failed messages with
+  their retry lanes, so the caller retries just those. 429 and
+  every 5xx are retryable; every other non-2xx status (400,
+  401, 403, 404: unknown webhook, invalid body) is
+  fail-closed, non-retryable, and a codeless transport failure
+  is retryable. A missing client or a missing/invalid webhook
+  URL throws `DiscordSinkConfigError` → `non_retryable`, the
+  WR-116 rule. `dryRun` validates (including text derivation)
+  with zero client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same

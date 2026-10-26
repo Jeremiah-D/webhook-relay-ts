@@ -69,6 +69,7 @@ import { SlackSinkConfigError } from "./slack-sink.ts";
 import { DingTalkSinkConfigError } from "./dingtalk-sink.ts";
 import { FeishuSinkConfigError } from "./feishu-sink.ts";
 import { TelegramSinkConfigError } from "./telegram-sink.ts";
+import { DiscordSinkConfigError } from "./discord-sink.ts";
 import { DigestAuthError } from "./digest-auth.ts";
 import { CredentialSecretUnavailableError } from "./outbound-credentials.ts";
 import { AssertionFailedError } from "./response-assertions.ts";
@@ -369,6 +370,17 @@ export function classifyFailure(err: unknown): ClassifiedFailure {
   // per-record channel fallback: a missing chat id has nowhere
   // to deliver to.
   if (err instanceof TelegramSinkConfigError) {
+    return { failureClass: "non_retryable" };
+  }
+  // WR-232: a Discord sink with no injected client or no valid
+  // webhook URL is a local config problem — the POST was never
+  // built, let alone sent. Retrying can never succeed for this
+  // item, so dead-letter immediately instead of burning the
+  // retry budget and the backoff clock (the WR-116 rule,
+  // applied to the Discord sink like the Telegram sink above).
+  // There is no per-record channel fallback: a missing URL has
+  // nowhere to deliver to.
+  if (err instanceof DiscordSinkConfigError) {
     return { failureClass: "non_retryable" };
   }
   // WR-212: a Digest challenge this client cannot answer (unsupported
