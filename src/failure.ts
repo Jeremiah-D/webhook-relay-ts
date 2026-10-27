@@ -72,6 +72,7 @@ import { TelegramSinkConfigError } from "./telegram-sink.ts";
 import { DiscordSinkConfigError } from "./discord-sink.ts";
 import { TeamsSinkConfigError } from "./teams-sink.ts";
 import { WeComSinkConfigError } from "./wecom-sink.ts";
+import { GoogleChatSinkConfigError } from "./google-chat-sink.ts";
 import { EmailSinkConfigError } from "./email-sink.ts";
 import { DigestAuthError } from "./digest-auth.ts";
 import { CredentialSecretUnavailableError } from "./outbound-credentials.ts";
@@ -406,6 +407,17 @@ export function classifyFailure(err: unknown): ClassifiedFailure {
   // There is no per-record group fallback: a missing URL has
   // nowhere to deliver to.
   if (err instanceof WeComSinkConfigError) {
+    return { failureClass: "non_retryable" };
+  }
+  // WR-236: a Google Chat sink with no injected client or no valid
+  // webhook URL is a local config problem — the POST was never
+  // built, let alone sent. Retrying can never succeed for this
+  // item, so dead-letter immediately instead of burning the
+  // retry budget and the backoff clock (the WR-116 rule,
+  // applied to the Google Chat sink like the WeCom sink above).
+  // There is no per-record space fallback: a missing URL has
+  // nowhere to deliver to.
+  if (err instanceof GoogleChatSinkConfigError) {
     return { failureClass: "non_retryable" };
   }
   // WR-233: an email sink with no injected client or no
