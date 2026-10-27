@@ -6623,6 +6623,70 @@ await sink.send([
   WR-116 rule. `dryRun` validates (including text derivation)
   with zero client I/O.
 
+`src/ntfy-sink.ts` (WR-241) delivers to an ntfy topic: one
+event is posted as one notification to a configured topic
+URL, and ntfy — not the relay — owns the subscription, the
+delivery, and the retention of the notification. No HTTP
+client is bundled — the client is injected through the
+config, so the module has zero new dependencies and tests
+never need an ntfy server.
+
+```ts
+const sink = new NtfySink({
+  topicUrl: "https://ntfy.sh/relay-alerts",
+  client, // your client adapter implementing NtfyTopicClient
+  // includePayload: true, // opt-in only: body appended, truncated
+});
+await sink.send([
+  { body: JSON.stringify(event), subject: "order.created", traceId: "trace-9" },
+]);
+```
+
+- **Topic targeting and authentication** — one sink
+  targets one topic URL, posted verbatim: ntfy authenticates
+  and routes by the URL itself, so no token is ever
+  appended or extracted — the URL is the target, and moving
+  a topic never means changing sink code. The host is not
+  pinned to any one deployment (ntfy.sh, self-hosted ntfy,
+  or a proxy/sidecar fronting is allowed), but the URL must
+  parse as `https:` — a plaintext or unparseable URL fails
+  closed with `NtfySinkConfigError` at send time, as does a
+  missing URL or a missing client.
+- **No title, tag, or priority header** — the topic is the
+  target and the body is the message: the relay-side request
+  carries only the URL and the plain-text body, never a
+  header override, so a delivery can never re-prioritize or
+  re-route a notification the operator meant to be plain.
+- **Plain-text body, not a JSON envelope** — ntfy takes the
+  raw message body as the notification text, so the client
+  POSTs the derived text verbatim as the request body. A
+  JSON envelope would deliver literal quotes and braces to
+  the subscriber's screen.
+- **Message text** — one line of summary, derived from the
+  event's own values, first non-empty wins: `subject`, then
+  `key`, then `traceId`. An event with none of the three still
+  notifies, with the generic summary `webhook event`: a
+  notification sink must not silently drop sourceless events.
+- **Payload inclusion** — by default the message carries the
+  summary only, never the full payload: event bodies routinely
+  carry PII, and a push notification is a far wider audience
+  than a queue or a stream. Opting into `includePayload`
+  appends the body verbatim after a blank line, truncated to
+  `payloadMaxChars` characters (default 2000) with a truncation
+  marker — the truncation is unconditional under the opt-in,
+  and the body stays plain text, not a fenced code block, so
+  no fence noise lands on a phone screen.
+- **Failure handling** — a non-2xx POST throws
+  `NtfySinkError` carrying exactly the failed messages with
+  their retry lanes, so the caller retries just those. 429 and
+  every 5xx are retryable; every other non-2xx status (400,
+  401, 403, 404: unknown topic, invalid body) is
+  fail-closed, non-retryable, and a codeless transport failure
+  is retryable. A missing client or a missing/invalid topic
+  URL throws `NtfySinkConfigError` → `non_retryable`, the
+  WR-116 rule. `dryRun` validates (including text derivation)
+  with zero client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same
