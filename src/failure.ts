@@ -74,6 +74,7 @@ import { TeamsSinkConfigError } from "./teams-sink.ts";
 import { WeComSinkConfigError } from "./wecom-sink.ts";
 import { GoogleChatSinkConfigError } from "./google-chat-sink.ts";
 import { MattermostSinkConfigError } from "./mattermost-sink.ts";
+import { RocketChatSinkConfigError } from "./rocketchat-sink.ts";
 import { EmailSinkConfigError } from "./email-sink.ts";
 import { DigestAuthError } from "./digest-auth.ts";
 import { CredentialSecretUnavailableError } from "./outbound-credentials.ts";
@@ -430,6 +431,17 @@ export function classifyFailure(err: unknown): ClassifiedFailure {
   // There is no per-record channel fallback: a missing URL has
   // nowhere to deliver to.
   if (err instanceof MattermostSinkConfigError) {
+    return { failureClass: "non_retryable" };
+  }
+  // WR-238: a Rocket.Chat sink with no injected client or no valid
+  // webhook URL is a local config problem — the POST was never
+  // built, let alone sent. Retrying can never succeed for this
+  // item, so dead-letter immediately instead of burning the
+  // retry budget and the backoff clock (the WR-116 rule,
+  // applied to the Rocket.Chat sink like the Mattermost sink above).
+  // There is no per-record channel fallback: a missing URL has
+  // nowhere to deliver to.
+  if (err instanceof RocketChatSinkConfigError) {
     return { failureClass: "non_retryable" };
   }
   // WR-233: an email sink with no injected client or no
