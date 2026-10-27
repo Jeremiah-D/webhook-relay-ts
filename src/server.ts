@@ -8025,6 +8025,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     const isEndpointsBulkDisable = pathname === "/endpoints/bulk-disable";
     // WR-239: bulk endpoint delete.
     const isEndpointsBulkDelete = pathname === "/endpoints/bulk-delete";
+    // WR-240: bulk endpoint resume.
+    const isEndpointsBulkResume = pathname === "/endpoints/bulk-resume";
     // WR-145: per-endpoint drill-mode toggle.
     const isEndpointsDryRun = pathname === "/endpoints/dry-run";
     // WR-114: dynamic endpoint registry. The negative lookahead keeps
@@ -8033,7 +8035,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // registry pattern in `src/operator-routes.ts`).
     const isEndpointsRegistry = pathname === "/endpoints";
     const endpointIdMatch =
-      /^\/endpoints\/(?!pause$|resume$|enable$|bulk-enable$|bulk-disable$|bulk-delete$)(.+)$/.exec(pathname);
+      /^\/endpoints\/(?!pause$|resume$|enable$|bulk-enable$|bulk-disable$|bulk-delete$|bulk-resume$)(.+)$/.exec(pathname);
     const isScheduledList = pathname === "/scheduled";
     const scheduleActionMatch = /^\/scheduled\/([^/]+)\/(pause|resume)$/.exec(pathname);
     const deliveryMatch = /^\/deliveries\/([^/]+)$/.exec(pathname);
@@ -9573,6 +9575,76 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
           });
         }
       }
+      respondJson(res, 200, { results });
+      return;
+    }
+    if (isEndpointsBulkResume) {
+      // WR-240: bulk endpoint resume. Body is
+      // `{ endpoints: [...] }`. Each listed endpoint goes
+      // through the WR-50 single-resume semantics, one at a
+      // time: the pause set entry is cleared, parked items
+      // are re-armed with their remaining delays (attempt
+      // counts untouched), and a real transition appends the
+      // same `endpoint_resumed` audit event as the single
+      // route (stamped with this call's keyId via
+      // `runAsOperator`). Operator authentication and the
+      // WR-82 admin scope check above apply exactly like
+      // the single routes. The list is validated whole
+      // before anything moves — a malformed list (non-array,
+      // empty, illegal name) answers 400 and means "nothing
+      // changed" — and duplicates collapse to the first
+      // occurrence. Unknown endpoints are reported per row,
+      // never silently skipped, and never abort the
+      // remaining rows. Resuming a non-paused endpoint is an
+      // idempotent success row (the single route's no-op
+      // 200). Each successfully processed endpoint lands one
+      // WR-197 operator-ledger entry (same before/after
+      // shape as the single route). Orthogonal to WR-230
+      // bulk-enable (clearing the auto-disable gate, not the
+      // pause set) and to WR-239 bulk-delete (removal, not
+      // resumption).
+      let body: Record<string, unknown>;
+      try {
+        const raw = (await readRawBody(req, maxBodyBytes)).toString("utf8");
+        body = raw.trim() === "" ? {} : JSON.parse(raw);
+      } catch (err) {
+        if (err instanceof BodyTooLargeError) {
+          respondJson(res, 413, { error: "request body too large" });
+          return;
+        }
+        respondJson(res, 400, { error: "invalid JSON body" });
+        return;
+      }
+      if (typeof body !== "object" || body === null || Array.isArray(body)) {
+        respondJson(res, 400, { error: "body must be a JSON object" });
+        return;
+      }
+      let endpoints: string[];
+      try {
+        endpoints = normalizeBulkEndpoints(body.endpoints);
+      } catch (err) {
+        respondJson(res, 400, {
+          error: err instanceof Error ? err.message : "invalid endpoints",
+        });
+        return;
+      }
+      const results = applyBulkEndpointOperation(endpoints, {
+        isKnown: (endpoint) => knownEndpoints.has(endpoint),
+        apply: (endpoint) => {
+          const wasPaused = queue.isEndpointPaused(endpoint);
+          const moved = runAsOperator(operatorKeyId, () => queue.resumeEndpoint(endpoint));
+          // WR-197: the mutation lands in the centralized operator
+          // ledger with its before/after diff (idempotent re-resume
+          // is still a recorded operator action, with
+          // before == after, like the single route).
+          recordOperatorAction("endpoints.bulk-resume", {
+            target: endpoint,
+            before: { paused: wasPaused },
+            after: { paused: false },
+          });
+          return moved;
+        },
+      });
       respondJson(res, 200, { results });
       return;
     }

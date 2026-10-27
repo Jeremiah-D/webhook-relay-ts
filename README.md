@@ -2298,6 +2298,46 @@ curl -X POST http://127.0.0.1:PORT/endpoints/bulk-delete \
 - **Fail-closed list validation** — a non-array, empty, or
   illegal list answers 400 with zero side effects.
 
+Resuming a set of paused endpoints at once uses the same bulk shape:
+`POST /endpoints/bulk-resume` (WR-240) — same operator
+authentication and WR-82 admin scope as the single routes,
+same `{ endpoints: [...] }` body, same
+`{ results: [{ endpoint, ok, error? }] }` response.
+
+```sh
+curl -X POST http://127.0.0.1:PORT/endpoints/bulk-resume \
+  -H "Authorization: Bearer $OPERATOR_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"endpoints":["https://a/hook","https://typo/hook"]}'
+# → 200 { results: [
+#   { endpoint: "https://a/hook", ok: true },
+#   { endpoint: "https://typo/hook", ok: false, error: "unknown endpoint" } ] }
+```
+
+- **Batch form of the single resume, not a new gate** — each
+  listed endpoint goes through the WR-50 single-resume
+  semantics: the pause set entry is cleared, parked items
+  are re-armed with their remaining delays, and attempt
+  counts are untouched.
+- **One row per endpoint, in request order** — duplicates
+  collapse to the first occurrence; unknown endpoints are
+  reported per row, never silently skipped, and never abort the
+  remaining rows; a single endpoint's failure is contained to
+  its row.
+- **Idempotent re-resume** — resuming a non-paused endpoint
+  is a success row with no new audit event, like the single
+  route's no-op 200.
+- **Same audit trail as the single route** — each real
+  transition appends `endpoint_resumed`, and each processed
+  endpoint lands one operator-ledger entry
+  (`endpoints.bulk-resume`, same before/after shape as
+  `endpoints.resume`).
+- **Orthogonal to bulk-enable and bulk-delete** — bulk-enable
+  clears the auto-disable gate, not the pause set; bulk-delete
+  removes endpoints, it does not resume them.
+- **Fail-closed list validation** — a non-array, empty, or
+  illegal list answers 400 with zero side effects.
+
 ## Queue-depth breach alerting (opt-in)
 
 Pure observation for backlog pressure: when an endpoint's queue depth —

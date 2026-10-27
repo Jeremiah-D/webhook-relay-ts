@@ -458,3 +458,146 @@ describe("POST /endpoints/bulk-delete operator route", () => {
     assert.equal((empty.json as { endpoints: unknown[] }).endpoints.length, 0);
   });
 });
+
+describe("POST /endpoints/bulk-resume operator route", () => {
+  let servers: Server[] = [];
+  afterEach(async () => {
+    for (const s of servers) {
+      s.close();
+      await new Promise((r) => s.once("close", r));
+    }
+    servers = [];
+  });
+
+  async function listen(server: Server): Promise<number> {
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const addr = server.address();
+    assert.ok(addr && typeof addr === "object");
+    return addr.port;
+  }
+
+  function postJson(port: number, path: string, body: unknown, token?: string, method = "POST") {
+    return new Promise<{ status: number; json: unknown }>((resolve, reject) => {
+      const headers: Record<string, string> = { "content-type": "application/json" };
+      if (token !== undefined) headers["authorization"] = `Bearer ${token}`;
+      const r = httpRequest({ host: "127.0.0.1", port, path, method, headers }, (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (c: Buffer) => chunks.push(c));
+        res.on("end", () =>
+          resolve({
+            status: res.statusCode ?? 0,
+            json: JSON.parse(Buffer.concat(chunks).toString() || "{}"),
+          })
+        );
+      });
+      r.on("error", reject);
+      r.end(JSON.stringify(body));
+    });
+  }
+
+  function postWebhook(port: number) {
+    return new Promise<number>((resolve, reject) => {
+      const r = httpRequest(
+        {
+          host: "127.0.0.1",
+          port,
+          path: "/hook",
+          method: "POST",
+          headers: {
+            "x-signature": signSha256(BODY, hookSecret),
+            "content-type": "application/json",
+            "content-length": String(BODY.length),
+          },
+        },
+        (res) => {
+          res.resume();
+          res.on("end", () => resolve(res.statusCode ?? 0));
+        }
+      );
+      r.on("error", reject);
+      r.end(BODY);
+    });
+  }
+
+  async function makeRelay() {
+    const dir = mkdtempSync(join(tmpdir(), "bulk-resume-"));
+    const audit = new AuditLog(join(dir, "audit.jsonl"));
+    let calls = 0;
+    const relay = createRelayServer({
+      // Computed key on purpose: a literal `secret:` key here is
+      // rewritten by the runtime's secret redaction when writing
+      // test sources, which breaks parsing (see AGENTS.md).
+      ["sec" + "ret"]: hookSecret,
+      forwardUrl: URL,
+      auditLog: audit,
+      operatorToken: TOKEN,
+      sender: async () => {
+        calls += 1;
+      },
+      retry: { baseDelayMs: 10, maxAttempts: 1, jitterMs: 0 },
+    });
+    servers.push(relay);
+    return { port: await listen(relay), audit, calls: () => calls };
+  }
+
+  it("bulk-resumes a paused endpoint, re-arms parked deliveries, and reports unknown rows", async () => {
+    const { port, audit, calls } = await makeRelay();
+    const paused = await postJson(port, "/endpoints/bulk-disable", { endpoints: [URL] }, TOKEN);
+    assert.equal(paused.status, 200);
+    assert.deepEqual(paused.json, { results: [{ endpoint: URL, ok: true }] });
+    assert.equal(audit.query({ event: "endpoint_paused" }).length, 1);
+
+    // A webhook arriving while paused is accepted but never attempted.
+    assert.equal(await postWebhook(port), 202);
+    await new Promise((r) => setTimeout(r, 200));
+    assert.equal(calls(), 0);
+
+    const res = await postJson(
+      port,
+      "/endpoints/bulk-resume",
+      { endpoints: [URL, URL, UNKNOWN] },
+      TOKEN
+    );
+    assert.equal(res.status, 200);
+    assert.deepEqual(res.json, {
+      results: [
+        { endpoint: URL, ok: true },
+        { endpoint: UNKNOWN, ok: false, error: "unknown endpoint" },
+      ],
+    });
+    const resumed = audit.query({ event: "endpoint_resumed" }) as Array<{ endpoint: string }>;
+    assert.equal(resumed.length, 1);
+    assert.equal(resumed[0].endpoint, URL);
+
+    // The parked delivery is re-armed with its remaining delay and attempted.
+    const deadline = Date.now() + 5000;
+    while (calls() < 1 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    assert.equal(calls(), 1);
+
+    // Re-resuming a non-paused endpoint is an idempotent ok row, no new audit.
+    const again = await postJson(port, "/endpoints/bulk-resume", { endpoints: [URL] }, TOKEN);
+    assert.equal(again.status, 200);
+    assert.deepEqual(again.json, { results: [{ endpoint: URL, ok: true }] });
+    assert.equal(audit.query({ event: "endpoint_resumed" }).length, 1);
+  });
+
+  it("fails closed on malformed lists, and gates auth and method", async () => {
+    const { port, audit } = await makeRelay();
+    for (const bad of [[], "x", [""], [URL, 42]]) {
+      const badRes = await postJson(port, "/endpoints/bulk-resume", { endpoints: bad }, TOKEN);
+      assert.equal(badRes.status, 400);
+    }
+    assert.equal(audit.query({ event: "endpoint_resumed" }).length, 0);
+
+    assert.equal(
+      (await postJson(port, "/endpoints/bulk-resume", { endpoints: [URL] })).status,
+      403
+    );
+    assert.equal(
+      (await postJson(port, "/endpoints/bulk-resume", {}, TOKEN, "GET")).status,
+      405
+    );
+  });
+});

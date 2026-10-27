@@ -702,6 +702,26 @@ export const OPERATOR_ROUTES: readonly OperatorRoute[] = [
     },
   },
   {
+    path: "/endpoints/bulk-resume",
+    pattern: exact("/endpoints/bulk-resume"),
+    methods: ["POST"],
+    summary: "Bulk resume paused endpoints",
+    description:
+      "WR-240: apply the WR-50 `resumeEndpoint` move to each listed endpoint — clear its pause set entry and re-arm parked items with their remaining delays (attempt counts untouched). A real transition is audited as `endpoint_resumed`, like the single route; resuming a non-paused endpoint is an idempotent success row. Orthogonal to WR-230 bulk-enable (which clears the auto-disable gate, not the pause set) and to WR-239 bulk-delete. The list is deduplicated and validated whole before anything moves (a malformed or empty list answers 400, nothing changed); unknown endpoints are reported per row as `{ endpoint, ok: false, error: \\\"unknown endpoint\\\" }` instead of aborting the batch.",
+    okDescription: "`{ results: [{ endpoint, ok, error? }] }`, one row per deduplicated endpoint.",
+    requestBody: {
+      description: "Lists the endpoints to resume.",
+      required: ["endpoints"],
+      properties: {
+        endpoints: {
+          type: "array",
+          items: { type: "string" },
+          description: "Target URLs to resume; duplicates collapse to the first occurrence.",
+        },
+      },
+    },
+  },
+  {
     path: "/endpoints",
     pattern: exact("/endpoints"),
     methods: ["GET", "POST"],
@@ -746,7 +766,7 @@ export const OPERATOR_ROUTES: readonly OperatorRoute[] = [
   },
   {
     path: "/endpoints/{id}",
-    pattern: /^\/endpoints\/(?!pause$|resume$|enable$|bulk-enable$|bulk-disable$|bulk-delete$|dry-run$)(.+)$/,
+    pattern: /^\/endpoints\/(?!pause$|resume$|enable$|bulk-enable$|bulk-disable$|bulk-delete$|bulk-resume$|dry-run$)(.+)$/,
     methods: ["PUT", "DELETE"],
     summary: "Endpoint registry: update / delete one endpoint",
     description:
