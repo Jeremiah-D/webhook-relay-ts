@@ -79,6 +79,7 @@ import { NtfySinkConfigError } from "./ntfy-sink.ts";
 import { GotifySinkConfigError } from "./gotify-sink.ts";
 import { BarkSinkConfigError } from "./bark-sink.ts";
 import { PushoverSinkConfigError } from "./pushover-sink.ts";
+import { PushbulletSinkConfigError } from "./pushbullet-sink.ts";
 import { EmailSinkConfigError } from "./email-sink.ts";
 import { DigestAuthError } from "./digest-auth.ts";
 import { CredentialSecretUnavailableError } from "./outbound-credentials.ts";
@@ -490,6 +491,17 @@ export function classifyFailure(err: unknown): ClassifiedFailure {
   // There is no per-record target fallback: missing
   // credentials have nowhere to deliver to.
   if (err instanceof PushoverSinkConfigError) {
+    return { failureClass: "non_retryable" };
+  }
+  // WR-245: a Pushbullet sink with no injected client or no
+  // access token is a local config problem — the POST was never
+  // built, let alone sent. Retrying can never succeed for this
+  // item, so dead-letter immediately instead of burning the
+  // retry budget and the backoff clock (the WR-116 rule,
+  // applied to the Pushbullet sink like the Pushover sink
+  // above). There is no per-record target fallback: a missing
+  // token has nowhere to deliver to.
+  if (err instanceof PushbulletSinkConfigError) {
     return { failureClass: "non_retryable" };
   }
   // WR-233: an email sink with no injected client or no

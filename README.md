@@ -6877,6 +6877,73 @@ await sink.send([
   WR-116 rule. `dryRun` validates (including text derivation)
   with zero client I/O.
 
+`src/pushbullet-sink.ts` (WR-245) delivers to Pushbullet: one
+event is posted as one push to the Pushbullet pushes endpoint,
+and Pushbullet — not the relay — owns the subscription, the
+delivery, and the retention of the push. No HTTP
+client is bundled — the client is injected through the
+config, so the module has zero new dependencies and tests
+never need a Pushbullet server.
+
+```ts
+const sink = new PushbulletSink({
+  accessToken: "<access-token>",
+  client, // your client adapter implementing PushbulletPushClient
+  // includePayload: true, // opt-in only: body appended, truncated
+});
+await sink.send([
+  { body: JSON.stringify(event), subject: "order.created", key: "agg-7" },
+]);
+```
+
+- **Fixed host and header authentication** — one sink
+  targets one Pushbullet account: every push POSTs to the fixed
+  endpoint `https://api.pushbullet.com/v2/pushes`, with the
+  access token carried in the exact `Access-Token` request
+  header — never in the URL (unlike the Gotify and Bark sinks,
+  whose credentials ride in the URL) and never in the body
+  (unlike the Pushover sink, whose token and user key ride
+  inside the body). The header name is exact, not
+  `Authorization: Bearer`, because that is the scheme
+  Pushbullet's API takes, and the token is never logged. The
+  host is not configurable: Pushbullet is a single hosted
+  service, so a configurable URL could only misroute a push
+  to a server that is not Pushbullet. A missing client or
+  missing access token fails closed with
+  `PushbulletSinkConfigError` at send time.
+- **JSON body, type note only** — Pushbullet's pushes
+  endpoint takes a JSON object, so the client POSTs
+  `{"type":"note","title","body"}` verbatim as the request
+  body. The type is fixed at `note`: the relay sends plain-text
+  pushes, not links or files, and never restyles an operator's
+  notifications by picking another type per event.
+- **Title and body** — the title takes `subject`,
+  falling back to `key`; the body takes `key`, falling
+  back to `traceId`. An event with none of the values a field
+  needs still notifies, with the generic summary
+  `webhook event`: a notification sink must not silently drop
+  sourceless events.
+- **Payload inclusion** — by default the body carries the
+  summary only, never the full payload: event bodies routinely
+  carry PII, and a push notification is a far wider audience
+  than a queue or a stream. Opting into `includePayload`
+  appends the body verbatim after a blank line, truncated to
+  `payloadMaxChars` characters (default 2000) with a truncation
+  marker — the truncation is unconditional under the opt-in,
+  and the body stays plain text inside the `body` field,
+  not a fenced code block, so no fence noise lands on a phone
+  screen.
+- **Failure handling** — a non-2xx POST throws
+  `PushbulletSinkError` carrying exactly the failed messages with
+  their retry lanes, so the caller retries just those. 429 and
+  every 5xx are retryable; every other non-2xx status (400,
+  401, 403, 404: unknown access token, invalid body) is
+  fail-closed, non-retryable, and a codeless transport failure
+  is retryable. A missing client or missing access token throws
+  `PushbulletSinkConfigError` → `non_retryable`, the
+  WR-116 rule. `dryRun` validates (including text derivation)
+  with zero client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same
