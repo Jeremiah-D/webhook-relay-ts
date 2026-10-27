@@ -70,6 +70,8 @@ import { DingTalkSinkConfigError } from "./dingtalk-sink.ts";
 import { FeishuSinkConfigError } from "./feishu-sink.ts";
 import { TelegramSinkConfigError } from "./telegram-sink.ts";
 import { DiscordSinkConfigError } from "./discord-sink.ts";
+import { TeamsSinkConfigError } from "./teams-sink.ts";
+import { WeComSinkConfigError } from "./wecom-sink.ts";
 import { EmailSinkConfigError } from "./email-sink.ts";
 import { DigestAuthError } from "./digest-auth.ts";
 import { CredentialSecretUnavailableError } from "./outbound-credentials.ts";
@@ -382,6 +384,28 @@ export function classifyFailure(err: unknown): ClassifiedFailure {
   // There is no per-record channel fallback: a missing URL has
   // nowhere to deliver to.
   if (err instanceof DiscordSinkConfigError) {
+    return { failureClass: "non_retryable" };
+  }
+  // WR-234: a Teams sink with no injected client or no valid
+  // webhook URL is a local config problem — the POST was never
+  // built, let alone sent. Retrying can never succeed for this
+  // item, so dead-letter immediately instead of burning the
+  // retry budget and the backoff clock (the WR-116 rule,
+  // applied to the Teams sink like the Discord sink above).
+  // There is no per-record channel fallback: a missing URL has
+  // nowhere to deliver to.
+  if (err instanceof TeamsSinkConfigError) {
+    return { failureClass: "non_retryable" };
+  }
+  // WR-235: a WeCom sink with no injected client or no valid
+  // webhook URL is a local config problem — the POST was never
+  // built, let alone sent. Retrying can never succeed for this
+  // item, so dead-letter immediately instead of burning the
+  // retry budget and the backoff clock (the WR-116 rule,
+  // applied to the WeCom sink like the Teams sink above).
+  // There is no per-record group fallback: a missing URL has
+  // nowhere to deliver to.
+  if (err instanceof WeComSinkConfigError) {
     return { failureClass: "non_retryable" };
   }
   // WR-233: an email sink with no injected client or no
