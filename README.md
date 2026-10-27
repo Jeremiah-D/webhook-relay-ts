@@ -6315,6 +6315,62 @@ await sink.send([
   WR-116 rule. `dryRun` validates (including text derivation)
   with zero client I/O.
 
+`src/wecom-sink.ts` (WR-235) delivers to a WeCom (企业微信)
+group: one event is posted as one markdown message to a
+configured robot webhook URL, and WeCom — not the relay — owns
+the group, the message id, and the retention of the
+notification. No HTTP client is bundled — the client is
+injected through the config, so the module has zero new
+dependencies and tests never need a WeCom group.
+
+```ts
+const sink = new WeComSink({
+  webhookUrl: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=<key>",
+  client, // your client adapter implementing WeComWebhookClient
+  // includePayload: true, // opt-in only: body appended, truncated
+});
+await sink.send([
+  { body: JSON.stringify(event), subject: "order.created", traceId: "trace-9" },
+]);
+```
+
+- **Webhook targeting and authentication** — one sink
+  targets one robot webhook URL, posted verbatim: WeCom
+  authenticates a robot webhook by the key in the URL query
+  (`.../cgi-bin/webhook/send?key=<key>`), so no token is
+  ever appended or spliced at send time — the URL, key
+  included, is the credential, and rotating the webhook
+  never means changing sink code. The host is not pinned to
+  qyapi.weixin.qq.com (a proxy or sidecar fronting is
+  allowed), but the URL must parse as `https:` — a
+  plaintext or unparseable URL fails closed with
+  `WeComSinkConfigError` at send time, as does a missing
+  URL or a missing client.
+- **Message type and text** — every message is sent as
+  `msgtype: "markdown"`, and its content is one line of
+  summary, derived from the event's own values, first
+  non-empty wins: `subject`, then `key`, then `traceId`.
+  An event with none of the three still notifies, with the
+  generic summary `webhook event`: a notification sink must
+  not silently drop sourceless events.
+- **Payload inclusion** — by default the message carries the
+  summary only, never the full payload: event bodies routinely
+  carry PII, and a group is a far wider audience than a
+  queue or a stream. Opting into `includePayload` appends the
+  body verbatim inside a fenced code block, truncated to
+  `payloadMaxChars` characters (default 2000) with a truncation
+  marker — the truncation is unconditional under the opt-in.
+- **Failure handling** — a non-2xx POST throws
+  `WeComSinkError` carrying exactly the failed messages with
+  their retry lanes, so the caller retries just those. 429 and
+  every 5xx are retryable; every other non-2xx status (400,
+  401, 403, 404: unknown webhook, invalid body) is
+  fail-closed, non-retryable, and a codeless transport failure
+  is retryable. A missing client or a missing/invalid webhook
+  URL throws `WeComSinkConfigError` → `non_retryable`, the
+  WR-116 rule. `dryRun` validates (including text derivation)
+  with zero client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same
