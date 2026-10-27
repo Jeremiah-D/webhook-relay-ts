@@ -204,6 +204,7 @@ import {
 import {
   applyBulkEndpointOperation,
   normalizeBulkEndpoints,
+  type BulkEndpointResultRow,
 } from "./endpoint-bulk.ts";
 import { InboundRateLimiter, type InboundRateLimitOptions } from "./ratelimit.ts";
 import {
@@ -8022,6 +8023,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // WR-230: bulk endpoint enable/disable.
     const isEndpointsBulkEnable = pathname === "/endpoints/bulk-enable";
     const isEndpointsBulkDisable = pathname === "/endpoints/bulk-disable";
+    // WR-239: bulk endpoint delete.
+    const isEndpointsBulkDelete = pathname === "/endpoints/bulk-delete";
     // WR-145: per-endpoint drill-mode toggle.
     const isEndpointsDryRun = pathname === "/endpoints/dry-run";
     // WR-114: dynamic endpoint registry. The negative lookahead keeps
@@ -8030,7 +8033,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // registry pattern in `src/operator-routes.ts`).
     const isEndpointsRegistry = pathname === "/endpoints";
     const endpointIdMatch =
-      /^\/endpoints\/(?!pause$|resume$|enable$|bulk-enable$|bulk-disable$)(.+)$/.exec(pathname);
+      /^\/endpoints\/(?!pause$|resume$|enable$|bulk-enable$|bulk-disable$|bulk-delete$)(.+)$/.exec(pathname);
     const isScheduledList = pathname === "/scheduled";
     const scheduleActionMatch = /^\/scheduled\/([^/]+)\/(pause|resume)$/.exec(pathname);
     const deliveryMatch = /^\/deliveries\/([^/]+)$/.exec(pathname);
@@ -9463,6 +9466,113 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
           return moved;
         },
       });
+      respondJson(res, 200, { results });
+      return;
+    }
+    if (isEndpointsBulkDelete) {
+      // WR-239: bulk endpoint delete. Body is
+      // `{ endpoints: [...] }`. Each listed endpoint is deleted
+      // through the WR-114 single-delete semantics, one at a
+      // time: the registry record is found by targetUrl, the
+      // endpoint is drained first (the same bounded in-flight
+      // wait as `DELETE /endpoints/{id}` — a drain timeout
+      // fails just that row, it never aborts the batch and
+      // never deletes an endpoint with deliveries still in
+      // flight), then the record is removed, its deliver-policy
+      // overrides are cleared, and the same audit event as the
+      // single route is appended (`endpoint_config_updated`
+      // with operation `deleted`). Operator authentication
+      // and the WR-82 admin scope check above apply exactly
+      // like the single routes. The list is validated whole
+      // before anything moves — a malformed list (non-array,
+      // empty, illegal name) answers 400 and means "nothing
+      // changed" — and duplicates collapse to the first
+      // occurrence. Only dynamic registry endpoints can be
+      // deleted: a static endpoint (or any targetUrl with no
+      // registry record) is reported per row as "unknown
+      // endpoint", never silently skipped, because startup
+      // config cannot be removed at runtime. Unlike the
+      // single route there is no `force` flag: a row whose
+      // drain times out must be retried after its deliveries
+      // settle, not forced past in-flight work. No WR-197
+      // operator-ledger entry is recorded, matching the
+      // single DELETE route (the audit event is the record).
+      let body: Record<string, unknown>;
+      try {
+        const raw = (await readRawBody(req, maxBodyBytes)).toString("utf8");
+        body = raw.trim() === "" ? {} : JSON.parse(raw);
+      } catch (err) {
+        if (err instanceof BodyTooLargeError) {
+          respondJson(res, 413, { error: "request body too large" });
+          return;
+        }
+        respondJson(res, 400, { error: "invalid JSON body" });
+        return;
+      }
+      if (typeof body !== "object" || body === null || Array.isArray(body)) {
+        respondJson(res, 400, { error: "body must be a JSON object" });
+        return;
+      }
+      let endpoints: string[];
+      try {
+        endpoints = normalizeBulkEndpoints(body.endpoints);
+      } catch (err) {
+        respondJson(res, 400, {
+          error: err instanceof Error ? err.message : "invalid endpoints",
+        });
+        return;
+      }
+      const results: BulkEndpointResultRow[] = [];
+      for (const endpoint of endpoints) {
+        const record = endpointRegistry.getByTargetUrl(endpoint);
+        if (record === undefined) {
+          results.push({ endpoint, ok: false, error: "unknown endpoint" });
+          continue;
+        }
+        try {
+          const drain = await waitForEndpointDrain(
+            () => queue.getConcurrencyStats(),
+            endpoint,
+            opts.endpointDrainTimeoutMs !== undefined
+              ? { timeoutMs: opts.endpointDrainTimeoutMs }
+              : {}
+          );
+          if (!drain.drained) {
+            results.push({
+              endpoint,
+              ok: false,
+              error: `endpoint has ${drain.remaining} in-flight deliveries; retry later`,
+            });
+            continue;
+          }
+          endpointRegistry.remove(record.id);
+          if (record.maxConcurrentPerEndpoint !== undefined) {
+            queue.clearEndpointConfigOverride(undefined, endpoint, "maxConcurrentPerEndpoint");
+          }
+          if (record.circuitBreaker !== undefined) {
+            queue.clearEndpointConfigOverride(undefined, endpoint, "circuitBreaker");
+          }
+          if (record.quota !== undefined) {
+            queue.clearEndpointConfigOverride(undefined, endpoint, "quota");
+          }
+          opts.auditLog.append({
+            event: "endpoint_config_updated",
+            endpoint: record.targetUrl,
+            endpointId: record.id,
+            operation: "deleted",
+            keyId: operatorKeyId,
+            changes: diffEndpointConfigs(record, null),
+          });
+          results.push({ endpoint, ok: true });
+        } catch (err) {
+          results.push({
+            endpoint,
+            ok: false,
+            error:
+              err instanceof Error && err.message !== "" ? err.message : "delete failed",
+          });
+        }
+      }
       respondJson(res, 200, { results });
       return;
     }

@@ -682,6 +682,26 @@ export const OPERATOR_ROUTES: readonly OperatorRoute[] = [
     },
   },
   {
+    path: "/endpoints/bulk-delete",
+    pattern: exact("/endpoints/bulk-delete"),
+    methods: ["POST"],
+    summary: "Bulk delete endpoints",
+    description:
+      "WR-239: delete each listed endpoint through the WR-114 single-delete semantics, one at a time — the registry record is found by targetUrl, the endpoint is drained first (the same bounded in-flight wait as `DELETE /endpoints/{id}`; a drain timeout fails just that row, never the batch), then the record is removed, its deliver-policy overrides are cleared, and the same audit event as the single route is appended (`endpoint_config_updated` with operation `deleted`). The list is deduplicated and validated whole before anything moves (a malformed or empty list answers 400, nothing changed); endpoints with no registry record — including static startup endpoints, which cannot be removed at runtime — are reported per row as `{ endpoint, ok: false, error: \"unknown endpoint\" }` instead of aborting the batch. Unlike the single route there is no `force` flag: a row whose drain times out must be retried after its deliveries settle.",
+    okDescription: "`{ results: [{ endpoint, ok, error? }] }`, one row per deduplicated endpoint.",
+    requestBody: {
+      description: "Lists the endpoints to delete.",
+      required: ["endpoints"],
+      properties: {
+        endpoints: {
+          type: "array",
+          items: { type: "string" },
+          description: "Target URLs to delete; duplicates collapse to the first occurrence.",
+        },
+      },
+    },
+  },
+  {
     path: "/endpoints",
     pattern: exact("/endpoints"),
     methods: ["GET", "POST"],
@@ -726,7 +746,7 @@ export const OPERATOR_ROUTES: readonly OperatorRoute[] = [
   },
   {
     path: "/endpoints/{id}",
-    pattern: /^\/endpoints\/(?!pause$|resume$|enable$|bulk-enable$|bulk-disable$|dry-run$)(.+)$/,
+    pattern: /^\/endpoints\/(?!pause$|resume$|enable$|bulk-enable$|bulk-disable$|bulk-delete$|dry-run$)(.+)$/,
     methods: ["PUT", "DELETE"],
     summary: "Endpoint registry: update / delete one endpoint",
     description:

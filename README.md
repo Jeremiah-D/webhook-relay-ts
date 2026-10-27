@@ -2257,6 +2257,47 @@ curl -X POST http://127.0.0.1:PORT/endpoints/bulk-enable \
   `endpoint_paused`); idempotent re-ops stay silent, like the
   single routes' no-op 200s.
 
+Removing a set of endpoints at once uses the same bulk shape:
+`POST /endpoints/bulk-delete` (WR-239) — same operator
+authentication and WR-82 admin scope as the single routes,
+same `{ endpoints: [...] }` body, same
+`{ results: [{ endpoint, ok, error? }] }` response.
+
+```sh
+curl -X POST http://127.0.0.1:PORT/endpoints/bulk-delete \
+  -H "Authorization: Bearer $OPERATOR_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"endpoints":["https://a/hook","https://typo/hook"]}'
+# → 200 { results: [
+#   { endpoint: "https://a/hook", ok: true },
+#   { endpoint: "https://typo/hook", ok: false, error: "unknown endpoint" } ] }
+```
+
+- **Batch form of the single delete, not a new gate** — each
+  listed endpoint goes through the WR-114 single-delete
+  semantics: the registry record is found by targetUrl, the
+  endpoint is drained first (the same bounded in-flight wait
+  as `DELETE /endpoints/{id}`), then the record is removed
+  and its deliver-policy overrides are cleared.
+- **One row per endpoint, in request order** — duplicates
+  collapse to the first occurrence; unknown endpoints are
+  reported per row, never silently skipped, and never abort the
+  remaining rows; a single endpoint's failure (including a
+  drain timeout) is contained to its row.
+- **Only registry endpoints can be deleted** — a targetUrl
+  with no registry record, including a static startup
+  endpoint, is reported as `unknown endpoint`: startup config
+  cannot be removed at runtime.
+- **No `force` flag** — unlike the single route, a row whose
+  drain times out must be retried after its deliveries
+  settle, not forced past in-flight work.
+- **Same audit trail as the single route** — each successful
+  deletion appends `endpoint_config_updated` with operation
+  `deleted`; no operator-ledger entry is recorded, matching
+  the single DELETE route.
+- **Fail-closed list validation** — a non-array, empty, or
+  illegal list answers 400 with zero side effects.
+
 ## Queue-depth breach alerting (opt-in)
 
 Pure observation for backlog pressure: when an endpoint's queue depth —
