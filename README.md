@@ -6751,6 +6751,68 @@ await sink.send([
   WR-116 rule. `dryRun` validates (including text derivation)
   with zero client I/O.
 
+`src/bark-sink.ts` (WR-243) delivers to a Bark server: one
+event is posted as one notification to a configured push
+URL, and Bark — not the relay — owns the subscription, the
+delivery, and the retention of the notification. No HTTP
+client is bundled — the client is injected through the
+config, so the module has zero new dependencies and tests
+never need a Bark server.
+
+```ts
+const sink = new BarkSink({
+  pushUrl: "https://api.day.app/<device-key>/",
+  client, // your client adapter implementing BarkPushClient
+  // includePayload: true, // opt-in only: body appended, truncated
+});
+await sink.send([
+  { body: JSON.stringify(event), subject: "order.created", key: "agg-7" },
+]);
+```
+
+- **Push targeting and authentication** — one sink
+  targets one push URL, posted verbatim, device key
+  included: Bark routes and authenticates by the URL itself
+  (api.day.app or a self-hosted server), so no token is ever
+  appended or extracted — the URL is the target, and rotating
+  a device key never means changing sink code. The host is not
+  pinned to any one deployment (api.day.app, self-hosted Bark,
+  or a proxy/sidecar fronting it, is allowed), but the URL must
+  parse as `https:` — a plaintext or unparseable URL fails
+  closed with `BarkSinkConfigError` at send time, as does a
+  missing URL or a missing client.
+- **JSON body, title and body only** — Bark's push
+  endpoint takes a JSON object, so the client POSTs
+  `{"title","body"}` verbatim as the request body. No badge,
+  sound, icon, or grouping key is ever set: the relay never
+  restyles an operator's notifications.
+- **Title and body** — the title takes `subject`,
+  falling back to `key`; the body takes `key`, falling
+  back to `traceId`. An event with none of the values a field
+  needs still notifies, with the generic summary
+  `webhook event`: a notification sink must not silently drop
+  sourceless events.
+- **Payload inclusion** — by default the body carries the
+  summary only, never the full payload: event bodies routinely
+  carry PII, and a push notification is a far wider audience
+  than a queue or a stream. Opting into `includePayload`
+  appends the body verbatim after a blank line, truncated to
+  `payloadMaxChars` characters (default 2000) with a truncation
+  marker — the truncation is unconditional under the opt-in,
+  and the body stays plain text inside the `body` field,
+  not a fenced code block, so no fence noise lands on a phone
+  screen.
+- **Failure handling** — a non-2xx POST throws
+  `BarkSinkError` carrying exactly the failed messages with
+  their retry lanes, so the caller retries just those. 429 and
+  every 5xx are retryable; every other non-2xx status (400,
+  401, 403, 404: unknown device key, invalid body) is
+  fail-closed, non-retryable, and a codeless transport failure
+  is retryable. A missing client or a missing/invalid push
+  URL throws `BarkSinkConfigError` → `non_retryable`, the
+  WR-116 rule. `dryRun` validates (including text derivation)
+  with zero client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same
