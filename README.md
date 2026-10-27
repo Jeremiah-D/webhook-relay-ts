@@ -6813,6 +6813,70 @@ await sink.send([
   WR-116 rule. `dryRun` validates (including text derivation)
   with zero client I/O.
 
+`src/pushover-sink.ts` (WR-244) delivers to Pushover: one
+event is posted as one notification to the Pushover messages
+endpoint, and Pushover — not the relay — owns the subscription, the
+delivery, and the retention of the notification. No HTTP
+client is bundled — the client is injected through the
+config, so the module has zero new dependencies and tests
+never need a Pushover server.
+
+```ts
+const sink = new PushoverSink({
+  appToken: "<app-token>",
+  userKey: "<user-key>",
+  client, // your client adapter implementing PushoverMessageClient
+  // includePayload: true, // opt-in only: message appended, truncated
+});
+await sink.send([
+  { body: JSON.stringify(event), subject: "order.created", key: "agg-7" },
+]);
+```
+
+- **Fixed host and body-carried authentication** — one sink
+  targets one Pushover user: every message POSTs to the fixed
+  endpoint `https://api.pushover.net/1/messages.json`, with the
+  app token and user key carried in the request body's `token`
+  and `user` fields — never in the URL (unlike the Gotify and
+  Bark sinks, whose credentials ride in the URL) and never
+  logged. The host is not configurable: Pushover is a single
+  hosted service, so a configurable URL could only misroute a
+  notification to a server that is not Pushover. A missing
+  client or missing credential fails closed with
+  `PushoverSinkConfigError` at send time.
+- **JSON body, fixed priority** — Pushover's messages
+  endpoint takes a JSON object, so the client POSTs
+  `{"token","user","title","message","priority":0}` verbatim as
+  the request body. The priority is fixed at 0, the ordinary
+  Pushover priority: the relay never re-ranks an operator's
+  notifications.
+- **Title and message** — the title takes `subject`,
+  falling back to `key`; the message takes `key`, falling
+  back to `traceId`. An event with none of the values a field
+  needs still notifies, with the generic summary
+  `webhook event`: a notification sink must not silently drop
+  sourceless events.
+- **Payload inclusion** — by default the message carries the
+  summary only, never the full payload: event bodies routinely
+  carry PII, and a push notification is a far wider audience
+  than a queue or a stream. Opting into `includePayload`
+  appends the body verbatim after a blank line, truncated to
+  `payloadMaxChars` characters (default 2000) with a truncation
+  marker — the truncation is unconditional under the opt-in,
+  and the message stays plain text inside the `message` field,
+  not a fenced code block, so no fence noise lands on a phone
+  screen.
+- **Failure handling** — a non-2xx POST throws
+  `PushoverSinkError` carrying exactly the failed messages with
+  their retry lanes, so the caller retries just those. 429 and
+  every 5xx are retryable; every other non-2xx status (400,
+  401, 403, 404: unknown app token or user key, invalid body) is
+  fail-closed, non-retryable, and a codeless transport failure
+  is retryable. A missing client or missing credential throws
+  `PushoverSinkConfigError` → `non_retryable`, the
+  WR-116 rule. `dryRun` validates (including text derivation)
+  with zero client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same

@@ -78,6 +78,7 @@ import { RocketChatSinkConfigError } from "./rocketchat-sink.ts";
 import { NtfySinkConfigError } from "./ntfy-sink.ts";
 import { GotifySinkConfigError } from "./gotify-sink.ts";
 import { BarkSinkConfigError } from "./bark-sink.ts";
+import { PushoverSinkConfigError } from "./pushover-sink.ts";
 import { EmailSinkConfigError } from "./email-sink.ts";
 import { DigestAuthError } from "./digest-auth.ts";
 import { CredentialSecretUnavailableError } from "./outbound-credentials.ts";
@@ -478,6 +479,17 @@ export function classifyFailure(err: unknown): ClassifiedFailure {
   // There is no per-record target fallback: a missing URL has
   // nowhere to deliver to.
   if (err instanceof BarkSinkConfigError) {
+    return { failureClass: "non_retryable" };
+  }
+  // WR-244: a Pushover sink with no injected client or no
+  // credentials is a local config problem — the POST was never
+  // built, let alone sent. Retrying can never succeed for this
+  // item, so dead-letter immediately instead of burning the
+  // retry budget and the backoff clock (the WR-116 rule,
+  // applied to the Pushover sink like the Bark sink above).
+  // There is no per-record target fallback: missing
+  // credentials have nowhere to deliver to.
+  if (err instanceof PushoverSinkConfigError) {
     return { failureClass: "non_retryable" };
   }
   // WR-233: an email sink with no injected client or no
