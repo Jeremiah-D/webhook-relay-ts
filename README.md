@@ -6687,6 +6687,70 @@ await sink.send([
   WR-116 rule. `dryRun` validates (including text derivation)
   with zero client I/O.
 
+`src/gotify-sink.ts` (WR-242) delivers to a Gotify server: one
+event is posted as one notification to a configured message
+URL, and Gotify — not the relay — owns the subscription, the
+delivery, and the retention of the notification. No HTTP
+client is bundled — the client is injected through the
+config, so the module has zero new dependencies and tests
+never need a Gotify server.
+
+```ts
+const sink = new GotifySink({
+  messageUrl: "https://gotify.example.com/message?token=<app-token>",
+  client, // your client adapter implementing GotifyMessageClient
+  // includePayload: true, // opt-in only: body appended, truncated
+});
+await sink.send([
+  { body: JSON.stringify(event), subject: "order.created", key: "agg-7" },
+]);
+```
+
+- **Message targeting and authentication** — one sink
+  targets one message URL, posted verbatim, query string
+  included: Gotify authenticates by the URL itself (the app
+  token travels in the query string), so no token is ever
+  appended or extracted — the URL is the target, and rotating
+  an app token never means changing sink code. The host is not
+  pinned to any one deployment (self-hosted Gotify, or a
+  proxy/sidecar fronting it, is allowed), but the URL must
+  parse as `https:` — a plaintext or unparseable URL fails
+  closed with `GotifySinkConfigError` at send time, as does a
+  missing URL or a missing client.
+- **JSON body, fixed priority** — Gotify's `/message`
+  endpoint takes a JSON object, so the client POSTs
+  `{"title","message","priority":5}` verbatim as the request
+  body. The priority is fixed at 5, the middle of Gotify's
+  0–10 scale: an ordinary notification, neither silent nor
+  alarming — the relay never re-ranks an operator's
+  notifications.
+- **Title and message** — the title takes `subject`,
+  falling back to `key`; the message takes `key`, falling
+  back to `traceId`. An event with none of the values a field
+  needs still notifies, with the generic summary
+  `webhook event`: a notification sink must not silently drop
+  sourceless events.
+- **Payload inclusion** — by default the message carries the
+  summary only, never the full payload: event bodies routinely
+  carry PII, and a push notification is a far wider audience
+  than a queue or a stream. Opting into `includePayload`
+  appends the body verbatim after a blank line, truncated to
+  `payloadMaxChars` characters (default 2000) with a truncation
+  marker — the truncation is unconditional under the opt-in,
+  and the body stays plain text inside the `message` field,
+  not a fenced code block, so no fence noise lands on a phone
+  screen.
+- **Failure handling** — a non-2xx POST throws
+  `GotifySinkError` carrying exactly the failed messages with
+  their retry lanes, so the caller retries just those. 429 and
+  every 5xx are retryable; every other non-2xx status (400,
+  401, 403, 404: unknown app token, invalid body) is
+  fail-closed, non-retryable, and a codeless transport failure
+  is retryable. A missing client or a missing/invalid message
+  URL throws `GotifySinkConfigError` → `non_retryable`, the
+  WR-116 rule. `dryRun` validates (including text derivation)
+  with zero client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same
