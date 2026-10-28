@@ -89,6 +89,7 @@ import { WhatsAppSinkConfigError } from "./whatsapp-sink.ts";
 import { VonageSinkConfigError } from "./vonage-sink.ts";
 import { SendGridSinkConfigError } from "./sendgrid-sink.ts";
 import { ResendSinkConfigError } from "./resend-sink.ts";
+import { PlivoSinkConfigError } from "./plivo-sink.ts";
 import { EmailSinkConfigError } from "./email-sink.ts";
 import { DigestAuthError } from "./digest-auth.ts";
 import { CredentialSecretUnavailableError } from "./outbound-credentials.ts";
@@ -612,6 +613,17 @@ export function classifyFailure(err: unknown): ClassifiedFailure {
   // There is no per-record recipient fallback: a missing
   // recipient has nowhere to deliver to.
   if (err instanceof ResendSinkConfigError) {
+    return { failureClass: "non_retryable" };
+  }
+  // WR-255: a Plivo sink with no injected client or no
+  // auth id, sender, or recipient is a local config problem —
+  // the POST was never built, let alone sent. Retrying can
+  // never succeed for this item, so dead-letter immediately
+  // instead of burning the retry budget and the backoff clock
+  // (the WR-116 rule, applied to the Plivo sink like the
+  // Resend sink above). There is no per-record recipient
+  // fallback: a missing recipient has nowhere to deliver to.
+  if (err instanceof PlivoSinkConfigError) {
     return { failureClass: "non_retryable" };
   }
   // WR-233: an email sink with no injected client or no

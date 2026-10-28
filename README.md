@@ -7552,6 +7552,71 @@ await sink.send([
   the WR-116 rule. `dryRun` validates (including text
   derivation) with zero client I/O.
 
+`src/plivo-sink.ts` (WR-255) delivers to Plivo's
+Message HTTP API by SMS: one event is sent as one SMS,
+and Plivo — not the relay — owns the carrier routing,
+the delivery, and the retention of the message. No HTTP
+client is bundled — the client is injected through the
+config, so the module has zero new dependencies and
+tests never need a Plivo server.
+
+```ts
+const sink = new PlivoSink({
+  authId: "MAXXXXXXXXXXXXXXXX", // account id: URL path only
+  src: "+14155550100",
+  dst: "+14155550101",
+  client, // your client adapter implementing PlivoMessageClient
+  // includePayload: true, // opt-in only: body appended, truncated
+});
+await sink.send([
+  { body: JSON.stringify(event), subject: "order.created", key: "agg-7" },
+]);
+```
+
+- **HTTP API envelope, client-held Basic auth** —
+  one sink targets one sender number and one recipient
+  number: every message POSTs to the account's fixed
+  `https://api.plivo.com/v1/Account/<auth_id>/Message/`
+  (Plivo is not self-hostable, so no site is
+  configurable), with the JSON body `src`, `dst`, and
+  `text`. The auth token is held by the client alone —
+  the sink never receives it, so the request it hands the
+  client carries no credential at all; the client adds the
+  `Authorization: Basic` header itself from the
+  `auth_id:auth_token` pair it alone holds (the Twilio
+  client-held-token rule, and the opposite of the Vonage
+  body-carried credential). The auth id itself is an
+  account identifier, not a secret: it lives in the sink
+  config and appears only in the URL path, never in the
+  body. A missing client, auth id, sender, or recipient
+  fails closed with `PlivoSinkConfigError` at send time.
+- **Single text field** — an SMS carries one text field,
+  so there is no subject/value split like the email sinks:
+  the text takes the first non-empty among the record's
+  `subject`, `key`, and `traceId`, falling back to the
+  generic summary `webhook event` for sourceless events,
+  which must not be silently dropped.
+- **Payload inclusion** — by default the message carries
+  the summary only, never the full payload: event bodies
+  routinely carry PII, and a phone is a far wider
+  audience than a queue or a stream. Opting into
+  `includePayload` appends the body verbatim after a blank
+  line, truncated to `payloadMaxChars` characters (default
+  2000) with a truncation marker — the truncation is
+  unconditional under the opt-in, and the body stays plain
+  text inside the `text` field, not a fenced code block.
+- **Failure handling** — a non-2xx POST throws
+  `PlivoSinkError` carrying exactly the failed messages
+  with their retry lanes, so the caller retries just those.
+  429 and every 5xx are retryable; every other non-2xx
+  status (400, 401, 403, 404: unknown number, invalid body,
+  bad credentials) is fail-closed, non-retryable,
+  and a codeless transport failure is retryable. A missing
+  client, auth id, sender, or recipient throws
+  `PlivoSinkConfigError` → `non_retryable`,
+  the WR-116 rule. `dryRun` validates (including text
+  derivation) with zero client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same
