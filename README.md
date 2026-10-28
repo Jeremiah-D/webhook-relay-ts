@@ -7273,6 +7273,90 @@ await sink.send([
   the WR-116 rule. `dryRun` validates (including text
   derivation) with zero client I/O.
 
+`src/whatsapp-sink.ts` (WR-251) delivers to WhatsApp
+Business: one event is sent as one text message to one
+recipient, and WhatsApp — not the relay — owns the
+delivery and the retention of the message. No HTTP
+client is bundled — the client is injected through the
+config, so the module has zero new dependencies and
+tests never need a WhatsApp server.
+
+```ts
+const sink = new WhatsAppSink({
+  phoneNumberId: "123456789012345",
+  to: "14155551234", // country code, no leading +
+  client, // your client adapter implementing WhatsAppMessageClient
+  // includePayload: true, // opt-in only: body appended, truncated
+});
+await sink.send([
+  { body: JSON.stringify(event), subject: "order.created", key: "agg-7" },
+]);
+```
+
+- **Pinned Graph version, client-held Bearer token** —
+  one sink targets one recipient from one registered
+  number: every message POSTs to
+  `https://graph.facebook.com/v26.0/{phone-number-id}/messages`
+  (the version pinned in `WHATSAPP_GRAPH_API_VERSION`,
+  verified latest at implementation time — v26.0,
+  released July 2026 — not scattered through code),
+  and the access token is held by the client alone —
+  the sink never receives it, so the request it hands
+  the client carries no credential at all; the client
+  adds the `Authorization: Bearer` header itself (the
+  Twilio client-held-token rule). A missing client,
+  phone-number id, or recipient fails closed with
+  `WhatsAppSinkConfigError` at send time.
+- **Phone-number id only in the URL path** — the id
+  identifies the sender's number to Meta's routing, not
+  to the recipient, so it travels in the path the client
+  builds from the `phoneNumberId` field and never
+  appears in the message body (the Matrix room-id rule).
+  The body is the JSON object `messaging_product`
+  (`whatsapp`), `recipient_type` (`individual`), `to`,
+  `type` (`text`), and `text` (`body`,
+  `preview_url: false`).
+- **Text messages, not templates** — the sink sends
+  only `type: "text"` messages with link previews off.
+  Text messages require an open 24-hour customer-service
+  window with the recipient; template messages, which
+  are what opens a window, are out of scope — an
+  operator whose window has lapsed gets a fail-closed
+  non-2xx from the API, not a silently reworded
+  template.
+- **Identifiers, not human names** — both the
+  phone-number id and the recipient are opaque
+  identifiers, so config validation requires each to be
+  non-empty and free of NUL and whitespace (the Twilio
+  phone-number rule); a recipient is a number with
+  country code and no leading `+`.
+- **Single text field** — the message carries one
+  `text.body` field, so the derivation chain folds into
+  one value: the first non-empty among the record's
+  `subject`, `key`, and `traceId`, falling back to the
+  generic summary `webhook event` for sourceless events,
+  which must not be silently dropped.
+- **Payload inclusion** — by default the message carries
+  the summary only, never the full payload: event bodies
+  routinely carry PII, and a customer's chat app is a far
+  wider audience than a queue or a stream. Opting into
+  `includePayload` appends the body verbatim after a blank
+  line, truncated to `payloadMaxChars` characters (default
+  2000) with a truncation marker — the truncation is
+  unconditional under the opt-in, and the body stays plain
+  text inside `text.body`, not a fenced code block.
+- **Failure handling** — a non-2xx POST throws
+  `WhatsAppSinkError` carrying exactly the failed messages
+  with their retry lanes, so the caller retries just those.
+  429 and every 5xx are retryable; every other non-2xx
+  status (400, 401, 403, 404: unknown number, invalid body,
+  lapsed 24-hour window) is fail-closed, non-retryable,
+  and a codeless transport failure is retryable. A missing
+  client, phone-number id, or recipient throws
+  `WhatsAppSinkConfigError` → `non_retryable`,
+  the WR-116 rule. `dryRun` validates (including text
+  derivation) with zero client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same
