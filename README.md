@@ -7132,6 +7132,81 @@ await sink.send([
   `non_retryable`, the WR-116 rule. `dryRun` validates
   (including summary derivation) with zero client I/O.
 
+`src/zulip-sink.ts` (WR-249) delivers to Zulip: one
+event is posted as one stream message, and Zulip — not
+the relay — owns the stream, the delivery, and the
+retention of the message. No HTTP client is bundled —
+the client is injected through the config, so the module
+has zero new dependencies and tests never need a Zulip
+server.
+
+```ts
+const sink = new ZulipSink({
+  site: "https://zulip.example.com",
+  to: "alerts",
+  subject: "webhook events", // the topic (Zulip's API field name)
+  client, // your client adapter implementing ZulipMessageClient
+  // includePayload: true, // opt-in only: body appended, truncated
+});
+await sink.send([
+  { body: JSON.stringify(event), subject: "order.created", key: "agg-7" },
+]);
+```
+
+- **Configurable site, client-held Basic auth** —
+  one sink targets one stream topic on one Zulip site:
+  Zulip is self-hostable, so the site varies (the Matrix
+  homeserver rule). Every message POSTs to
+  `{site}/api/v1/messages`, and the bot email and API key
+  are held by the client alone — the sink never receives
+  them, so the request it hands the client carries no
+  credential at all; the client adds the
+  `Authorization: Basic` header itself (the Twilio
+  client-held-token rule). A missing client, site,
+  stream, or topic fails closed with
+  `ZulipSinkConfigError` at send time.
+- **Form body, not JSON** — the client POSTs the urlencoded
+  object `type`, `to`, `subject`, `content` verbatim as the
+  request body (an `application/x-www-form-urlencoded`
+  body, not JSON): Zulip's Messages API takes form fields,
+  and values are percent-encoded so a stream or topic name
+  with spaces, or a content with `&`, `=`, or newlines,
+  cannot break the form. Note the two `subject` values:
+  the configured `subject` is the topic, while the record's
+  `subject` field is the first link of the content chain —
+  different values that share a name, kept in different
+  variables.
+- **Human names may contain spaces** — unlike phone
+  numbers, stream and topic names are human names, so
+  config validation requires them only to be non-empty
+  and free of NUL; the site, being a URL, keeps the
+  stricter no-whitespace rule.
+- **Single content field** — the message carries one
+  content field, so the derivation chain folds into one
+  value: the first non-empty among the record's `subject`,
+  `key`, and `traceId`, falling back to the generic summary
+  `webhook event` for sourceless events, which must not be
+  silently dropped.
+- **Payload inclusion** — by default the message carries
+  the summary only, never the full payload: event bodies
+  routinely carry PII, and a team stream is a far wider
+  audience than a queue or a stream. Opting into
+  `includePayload` appends the body verbatim after a blank
+  line, truncated to `payloadMaxChars` characters (default
+  2000) with a truncation marker — the truncation is
+  unconditional under the opt-in, and the body stays plain
+  text inside `content`, not a fenced code block.
+- **Failure handling** — a non-2xx POST throws
+  `ZulipSinkError` carrying exactly the failed messages
+  with their retry lanes, so the caller retries just those.
+  429 and every 5xx are retryable; every other non-2xx
+  status (400, 401, 403, 404: unknown stream, invalid body)
+  is fail-closed, non-retryable, and a codeless transport
+  failure is retryable. A missing client, site, stream, or
+  topic throws `ZulipSinkConfigError` → `non_retryable`,
+  the WR-116 rule. `dryRun` validates (including content
+  derivation) with zero client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same
