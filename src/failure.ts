@@ -87,6 +87,7 @@ import { ZulipSinkConfigError } from "./zulip-sink.ts";
 import { WebexSinkConfigError } from "./webex-sink.ts";
 import { WhatsAppSinkConfigError } from "./whatsapp-sink.ts";
 import { VonageSinkConfigError } from "./vonage-sink.ts";
+import { SendGridSinkConfigError } from "./sendgrid-sink.ts";
 import { EmailSinkConfigError } from "./email-sink.ts";
 import { DigestAuthError } from "./digest-auth.ts";
 import { CredentialSecretUnavailableError } from "./outbound-credentials.ts";
@@ -588,6 +589,17 @@ export function classifyFailure(err: unknown): ClassifiedFailure {
   // There is no per-record recipient fallback: a missing
   // recipient has nowhere to deliver to.
   if (err instanceof VonageSinkConfigError) {
+    return { failureClass: "non_retryable" };
+  }
+  // WR-253: a SendGrid sink with no injected client or no
+  // sender or recipient is a local config problem — the POST
+  // was never built, let alone sent. Retrying can never succeed
+  // for this item, so dead-letter immediately instead of burning
+  // the retry budget and the backoff clock (the WR-116 rule,
+  // applied to the SendGrid sink like the Vonage sink above).
+  // There is no per-record recipient fallback: a missing
+  // recipient has nowhere to deliver to.
+  if (err instanceof SendGridSinkConfigError) {
     return { failureClass: "non_retryable" };
   }
   // WR-233: an email sink with no injected client or no

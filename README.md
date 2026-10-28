@@ -7420,6 +7420,74 @@ await sink.send([
   the WR-116 rule. `dryRun` validates (including text
   derivation) with zero client I/O.
 
+`src/sendgrid-sink.ts` (WR-253) delivers to SendGrid's
+Mail Send HTTP API: one event is sent as one email, and
+SendGrid — not the relay — owns the mailbox, the
+delivery, and the retention of the message. No HTTP
+client is bundled — the client is injected through the
+config, so the module has zero new dependencies and
+tests never need a SendGrid server.
+
+```ts
+const sink = new SendGridSink({
+  from: "alerts@example.com",
+  to: "ops@example.com",
+  client, // your client adapter implementing SendGridMessageClient
+  // includePayload: true, // opt-in only: body appended, truncated
+});
+await sink.send([
+  { body: JSON.stringify(event), subject: "order.created", key: "agg-7" },
+]);
+```
+
+- **HTTP API envelope, client-held Bearer <redacted>** —
+  one sink targets one sender address and one recipient
+  address: every message POSTs to the fixed
+  `https://api.sendgrid.com/v3/mail/send` (SendGrid is not
+  self-hostable, so no site is configurable), with the
+  JSON body `personalizations` (one entry: `to` with the
+  recipient address, `subject`), `from` (the sender
+  address), and `content` (one `text/plain` entry). The
+  API key is held by the client alone — the sink never
+  receives it, so the request it hands the client carries
+  no credential at all; the client adds the
+  `Authorization: Bearer` header itself (the Webex /
+  WhatsApp client-held-token rule, and the opposite of
+  the Vonage body-carried credential). This is the HTTP
+  API counterpart to the generic injected-SMTP email sink
+  (WR-233), not a second SMTP client. A missing client,
+  sender, or recipient fails closed with
+  `SendGridSinkConfigError` at send time.
+- **Subject and value split** — the envelope carries two
+  text fields, so the derivation chain splits: the
+  subject takes the first non-empty among the record's
+  `subject` and `key` (the trace id is too opaque for a
+  subject line), while the content value takes the first
+  non-empty among `subject`, `key`, and `traceId`; both
+  fall back to the generic summary `webhook event` for
+  sourceless events, which must not be silently dropped.
+- **Payload inclusion** — by default the message carries
+  the summary only, never the full payload: event bodies
+  routinely carry PII, and an inbox is a far wider
+  audience than a queue or a stream. Opting into
+  `includePayload` appends the body verbatim after a blank
+  line, truncated to `payloadMaxChars` characters (default
+  2000) with a truncation marker — the truncation is
+  unconditional under the opt-in, and the body stays plain
+  text inside the `text/plain` value, not a fenced code
+  block.
+- **Failure handling** — a non-2xx POST throws
+  `SendGridSinkError` carrying exactly the failed messages
+  with their retry lanes, so the caller retries just those.
+  429 and every 5xx are retryable; every other non-2xx
+  status (400, 401, 403, 404: unknown address, invalid body,
+  bad API key) is fail-closed, non-retryable,
+  and a codeless transport failure is retryable. A missing
+  client, sender, or recipient throws
+  `SendGridSinkConfigError` → `non_retryable`,
+  the WR-116 rule. `dryRun` validates (including text
+  derivation) with zero client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same
