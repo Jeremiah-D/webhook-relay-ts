@@ -7357,6 +7357,69 @@ await sink.send([
   the WR-116 rule. `dryRun` validates (including text
   derivation) with zero client I/O.
 
+`src/vonage-sink.ts` (WR-252) delivers to Vonage by SMS:
+one event is posted as one message to the Vonage SMS API,
+and Vonage — not the relay — owns the number, the
+delivery, and the retention of the message. No HTTP
+client is bundled — the client is injected through the
+config, so the module has zero new dependencies and
+tests never need a Vonage server.
+
+```ts
+const sink = new VonageSink({
+  from: "14155550000",
+  to: "14155551234",
+  client, // your client adapter implementing VonageMessageClient
+  // includePayload: true, // opt-in only: body appended, truncated
+});
+await sink.send([
+  { body: JSON.stringify(event), subject: "order.created", key: "agg-7" },
+]);
+```
+
+- **Second SMS shape: body-carried key/secret, client-held**
+  — one sink targets one sender number and one recipient
+  number: every message POSTs to the fixed
+  `https://rest.nexmo.com/sms/json` (Vonage is not
+  self-hostable, so no site is configurable), and on the
+  wire the form is `api_key`, `api_secret`, `from`, `to`,
+  `text` — the Twilio shape's opposite (Twilio routes by
+  an Account SID in the URL path and authenticates with a
+  Basic header; Vonage authenticates inside the body).
+  The key and secret are held by the client alone — the
+  sink never receives them, so the request it hands the
+  client carries only `from`, `to`, and `text`; the client
+  inserts `api_key` and `api_secret` itself, and nothing
+  in the sink's request can leak into a log line. A
+  missing client, sender, or recipient fails closed with
+  `VonageSinkConfigError` at send time.
+- **Single text field** — the message carries one
+  `text` field, so the derivation chain folds into one
+  value: the first non-empty among the record's
+  `subject`, `key`, and `traceId`, falling back to the
+  generic summary `webhook event` for sourceless events,
+  which must not be silently dropped.
+- **Payload inclusion** — by default the message carries
+  the summary only, never the full payload: event bodies
+  routinely carry PII, and an SMS is a far wider
+  audience than a queue or a stream. Opting into
+  `includePayload` appends the body verbatim after a blank
+  line, truncated to `payloadMaxChars` characters (default
+  2000) with a truncation marker — the truncation is
+  unconditional under the opt-in, and the body stays plain
+  text inside `text`, not a fenced code block.
+- **Failure handling** — a non-2xx POST throws
+  `VonageSinkError` carrying exactly the failed messages
+  with their retry lanes, so the caller retries just those.
+  429 and every 5xx are retryable; every other non-2xx
+  status (400, 401, 403, 404: unknown number, invalid body,
+  bad credentials) is fail-closed, non-retryable,
+  and a codeless transport failure is retryable. A missing
+  client, sender, or recipient throws
+  `VonageSinkConfigError` → `non_retryable`,
+  the WR-116 rule. `dryRun` validates (including text
+  derivation) with zero client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same
