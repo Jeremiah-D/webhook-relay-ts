@@ -7071,6 +7071,67 @@ await sink.send([
   the WR-116 rule. `dryRun` validates (including text
   derivation) with zero client I/O.
 
+`src/pagerduty-sink.ts` (WR-248) delivers to PagerDuty: one
+event is posted as one Events API v2 event, and PagerDuty —
+not the relay — owns the incident, the escalation, and the
+acknowledgement. No HTTP client is bundled — the client is
+injected through the config, so the module has zero new
+dependencies and tests never need a PagerDuty server.
+
+```ts
+const sink = new PagerDutySink({
+  routingKey: "<service-integration-key>",
+  client, // your client adapter implementing PagerDutyEventClient
+  // severity: "critical", // default "error"; set explicitly to page
+  // includePayload: true, // opt-in only: body under custom_details.body, truncated
+});
+await sink.send([
+  { body: JSON.stringify(event), subject: "order.created", key: "agg-7" },
+]);
+```
+
+- **Fixed endpoint, routing key in the envelope** —
+  one sink targets one PagerDuty service integration: every
+  event POSTs to the fixed endpoint
+  `https://events.pagerduty.com/v2/enqueue` with
+  `event_action: "trigger"`. The Events API v2 envelope
+  authenticates by `routing_key` in the body itself, so
+  unlike the Twilio sink there is no client-held-token
+  alternative — the key is held by the sink config and
+  emitted with every event (the Slack webhook URL
+  precedent), and the config must be treated as sensitive.
+  A missing client or routing key fails closed with
+  `PagerDutySinkConfigError` at send time.
+- **Dedup key is the event key** — PagerDuty deduplicates
+  natively on `dedup_key`, so a redelivered event with the
+  same key updates the open incident instead of opening a
+  second one. A keyless event carries no `dedup_key`;
+  PagerDuty generates one, and no key is invented.
+- **Summary and severity** — the payload summary is the
+  first non-empty among `subject`, `key`, and `traceId`,
+  falling back to the generic summary `webhook event` for
+  sourceless events, which must not be silently dropped.
+  Severity is a property of the sink, not of any one event:
+  it defaults to `error` — an incident without paging the
+  rotation as `critical` for every relayed event — and is
+  configurable to `critical`, `warning`, or `info`.
+- **Payload inclusion** — by default the incident carries
+  the summary plus identifiers only (`custom_details` holds
+  `key`/`traceId` when set, never the body). Opting into
+  `includePayload` adds the body verbatim under
+  `custom_details.body`, truncated to `payloadMaxChars`
+  characters (default 2000) with a truncation marker.
+- **Failure handling** — a non-2xx POST throws
+  `PagerDutySinkError` carrying exactly the failed events
+  with their retry lanes, so the caller retries just those.
+  429 and every 5xx are retryable; every other non-2xx
+  status (400, 401, 403, 404: unknown routing key, invalid
+  envelope) is fail-closed, non-retryable, and a codeless
+  transport failure is retryable. A missing client or
+  routing key throws `PagerDutySinkConfigError` →
+  `non_retryable`, the WR-116 rule. `dryRun` validates
+  (including summary derivation) with zero client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same
