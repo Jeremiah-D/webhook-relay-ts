@@ -7207,6 +7207,72 @@ await sink.send([
   the WR-116 rule. `dryRun` validates (including content
   derivation) with zero client I/O.
 
+`src/webex-sink.ts` (WR-250) delivers to Webex: one
+event is posted as one room message, and Webex — not
+the relay — owns the room, the delivery, and the
+retention of the message. No HTTP client is bundled —
+the client is injected through the config, so the module
+has zero new dependencies and tests never need a Webex
+server.
+
+```ts
+const sink = new WebexSink({
+  roomId: "Y2lzY29zcGFyL2Nfc2Vzc2lvbjpjY2NjY2NjYy00MDAw",
+  client, // your client adapter implementing WebexMessageClient
+  // includePayload: true, // opt-in only: body appended, truncated
+});
+await sink.send([
+  { body: JSON.stringify(event), subject: "order.created", key: "agg-7" },
+]);
+```
+
+- **Fixed endpoint, client-held Bearer token** —
+  one sink targets one Webex room: every message POSTs
+  to the fixed `https://webexapis.com/v1/messages`
+  (Webex is not self-hostable, so no site is
+  configured), and the bot token is held by the client
+  alone — the sink never receives it, so the request it
+  hands the client carries no credential at all; the
+  client adds the `Authorization: Bearer` header itself
+  (the Twilio client-held-token rule). A missing client
+  or room fails closed with `WebexSinkConfigError` at
+  send time.
+- **JSON body, not form** — the client POSTs the JSON
+  object `roomId`, `text` verbatim as the request body:
+  Webex's Messages API takes JSON, and the serialized
+  body is built with `JSON.stringify`, so a text with
+  quotes or newlines cannot break the wire shape.
+- **Room ids are identifiers** — unlike Zulip stream
+  and topic names, a Webex room id is an opaque
+  identifier, so config validation requires it to be
+  non-empty and free of NUL and whitespace (the Twilio
+  phone-number rule).
+- **Single text field** — the message carries one
+  text field, so the derivation chain folds into one
+  value: the first non-empty among the record's
+  `subject`, `key`, and `traceId`, falling back to the
+  generic summary `webhook event` for sourceless events,
+  which must not be silently dropped.
+- **Payload inclusion** — by default the message carries
+  the summary only, never the full payload: event bodies
+  routinely carry PII, and a team room is a far wider
+  audience than a queue or a stream. Opting into
+  `includePayload` appends the body verbatim after a blank
+  line, truncated to `payloadMaxChars` characters (default
+  2000) with a truncation marker — the truncation is
+  unconditional under the opt-in, and the body stays plain
+  text inside `text`, not a fenced code block.
+- **Failure handling** — a non-2xx POST throws
+  `WebexSinkError` carrying exactly the failed messages
+  with their retry lanes, so the caller retries just those.
+  429 and every 5xx are retryable; every other non-2xx
+  status (400, 401, 403, 404: unknown room, invalid body)
+  is fail-closed, non-retryable, and a codeless transport
+  failure is retryable. A missing client or room throws
+  `WebexSinkConfigError` → `non_retryable`,
+  the WR-116 rule. `dryRun` validates (including text
+  derivation) with zero client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same

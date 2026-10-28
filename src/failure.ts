@@ -84,6 +84,7 @@ import { MatrixSinkConfigError } from "./matrix-sink.ts";
 import { TwilioSinkConfigError } from "./twilio-sink.ts";
 import { PagerDutySinkConfigError } from "./pagerduty-sink.ts";
 import { ZulipSinkConfigError } from "./zulip-sink.ts";
+import { WebexSinkConfigError } from "./webex-sink.ts";
 import { EmailSinkConfigError } from "./email-sink.ts";
 import { DigestAuthError } from "./digest-auth.ts";
 import { CredentialSecretUnavailableError } from "./outbound-credentials.ts";
@@ -551,6 +552,17 @@ export function classifyFailure(err: unknown): ClassifiedFailure {
   // There is no per-record target fallback: a missing stream
   // has nowhere to deliver to.
   if (err instanceof ZulipSinkConfigError) {
+    return { failureClass: "non_retryable" };
+  }
+  // WR-250: a Webex sink with no injected client or no
+  // room is a local config problem — the POST was never
+  // built, let alone sent. Retrying can never succeed
+  // for this item, so dead-letter immediately instead of
+  // burning the retry budget and the backoff clock (the
+  // WR-116 rule, applied to the Webex sink like the Zulip
+  // sink above). There is no per-record room fallback: a
+  // missing room has nowhere to deliver to.
+  if (err instanceof WebexSinkConfigError) {
     return { failureClass: "non_retryable" };
   }
   // WR-233: an email sink with no injected client or no
