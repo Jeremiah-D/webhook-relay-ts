@@ -7003,6 +7003,74 @@ await sink.send([
   WR-116 rule. `dryRun` validates (including text derivation)
   with zero client I/O.
 
+`src/twilio-sink.ts` (WR-247) delivers to Twilio by SMS: one
+event is posted as one message to the Twilio Messages API,
+and Twilio — not the relay — owns the number, the delivery, and
+the retention of the message. No HTTP
+client is bundled — the client is injected through the
+config, so the module has zero new dependencies and tests
+never need a Twilio server.
+
+```ts
+const sink = new TwilioSink({
+  accountSid: "<account-sid>",
+  from: "+15550001111",
+  to: "+15550002222",
+  client, // your client adapter implementing TwilioMessageClient
+  // includePayload: true, // opt-in only: text appended, truncated
+});
+await sink.send([
+  { body: JSON.stringify(event), subject: "order.created", key: "agg-7" },
+]);
+```
+
+- **Fixed host, SID in the path, token held by the client** —
+  one sink targets one Twilio account, one sender number, and
+  one recipient number: every message POSTs to the fixed
+  endpoint
+  `https://api.twilio.com/2010-04-01/Accounts/{AccountSid}/Messages.json`.
+  The Account SID rides in the URL path only, never in the
+  body, and the auth token is held by the client alone — the
+  sink never receives it, so the request it hands the client
+  carries no credential at all; the client adds the
+  `Authorization: Basic` header itself. The host is not
+  configurable: Twilio is a single hosted service, so a
+  configurable URL could only misroute a message to a server
+  that is not Twilio. A missing client, account SID, sender,
+  or recipient fails closed with `TwilioSinkConfigError` at
+  send time.
+- **Form body, not JSON** — the client POSTs the urlencoded
+  object `To`, `From`, `Body` verbatim as the request body
+  (an `application/x-www-form-urlencoded` body, not JSON):
+  Twilio's Messages API takes form fields, and values are
+  percent-encoded so a text with `&`, `=`, or newlines cannot
+  break the form.
+- **Single text field** — the message carries one text field,
+  so the derivation chain folds into one value: the first
+  non-empty among `subject`, `key`, and `traceId`, falling
+  back to the generic summary `webhook event` for sourceless
+  events, which must not be silently dropped.
+- **Payload inclusion** — by default the message carries the
+  summary only, never the full payload: event bodies routinely
+  carry PII, and an SMS is a far wider audience
+  than a queue or a stream. Opting into `includePayload`
+  appends the body verbatim after a blank line, truncated to
+  `payloadMaxChars` characters (default 2000) with a truncation
+  marker — the truncation is unconditional under the opt-in,
+  and the body stays plain text inside the `Body` field,
+  not a fenced code block, so no fence noise lands on a phone
+  screen.
+- **Failure handling** — a non-2xx POST throws
+  `TwilioSinkError` carrying exactly the failed messages with
+  their retry lanes, so the caller retries just those. 429 and
+  every 5xx are retryable; every other non-2xx status (400,
+  401, 403, 404: unknown account SID or number, invalid body) is
+  fail-closed, non-retryable, and a codeless transport failure
+  is retryable. A missing client, account SID, sender, or
+  recipient throws `TwilioSinkConfigError` → `non_retryable`,
+  the WR-116 rule. `dryRun` validates (including text
+  derivation) with zero client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same
