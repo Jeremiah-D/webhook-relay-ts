@@ -8351,6 +8351,76 @@ await sink.send([
   the WR-116 rule. `dryRun` validates (including text
   derivation) with zero client I/O.
 
+`src/infobip-sink.ts` (WR-267) delivers to
+Infobip's SMS API: one event is
+sent as one SMS, and Infobip — not the relay —
+owns the carrier routing, the delivery, and the
+retention of the message. No HTTP client is bundled —
+the client is injected through the config, so the module
+has zero new dependencies and tests never need an
+Infobip server.
+
+```ts
+const sink = new InfobipSink({
+  from: "+14155550100",
+  to: "+14155550101",
+  baseUrl: "https://xxx.api.infobip.com",
+  client, // your client adapter implementing InfobipMessageClient
+  // includePayload: true, // opt-in only: text appended, truncated
+});
+await sink.send([
+  { body: JSON.stringify(event), subject: "order.created", key: "agg-7" },
+]);
+```
+
+- **HTTP API envelope, client-held App auth, account
+  base URL** — one sink targets one sender number and
+  one recipient number: every message POSTs to
+  `{baseUrl}/sms/2/text/advanced` (Infobip accounts live
+  on per-account subdomains such as
+  `xxx.api.infobip.com`, so the base URL comes from the
+  sink config — unlike the Telnyx sink's single fixed
+  endpoint — and the sink uses it as given, never
+  prepending a protocol prefix), with the JSON body
+  `messages: [{ from, destinations: [{ to }], text }]`
+  (the recipient rides in a single-element `destinations`
+  array — Infobip's fixed shape, unlike the Telnyx sink's
+  bare `to` string). The API key is held by the client
+  alone and sent by the client as the
+  `Authorization: App` header — the sink never receives
+  the key, so the request it hands the client carries no
+  credential at all (the Telnyx client-held-token rule,
+  and the opposite of the Vonage body-carried
+  credential). A missing client, sender, recipient, or
+  base URL fails closed with
+  `InfobipSinkConfigError` at send time.
+- **Single text field** — an SMS carries one text field,
+  so there is no subject/value split like the email
+  sinks: the text takes the first non-empty among the
+  record's `subject`, `key`, and `traceId`, falling back
+  to the generic summary `webhook event` for sourceless
+  events, which must not be silently dropped.
+- **Payload inclusion** — by default the message carries
+  the summary only, never the full payload: event bodies
+  routinely carry PII, and a phone is a far wider
+  audience than a queue or a stream. Opting into
+  `includePayload` appends the body verbatim after a blank
+  line, truncated to `payloadMaxChars` characters (default
+  2000) with a truncation marker — the truncation is
+  unconditional under the opt-in, and the body stays plain
+  text inside the `text` field, not a fenced code block.
+- **Failure handling** — a non-2xx POST throws
+  `InfobipSinkError` carrying exactly the failed messages
+  with their retry lanes, so the caller retries just those.
+  429 and every 5xx are retryable; every other non-2xx
+  status (400, 401, 403, 404: unknown number, invalid body,
+  bad API key) is fail-closed, non-retryable,
+  and a codeless transport failure is retryable. A missing
+  client, sender, recipient, or base URL throws
+  `InfobipSinkConfigError` → `non_retryable`,
+  the WR-116 rule. `dryRun` validates (including text
+  derivation) with zero client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same
