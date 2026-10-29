@@ -93,6 +93,7 @@ import { PlivoSinkConfigError } from "./plivo-sink.ts";
 import { MailgunSinkConfigError } from "./mailgun-sink.ts";
 import { MessageBirdSinkConfigError } from "./messagebird-sink.ts";
 import { SinchSinkConfigError } from "./sinch-sink.ts";
+import { BandwidthSinkConfigError } from "./bandwidth-sink.ts";
 import { PostmarkSinkConfigError } from "./postmark-sink.ts";
 import { SparkPostSinkConfigError } from "./sparkpost-sink.ts";
 import { MailjetSinkConfigError } from "./mailjet-sink.ts";
@@ -667,6 +668,18 @@ export function classifyFailure(err: unknown): ClassifiedFailure {
   // no per-record recipient fallback: a missing recipient
   // has nowhere to deliver to.
   if (err instanceof SinchSinkConfigError) {
+    return { failureClass: "non_retryable" };
+  }
+  // WR-263: a Bandwidth sink with no injected client or no
+  // account id, application id, sender, or recipient is a
+  // local config problem — the POST was never built, let
+  // alone sent. Retrying can never succeed for this item,
+  // so dead-letter immediately instead of burning the
+  // retry budget and the backoff clock (the WR-116 rule,
+  // applied to the Bandwidth sink like the Sinch sink
+  // above). There is no per-record recipient fallback: a
+  // missing recipient has nowhere to deliver to.
+  if (err instanceof BandwidthSinkConfigError) {
     return { failureClass: "non_retryable" };
   }
   // WR-258: a Postmark sink with no injected client or no
