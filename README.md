@@ -7747,6 +7747,73 @@ await sink.send([
   the WR-116 rule. `dryRun` validates (including body
   derivation) with zero client I/O.
 
+`src/sinch-sink.ts` (WR-260) delivers to
+Sinch's SMS batch API: one event is
+sent as one SMS, and Sinch — not the relay —
+owns the carrier routing, the delivery, and the
+retention of the message. No HTTP client is bundled —
+the client is injected through the config, so the module
+has zero new dependencies and tests never need a
+Sinch server.
+
+```ts
+const sink = new SinchSink({
+  from: "RelayAlert",
+  recipient: "+14155550101",
+  servicePlanId: "01W4FFTRDVT4V8V2X7Y9Z0ABC",
+  // region: "eu", // optional, defaults to "us"
+  client, // your client adapter implementing SinchMessageClient
+  // includePayload: true, // opt-in only: body appended, truncated
+});
+await sink.send([
+  { body: JSON.stringify(event), subject: "order.created", key: "agg-7" },
+]);
+```
+
+- **HTTP API envelope, client-held Bearer auth** —
+  one sink targets one sender and one recipient
+  number under one service plan: every message POSTs
+  to `https://<region>.sms.api.sinch.com/xms/v1/<servicePlanId>/batches`
+  (region defaults to `us`; the service plan id is
+  percent-encoded into the URL path only, never into
+  the request body), with the JSON body `from`, `to`
+  (a single-element array with the configured
+  recipient), and `body`. The API token is held by the
+  client alone — the sink never receives it, so the
+  request it hands the client carries no credential at
+  all; the client adds the `Authorization: Bearer`
+  header itself from the token it alone holds (the
+  MessageBird client-held-token rule, and the opposite
+  of the Vonage body-carried credential). A missing
+  client, sender, recipient, or service plan id fails
+  closed with `SinchSinkConfigError` at send time.
+- **Single body field** — an SMS carries one body field,
+  so there is no subject/value split like the email
+  sinks: the body takes the first non-empty among the
+  record's `subject`, `key`, and `traceId`, falling back
+  to the generic summary `webhook event` for sourceless
+  events, which must not be silently dropped.
+- **Payload inclusion** — by default the message carries
+  the summary only, never the full payload: event bodies
+  routinely carry PII, and a phone is a far wider
+  audience than a queue or a stream. Opting into
+  `includePayload` appends the body verbatim after a blank
+  line, truncated to `payloadMaxChars` characters (default
+  2000) with a truncation marker — the truncation is
+  unconditional under the opt-in, and the body stays plain
+  text inside the `body` field, not a fenced code block.
+- **Failure handling** — a non-2xx POST throws
+  `SinchSinkError` carrying exactly the failed
+  messages with their retry lanes, so the caller retries
+  just those. 429 and every 5xx are retryable; every other
+  non-2xx status (400, 401, 403, 404: unknown number,
+  invalid body, bad credentials) is fail-closed,
+  non-retryable, and a codeless transport failure is
+  retryable. A missing client, sender, recipient, or
+  service plan id throws `SinchSinkConfigError` →
+  `non_retryable`, the WR-116 rule. `dryRun` validates
+  (including body derivation) with zero client I/O.
+
 `src/postmark-sink.ts` (WR-258) delivers to Postmark's
 Email HTTP API: one event is sent as one email, and
 Postmark — not the relay — owns the mailbox, the
