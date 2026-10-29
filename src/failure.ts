@@ -96,6 +96,7 @@ import { SinchSinkConfigError } from "./sinch-sink.ts";
 import { PostmarkSinkConfigError } from "./postmark-sink.ts";
 import { SparkPostSinkConfigError } from "./sparkpost-sink.ts";
 import { MailjetSinkConfigError } from "./mailjet-sink.ts";
+import { BrevoSinkConfigError } from "./brevo-sink.ts";
 import { EmailSinkConfigError } from "./email-sink.ts";
 import { DigestAuthError } from "./digest-auth.ts";
 import { CredentialSecretUnavailableError } from "./outbound-credentials.ts";
@@ -699,6 +700,17 @@ export function classifyFailure(err: unknown): ClassifiedFailure {
   // There is no per-record recipient fallback: a missing recipient
   // has nowhere to deliver to.
   if (err instanceof MailjetSinkConfigError) {
+    return { failureClass: "non_retryable" };
+  }
+  // WR-262: a Brevo sink with no injected client or no
+  // sender or recipient is a local config problem — the POST
+  // was never built, let alone sent. Retrying can never succeed
+  // for this item, so dead-letter immediately instead of burning
+  // the retry budget and the backoff clock (the WR-116 rule,
+  // applied to the Brevo sink like the Mailjet sink above).
+  // There is no per-record recipient fallback: a missing recipient
+  // has nowhere to deliver to.
+  if (err instanceof BrevoSinkConfigError) {
     return { failureClass: "non_retryable" };
   }
   // WR-233: an email sink with no injected client or no

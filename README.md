@@ -8015,6 +8015,73 @@ await sink.send([
   the WR-116 rule. `dryRun` validates (including text
   derivation) with zero client I/O.
 
+`src/brevo-sink.ts` (WR-262) delivers to Brevo's
+SMTP email HTTP API: one event is sent as one email,
+and Brevo — not the relay — owns the mailbox, the
+delivery, and the retention of the message. No HTTP
+client is bundled — the client is injected through the
+config, so the module has zero new dependencies and
+tests never need a Brevo server.
+
+```ts
+const sink = new BrevoSink({
+  from: "alerts@example.com",
+  to: "ops@example.com",
+  client, // your client adapter implementing BrevoMessageClient
+  // includePayload: true, // opt-in only: body appended, truncated
+});
+await sink.send([
+  { body: JSON.stringify(event), subject: "order.created", key: "agg-7" },
+]);
+```
+
+- **HTTP API envelope, client-held api-key auth** —
+  one sink targets one sender address and one recipient
+  address: every message POSTs to the fixed
+  `https://api.brevo.com/v3/smtp/email` (Brevo is not
+  self-hostable, so no site is configurable), with the
+  JSON body `sender: { email }`, `to: [{ email }]`,
+  `subject`, and `textContent`. The API key is held by
+  the client alone — the sink never receives it, so the
+  request it hands the client carries no credential at
+  all; the client adds the `api-key` header itself. This
+  is the Brevo counterpart to the Mailjet sink (WR-261),
+  not a second copy of it: Mailjet uses Basic auth with
+  a `Messages` array envelope, while Brevo uses an
+  `api-key` header with a flat `sender`/`to` envelope.
+  It is likewise distinct from WR-253/WR-254/WR-258/
+  WR-259, which use Bearer, Bearer, server-token, and
+  bare-key auth with different envelopes. A missing
+  client, sender, or recipient fails closed with
+  `BrevoSinkConfigError` at send time.
+- **Subject and text split** — like the email sinks, the
+  subject takes the first non-empty among the record's
+  `subject` and `key`, while the text takes the first
+  non-empty among `subject`, `key`, and `traceId`,
+  falling back to the generic summary `webhook event`
+  for sourceless events, which must not be silently
+  dropped.
+- **Payload inclusion** — by default the message carries
+  the summary only, never the full payload: event bodies
+  routinely carry PII, and an inbox is a far wider
+  audience than a queue or a stream. Opting into
+  `includePayload` appends the body verbatim after a blank
+  line, truncated to `payloadMaxChars` characters (default
+  2000) with a truncation marker — the truncation is
+  unconditional under the opt-in, and the body stays plain
+  text inside the `textContent` field, not a fenced code block.
+- **Failure handling** — a non-2xx POST throws
+  `BrevoSinkError` carrying exactly the failed messages
+  with their retry lanes, so the caller retries just those.
+  429 and every 5xx are retryable; every other non-2xx
+  status (400, 401, 403, 404: unknown address, invalid body,
+  bad API key) is fail-closed, non-retryable,
+  and a codeless transport failure is retryable. A missing
+  client, sender, or recipient throws
+  `BrevoSinkConfigError` → `non_retryable`,
+  the WR-116 rule. `dryRun` validates (including text
+  derivation) with zero client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same
