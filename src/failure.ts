@@ -90,6 +90,7 @@ import { VonageSinkConfigError } from "./vonage-sink.ts";
 import { SendGridSinkConfigError } from "./sendgrid-sink.ts";
 import { ResendSinkConfigError } from "./resend-sink.ts";
 import { PlivoSinkConfigError } from "./plivo-sink.ts";
+import { MailgunSinkConfigError } from "./mailgun-sink.ts";
 import { EmailSinkConfigError } from "./email-sink.ts";
 import { DigestAuthError } from "./digest-auth.ts";
 import { CredentialSecretUnavailableError } from "./outbound-credentials.ts";
@@ -624,6 +625,18 @@ export function classifyFailure(err: unknown): ClassifiedFailure {
   // Resend sink above). There is no per-record recipient
   // fallback: a missing recipient has nowhere to deliver to.
   if (err instanceof PlivoSinkConfigError) {
+    return { failureClass: "non_retryable" };
+  }
+  // WR-256: a Mailgun sink with no injected client or no
+  // domain, sender, or recipient is a local config problem
+  // — the POST was never built, let alone sent. Retrying
+  // can never succeed for this item, so dead-letter
+  // immediately instead of burning the retry budget and
+  // the backoff clock (the WR-116 rule, applied to the
+  // Mailgun sink like the Plivo sink above). There is no
+  // per-record recipient fallback: a missing recipient has
+  // nowhere to deliver to.
+  if (err instanceof MailgunSinkConfigError) {
     return { failureClass: "non_retryable" };
   }
   // WR-233: an email sink with no injected client or no
