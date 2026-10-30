@@ -8767,6 +8767,74 @@ await sink.send([
   the WR-116 rule. `dryRun` validates (including text
   derivation) with zero client I/O.
 
+`src/mailtrap-sink.ts` (WR-273) delivers to
+Mailtrap's send API: one event is
+sent as one POST, and Mailtrap — not the relay —
+owns the mailbox, the delivery, and the
+retention of the message. No HTTP client is bundled —
+the client is injected through the config, so the module
+has zero new dependencies and tests never need a
+Mailtrap server.
+
+```ts
+const sink = new MailtrapSink({
+  from: "alerts@example.com",
+  to: "ops@example.com",
+  client, // your client adapter implementing MailtrapMessageClient
+  // includePayload: true, // opt-in only: text appended, truncated
+});
+await sink.send([
+  { body: JSON.stringify(event), subject: "order.created", key: "agg-7" },
+]);
+```
+
+- **HTTP API envelope, client-held Bearer header auth** —
+  one sink targets one sender address and one recipient
+  address: every message POSTs to the fixed
+  `https://send.api.mailtrap.io/api/send` (Mailtrap
+  is not self-hostable, so no URL is configurable),
+  with the JSON body `{ from: { email }, to: [{ email }],
+  subject, text }` (plain text only — no `html` field is
+  configured). The API key is held by the client alone
+  and sent by the client as the `Authorization: Bearer`
+  header — Mailtrap's header-auth shape, not a
+  body-carried key — so the request the sink hands the
+  client carries no credential at all (the opposite of
+  the SMTP2GO sink's client-inserted `api_key` body
+  field, and distinct from the MailerSend v1 endpoint
+  even though both vendors' envelopes share the `from`
+  object / `to` object-array shape). A missing client,
+  sender, or recipient fails closed with
+  `MailtrapSinkConfigError` at send time.
+- **Subject / text split** — the subject takes the first
+  non-empty among the record's `subject` and `key`
+  (the trace id is too opaque for a subject line); the
+  text takes the first non-empty among `subject`, `key`,
+  and `traceId`, falling back to the generic summary
+  `webhook event` for sourceless events, which must not
+  be silently dropped.
+- **Payload inclusion** — by default the message carries
+  the summary only, never the full payload: event bodies
+  routinely carry PII, and an inbox is a far wider
+  audience than a queue or a stream. Opting into
+  `includePayload` appends the body verbatim after a blank
+  line, truncated to `payloadMaxChars` characters (default
+  2000) with a truncation marker — the truncation is
+  unconditional under the opt-in, and the payload stays
+  plain text inside the `text` field, not a fenced code
+  block.
+- **Failure handling** — a non-2xx POST throws
+  `MailtrapSinkError` carrying exactly the failed messages
+  with their retry lanes, so the caller retries just those.
+  429 and every 5xx are retryable; every other non-2xx
+  status (400, 401, 403, 404: unknown address, invalid body,
+  bad API key) is fail-closed, non-retryable,
+  and a codeless transport failure is retryable. A missing
+  client, sender, or recipient throws
+  `MailtrapSinkConfigError` → `non_retryable`,
+  the WR-116 rule. `dryRun` validates (including text
+  derivation) with zero client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same
