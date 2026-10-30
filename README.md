@@ -8628,6 +8628,77 @@ await sink.send([
   the WR-116 rule. `dryRun` validates (including text
   derivation) with zero client I/O.
 
+
+`src/smtp2go-sink.ts` (WR-271) delivers to
+SMTP2GO's email API: one event is
+sent as one email, and SMTP2GO — not the relay —
+owns the mailbox, the delivery, and the
+retention of the message. No HTTP client is bundled —
+the client is injected through the config, so the module
+has zero new dependencies and tests never need an
+SMTP2GO server.
+
+```ts
+const sink = new Smtp2goSink({
+  from: "alerts@example.com",
+  to: "ops@example.com",
+  client, // your client adapter implementing Smtp2goMessageClient
+  // includePayload: true, // opt-in only: text_body appended, truncated
+});
+await sink.send([
+  { body: JSON.stringify(event), subject: "order.created", key: "agg-7" },
+]);
+```
+
+- **HTTP API envelope, client-inserted api_key body field** —
+  one sink targets one sender address and one recipient
+  address: every message POSTs to the fixed
+  `https://api.smtp2go.com/v3/email/send` (SMTP2GO is
+  not self-hostable, so no URL is configurable), with the
+  flat JSON envelope `to: [email]`, `sender`,
+  `subject`, `text_body` (plain text only — SMTP2GO's
+  `html_body` field is out of scope). The API key
+  is held by the client alone and inserted by the client
+  as the `api_key` field at wire time (the first field of
+  the wire body: `{api_key, to, sender, subject,
+  text_body}`) — the sink never receives the key, so the
+  handed request carries no credential at all (the
+  key-in-body-at-wire-time rule, the sibling of the
+  Mandrill `key` field in its nested `message` envelope,
+  and the opposite of the ZeptoMail dedicated
+  `Zoho-enczapikey` header and the MailerSend Bearer
+  header with its flat `from: { email }` /
+  `to: [{ email }]` envelope). A missing client, sender,
+  or recipient fails closed with
+  `Smtp2goSinkConfigError` at send time.
+- **Subject and text_body split** — like the email sinks, the
+  subject takes the first non-empty among the record's
+  `subject` and `key`, while the text_body takes the first
+  non-empty among `subject`, `key`, and `traceId`,
+  falling back to the generic summary `webhook event`
+  for sourceless events, which must not be silently
+  dropped.
+- **Payload inclusion** — by default the message carries
+  the summary only, never the full payload: event bodies
+  routinely carry PII, and an inbox is a far wider
+  audience than a queue or a stream. Opting into
+  `includePayload` appends the body verbatim after a blank
+  line, truncated to `payloadMaxChars` characters (default
+  2000) with a truncation marker — the truncation is
+  unconditional under the opt-in, and the body stays plain
+  text inside the `text_body` field, not a fenced code block.
+- **Failure handling** — a non-2xx POST throws
+  `Smtp2goSinkError` carrying exactly the failed messages
+  with their retry lanes, so the caller retries just those.
+  429 and every 5xx are retryable; every other non-2xx
+  status (400, 401, 403, 404: unknown address, invalid body,
+  bad API key) is fail-closed, non-retryable,
+  and a codeless transport failure is retryable. A missing
+  client, sender, or recipient throws
+  `Smtp2goSinkConfigError` → `non_retryable`,
+  the WR-116 rule. `dryRun` validates (including text
+  derivation) with zero client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same
