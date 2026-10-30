@@ -9193,6 +9193,78 @@ await sink.send([
   the WR-116 rule. `dryRun` validates (including subject/
   body derivation) with zero client I/O.
 
+`src/courier-sink.ts` (WR-279) delivers to
+Courier's `/send` API: one event notification is
+sent as one POST, and Courier — not the relay — owns
+the channels, the routing, and the delivery of the
+message. No HTTP client is bundled — the client is
+injected through the config, so the module has zero
+new dependencies and tests never need a Courier server.
+
+```ts
+const sink = new CourierSink({
+  to: "alerts@example.com", // the one configured recipient email
+  client, // your client adapter implementing CourierMessageClient
+  // includePayload: true, // opt-in only: body appended, truncated
+});
+await sink.send([
+  { body: JSON.stringify(event), subject: "order.created", key: "agg-7" },
+]);
+```
+
+- **Message envelope, client-held Bearer auth** —
+  one sink targets one recipient email: every message POSTs
+  to the fixed `https://api.courier.com/send`, with the JSON
+  body `{"message":{"to":{"email":"<email>"},"content":{"title":"<title>","body":"<body>"}}}`
+  (inline `content` — no template dependency). The API key
+  is held by the client alone and sent by the client as the
+  `Authorization: Bearer` header — Courier's header-auth
+  shape — so the request the sink hands the client carries
+  no credential at all (orthogonal to the Braze sink,
+  WR-278: Braze posts an `external_user_ids` array plus a
+  `messages.email` envelope addressed to users it already
+  knows, while Courier posts a single-recipient
+  `message/to/content` envelope; and to the Mailtrap sink,
+  WR-273: Mailtrap posts a `from` object / `to`
+  object-array envelope, while Courier posts a
+  multi-channel notification API envelope). Courier's EU
+  data center uses its own host (`api.eu.courier.com`),
+  which the operator's client adapter points at — out of
+  scope for this sink. A missing client or recipient fails
+  closed with `CourierSinkConfigError` at send time. The
+  response's `requestId` is only an acceptance receipt, not
+  a delivery result: a 2xx means Courier accepted the
+  message for routing, and delivery confirmation lives in
+  Courier's logs, so the sink's retry mapping reads the
+  HTTP status only.
+- **Title and body split** — the title takes the first
+  non-empty among the record's `subject` and `key`, while
+  the body takes the first non-empty among `subject`, `key`,
+  and `traceId` (the trace id is too opaque for a title),
+  falling back to the generic summary `webhook event` in
+  both fields for sourceless events, which must not be
+  silently dropped.
+- **Payload inclusion** — by default the message carries
+  the summary only, never the full payload: event bodies
+  routinely carry PII, and an inbox is a far wider
+  audience than a queue or a stream. Opting into
+  `includePayload` appends the body verbatim after a blank
+  line, truncated to `payloadMaxChars` characters (default
+  2000) with a truncation marker — the truncation is
+  unconditional under the opt-in, and the payload stays
+  plain text inside the `body` field, not a fenced code
+  block.
+- **Failure handling** — a non-2xx POST throws
+  `CourierSinkError` carrying exactly the failed messages
+  with their retry lanes, so the caller retries just those.
+  429 and every 5xx are retryable; every other non-2xx
+  status (400, 401, 403, 404: unknown recipient, invalid
+  body, bad API key) is fail-closed, non-retryable, and a
+  codeless transport failure is retryable. A missing client
+  or recipient throws `CourierSinkConfigError` →
+  `non_retryable`, the WR-116 rule. `dryRun` validates
+  (including title/body derivation) with zero client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same
