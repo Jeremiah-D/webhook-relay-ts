@@ -111,6 +111,7 @@ import { MailtrapSinkConfigError } from "./mailtrap-sink.ts";
 import { ClickatellSinkConfigError } from "./clickatell-sink.ts";
 import { OneSignalSinkConfigError } from "./onesignal-sink.ts";
 import { FcmSinkConfigError } from "./fcm-sink.ts";
+import { ElksSinkConfigError } from "./46elks-sink.ts";
 import { EmailSinkConfigError } from "./email-sink.ts";
 import { DigestAuthError } from "./digest-auth.ts";
 import { CredentialSecretUnavailableError } from "./outbound-credentials.ts";
@@ -890,6 +891,18 @@ export function classifyFailure(err: unknown): ClassifiedFailure {
   // There is no per-record target fallback: a missing
   // project id or device token has nowhere to deliver to.
   if (err instanceof FcmSinkConfigError) {
+    return { failureClass: "non_retryable" };
+  }
+  // WR-277: a 46elks sink with no injected client or no
+  // sender or recipient is a local config problem — the POST
+  // was never built, let alone sent. Retrying can never
+  // succeed for this item, so dead-letter immediately
+  // instead of burning the retry budget and the backoff
+  // clock (the WR-116 rule, applied to the 46elks sink
+  // like the FCM sink above).
+  // There is no per-record target fallback: a missing
+  // sender or recipient has nowhere to deliver to.
+  if (err instanceof ElksSinkConfigError) {
     return { failureClass: "non_retryable" };
   }
   // WR-233: an email sink with no injected client or no
