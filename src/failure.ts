@@ -108,6 +108,7 @@ import { ZeptoMailSinkConfigError } from "./zeptomail-sink.ts";
 import { Smtp2goSinkConfigError } from "./smtp2go-sink.ts";
 import { TextMagicSinkConfigError } from "./textmagic-sink.ts";
 import { MailtrapSinkConfigError } from "./mailtrap-sink.ts";
+import { ClickatellSinkConfigError } from "./clickatell-sink.ts";
 import { EmailSinkConfigError } from "./email-sink.ts";
 import { DigestAuthError } from "./digest-auth.ts";
 import { CredentialSecretUnavailableError } from "./outbound-credentials.ts";
@@ -851,6 +852,18 @@ export function classifyFailure(err: unknown): ClassifiedFailure {
   // There is no per-record recipient fallback: a missing
   // recipient has nowhere to deliver to.
   if (err instanceof MailtrapSinkConfigError) {
+    return { failureClass: "non_retryable" };
+  }
+  // WR-274: a Clickatell sink with no injected client or no
+  // recipient set is a local config problem — the POST
+  // was never built, let alone sent. Retrying can never
+  // succeed for this item, so dead-letter immediately
+  // instead of burning the retry budget and the backoff
+  // clock (the WR-116 rule, applied to the Clickatell sink
+  // like the Mailtrap sink above).
+  // There is no per-record recipient fallback: a missing
+  // recipient set has nowhere to deliver to.
+  if (err instanceof ClickatellSinkConfigError) {
     return { failureClass: "non_retryable" };
   }
   // WR-233: an email sink with no injected client or no
