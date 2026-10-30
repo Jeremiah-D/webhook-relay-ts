@@ -9121,6 +9121,78 @@ await sink.send([
   the WR-116 rule. `dryRun` validates (including content
   derivation) with zero client I/O.
 
+`src/braze-sink.ts` (WR-278) delivers to
+Braze's `/messages/send` API: one event email is
+sent as one POST, and Braze — not the relay —
+owns the user profiles, the delivery, and the
+retention of the message. No HTTP client is bundled —
+the client is injected through the config, so the module
+has zero new dependencies and tests never need a
+Braze server.
+
+```ts
+const sink = new BrazeSink({
+  appId: "braze-app-123",
+  from: "alerts@example.com",
+  externalUserIds: ["user-1", "user-2"], // must already exist in Braze
+  client, // your client adapter implementing BrazeMessageClient
+  // includePayload: true, // opt-in only: body appended, truncated
+});
+await sink.send([
+  { body: JSON.stringify(event), subject: "order.created", key: "agg-7" },
+]);
+```
+
+- **External-id envelope, client-held Bearer header auth** —
+  one sink targets one Braze app, one sender address, and
+  one set of external ids: every message POSTs to the fixed
+  `https://rest.iad-01.braze.com/messages/send` (Braze's
+  US-01 instance; other instances use their own REST
+  endpoints, which the operator's client adapter points
+  at), with the JSON body
+  `{"external_user_ids":["<external_id>"],"messages":{"email":{"app_id":"<app_id>","subject":"<subject>","body":"<body>","from":"<from>"}}}`.
+  The REST API key (which needs the `messages.send`
+  permission) is held by the client alone and sent by the
+  client as the `Authorization: Bearer` header — Braze's
+  header-auth shape — so the request the sink hands the
+  client carries no credential at all (orthogonal to the
+  Mailtrap sink, WR-273: Mailtrap posts a `from` object /
+  `to` object-array envelope, while Braze addresses users
+  by external id inside a `messages.email` envelope).
+  Recipients must already exist in Braze: the API-only
+  send does not create users, and an unknown external id
+  fails with a 400, fail-closed. A missing client, app id,
+  sender, or recipient set fails closed with
+  `BrazeSinkConfigError` at send time.
+- **Subject and body split** — the subject takes the first
+  non-empty among the record's `subject` and `key`, while
+  the body takes the first non-empty among `subject`, `key`,
+  and `traceId` (the trace id is too opaque for a subject
+  line), falling back to the generic summary `webhook
+  event` in both fields for sourceless events, which must
+  not be silently dropped.
+- **Payload inclusion** — by default the message carries
+  the summary only, never the full payload: event bodies
+  routinely carry PII, and an inbox is a far wider
+  audience than a queue or a stream. Opting into
+  `includePayload` appends the body verbatim after a blank
+  line, truncated to `payloadMaxChars` characters (default
+  2000) with a truncation marker — the truncation is
+  unconditional under the opt-in, and the payload stays
+  plain text inside the `body` field, not a fenced code
+  block. No `html` field is configured: plain text only.
+- **Failure handling** — a non-2xx POST throws
+  `BrazeSinkError` carrying exactly the failed messages
+  with their retry lanes, so the caller retries just those.
+  429 and every 5xx are retryable; every other non-2xx
+  status (400, 401, 403, 404: unknown external id,
+  invalid body, bad API key) is fail-closed, non-retryable,
+  and a codeless transport failure is retryable. A missing
+  client, app id, sender, or recipient set throws
+  `BrazeSinkConfigError` → `non_retryable`,
+  the WR-116 rule. `dryRun` validates (including subject/
+  body derivation) with zero client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same
