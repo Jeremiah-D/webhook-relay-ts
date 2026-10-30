@@ -8904,6 +8904,77 @@ await sink.send([
   the WR-116 rule. `dryRun` validates (including content
   derivation) with zero client I/O.
 
+`src/onesignal-sink.ts` (WR-275) delivers to
+OneSignal's notifications API: one event is
+sent as one POST, and OneSignal — not the relay —
+owns the device routing, the delivery, and the
+retention of the notification. No HTTP client is bundled —
+the client is injected through the config, so the module
+has zero new dependencies and tests never need a
+OneSignal server.
+
+```ts
+const sink = new OneSignalSink({
+  appId: "app-123",
+  includePlayerIds: ["player-1", "player-2"],
+  client, // your client adapter implementing OneSignalMessageClient
+  // includePayload: true, // opt-in only: contents appended, truncated
+});
+await sink.send([
+  { body: JSON.stringify(event), subject: "order.created", key: "agg-7" },
+]);
+```
+
+- **HTTP API envelope, client-held Basic header auth** —
+  one sink targets one OneSignal app and one set of
+  player ids: every message POSTs to the fixed
+  `https://api.onesignal.com/notifications` (OneSignal
+  is not self-hostable, so no URL is configurable),
+  with the JSON body `{ app_id, include_player_ids,
+  headings, contents }` (one POST fans the notification
+  out to every listed device). The REST API key is held
+  by the client alone and sent by the client as the
+  `Authorization: Basic` header — OneSignal's header-auth
+  shape — so the request the sink hands the client
+  carries no credential at all (the opposite of the
+  Vonage body-carried credential, and distinct from the
+  TextMagic `X-TM-Username` / `X-TM-Key` header pair and
+  from the Clickatell bare-key header with its flat
+  `content`/`to` envelope). Segment targeting is out of
+  scope for this item: no `included_segments` field is
+  configured. A missing client, app id, or player set
+  fails closed with `OneSignalSinkConfigError` at send
+  time.
+- **Headings/contents split** — a push notification carries
+  two fields, so the event's values split across them:
+  `headings.en` takes the event's `subject` and is
+  omitted entirely when the event has no subject, while
+  `contents.en` takes the first non-empty among the
+  record's `subject`, `key`, and `traceId`, falling back
+  to the generic summary `webhook event` for sourceless
+  events, which must not be silently dropped.
+- **Payload inclusion** — by default the notification
+  carries the summary only, never the full payload: event
+  bodies routinely carry PII, and a device is a far wider
+  audience than a queue or a stream. Opting into
+  `includePayload` appends the body verbatim after a blank
+  line inside `contents.en`, truncated to `payloadMaxChars`
+  characters (default 2000) with a truncation marker —
+  the truncation is unconditional under the opt-in, and
+  the payload stays plain text inside the `contents`
+  field, not a fenced code block.
+- **Failure handling** — a non-2xx POST throws
+  `OneSignalSinkError` carrying exactly the failed messages
+  with their retry lanes, so the caller retries just those.
+  429 and every 5xx are retryable; every other non-2xx
+  status (400, 401, 403, 404: unknown player, invalid body,
+  bad credentials) is fail-closed, non-retryable,
+  and a codeless transport failure is retryable. A missing
+  client, app id, or player set throws
+  `OneSignalSinkConfigError` → `non_retryable`,
+  the WR-116 rule. `dryRun` validates (including headings/
+  contents derivation) with zero client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same
