@@ -9265,6 +9265,89 @@ await sink.send([
   `non_retryable`, the WR-116 rule. `dryRun` validates
   (including title/body derivation) with zero client I/O.
 
+`src/expo-sink.ts` (WR-280) delivers to
+Expo's push API: one event notification is sent as one
+POST, and Expo — not the relay — owns the device routing,
+the delivery, and the retention of the message. No HTTP
+client is bundled — the client is injected through the
+config, so the module has zero new dependencies and tests
+never need an Expo server.
+
+```ts
+const sink = new ExpoSink({
+  to: "ExponentPushToken[xxxxxxxxxxxxxxxxxxxxxx]", // the one configured push token
+  client, // your client adapter implementing ExpoMessageClient
+  // accessToken: "<Expo access token>", // opt-in only: enhanced push security
+  // includePayload: true, // opt-in only: body appended, truncated
+});
+await sink.send([
+  { body: JSON.stringify(event), subject: "order.created", key: "agg-7" },
+]);
+```
+
+- **Message envelope, no auth by default** —
+  one sink targets one ExponentPushToken: every message
+  POSTs to the fixed `https://exp.host/--/api/v2/push/send`,
+  with the flat JSON body `{"to":"<ExponentPushToken>","title":"<title>","body":"<body>"}`,
+  `title` present only when the event has a subject. Expo
+  requires no authentication by default, so no
+  `Authorization` header is sent unless the sink config
+  opts into an `accessToken` — only a project that enabled
+  enhanced push security sets one, and the sink then hands
+  it to the client as the `Authorization: Bearer` header
+  (the Pushbullet sink's WR-245 pattern: the token rides
+  in the headers, never in the body, never logged). This
+  is orthogonal to the FCM sink, WR-276: FCM posts a
+  project-level endpoint with an OAuth Bearer token the
+  client alone holds and a `{message: {token,
+  notification}}` envelope, while Expo posts a single
+  fixed endpoint with no authentication by default and a
+  flat `{to, title, body}` envelope with a ticket model;
+  and to the OneSignal sink, WR-275: OneSignal posts with
+  a Basic header and an `app_id` plus player-id targeting
+  and a `headings`/`contents` envelope, while Expo posts
+  with no authentication by default and a single push
+  token target. A missing client or push token fails
+  closed with `ExpoSinkConfigError` at send time.
+- **Title and body split** — the title takes the event's
+  `subject` (omitted when absent — neither the key nor the
+  trace id is a title), while the body takes the first
+  non-empty among `subject`, `key`, and `traceId`,
+  falling back to the generic summary `webhook event`
+  for sourceless events, which must not be silently
+  dropped. `sound` is out of scope for this sink.
+- **Payload inclusion** — by default the message carries
+  the summary only, never the full payload: event bodies
+  routinely carry PII, and a device is a far wider
+  audience than a queue or a stream. Opting into
+  `includePayload` appends the body verbatim after a blank
+  line, truncated to `payloadMaxChars` characters (default
+  2000) with a truncation marker — the truncation is
+  unconditional under the opt-in, and the payload stays
+  plain text inside the `body` field, not a fenced code
+  block.
+- **Failure handling, ticket model** — an HTTP 200 returns
+  `{data: {status}}`, one push ticket per message, and the
+  ticket is the per-message acceptance result: `status:
+  "ok"` means Expo accepted the message (the ticket `id`
+  is only an acceptance receipt, not a delivery result),
+  while `status: "error"` means Expo refused it. A
+  `DeviceNotRegistered` ticket error is non-retryable —
+  the token is dead, so the message is dead-lettered
+  without retry — while any other ticket error is
+  retryable, as is a 200 with no ticket surfaced at all
+  (without the ticket the sink cannot claim acceptance).
+  A non-2xx POST throws `ExpoSinkError` carrying exactly
+  the failed messages with their retry lanes, so the caller
+  retries just those. 429 and every 5xx are retryable;
+  every other non-2xx status (400, 401, 403, 404: unknown
+  token, invalid body, bad access token) is fail-closed,
+  non-retryable, and a codeless transport failure is
+  retryable. A missing client or push token throws
+  `ExpoSinkConfigError` → `non_retryable`, the WR-116
+  rule. `dryRun` validates (including title/body
+  derivation) with zero client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same
