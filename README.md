@@ -8975,6 +8975,83 @@ await sink.send([
   the WR-116 rule. `dryRun` validates (including headings/
   contents derivation) with zero client I/O.
 
+`src/fcm-sink.ts` (WR-276) delivers to
+Firebase Cloud Messaging's HTTP v1 API: one event is
+sent as one POST, and FCM — not the relay —
+owns the device routing, the delivery, and the
+retention of the notification. No HTTP client is bundled —
+the client is injected through the config, so the module
+has zero new dependencies and tests never need an
+FCM server.
+
+```ts
+const sink = new FcmSink({
+  project: "my-project",
+  token: "device-token-abc",
+  client, // your client adapter implementing FcmMessageClient
+  // includePayload: true, // opt-in only: data.payload appended, truncated
+});
+await sink.send([
+  { body: JSON.stringify(event), subject: "order.created", key: "agg-7" },
+]);
+```
+
+- **HTTP v1 envelope, client-held Bearer header auth** —
+  one sink targets one Firebase project and one device
+  registration token: every message POSTs to the fixed
+  `https://fcm.googleapis.com/v1/projects/<project>/messages:send`
+  (FCM is not self-hostable, so no URL is configurable;
+  only the project segment varies), with the JSON body
+  `{ message: { token, notification: { title, body } } }`
+  (one POST delivers the notification to the one device
+  named by `token`). The OAuth 2.0 access token is held
+  by the client alone and sent by the client as the
+  `Authorization: Bearer` header — FCM's header-auth
+  shape; the token is minted from the operator's Firebase
+  service account (scope
+  `https://www.googleapis.com/auth/firebase.messaging`),
+  and minting/refreshing live outside this sink — so the
+  request the sink hands the client carries no credential
+  at all (the opposite of the Vonage body-carried
+  credential, and distinct from the OneSignal Basic
+  header with its `app_id` / `include_player_ids`
+  envelope). Only the HTTP v1 API is used: the legacy
+  server-key interface was retired in July 2024, so no
+  legacy `key=` header or `to` field is accepted. A
+  missing client, project id, or device token fails closed
+  with `FcmSinkConfigError` at send time.
+- **Title/body split** — a push notification carries
+  two fields, so the event's values split across them:
+  `notification.title` takes the event's `subject` and is
+  omitted entirely when the event has no subject, while
+  `notification.body` takes the first non-empty among the
+  record's `subject`, `key`, and `traceId`, falling back
+  to the generic summary `webhook event` for sourceless
+  events, which must not be silently dropped.
+- **Payload inclusion** — by default the notification
+  carries the summary only, never the full payload: event
+  bodies routinely carry PII, and a device is a far wider
+  audience than a queue or a stream. Opting into
+  `includePayload` appends the body verbatim as the
+  `data.payload` field of the `message` object, truncated
+  to `payloadMaxChars` characters (default 2000) with a
+  truncation marker — the truncation is unconditional
+  under the opt-in, and the payload rides in `data`
+  (FCM's machine-readable channel), not inside the
+  notification text, so an opted-in body never changes
+  what the device renders.
+- **Failure handling** — a non-2xx POST throws
+  `FcmSinkError` carrying exactly the failed messages
+  with their retry lanes, so the caller retries just those.
+  429 and every 5xx are retryable; every other non-2xx
+  status (400, 401, 403, 404: unknown token, invalid body,
+  bad credentials) is fail-closed, non-retryable,
+  and a codeless transport failure is retryable. A missing
+  client, project id, or device token throws
+  `FcmSinkConfigError` → `non_retryable`,
+  the WR-116 rule. `dryRun` validates (including title/
+  body derivation) with zero client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same

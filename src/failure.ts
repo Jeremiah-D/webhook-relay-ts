@@ -110,6 +110,7 @@ import { TextMagicSinkConfigError } from "./textmagic-sink.ts";
 import { MailtrapSinkConfigError } from "./mailtrap-sink.ts";
 import { ClickatellSinkConfigError } from "./clickatell-sink.ts";
 import { OneSignalSinkConfigError } from "./onesignal-sink.ts";
+import { FcmSinkConfigError } from "./fcm-sink.ts";
 import { EmailSinkConfigError } from "./email-sink.ts";
 import { DigestAuthError } from "./digest-auth.ts";
 import { CredentialSecretUnavailableError } from "./outbound-credentials.ts";
@@ -877,6 +878,18 @@ export function classifyFailure(err: unknown): ClassifiedFailure {
   // There is no per-record target fallback: a missing
   // app id or player set has nowhere to deliver to.
   if (err instanceof OneSignalSinkConfigError) {
+    return { failureClass: "non_retryable" };
+  }
+  // WR-276: an FCM sink with no injected client or no
+  // project id or device token is a local config problem — the POST
+  // was never built, let alone sent. Retrying can never
+  // succeed for this item, so dead-letter immediately
+  // instead of burning the retry budget and the backoff
+  // clock (the WR-116 rule, applied to the FCM sink
+  // like the OneSignal sink above).
+  // There is no per-record target fallback: a missing
+  // project id or device token has nowhere to deliver to.
+  if (err instanceof FcmSinkConfigError) {
     return { failureClass: "non_retryable" };
   }
   // WR-233: an email sink with no injected client or no
