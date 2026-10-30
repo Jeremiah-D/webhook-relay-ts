@@ -8699,6 +8699,74 @@ await sink.send([
   the WR-116 rule. `dryRun` validates (including text
   derivation) with zero client I/O.
 
+`src/textmagic-sink.ts` (WR-272) delivers to
+TextMagic's SMS API: one event is
+sent as one POST, and TextMagic — not the relay —
+owns the carrier routing, the delivery, and the
+retention of the message. No HTTP client is bundled —
+the client is injected through the config, so the module
+has zero new dependencies and tests never need a
+TextMagic server.
+
+```ts
+const sink = new TextMagicSink({
+  phones: ["+14155550100", "+14155550101"],
+  client, // your client adapter implementing TextMagicMessageClient
+  // includePayload: true, // opt-in only: text appended, truncated
+});
+await sink.send([
+  { body: JSON.stringify(event), subject: "order.created", key: "agg-7" },
+]);
+```
+
+- **HTTP API envelope, client-held X-TM header auth** —
+  one sink targets one set of recipient numbers: every
+  message POSTs to the fixed
+  `https://rest.textmagic.com/api/v2/messages` (TextMagic
+  is not self-hostable, so no URL is configurable — unlike
+  the Infobip sink's per-account base URL), with the flat
+  JSON body `{ text, phones }` (the recipients are an
+  array of E.164 strings — TextMagic's fixed shape,
+  unlike the ClickSend sink's single `to` string; one
+  POST fans the text out to every number in the array).
+  The username + API key pair is held by the client
+  alone and sent by the client as the `X-TM-Username`
+  and `X-TM-Key` headers — TextMagic v2's header-auth
+  shape, not Basic or Bearer — so the request the sink
+  hands the client carries no credential at all (the
+  opposite of the Vonage body-carried credential). A
+  sender ID is out of scope for this item: no `from`
+  field is configured. A missing client or recipient set
+  fails closed with `TextMagicSinkConfigError` at send
+  time.
+- **Single text field** — an SMS carries one text field,
+  so there is no subject/value split like the email
+  sinks: the text takes the first non-empty among the
+  record's `subject`, `key`, and `traceId`, falling back
+  to the generic summary `webhook event` for sourceless
+  events, which must not be silently dropped.
+- **Payload inclusion** — by default the message carries
+  the summary only, never the full payload: event bodies
+  routinely carry PII, and a phone is a far wider
+  audience than a queue or a stream. Opting into
+  `includePayload` appends the body verbatim after a blank
+  line, truncated to `payloadMaxChars` characters (default
+  2000) with a truncation marker — the truncation is
+  unconditional under the opt-in, and the payload stays
+  plain text inside the `text` field, not a fenced code
+  block.
+- **Failure handling** — a non-2xx POST throws
+  `TextMagicSinkError` carrying exactly the failed messages
+  with their retry lanes, so the caller retries just those.
+  429 and every 5xx are retryable; every other non-2xx
+  status (400, 401, 403, 404: unknown number, invalid body,
+  bad credentials) is fail-closed, non-retryable,
+  and a codeless transport failure is retryable. A missing
+  client or recipient set throws
+  `TextMagicSinkConfigError` → `non_retryable`,
+  the WR-116 rule. `dryRun` validates (including text
+  derivation) with zero client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same
