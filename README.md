@@ -9609,6 +9609,98 @@ await sink.send([
   validates (including content derivation) with zero
   client I/O.
 
+`src/airship-sink.ts` (WR-284) delivers to
+Airship's Push API: one event notification is sent as
+one POST to `https://go.urbanairship.com/api/push`,
+and Airship — not the relay — owns the device routing,
+the delivery, and the retention of the notification.
+No HTTP client is bundled — the client is injected
+through `config.client`, so the module has zero new
+dependencies and tests never need an Airship server.
+
+```ts
+const sink = new AirshipSink({
+  audience: { named_user: "user-1" }, // or "all" (the default: a broadcast)
+  client, // your client adapter implementing AirshipMessageClient
+});
+await sink.send([
+  { body: JSON.stringify(event), subject: "order.created", key: "agg-7" },
+]);
+```
+
+- **Message envelope, JSON push** — one sink targets
+  one Airship application audience: every message
+  POSTs to the fixed
+  `https://go.urbanairship.com/api/push`, with a JSON
+  body `{"audience":<audience>,"notification":{"alert":"<alert>"},"device_types":"all"}`,
+  `Content-Type: application/json`, and an `Accept:
+  application/vnd.urbanairship+json; version=3` header
+  pinning API v3 (the current and only supported
+  version). The endpoint, envelope, and header match
+  the current Airship documentation (checked this
+  round, 2026-10-31), and the client authenticates
+  with an `Authorization: Basic` header carrying the
+  base64 of `app key:app secret` — which the client
+  alone holds, so the handed request carries no
+  credential at all (the backlog item's "配置持有" is
+  the client's configuration, never the sink's).
+  Targeting is config-held and passed through verbatim
+  — `audience` is either the string `"all"` (a
+  broadcast, the default when unset) or an object with
+  audience selectors (`ios_channel`,
+  `android_channel`, `named_user`, `tag`, `segment`,
+  `channel`, combined with `and`/`or`/`not` per the
+  docs). Unlike the WonderPush sink, which invents no
+  default audience because the API refuses a delivery
+  with no target, Airship accepts a broadcast audience,
+  so a missing audience never fails closed.
+  `device_types` is fixed to `"all"`: every device type
+  in the audience. Orthogonal to the WonderPush sink
+  (WR-282: form-encoded body, token in the
+  `accessToken` field, `notification` JSON string with
+  a `title`/`text` split), to the FCM sink (WR-276:
+  OAuth Bearer header, `{message: {token,
+  notification}}` envelope to one device token), and to
+  the OneSignal sink (WR-275: `app_id`/
+  `included_segments` envelope with a bare-key header).
+  A missing client fails closed with
+  `AirshipSinkConfigError` at send time. The response's
+  `push_ids` are only an acceptance receipt, not a
+  delivery result — delivery confirmation lives in
+  Airship's reports, keyed by the response's
+  `operation_id`.
+- **Alert derivation** — the alert takes the first
+  non-empty among `subject`, `key`, and `traceId`,
+  falling back to the generic summary `webhook event`
+  for sourceless events, which must not be silently
+  dropped. There is no title/alert split: the Airship
+  push object carries a single `alert` string.
+- **Payload inclusion** — by default the notification
+  carries the summary only, never the full payload:
+  event bodies routinely carry PII, and a device is a
+  far wider audience than a queue or a stream. Opting
+  into `includePayload` appends the body verbatim after
+  a blank line inside `alert`, truncated to
+  `payloadMaxChars` characters (default 2000) with a
+  truncation marker — the truncation is unconditional
+  under the opt-in, and the payload stays plain text
+  inside the `alert` field, not a fenced code block.
+- **Failure handling, push ids** — a 202 returns the
+  created push's `push_ids`, and the ids — not the HTTP
+  status alone — decide acceptance: a 2xx with no push
+  ids surfaced is retryable (without the ids the sink
+  cannot claim the push was created). A non-2xx POST
+  throws `AirshipSinkError` carrying exactly the failed
+  messages with their retry lanes, so the caller retries
+  just those. 429 and every 5xx are retryable; every
+  other non-2xx status (400, 401, 403, 404: unknown
+  audience selector, invalid body, bad app key) is
+  fail-closed, non-retryable, and a codeless transport
+  failure is retryable. A missing client throws
+  `AirshipSinkConfigError` → `non_retryable`, the
+  WR-116 rule. `dryRun` validates (including alert
+  derivation) with zero client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same
