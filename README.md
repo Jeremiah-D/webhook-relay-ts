@@ -9701,6 +9701,110 @@ await sink.send([
   WR-116 rule. `dryRun` validates (including alert
   derivation) with zero client I/O.
 
+`src/clevertap-sink.ts` (WR-285) delivers to
+CleverTap's Create Campaign API: one event notification
+is sent as one POST that creates a push campaign, and
+CleverTap — not the relay — owns the audience targeting,
+the delivery, and the retention of the notification.
+No HTTP client is bundled — the client is injected
+through `config.client`, so the module has zero new
+dependencies and tests never need a CleverTap server.
+
+```ts
+const sink = new CleverTapSink({
+  regionHost: "in1.api.clevertap.com", // or "us1.api.clevertap.com"; default api.clevertap.com (Europe)
+  campaignName: "Price drop", // or derived per message from the event key
+  where: { event_name: "Charged", from: 20251001, to: 20251220 }, // or {} (the entire user base)
+  client, // your client adapter implementing CleverTapMessageClient
+});
+await sink.send([
+  { body: JSON.stringify(event), subject: "order.created", key: "agg-7" },
+]);
+```
+
+- **Message envelope, JSON campaign** — one sink targets
+  one CleverTap region account audience: every message
+  POSTs to `https://<region host>/1/targets/create.json`
+  (default host `api.clevertap.com`, the Europe region;
+  `in1.api.clevertap.com` serves India,
+  `us1.api.clevertap.com` serves the US), with a JSON
+  body `{"name":"<name>","target_mode":"Push","where":{...},"content":{"title":"<title>","body":"<body>"}}`
+  and a `Content-Type: application/json` header. The
+  endpoint, envelope, and headers match the current
+  CleverTap documentation (checked this round,
+  2026-10-31), and the client authenticates with
+  `X-CleverTap-Account-Id` and `X-CleverTap-Passcode`
+  headers carrying the account id and passcode — which
+  the client alone holds, so the handed request carries
+  no credential at all (the backlog item's "配置持有" is
+  the client's configuration, never the sink's).
+  Targeting is config-held and passed through verbatim
+  — `where` filters the target base on user events and
+  profile properties, and an empty object targets the
+  entire user base per the docs, so a missing `where`
+  sends `{}` and never invents a filter. The campaign
+  `name` comes from the config when set, otherwise
+  derives per message from the event's key
+  (`webhook-<key>`, falling back to `webhook event` for
+  keyless events). Orthogonal to the Airship sink
+  (WR-284: fixed-host JSON body, Basic auth, an
+  `audience`/`notification`/`device_types` envelope
+  decided by surfaced `push_ids`), to the WonderPush
+  sink (WR-282: form-encoded body, token in the
+  `accessToken` field, a `notification` JSON string with
+  a `title`/`text` split), and to the OneSignal sink
+  (WR-275: `app_id`/`included_segments` envelope with a
+  bare-key header). A missing client fails closed with
+  `CleverTapSinkConfigError` at send time. The endpoint
+  is limited to 3 requests per second — the relay's
+  retry budget and the 429 lane below absorb bursts;
+  the sink itself adds no limiter.
+- **Content derivation** — `content.title` and
+  `content.body` both take the first non-empty among
+  `subject`, `key`, and `traceId`, falling back to the
+  generic summary `webhook event` for sourceless events,
+  which must not be silently dropped. The title takes
+  the same chain because the docs require
+  `content.title` for push and the backlog pins it to
+  `subject`, the chain's first link — so when a subject
+  exists the title is exactly the subject, and when it
+  does not the chain's next value keeps the title valid.
+- **Payload inclusion** — by default the notification
+  carries the summary only, never the full payload:
+  event bodies routinely carry PII, and a device is a
+  far wider audience than a queue or a stream. Opting
+  into `includePayload` appends the body verbatim after
+  a blank line inside `content.body`, truncated to
+  `payloadMaxChars` characters (default 2000) with a
+  truncation marker — the truncation is unconditional
+  under the opt-in, and the payload stays plain text
+  inside the `body` field, not a fenced code block.
+- **Failure handling, status field** — a 200 answers
+  `{"status": "success", "message": "Added to queue for
+  processing"}`, and the `status` field — not the HTTP
+  status alone — decides acceptance: a 2xx with no
+  `status` field surfaced is retryable (without the
+  field the sink cannot claim the campaign was created).
+  A successful response is only an acceptance receipt,
+  not a delivery result — delivery is handled by the
+  provider and depends on valid recipient ids. A 2xx
+  with `status: "fail"` is a failure — retryable only
+  for error code 89 ("Unexpected error, please try
+  again", per the docs), non-retryable for every other
+  code (21 missing `to`, 78 invalid payload, 84 invalid
+  recipients, and the rest are validation verdicts
+  retrying cannot change). A non-2xx POST throws
+  `CleverTapSinkError` carrying exactly the failed
+  messages with their retry lanes, so the caller retries
+  just those. 429 and every 5xx are retryable; every
+  other non-2xx status (400, 401, 403, 404: unknown
+  targeting, invalid body, bad account id or passcode)
+  is fail-closed, non-retryable, and a codeless
+  transport failure is retryable. A missing client
+  throws `CleverTapSinkConfigError` → `non_retryable`,
+  the WR-116 rule. `dryRun` validates (including
+  content derivation) with zero client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same
