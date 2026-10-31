@@ -9528,6 +9528,87 @@ await sink.send([
   the WR-116 rule. `dryRun` validates (including
   title/text derivation) with zero client I/O.
 
+`src/telesign-sink.ts` (WR-283) delivers to
+Telesign's Messaging API: one event is sent as one POST
+to `https://rest-ww.telesign.com/v1/messaging`, and
+Telesign — not the relay — owns the carrier routing,
+the delivery, and the retention of the message.
+No HTTP client is bundled — the client is injected
+through `config.client`, so the module has zero new
+dependencies and tests never need a Telesign server.
+
+```ts
+const sink = new TelesignSink({
+  phoneNumber: "+14155550100", // E.164 recipient, country code included
+  client, // your client adapter implementing TelesignMessageClient
+});
+await sink.send([
+  { body: JSON.stringify(event), subject: "order.created", key: "agg-7" },
+]);
+```
+
+- **Message envelope, form-encoded SMS** — one sink
+  targets one recipient number: every message POSTs to
+  the fixed `https://rest-ww.telesign.com/v1/messaging`,
+  with a form-encoded body
+  (`Content-Type: application/x-www-form-urlencoded`)
+  carrying `phone_number`, `message`, and
+  `message_type=ARN` (alerts, reminders, and
+  notifications — the OTP channel is out of scope).
+  The endpoint and fields match the current Telesign
+  documentation (checked this round, 2026-10-31), and
+  the client authenticates with an `Authorization:
+  Basic` header carrying the base64 of
+  `customer_id:api_key` — which the client alone holds,
+  so the handed request carries no credential at all
+  (the backlog item's "配置持有" is the client's
+  configuration, never the sink's). Orthogonal to the
+  46elks sink (WR-277: form-encoded
+  `from`/`to`/`message` body with a sender identity and
+  no acceptance id), to the ClickSend sink (WR-268:
+  JSON `messages`/`body` envelope with a single `to`
+  string), and to the WonderPush sink (WR-282:
+  form-encoded delivery to a segment audience, delivery
+  id receipt). A missing client or recipient fails
+  closed with `TelesignSinkConfigError` at send time.
+  The response's `reference_id` is only an acceptance
+  receipt, not a delivery result — delivery
+  confirmation lives in Telesign's Transaction Callback
+  Service, keyed by that id.
+- **Content derivation** — the message takes the first
+  non-empty among `subject`, `key`, and `traceId`,
+  falling back to the generic summary `webhook event`
+  for sourceless events, which must not be silently
+  dropped.
+- **Payload inclusion** — by default the message carries
+  the summary only, never the full payload: event bodies
+  routinely carry PII, and a phone is a far wider
+  audience than a queue or a stream. Opting into
+  `includePayload` appends the body verbatim after a blank
+  line, truncated to `payloadMaxChars` characters
+  (default 2000) with a truncation marker — the
+  truncation is unconditional under the opt-in, and the
+  payload stays plain text inside the `message` field,
+  not a fenced code block. Telesign splits a message
+  longer than its per-part limit into separate parts, so
+  a long opted-in body still sends.
+- **Failure handling, reference id** — a 2xx returns
+  the transaction's `reference_id`, and the id — not
+  the HTTP status alone — decides acceptance: a 2xx
+  with no reference id surfaced is retryable (without
+  the id the sink cannot claim the message was
+  accepted). A non-2xx POST throws `TelesignSinkError`
+  carrying exactly the failed messages with their retry
+  lanes, so the caller retries just those. 429 and every
+  5xx are retryable; every other non-2xx status (400,
+  401, 403, 404: unknown number, invalid body, bad
+  credentials) is fail-closed, non-retryable, and a
+  codeless transport failure is retryable. A missing
+  client or recipient throws `TelesignSinkConfigError`
+  → `non_retryable`, the WR-116 rule. `dryRun`
+  validates (including content derivation) with zero
+  client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same
