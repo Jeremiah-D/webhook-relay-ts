@@ -9920,6 +9920,117 @@ await sink.send([
   WR-116 rule. `dryRun` validates (including content
   derivation) with zero client I/O.
 
+`src/customerio-sink.ts` (WR-287) delivers to
+Customer.io's Transactional API: one event notification
+is sent as one POST that triggers a pre-built
+transactional push message, and Customer.io — not the
+relay — owns the audience targeting, the delivery, and
+the retention of the notification. No HTTP client is
+bundled — the client is injected through
+`config.client`, so the module has zero new
+dependencies and tests never need a Customer.io server.
+
+```ts
+const sink = new CustomerIoSink({
+  regionHost: "api.customer.io", // default (US); api-eu.customer.io serves the EU
+  transactionalMessageId: 44, // or a trigger name, e.g. "password reset"
+  identifiers: { email: "person@example.com" }, // exactly one of id / email / cio_id
+  to: "last_used", // or "all" / a device token; omitted defaults to all
+  client, // your client adapter implementing CustomerIoMessageClient
+});
+await sink.send([
+  { body: JSON.stringify(event), subject: "order.created", key: "agg-7" },
+]);
+```
+
+- **Message envelope, Transactional API** — one sink
+  triggers one transactional push template for one
+  Customer.io person: every message POSTs to
+  `https://<region host>/v1/send/push` (default host
+  `api.customer.io`, US; `api-eu.customer.io` serves the
+  EU), with a JSON body
+  `{"transactional_message_id":44,"identifiers":{"email":"person@example.com"},"message_data":{"title":"<title>","message":"<body>"}}`
+  and `Content-Type: application/json` — the endpoint,
+  envelope, and headers match the current Customer.io
+  documentation (checked this round, 2026-10-31). The
+  client authenticates with an `Authorization: Bearer
+  <key>` header carrying the App API private key (`sk_…`)
+  — which the client alone holds, so the handed request
+  carries no credential at all (the backlog item's "App
+  API Bearer 认证" is the client's configuration, never
+  the sink's). The general App API limit is 10 requests
+  per second, but the current docs exempt transactional
+  messages from it ("Transactional messages aren't rate
+  limited"), so the sink adds no limiter. The template
+  reference is config-held and required — the numeric ID
+  or trigger name of a message built beforehand in
+  Customer.io; a message sent against a template that
+  does not exist answers 400. The recipient identifiers
+  are config-held and required — exactly one of `id`,
+  `email`, or `cio_id`, enforced at construction, because
+  the docs require exactly one of the three. The device
+  selection is config-held and optional — `all`,
+  `last_used`, or a device token; when omitted the
+  request carries no `to` field and Customer.io defaults
+  to `all` of the identified profile's devices. Orthogonal
+  to the MoEngage sink (WR-286: Basic auth, a
+  `campaignName`/`targetPlatform`/`targetAudience`/
+  `payload` envelope decided by the `type` field), to the
+  CleverTap sink (WR-285: `X-CleverTap-*` dual headers,
+  a `name`/`target_mode`/`where`/`content` envelope
+  decided by the `status` field), and to the Airship sink
+  (WR-284: Basic auth, an `audience`/`notification`/
+  `device_types` envelope decided by surfaced `push_ids`).
+  A missing client fails closed with
+  `CustomerIoSinkConfigError` at send time.
+- **Content derivation** — `message_data` carries the
+  notification as `title` and `message`, both taking the
+  first non-empty among `subject`, `key`, and `traceId`,
+  falling back to the generic summary `webhook event`
+  for sourceless events, which must not be silently
+  dropped. The title takes the same chain because the
+  template's title slot needs a value and the backlog
+  pins the message to the event, with `subject` the
+  chain's first link — so when a subject exists the title
+  is exactly the subject, and when it does not the chain's
+  next value keeps the title valid. The template renders
+  them as `{{trigger.title}}` / `{{trigger.message}}`:
+  the template is the message's skin, the event is its
+  content. The chain goes into `message_data`, not into
+  the top-level `title`/`message` override fields, which
+  would replace the template's own title and body
+  outright.
+- **Payload inclusion** — by default the notification
+  carries the summary only, never the full payload:
+  event bodies routinely carry PII, and a device is a
+  far wider audience than a queue or a stream. Opting
+  into `includePayload` appends the body verbatim after
+  a blank line inside `message_data.message`, truncated
+  to `payloadMaxChars` characters (default 2000) with a
+  truncation marker — the truncation is unconditional
+  under the opt-in, and the payload stays plain text
+  inside the `message` field, not a fenced code block.
+- **Failure handling, delivery_id field** — a 200 answers
+  `{"delivery_id": "<id>", "queued_at": <unix>}`, and the
+  `delivery_id` field — not the HTTP status alone —
+  decides acceptance: a 2xx with no `delivery_id` field
+  surfaced is retryable (without the field the sink
+  cannot claim the message was queued). A successful
+  response is only an acceptance receipt, not a delivery
+  result — delivery is handled by the provider and depends
+  on valid recipient identifiers and a reachable device. A
+  non-2xx POST throws `CustomerIoSinkError` carrying
+  exactly the failed messages with their retry lanes, so
+  the caller retries just those. 429 and every 5xx are
+  retryable; every other non-2xx status (400, 401, 403,
+  404, 405: unknown template, missing identifiers, bad
+  App API key, workspace set to "Do Not Send", misspelled
+  URI) is fail-closed, non-retryable, and a codeless
+  transport failure is retryable. A missing client throws
+  `CustomerIoSinkConfigError` → `non_retryable`, the
+  WR-116 rule. `dryRun` validates (including content
+  derivation) with zero client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same
