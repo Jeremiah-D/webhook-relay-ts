@@ -10031,6 +10031,110 @@ await sink.send([
   WR-116 rule. `dryRun` validates (including content
   derivation) with zero client I/O.
 
+`src/iterable-sink.ts` (WR-288) delivers to
+Iterable's push/target API: one event notification is
+sent as one POST that triggers a pre-built, activated
+API-triggered push campaign for one user, and Iterable
+— not the relay — owns the audience targeting, the
+delivery, and the retention of the notification. No
+HTTP client is bundled — the client is injected through
+`config.client`, so the module has zero new
+dependencies and tests never need an Iterable server.
+
+```ts
+const sink = new IterableSink({
+  regionHost: "api.iterable.com", // default (USDC); api.eu.iterable.com serves the EDC
+  campaignId: 123, // API-triggered push campaign, built beforehand and activated
+  recipient: { email: "person@example.com" }, // exactly one of email / userId
+  client, // your client adapter implementing IterableMessageClient
+});
+await sink.send([
+  { body: JSON.stringify(event), subject: "order.created", key: "agg-7" },
+]);
+```
+
+- **Message envelope, push/target API** — one sink
+  triggers one API-triggered push campaign for one
+  Iterable user: every message POSTs to
+  `https://<region host>/api/push/target` (default host
+  `api.iterable.com`, USDC; `api.eu.iterable.com` serves
+  the EDC), with a JSON body
+  `{"campaignId":123,"recipientEmail":"person@example.com","dataFields":{"title":"<title>","message":"<body>"}}`
+  and `Content-Type: application/json` — the endpoint,
+  envelope, and headers match the current Iterable
+  documentation (checked this round, 2026-10-31). The
+  client authenticates with an `Api-Key` header carrying
+  the server-side API key — which the client alone holds,
+  so the handed request carries no credential at all (the
+  backlog item's "Api-Key 头只由 client 持有" is the
+  client's configuration, never the sink's). The campaign
+  reference is config-held and required — the numeric ID
+  of an API-triggered push campaign built beforehand in
+  Iterable and activated (Running); a message sent
+  against a campaign that does not exist or is not
+  running answers 4xx. The recipient is config-held and
+  required — exactly one of `recipientEmail` or
+  `recipientUserId`, enforced at construction, because
+  the docs require one of the two and not both. `sendAt`
+  is never sent: omitting it means the message is sent
+  immediately, per the docs. Orthogonal to the
+  Customer.io sink (WR-287: Bearer auth, a
+  `transactional_message_id`/`identifiers`/`message_data`
+  envelope decided by the `delivery_id` field), to the
+  MoEngage sink (WR-286: Basic auth, a
+  `campaignName`/`targetPlatform`/`targetAudience`/
+  `payload` envelope decided by the `type` field), and to
+  the CleverTap sink (WR-285: `X-CleverTap-*` dual
+  headers, a `name`/`target_mode`/`where`/`content`
+  envelope decided by the `status` field). A missing
+  client fails closed with `IterableSinkConfigError` at
+  send time.
+- **Content derivation** — `dataFields` carries the
+  notification as `title` and `message`, both taking the
+  first non-empty among `subject`, `key`, and `traceId`,
+  falling back to the generic summary `webhook event`
+  for sourceless events, which must not be silently
+  dropped. The title takes the same chain because the
+  campaign's title slot needs a value and the backlog
+  pins the message to the event, with `subject` the
+  chain's first link — so when a subject exists the title
+  is exactly the subject, and when it does not the chain's
+  next value keeps the title valid. The campaign renders
+  them as Handlebars fields: the campaign is the
+  message's skin, the event is its content. The chain
+  goes into `dataFields`, not into top-level fields,
+  which would be a different request shape.
+- **Payload inclusion** — by default the notification
+  carries the summary only, never the full payload:
+  event bodies routinely carry PII, and a device is a
+  far wider audience than a queue or a stream. Opting
+  into `includePayload` appends the body verbatim after
+  a blank line inside `dataFields.message`, truncated
+  to `payloadMaxChars` characters (default 2000) with a
+  truncation marker — the truncation is unconditional
+  under the opt-in, and the payload stays plain text
+  inside the `message` field, not a fenced code block.
+- **Failure handling, 200 acceptance** — a 200 means the
+  request has been received, and the HTTP status alone
+  decides acceptance: there is no response-body
+  acceptance field to read, unlike Customer.io's
+  `delivery_id` or MoEngage's `type`, so any 2xx is an
+  acceptance receipt. A successful response is only an
+  acceptance receipt, not a delivery result — delivery
+  is handled by the provider and surfaces as a `pushSend`
+  event on the user's Iterable profile. A non-2xx POST
+  throws `IterableSinkError` carrying exactly the failed
+  messages with their retry lanes, so the caller retries
+  just those. 429 and every 5xx are retryable; every
+  other non-2xx status (400, 401, 403, 404: unknown
+  campaign, missing or doubled recipient, bad
+  server-side API key, campaign not activated) is
+  fail-closed, non-retryable, and a codeless transport
+  failure is retryable. A missing client throws
+  `IterableSinkConfigError` → `non_retryable`, the
+  WR-116 rule. `dryRun` validates (including content
+  derivation) with zero client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same

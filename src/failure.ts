@@ -122,6 +122,7 @@ import { AirshipSinkConfigError } from "./airship-sink.ts";
 import { CleverTapSinkConfigError } from "./clevertap-sink.ts";
 import { MoEngageSinkConfigError } from "./moengage-sink.ts";
 import { CustomerIoSinkConfigError } from "./customerio-sink.ts";
+import { IterableSinkConfigError } from "./iterable-sink.ts";
 import { EmailSinkConfigError } from "./email-sink.ts";
 import { DigestAuthError } from "./digest-auth.ts";
 import { CredentialSecretUnavailableError } from "./outbound-credentials.ts";
@@ -1032,6 +1033,19 @@ export function classifyFailure(err: unknown): ClassifiedFailure {
   // host or device selection is not a config error: they
   // default to the US host and the API's own `all`.)
   if (err instanceof CustomerIoSinkConfigError) {
+    return { failureClass: "non_retryable" };
+  }
+  // WR-288: an Iterable sink with no injected client is a
+  // local config problem — the POST was never built, let
+  // alone sent. Retrying can never succeed for this item, so dead-letter
+  // immediately instead of burning the retry budget and
+  // the backoff clock (the WR-116 rule, applied to the
+  // Iterable sink like the Customer.io sink above).
+  // There is no per-record target fallback: a missing
+  // client has nowhere to deliver to. (A missing region
+  // host is not a config error: it defaults to the USDC
+  // host.)
+  if (err instanceof IterableSinkConfigError) {
     return { failureClass: "non_retryable" };
   }
   // WR-233: an email sink with no injected client or no
