@@ -10172,6 +10172,52 @@ client throws `PusherBeamsSinkConfigError` →
 `non_retryable`, the WR-116 rule. `dryRun` validates
 (including content derivation) with zero client I/O.
 
+`src/batch-sink.ts` (WR-290) delivers to Batch's
+Transactional API: one event notification is sent as
+one POST to `https://api.batch.com/1.1/{apiKey}/transactional/send`
+and Batch — not the relay — owns the audience
+targeting, the delivery, and the retention of the
+notification. This module is not `src/batch.ts` (WR-17),
+the relay's own batch delivery merging. No HTTP client
+is bundled — the client is injected through
+`config.client`, which alone holds both Batch keys: it
+substitutes the `{apiKey}` placeholder in the handed
+URL template with the app API key and adds the
+`X-Authorization: <REST API key>` header (company REST
+API key), so the handed request carries no credential
+at all. The body carries `{ group_id, recipients,
+message, custom_payload? }`: `group_id` is config-held
+and required (analysis grouping only, default
+`"webhook-relay"` when unconfigured); `recipients` is
+config-held and required — at least one of `tokens`,
+`custom_ids`, or `install_ids`, never a default to the
+whole audience; `message` carries `body` (always,
+derived from the event's `subject` → `key` → `traceId`
+chain, fallback `webhook event`) and `title` (optional,
+from `subject` alone, omitted when the event carries
+none). iOS, Android, and Web are served from the same
+call by recipient registration, and Dev/Live are
+separate publications by the keys the client holds, so
+the sink selects neither. `custom_payload` (a JSON
+string carrying the event body verbatim, truncated to
+`payloadMaxChars`, default 2000) is appended only
+under the `includePayload` opt-in; per the docs, the
+CEP version of the API does not render template tags
+inside it. A 201 is acceptance, and the success body's
+transactional response token is returned as the receipt
+(`send()` returns the collected `tokens` in send
+order); the token is only an acceptance receipt, not a
+delivery result — delivery surfaces later through
+Batch's Transactional Stats API. Any other status is a
+failure: 429 and every 5xx are retryable; every other
+non-201 status (400, 401, 402, 404: bad recipients or
+payload, bad REST API key, unknown app API key) is
+fail-closed, non-retryable, and a codeless transport
+failure is retryable. A missing client throws
+`BatchSinkConfigError` → `non_retryable`, the WR-116
+rule. `dryRun` validates (including message
+derivation) with zero client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same

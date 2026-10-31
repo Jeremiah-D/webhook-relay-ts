@@ -124,6 +124,7 @@ import { MoEngageSinkConfigError } from "./moengage-sink.ts";
 import { CustomerIoSinkConfigError } from "./customerio-sink.ts";
 import { IterableSinkConfigError } from "./iterable-sink.ts";
 import { PusherBeamsSinkConfigError } from "./pusher-beams-sink.ts";
+import { BatchSinkConfigError } from "./batch-sink.ts";
 import { EmailSinkConfigError } from "./email-sink.ts";
 import { DigestAuthError } from "./digest-auth.ts";
 import { CredentialSecretUnavailableError } from "./outbound-credentials.ts";
@@ -1060,6 +1061,18 @@ export function classifyFailure(err: unknown): ClassifiedFailure {
   // list is not a config error: it defaults to all three
   // platforms.)
   if (err instanceof PusherBeamsSinkConfigError) {
+    return { failureClass: "non_retryable" };
+  }
+  // WR-290: a Batch sink with no injected client is a
+  // local config problem — the POST was never built, let
+  // alone sent. Retrying can never succeed for this item, so dead-letter
+  // immediately instead of burning the retry budget and
+  // the backoff clock (the WR-116 rule, applied to the
+  // Batch sink like the Pusher Beams sink above).
+  // There is no per-record target fallback: a missing
+  // client has nowhere to deliver to. (A missing group id
+  // is not a config error: it defaults to "webhook-relay".)
+  if (err instanceof BatchSinkConfigError) {
     return { failureClass: "non_retryable" };
   }
   // WR-233: an email sink with no injected client or no
