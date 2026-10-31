@@ -9348,6 +9348,94 @@ await sink.send([
   rule. `dryRun` validates (including title/body
   derivation) with zero client I/O.
 
+`src/pushwoosh-sink.ts` (WR-281) delivers to
+Pushwoosh's Remote API: one event notification is sent
+as one POST to `https://api.pushwoosh.com/json/1.3/createMessage`,
+and Pushwoosh — not the relay — owns the device routing,
+the delivery, and the retention of the notification.
+No HTTP client is bundled — the client is injected
+through `config.client`, so the module has zero new
+dependencies and tests never need a Pushwoosh server.
+
+```ts
+const sink = new PushwooshSink({
+  application: "XXXXX-XXXXX", // the Pushwoosh application code
+  auth: "<API access token>", // from Control Panel → Settings → API Access
+  client, // your client adapter implementing PushwooshMessageClient
+  // devices: ["hwid_XXXX"], // opt-in: target specific devices, else broadcast
+  // conditions: [["Country", "EQ", "fr"]], // opt-in: audience conditions
+});
+await sink.send([
+  { body: JSON.stringify(event), subject: "order.created", key: "agg-7" },
+]);
+```
+
+- **Message envelope, token in the body** — one sink
+  targets one Pushwoosh application: every message POSTs
+  to the fixed `https://api.pushwoosh.com/json/1.3/createMessage`,
+  with the JSON body
+  `{"request":{"application":"<application code>","auth":"<API access token>","notifications":[{"send_date":"now","content":"<content>"}]}}`.
+  The API access token rides in the request body — Pushwoosh's
+  documented auth shape (the Mandrill/SMTP2GO key-in-body
+  precedent) — never in a header, never in the URL, never
+  logged; the client alone sends it at wire time.
+  `createMessage` is marked Deprecated in Pushwoosh's current
+  documentation (the unified Messaging API v2 is its
+  successor) but remains fully operational, and this sink
+  pins it per the backlog item. Targeting is opt-in only:
+  `devices` (up to 1000 tokens or hwids) and `conditions`
+  (Pushwoosh `[field, operator, value]` triples) are held
+  by the sink config and passed through verbatim; with
+  neither set the notification goes to the whole
+  application audience. Orthogonal to the OneSignal sink
+  (WR-275: Basic header, `app_id` plus player-id
+  targeting, `headings`/`contents` envelope) and to the
+  FCM sink (WR-276: OAuth Bearer header, `{message:
+  {token, notification}}` envelope). A missing client,
+  application code, or API token fails closed with
+  `PushwooshSinkConfigError` at send time. The response's
+  `Messages` ids are only acceptance receipts, not
+  delivery results.
+- **Content derivation** — the content takes the first
+  non-empty among the record's `subject`, `key`, and
+  `traceId`, falling back to the generic summary `webhook
+  event` for sourceless events, which must not be
+  silently dropped. `send_date` is always `"now"`: the
+  relay delivers immediately; scheduled delivery is out
+  of scope.
+- **Payload inclusion** — by default the message carries
+  the summary only, never the full payload: event bodies
+  routinely carry PII, and a device is a far wider
+  audience than a queue or a stream. Opting into
+  `includePayload` appends the body verbatim after a blank
+  line, truncated to `payloadMaxChars` characters (default
+  2000) with a truncation marker — the truncation is
+  unconditional under the opt-in, and the payload stays
+  plain text inside the `content` field, not a fenced code
+  block.
+- **Failure handling, API verdict** — an HTTP 200 returns
+  `{"status_code": 200, "status_message": "OK",
+  "response": {"Messages": ["<message id>", ...]}}`, and
+  the verdict — not the HTTP status alone — decides
+  acceptance: `status_code` 200 with `status_message`
+  `"OK"` means Pushwoosh accepted the message, while any
+  other `status_code` (e.g. 210 access denied, 400 bad
+  request) is a refusal mapped by the same rule as the
+  HTTP mapping (429 and 5xx-range codes retryable, the
+  rest fail-closed), and a 200 with no verdict surfaced
+  at all is retryable (without the verdict the sink
+  cannot claim acceptance). A non-2xx POST throws
+  `PushwooshSinkError` carrying exactly the failed
+  messages with their retry lanes, so the caller retries
+  just those. 429 and every 5xx are retryable; every
+  other non-2xx status (400, 401, 403, 404: unknown
+  application, invalid body, bad API token) is
+  fail-closed, non-retryable, and a codeless transport
+  failure is retryable. A missing client, application
+  code, or API token throws `PushwooshSinkConfigError` →
+  `non_retryable`, the WR-116 rule. `dryRun` validates
+  (including content derivation) with zero client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same
