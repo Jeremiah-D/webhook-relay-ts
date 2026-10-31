@@ -9805,6 +9805,121 @@ await sink.send([
   the WR-116 rule. `dryRun` validates (including
   content derivation) with zero client I/O.
 
+`src/moengage-sink.ts` (WR-286) delivers to
+MoEngage's Push API (V5): one event notification is
+sent as one POST that creates a push campaign, and
+MoEngage — not the relay — owns the audience targeting,
+the delivery, and the retention of the notification.
+No HTTP client is bundled — the client is injected
+through `config.client`, so the module has zero new
+dependencies and tests never need a MoEngage server.
+
+```ts
+const sink = new MoEngageSink({
+  regionHost: "api-01.moengage.com", // default (DC-01); api-02 serves DC-02, and so on
+  targetAudience: "User", // or "Custom Segment" / "All Users"; default "User"
+  campaignName: "Price drop", // or derived per message from the event key
+  targetUserAttributes: { email: "user@example.com" }, // required for "User"
+  client, // your client adapter implementing MoEngageMessageClient
+});
+await sink.send([
+  { body: JSON.stringify(event), subject: "order.created", key: "agg-7" },
+]);
+```
+
+- **Message envelope, Push API V5** — one sink targets
+  one MoEngage data-center account audience: every message
+  POSTs to `https://<region host>/v5/push/notifications`
+  (default host `api-01.moengage.com`, DC-01), with a
+  camelCase JSON body `{"campaignName":"<name>","targetPlatform":["ANDROID","IOS","WEB"],"targetAudience":"User","payload":{"ANDROID":{"title":"<title>","message":"<body>"},"IOS":{...},"WEB":{...}},"requestType":"push","targetUserAttributes":{...}}`
+  and `Content-Type: application/json` plus an
+  `X-MOE-Query-Type` header derived from the audience
+  (`user`, or `bulk users` when `bulkUserRequest` is
+  true; `custom segment`; `all users`) — the docs require
+  the header to match `targetAudience`, case-insensitive,
+  and a missing or mismatched value returns 400, so the
+  sink computes it from the same resolved audience it
+  puts in the body and the two can never disagree. The
+  endpoint, envelope, and headers match the current
+  MoEngage documentation (checked this round,
+  2026-10-31), and the v2.1/v2 legacy endpoints stop
+  working after 30 November 2026, so this sink pins the
+  supported V5 endpoint and nothing older. The client
+  authenticates with a Basic `Authorization` header
+  carrying `workspace_id:api_key` — which the client
+  alone holds, so the handed request carries no
+  credential at all (the backlog item's "只由 client
+  持有" is the client's configuration, never the sink's).
+  The campaign `name` comes from the config when set,
+  otherwise derives per message from the event's key
+  (`webhook-<key>`, falling back to `webhook event` for
+  keyless events), and must be at least 5 characters;
+  for `User` the name is reused across calls (one
+  campaign per name), while for `Custom Segment` and
+  `All Users` a new campaign is created on every call,
+  so the name must be unique — a repeated name returns
+  409, and callers targeting those audiences must pass
+  a distinct key per message. Targeting is enforced at
+  construction: `User` requires `targetUserAttributes`,
+  `Custom Segment` requires `customSegmentName`,
+  `bulkUserRequest` requires the `User` audience and a
+  `requestId`, and targeting for another audience is
+  rejected rather than silently dropped. Orthogonal to
+  the CleverTap sink (WR-285: `X-CleverTap-*` dual
+  headers, a `name`/`target_mode`/`where`/`content`
+  envelope decided by the `status` field), to the
+  Airship sink (WR-284: Basic auth, an
+  `audience`/`notification`/`device_types` envelope
+  decided by surfaced `push_ids`), and to the Pushwoosh
+  sink (WR-281: token in the body). A missing client
+  fails closed with `MoEngageSinkConfigError` at send
+  time. The endpoint is limited to 10,000 requests per
+  minute — the relay's retry budget and the 429 lane
+  below absorb bursts; the sink itself adds no limiter.
+- **Content derivation** — each platform block's `title`
+  and `message` both take the first non-empty among
+  `subject`, `key`, and `traceId`, falling back to the
+  generic summary `webhook event` for sourceless events,
+  which must not be silently dropped. The title takes
+  the same chain because every platform block needs a
+  `title` and the backlog pins the message to the event,
+  with `subject` the chain's first link — so when a
+  subject exists the title is exactly the subject, and
+  when it does not the chain's next value keeps the title
+  valid.
+- **Payload inclusion** — by default the notification
+  carries the summary only, never the full payload:
+  event bodies routinely carry PII, and a device is a
+  far wider audience than a queue or a stream. Opting
+  into `includePayload` appends the body verbatim after
+  a blank line inside `message`, truncated to
+  `payloadMaxChars` characters (default 2000) with a
+  truncation marker — the truncation is unconditional
+  under the opt-in, and the payload stays plain text
+  inside the `message` field, not a fenced code block.
+- **Failure handling, type field** — a 2xx answers
+  `{"response_id": "<id>", "type": "push_notification",
+  "data": {...}}`, and the `type` field — not the HTTP
+  status alone — decides acceptance: a 2xx with no
+  `type` field surfaced is retryable (without the field
+  the sink cannot claim the campaign was created), and a
+  2xx with any other surfaced `type` is a non-retryable
+  failure (the server answered a different resource).
+  A successful response is only an acceptance receipt,
+  not a delivery result — delivery is handled by the
+  provider and depends on valid recipient attributes. A
+  non-2xx POST throws `MoEngageSinkError` carrying
+  exactly the failed messages with their retry lanes, so
+  the caller retries just those. 429 and every 5xx are
+  retryable; every other non-2xx status (400, 401, 403,
+  404, 409: mismatched query type, invalid body, bad
+  workspace id or API key, duplicate campaign name) is
+  fail-closed, non-retryable, and a codeless transport
+  failure is retryable. A missing client throws
+  `MoEngageSinkConfigError` → `non_retryable`, the
+  WR-116 rule. `dryRun` validates (including content
+  derivation) with zero client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same

@@ -120,6 +120,7 @@ import { WonderPushSinkConfigError } from "./wonderpush-sink.ts";
 import { TelesignSinkConfigError } from "./telesign-sink.ts";
 import { AirshipSinkConfigError } from "./airship-sink.ts";
 import { CleverTapSinkConfigError } from "./clevertap-sink.ts";
+import { MoEngageSinkConfigError } from "./moengage-sink.ts";
 import { EmailSinkConfigError } from "./email-sink.ts";
 import { DigestAuthError } from "./digest-auth.ts";
 import { CredentialSecretUnavailableError } from "./outbound-credentials.ts";
@@ -1003,6 +1004,20 @@ export function classifyFailure(err: unknown): ClassifiedFailure {
   // host or targeting is not a config error: they default
   // to the Europe host and the entire user base.)
   if (err instanceof CleverTapSinkConfigError) {
+    return { failureClass: "non_retryable" };
+  }
+  // WR-286: a MoEngage sink with no injected client is a
+  // local config problem — the POST was never built, let
+  // alone sent. Retrying can never succeed for this item, so dead-letter
+  // immediately instead of burning the retry budget and
+  // the backoff clock (the WR-116 rule, applied to the
+  // MoEngage sink like the CleverTap sink above).
+  // There is no per-record target fallback: a missing
+  // client has nowhere to deliver to. (A missing region
+  // host, platform list, or campaign name is not a config
+  // error: they default to the DC-01 host, all three
+  // platforms, and the derived name.)
+  if (err instanceof MoEngageSinkConfigError) {
     return { failureClass: "non_retryable" };
   }
   // WR-233: an email sink with no injected client or no
