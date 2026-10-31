@@ -123,6 +123,7 @@ import { CleverTapSinkConfigError } from "./clevertap-sink.ts";
 import { MoEngageSinkConfigError } from "./moengage-sink.ts";
 import { CustomerIoSinkConfigError } from "./customerio-sink.ts";
 import { IterableSinkConfigError } from "./iterable-sink.ts";
+import { PusherBeamsSinkConfigError } from "./pusher-beams-sink.ts";
 import { EmailSinkConfigError } from "./email-sink.ts";
 import { DigestAuthError } from "./digest-auth.ts";
 import { CredentialSecretUnavailableError } from "./outbound-credentials.ts";
@@ -1046,6 +1047,19 @@ export function classifyFailure(err: unknown): ClassifiedFailure {
   // host is not a config error: it defaults to the USDC
   // host.)
   if (err instanceof IterableSinkConfigError) {
+    return { failureClass: "non_retryable" };
+  }
+  // WR-289: a Pusher Beams sink with no injected client is a
+  // local config problem — the POST was never built, let
+  // alone sent. Retrying can never succeed for this item, so dead-letter
+  // immediately instead of burning the retry budget and
+  // the backoff clock (the WR-116 rule, applied to the
+  // Pusher Beams sink like the Iterable sink above).
+  // There is no per-record target fallback: a missing
+  // client has nowhere to deliver to. (A missing platforms
+  // list is not a config error: it defaults to all three
+  // platforms.)
+  if (err instanceof PusherBeamsSinkConfigError) {
     return { failureClass: "non_retryable" };
   }
   // WR-233: an email sink with no injected client or no

@@ -10135,6 +10135,43 @@ await sink.send([
   WR-116 rule. `dryRun` validates (including content
   derivation) with zero client I/O.
 
+`src/pusher-beams-sink.ts` (WR-289) delivers to
+Pusher Beams' Publish API: one event notification is
+sent as one POST that publishes to a fixed interest
+set, and Beams — not the relay — owns the audience
+targeting, the delivery, and the retention of the
+notification. No HTTP client is bundled — the client
+is injected through `config.client`, which alone holds
+the instance secret key and sends it as the
+`Authorization: Bearer <secret key>` header. The sink
+POSTs to
+`https://<instanceId>.pushnotifications.pusher.com/publish_api/v1/instances/<instanceId>/publishes`
+with `{ interests: [...], fcm, apns, web }`: 1–100
+interests per request, each at most 164 characters of
+ASCII letters, digits, and `_-=@,.;`, and one derived
+payload per enabled platform (`fcm.notification` /
+`web.notification`, `apns.aps.alert`), all carrying the
+same title/body derived from the event's `subject` →
+`key` → `traceId` chain (fallback `webhook event`).
+The payload body is appended only under the
+`includePayload` opt-in, truncated to `payloadMaxChars`
+(default 2000). A 2xx is acceptance, and the success
+body's `publishId` is returned as the receipt
+(`send()` returns the collected `publishIds` in send
+order, so the caller can correlate with Beams'
+publish webhooks). A non-2xx POST throws
+`PusherBeamsSinkError` carrying exactly the failed
+messages with their retry lanes, so the caller retries
+just those. 429 and every 5xx are retryable; every
+other non-2xx status (400, 401, 402, 404: bad
+interests or payload, bad instance secret key,
+publishing blocked for being over plan limits, unknown
+instance) is fail-closed, non-retryable, and a
+codeless transport failure is retryable. A missing
+client throws `PusherBeamsSinkConfigError` →
+`non_retryable`, the WR-116 rule. `dryRun` validates
+(including content derivation) with zero client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same
