@@ -9436,6 +9436,98 @@ await sink.send([
   `non_retryable`, the WR-116 rule. `dryRun` validates
   (including content derivation) with zero client I/O.
 
+`src/wonderpush-sink.ts` (WR-282) delivers to
+WonderPush's Management API: one event notification is
+sent as one POST to
+`https://management-api.wonderpush.com/v1/deliveries`,
+and WonderPush — not the relay — owns the device routing,
+the delivery, and the retention of the notification.
+No HTTP client is bundled — the client is injected
+through `config.client`, so the module has zero new
+dependencies and tests never need a WonderPush server.
+
+```ts
+const sink = new WonderPushSink({
+  accessToken: "<application access token>", // from the API Credentials page
+  targeting: { targetSegmentIds: "segment-1" }, // at least one target field
+  client, // your client adapter implementing WonderPushMessageClient
+});
+await sink.send([
+  { body: JSON.stringify(event), subject: "order.created", key: "agg-7" },
+]);
+```
+
+- **Message envelope, form-encoded delivery** — one sink
+  targets one WonderPush application audience: every
+  message POSTs to the fixed
+  `https://management-api.wonderpush.com/v1/deliveries`,
+  with a form-encoded body
+  (`Content-Type: application/x-www-form-urlencoded`)
+  carrying `accessToken`, the targeting fields, and
+  `notification` as a JSON string:
+  `{"alert":{"title":"<title>","text":"<text>"}}`.
+  The Management API is form-encoded per the current
+  WonderPush documentation (checked this round,
+  2026-10-31), and it authenticates with the
+  `accessToken` form field — there is no Bearer-header
+  auth in the current docs, so the sink follows the docs
+  rather than the backlog item's prescribed Bearer/JSON
+  envelope (the item itself says the implementation round
+  takes the current docs as authoritative). The token is
+  never logged and never appears in the URL the sink
+  builds. Targeting is config-held and passed through
+  verbatim — `targetSegmentIds`, `targetUserIds`,
+  `targetTags`, `targetInstallationIds`,
+  `targetDeviceIds` (string or string array, joined with
+  commas) — and at least one field must be set: the API
+  refuses a delivery with no target and no campaign. The
+  sink invents no default audience, in particular never
+  `@ALL` (the docs warn against it on a production app).
+  No `campaignId` is configured, so these deliveries are
+  not included in the dashboard metrics (the docs' own
+  caveat). Orthogonal to the Pushwoosh sink (WR-281: JSON
+  body, token in a `request`/`auth` field,
+  `notifications` array with `send_date`/`content`),
+  to the Expo sink (WR-280: flat `{to, title, body}`
+  JSON envelope to one push token, per-message ticket),
+  and to the FCM sink (WR-276: OAuth Bearer header,
+  `{message: {token, notification}}` envelope). A
+  missing client, access token, or targeting fails closed
+  with `WonderPushSinkConfigError` at send time. The
+  response's delivery id is only an acceptance receipt,
+  not a delivery result.
+- **Title and text split** — the title takes the event's
+  `subject` and is omitted entirely when the event has no
+  subject, while the text takes the first non-empty among
+  `subject`, `key`, and `traceId`, falling back to the
+  generic summary `webhook event` for sourceless events,
+  which must not be silently dropped.
+- **Payload inclusion** — by default the message carries
+  the summary only, never the full payload: event bodies
+  routinely carry PII, and a device is a far wider
+  audience than a queue or a stream. Opting into
+  `includePayload` appends the body verbatim after a blank
+  line inside `text`, truncated to `payloadMaxChars`
+  characters (default 2000) with a truncation marker —
+  the truncation is unconditional under the opt-in, and
+  the payload stays plain text inside the `text` field,
+  not a fenced code block.
+- **Failure handling, delivery id** — a 201 returns the
+  created delivery's id, and the id — not the HTTP status
+  alone — decides acceptance: a 2xx with no delivery id
+  surfaced is retryable (without the id the sink cannot
+  claim the delivery was created). A non-2xx POST throws
+  `WonderPushSinkError` carrying exactly the failed
+  messages with their retry lanes, so the caller retries
+  just those. 429 and every 5xx are retryable; every
+  other non-2xx status (400, 401, 403, 404: unknown
+  segment, invalid body, bad access token) is fail-closed,
+  non-retryable, and a codeless transport failure is
+  retryable. A missing client, access token, or targeting
+  throws `WonderPushSinkConfigError` → `non_retryable`,
+  the WR-116 rule. `dryRun` validates (including
+  title/text derivation) with zero client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same

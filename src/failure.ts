@@ -116,6 +116,7 @@ import { BrazeSinkConfigError } from "./braze-sink.ts";
 import { CourierSinkConfigError } from "./courier-sink.ts";
 import { ExpoSinkConfigError } from "./expo-sink.ts";
 import { PushwooshSinkConfigError } from "./pushwoosh-sink.ts";
+import { WonderPushSinkConfigError } from "./wonderpush-sink.ts";
 import { EmailSinkConfigError } from "./email-sink.ts";
 import { DigestAuthError } from "./digest-auth.ts";
 import { CredentialSecretUnavailableError } from "./outbound-credentials.ts";
@@ -952,6 +953,17 @@ export function classifyFailure(err: unknown): ClassifiedFailure {
   // There is no per-record target fallback: a missing
   // application code or token has nowhere to deliver to.
   if (err instanceof PushwooshSinkConfigError) {
+    return { failureClass: "non_retryable" };
+  }
+  // WR-282: a WonderPush sink with no injected client or no
+  // access token or targeting is a local config problem — the POST was never
+  // built, let alone sent. Retrying can never succeed for this item, so dead-letter
+  // immediately instead of burning the retry budget and
+  // the backoff clock (the WR-116 rule, applied to the
+  // WonderPush sink like the Pushwoosh sink above).
+  // There is no per-record target fallback: a missing
+  // access token or targeting has nowhere to deliver to.
+  if (err instanceof WonderPushSinkConfigError) {
     return { failureClass: "non_retryable" };
   }
   // WR-233: an email sink with no injected client or no
