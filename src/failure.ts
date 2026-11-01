@@ -127,6 +127,7 @@ import { PusherBeamsSinkConfigError } from "./pusher-beams-sink.ts";
 import { BatchSinkConfigError } from "./batch-sink.ts";
 import { NovuSinkConfigError } from "./novu-sink.ts";
 import { KnockSinkConfigError } from "./knock-sink.ts";
+import { SuprSendSinkConfigError } from "./suprsend-sink.ts";
 import { EmailSinkConfigError } from "./email-sink.ts";
 import { DigestAuthError } from "./digest-auth.ts";
 import { CredentialSecretUnavailableError } from "./outbound-credentials.ts";
@@ -1101,6 +1102,19 @@ export function classifyFailure(err: unknown): ClassifiedFailure {
   // key or recipient is not a client error: it fails at
   // construction with a `RangeError`.)
   if (err instanceof KnockSinkConfigError) {
+    return { failureClass: "non_retryable" };
+  }
+  // WR-293: a SuprSend sink with no injected client is a
+  // local config problem — the POST was never built, let
+  // alone sent. Retrying can never succeed for this item, so dead-letter
+  // immediately instead of burning the retry budget and
+  // the backoff clock (the WR-116 rule, applied to the
+  // SuprSend sink like the Knock sink above).
+  // There is no per-record target fallback: a missing
+  // client has nowhere to deliver to. (A missing workflow
+  // slug or recipient is not a client error: it fails at
+  // construction with a `RangeError`.)
+  if (err instanceof SuprSendSinkConfigError) {
     return { failureClass: "non_retryable" };
   }
   // WR-233: an email sink with no injected client or no
