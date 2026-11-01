@@ -10278,6 +10278,55 @@ the `includePayload` opt-in. A missing client throws
 rule. `dryRun` validates (including message
 derivation) with zero client I/O.
 
+`src/knock-sink.ts` (WR-292) triggers a Knock workflow
+through Knock's workflow trigger API: one event
+notification is sent as one POST to
+`https://api.knock.app/v1/workflows/<key>/trigger` and Knock — not
+the relay — owns the workflow execution, the channel
+fan-out, the delivery, and the retention of the
+notification. This module is orthogonal to WR-291
+(Novu's Events trigger API with its `Authorization: ApiKey` header
+and `name`/`to`/`payload` envelope), WR-287 (Customer.io's
+transactional push), and WR-279 (Courier's send API): Knock triggers a
+multi-channel workflow by key, with a `Bearer` secret key and a
+`key`/`recipients`/`data` envelope. No HTTP client is bundled — the client is
+injected through `config.client`, which alone holds the
+environment secret key and adds the `Authorization:
+Bearer <secret key>` header, so the handed request
+carries no credential at all. The body carries `{ key,
+recipients, data }`: `key` is config-held and required (the
+workflow key from the Knock dashboard; the workflow must already
+exist before a trigger can run it); `recipients` is config-held and
+required — an array of 1–1000 recipient identifiers (a user-id string,
+or a recipient object `{ id, collection? }` with extra profile fields
+passed through verbatim, which Knock identifies inline before
+triggering), never a default to the whole audience (there is
+no broadcast form here); `data` carries `body`
+(always, derived from the event's `subject` → `key` → `traceId` chain, fallback `webhook event`) and `title`
+(optional, from `subject` alone, omitted when the
+event carries none). `actor` (a recipient identifier naming who or
+what performed the action) and `cancellation_key` (a unique identifier
+enabling a later cancellation of this run, for delayed or batch steps)
+are optional, config-held, and passed through verbatim when set. Every
+trigger carries a deterministic `Idempotency-Key` header derived from
+the workflow key, the recipients, and the record, so a retry of the
+same record replays the same key and Knock returns the same response
+instead of running the workflow twice; the docs support the header only
+on this endpoint, and only cache successful (2xx) responses. A 200
+is acceptance, and the success body's `workflow_run_id` is returned as
+the receipt (`send()` returns the collected `workflowRunIds` in send
+order); the id is only an acceptance receipt, not a delivery result —
+delivery surfaces later through Knock's dashboard, and the workflow runs
+are executed asynchronously. Any other status is a failure: 429 and
+every 5xx are retryable; every other non-200 status (400, 401, 403, 404:
+bad recipients or payload, bad secret key, insufficient permissions,
+unknown workflow) is fail-closed, non-retryable, and a codeless
+transport failure is retryable. `eventBody` (a JSON string carrying the
+event body verbatim, truncated to `payloadMaxChars`, default 2000) is
+appended inside `data` only under the `includePayload` opt-in. A missing
+client throws `KnockSinkConfigError` → `non_retryable`, the WR-116
+rule. `dryRun` validates (including message derivation) with zero client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same
