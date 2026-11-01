@@ -10218,6 +10218,66 @@ failure is retryable. A missing client throws
 rule. `dryRun` validates (including message
 derivation) with zero client I/O.
 
+`src/novu-sink.ts` (WR-291) triggers a Novu workflow
+through Novu's Events trigger API: one event
+notification is sent as one POST to
+`https://api.novu.co/v1/events/trigger` and Novu — not
+the relay — owns the workflow execution, the channel
+fan-out, the delivery, and the retention of the
+notification. This module is orthogonal to WR-290
+(Batch's Transactional API with its `X-Authorization`
+header), WR-287 (Customer.io's transactional push), and
+WR-279 (Courier's send API): Novu triggers a
+multi-channel workflow by name, not a single-channel
+send. No HTTP client is bundled — the client is
+injected through `config.client`, which alone holds the
+environment secret key and adds the `Authorization:
+ApiKey <secret key>` header, so the handed request
+carries no credential at all. The body carries `{ name,
+to, payload }`: `name` is config-held and required (the
+workflow trigger identifier; the workflow must already
+exist and be published before a Production trigger can
+run it); `to` is config-held and required — a
+subscriber-id string, a subscriber object (Novu creates
+the subscriber on that trigger when they do not exist
+yet), a topic `{ type: "Topic", topicKey }` (Novu fans
+the workflow out to every subscriber in the topic), or
+an array of those (at most 100 recipients per the
+docs), never a default to the whole audience (there is
+no broadcast form here); `payload` carries `body`
+(always, derived from the event's `subject` → `key` →
+`traceId` chain, fallback `webhook event`) and `title`
+(optional, from `subject` alone, omitted when the
+event carries none). Every trigger carries a
+deterministic `Idempotency-Key` header derived from the
+workflow name, the recipients, and the record, so a
+retry of the same record replays the same key and Novu
+returns the cached response instead of running the
+workflow twice; while the first request is still in
+progress, a duplicate key returns 409 Conflict. A 201
+is acceptance, and the success body's `transactionId`
+is returned as the receipt (`send()` returns the
+collected `transactionIds` in send order); the id is
+only an acceptance receipt, not a delivery result —
+delivery surfaces later through Novu's Activity Feed. A
+201 whose body says the trigger was not processed
+(`acknowledged: false`, or a `status` other than
+`processed` — an unpublished workflow, an invalid
+recipient, a workflow with no steps) is a failure with
+a `NOVU_<status>` code, not an acceptance. Any other
+status is a failure: 429 and every 5xx are retryable;
+every other non-201 status (400, 401, 404, 409: bad
+recipients or payload, bad secret key, unknown
+workflow, an in-progress duplicate) is fail-closed,
+non-retryable, and a codeless transport failure is
+retryable. `eventBody` (a JSON string carrying the
+event body verbatim, truncated to `payloadMaxChars`,
+default 2000) is appended inside `payload` only under
+the `includePayload` opt-in. A missing client throws
+`NovuSinkConfigError` → `non_retryable`, the WR-116
+rule. `dryRun` validates (including message
+derivation) with zero client I/O.
+
 ## In-flight request coalescing (opt-in)
 
 When a burst of deliveries carries the identical logical request — same

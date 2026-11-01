@@ -125,6 +125,7 @@ import { CustomerIoSinkConfigError } from "./customerio-sink.ts";
 import { IterableSinkConfigError } from "./iterable-sink.ts";
 import { PusherBeamsSinkConfigError } from "./pusher-beams-sink.ts";
 import { BatchSinkConfigError } from "./batch-sink.ts";
+import { NovuSinkConfigError } from "./novu-sink.ts";
 import { EmailSinkConfigError } from "./email-sink.ts";
 import { DigestAuthError } from "./digest-auth.ts";
 import { CredentialSecretUnavailableError } from "./outbound-credentials.ts";
@@ -1073,6 +1074,19 @@ export function classifyFailure(err: unknown): ClassifiedFailure {
   // client has nowhere to deliver to. (A missing group id
   // is not a config error: it defaults to "webhook-relay".)
   if (err instanceof BatchSinkConfigError) {
+    return { failureClass: "non_retryable" };
+  }
+  // WR-291: a Novu sink with no injected client is a
+  // local config problem — the POST was never built, let
+  // alone sent. Retrying can never succeed for this item, so dead-letter
+  // immediately instead of burning the retry budget and
+  // the backoff clock (the WR-116 rule, applied to the
+  // Novu sink like the Batch sink above).
+  // There is no per-record target fallback: a missing
+  // client has nowhere to deliver to. (A missing workflow
+  // name or recipient is not a client error: it fails at
+  // construction with a `RangeError`.)
+  if (err instanceof NovuSinkConfigError) {
     return { failureClass: "non_retryable" };
   }
   // WR-233: an email sink with no injected client or no
