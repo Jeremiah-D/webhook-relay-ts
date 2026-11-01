@@ -130,6 +130,7 @@ import { KnockSinkConfigError } from "./knock-sink.ts";
 import { SuprSendSinkConfigError } from "./suprsend-sink.ts";
 import { MagicBellSinkConfigError } from "./magicbell-sink.ts";
 import { IntercomSinkConfigError } from "./intercom-sink.ts";
+import { PushySinkConfigError } from "./pushy-sink.ts";
 import { EmailSinkConfigError } from "./email-sink.ts";
 import { DigestAuthError } from "./digest-auth.ts";
 import { CredentialSecretUnavailableError } from "./outbound-credentials.ts";
@@ -1143,6 +1144,20 @@ export function classifyFailure(err: unknown): ClassifiedFailure {
   // or contact id is not a client error: it fails at
   // construction with a `RangeError`.)
   if (err instanceof IntercomSinkConfigError) {
+    return { failureClass: "non_retryable" };
+  }
+  // WR-296: a Pushy sink with no injected client is a
+  // local config problem — the POST was never built, let
+  // alone sent. Retrying can never succeed for this item, so dead-letter
+  // immediately instead of burning the retry budget and
+  // the backoff clock (the WR-116 rule, applied to the
+  // Pushy sink like the Intercom sink above).
+  // There is no per-record target fallback: a missing
+  // client has nowhere to deliver to. (A missing device
+  // token, or a `/topics/<name>` topic value, is not a
+  // client error: it fails at construction with a
+  // `RangeError`.)
+  if (err instanceof PushySinkConfigError) {
     return { failureClass: "non_retryable" };
   }
   // WR-233: an email sink with no injected client or no
