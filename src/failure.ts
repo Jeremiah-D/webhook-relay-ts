@@ -129,6 +129,7 @@ import { NovuSinkConfigError } from "./novu-sink.ts";
 import { KnockSinkConfigError } from "./knock-sink.ts";
 import { SuprSendSinkConfigError } from "./suprsend-sink.ts";
 import { MagicBellSinkConfigError } from "./magicbell-sink.ts";
+import { IntercomSinkConfigError } from "./intercom-sink.ts";
 import { EmailSinkConfigError } from "./email-sink.ts";
 import { DigestAuthError } from "./digest-auth.ts";
 import { CredentialSecretUnavailableError } from "./outbound-credentials.ts";
@@ -1129,6 +1130,19 @@ export function classifyFailure(err: unknown): ClassifiedFailure {
   // key is not a client error: it fails at construction
   // with a `RangeError`.)
   if (err instanceof MagicBellSinkConfigError) {
+    return { failureClass: "non_retryable" };
+  }
+  // WR-295: an Intercom sink with no injected client is a
+  // local config problem — the POST was never built, let
+  // alone sent. Retrying can never succeed for this item, so dead-letter
+  // immediately instead of burning the retry budget and
+  // the backoff clock (the WR-116 rule, applied to the
+  // Intercom sink like the MagicBell sink above).
+  // There is no per-record target fallback: a missing
+  // client has nowhere to deliver to. (A missing admin id
+  // or contact id is not a client error: it fails at
+  // construction with a `RangeError`.)
+  if (err instanceof IntercomSinkConfigError) {
     return { failureClass: "non_retryable" };
   }
   // WR-233: an email sink with no injected client or no
