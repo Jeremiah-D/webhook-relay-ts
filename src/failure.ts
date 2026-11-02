@@ -137,6 +137,7 @@ import { ZendutySinkConfigError } from "./zenduty-sink.ts";
 import { SquadcastSinkConfigError } from "./squadcast-sink.ts";
 import { Signl4SinkConfigError } from "./signl4-sink.ts";
 import { GrafanaOnCallSinkConfigError } from "./grafana-oncall-sink.ts";
+import { SpikeSinkConfigError } from "./spike-sink.ts";
 import { EmailSinkConfigError } from "./email-sink.ts";
 import { DigestAuthError } from "./digest-auth.ts";
 import { CredentialSecretUnavailableError } from "./outbound-credentials.ts";
@@ -1242,6 +1243,19 @@ export function classifyFailure(err: unknown): ClassifiedFailure {
   // not a client error: it fails at construction with a
   // `RangeError`.)
   if (err instanceof GrafanaOnCallSinkConfigError) {
+    return { failureClass: "non_retryable" };
+  }
+  // WR-303: a Spike.sh sink with no injected client is a
+  // local config problem — the POST was never built, let
+  // alone sent. Retrying can never succeed for this item, so dead-letter
+  // immediately instead of burning the retry budget and
+  // the backoff clock (the WR-116 rule, applied to the
+  // Spike.sh sink like the Grafana OnCall sink above).
+  // There is no per-record target fallback: a missing
+  // client has nowhere to deliver to. (A bad status,
+  // severity, or priority is not a client error: it fails
+  // at construction with a `RangeError`.)
+  if (err instanceof SpikeSinkConfigError) {
     return { failureClass: "non_retryable" };
   }
   // WR-233: an email sink with no injected client or no
