@@ -139,6 +139,7 @@ import { Signl4SinkConfigError } from "./signl4-sink.ts";
 import { GrafanaOnCallSinkConfigError } from "./grafana-oncall-sink.ts";
 import { SpikeSinkConfigError } from "./spike-sink.ts";
 import { SplunkOnCallSinkConfigError } from "./splunk-oncall-sink.ts";
+import { PagerTreeSinkConfigError } from "./pagertree-sink.ts";
 import { EmailSinkConfigError } from "./email-sink.ts";
 import { DigestAuthError } from "./digest-auth.ts";
 import { CredentialSecretUnavailableError } from "./outbound-credentials.ts";
@@ -1270,6 +1271,19 @@ export function classifyFailure(err: unknown): ClassifiedFailure {
   // message type is not a client error: it fails at
   // construction with a `RangeError`.)
   if (err instanceof SplunkOnCallSinkConfigError) {
+    return { failureClass: "non_retryable" };
+  }
+  // WR-305: a PagerTree sink with no injected client is a
+  // local config problem — the POST was never built, let
+  // alone sent. Retrying can never succeed for this item, so dead-letter
+  // immediately instead of burning the retry budget and
+  // the backoff clock (the WR-116 rule, applied to the
+  // PagerTree sink like the Splunk On-Call sink above).
+  // There is no per-record target fallback: a missing
+  // client has nowhere to deliver to. (A bad event type
+  // or urgency is not a client error: it fails at
+  // construction with a `RangeError`.)
+  if (err instanceof PagerTreeSinkConfigError) {
     return { failureClass: "non_retryable" };
   }
   // WR-233: an email sink with no injected client or no
