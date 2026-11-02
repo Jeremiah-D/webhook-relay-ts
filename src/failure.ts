@@ -136,6 +136,7 @@ import { IlertSinkConfigError } from "./ilert-sink.ts";
 import { ZendutySinkConfigError } from "./zenduty-sink.ts";
 import { SquadcastSinkConfigError } from "./squadcast-sink.ts";
 import { Signl4SinkConfigError } from "./signl4-sink.ts";
+import { GrafanaOnCallSinkConfigError } from "./grafana-oncall-sink.ts";
 import { EmailSinkConfigError } from "./email-sink.ts";
 import { DigestAuthError } from "./digest-auth.ts";
 import { CredentialSecretUnavailableError } from "./outbound-credentials.ts";
@@ -1228,6 +1229,19 @@ export function classifyFailure(err: unknown): ClassifiedFailure {
   // not a client error: it fails at construction with a
   // `RangeError`.)
   if (err instanceof Signl4SinkConfigError) {
+    return { failureClass: "non_retryable" };
+  }
+  // WR-302: a Grafana OnCall sink with no injected client is a
+  // local config problem — the POST was never built, let
+  // alone sent. Retrying can never succeed for this item, so dead-letter
+  // immediately instead of burning the retry budget and
+  // the backoff clock (the WR-116 rule, applied to the
+  // Grafana OnCall sink like the SIGNL4 sink above).
+  // There is no per-record target fallback: a missing
+  // client has nowhere to deliver to. (A bad status is
+  // not a client error: it fails at construction with a
+  // `RangeError`.)
+  if (err instanceof GrafanaOnCallSinkConfigError) {
     return { failureClass: "non_retryable" };
   }
   // WR-233: an email sink with no injected client or no
