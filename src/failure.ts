@@ -141,6 +141,7 @@ import { SpikeSinkConfigError } from "./spike-sink.ts";
 import { SplunkOnCallSinkConfigError } from "./splunk-oncall-sink.ts";
 import { PagerTreeSinkConfigError } from "./pagertree-sink.ts";
 import { XMattersSinkConfigError } from "./xmatters-sink.ts";
+import { AlertOpsSinkConfigError } from "./alertops-sink.ts";
 import { EmailSinkConfigError } from "./email-sink.ts";
 import { DigestAuthError } from "./digest-auth.ts";
 import { CredentialSecretUnavailableError } from "./outbound-credentials.ts";
@@ -1298,6 +1299,19 @@ export function classifyFailure(err: unknown): ClassifiedFailure {
   // a resolved record is not a client error: it fails at
   // construction or record validation with a `RangeError`.)
   if (err instanceof XMattersSinkConfigError) {
+    return { failureClass: "non_retryable" };
+  }
+  // WR-307: an AlertOps sink with no injected client is a
+  // local config problem — the POST was never built, let
+  // alone sent. Retrying can never succeed for this item, so dead-letter
+  // immediately instead of burning the retry budget and
+  // the backoff clock (the WR-116 rule, applied to the
+  // AlertOps sink like the xMatters sink above).
+  // There is no per-record target fallback: a missing
+  // client has nowhere to deliver to. (A bad status value
+  // or a keyless resolve is not a client error: it fails
+  // at construction or record validation with a `RangeError`.)
+  if (err instanceof AlertOpsSinkConfigError) {
     return { failureClass: "non_retryable" };
   }
   // WR-233: an email sink with no injected client or no
