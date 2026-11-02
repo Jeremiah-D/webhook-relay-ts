@@ -133,6 +133,7 @@ import { IntercomSinkConfigError } from "./intercom-sink.ts";
 import { PushySinkConfigError } from "./pushy-sink.ts";
 import { OpsgenieSinkConfigError } from "./opsgenie-sink.ts";
 import { IlertSinkConfigError } from "./ilert-sink.ts";
+import { ZendutySinkConfigError } from "./zenduty-sink.ts";
 import { EmailSinkConfigError } from "./email-sink.ts";
 import { DigestAuthError } from "./digest-auth.ts";
 import { CredentialSecretUnavailableError } from "./outbound-credentials.ts";
@@ -1186,6 +1187,19 @@ export function classifyFailure(err: unknown): ClassifiedFailure {
   // event type is not a client error: it fails at
   // construction with a `RangeError`.)
   if (err instanceof IlertSinkConfigError) {
+    return { failureClass: "non_retryable" };
+  }
+  // WR-299: a Zenduty sink with no injected client is a
+  // local config problem — the POST was never built, let
+  // alone sent. Retrying can never succeed for this item, so dead-letter
+  // immediately instead of burning the retry budget and
+  // the backoff clock (the WR-116 rule, applied to the
+  // Zenduty sink like the ilert sink above).
+  // There is no per-record target fallback: a missing
+  // client has nowhere to deliver to. (A bad alert type
+  // is not a client error: it fails at construction with
+  // a `RangeError`.)
+  if (err instanceof ZendutySinkConfigError) {
     return { failureClass: "non_retryable" };
   }
   // WR-233: an email sink with no injected client or no
