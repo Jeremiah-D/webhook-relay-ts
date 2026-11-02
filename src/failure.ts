@@ -140,6 +140,7 @@ import { GrafanaOnCallSinkConfigError } from "./grafana-oncall-sink.ts";
 import { SpikeSinkConfigError } from "./spike-sink.ts";
 import { SplunkOnCallSinkConfigError } from "./splunk-oncall-sink.ts";
 import { PagerTreeSinkConfigError } from "./pagertree-sink.ts";
+import { XMattersSinkConfigError } from "./xmatters-sink.ts";
 import { EmailSinkConfigError } from "./email-sink.ts";
 import { DigestAuthError } from "./digest-auth.ts";
 import { CredentialSecretUnavailableError } from "./outbound-credentials.ts";
@@ -1284,6 +1285,19 @@ export function classifyFailure(err: unknown): ClassifiedFailure {
   // or urgency is not a client error: it fails at
   // construction with a `RangeError`.)
   if (err instanceof PagerTreeSinkConfigError) {
+    return { failureClass: "non_retryable" };
+  }
+  // WR-306: an xMatters sink with no injected client is a
+  // local config problem — the POST was never built, let
+  // alone sent. Retrying can never succeed for this item, so dead-letter
+  // immediately instead of burning the retry budget and
+  // the backoff clock (the WR-116 rule, applied to the
+  // xMatters sink like the PagerTree sink above).
+  // There is no per-record target fallback: a missing
+  // client has nowhere to deliver to. (A bad priority or
+  // a resolved record is not a client error: it fails at
+  // construction or record validation with a `RangeError`.)
+  if (err instanceof XMattersSinkConfigError) {
     return { failureClass: "non_retryable" };
   }
   // WR-233: an email sink with no injected client or no
