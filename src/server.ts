@@ -125,10 +125,13 @@ import {
 } from "./adaptive-timeout.ts";
 import {
   PhaseTimeoutError,
+  applyPhaseTimeoutRevision,
   assertValidPhaseTimeoutBudgets,
   resolvePhaseTimeouts,
+  samePhaseTimeoutBudgets,
   type PhaseTimeoutBudgets,
   type PhaseTimeoutPhase,
+  type PhaseTimeoutRevision,
 } from "./phase-timeouts.ts";
 import {
   createHedgedSender,
@@ -1208,6 +1211,11 @@ export interface RelayServerOptions {
    * deadline stays end-to-end — both may be configured. All values
    * must be positive integers (ms) with at least one phase per
    * entry; invalid entries throw `RangeError` at startup.
+   *
+   * Runtime revision (WR-311): `server.setPhaseTimeouts(targetUrl,
+   * patch)` revises one endpoint's budgets in place — the next
+   * delivery judges by the new values (`server.getPhaseTimeouts()`
+   * snapshots the live record).
    */
   phaseTimeouts?: Record<string, PhaseTimeoutBudgets>;
   /**
@@ -5642,6 +5650,31 @@ export interface RelayServer extends Server {
    * enabling the cap needs a restart.
    */
   setGlobalRateLimit?: (patch: GlobalRateLimitRevision) => { messagesPerSec: number; maxBurst: number };
+  /**
+   * WR-311: revise one endpoint's per-phase timeout budgets at runtime
+   * (`targetUrl` exact match, partial — omitted phases keep their live
+   * values, a phase set to `null` deletes that phase, deleting the last
+   * phase removes the endpoint entry and the endpoint falls back to the
+   * attempt-total timeout behavior). The sender resolves the budgets
+   * per attempt from the same record this method rewrites in place, so
+   * the next delivery judges by the new values; an attempt already in
+   * flight keeps the timers it armed. An illegal patch throws
+   * `RangeError` and the live values are untouched; an empty patch (or
+   * values equal to the live ones) is a no-op with no audit event. A
+   * real revision is audited as `phase_timeout_revised` with `endpoint`
+   * and `previous` / `current` budgets (`null` when the endpoint had —
+   * or ends with — no entry), and returns the live budgets for the
+   * endpoint (`undefined` when the entry was deleted). Always set;
+   * throws `Error` when `phaseTimeouts` was never configured —
+   * enabling phase budgets needs a restart.
+   */
+  setPhaseTimeouts?: (targetUrl: string, patch: PhaseTimeoutRevision) => PhaseTimeoutBudgets | undefined;
+  /**
+   * WR-311: snapshot of the live per-endpoint phase timeout budgets
+   * (a deep copy — mutating it never touches the live record). Empty
+   * when `phaseTimeouts` was never configured.
+   */
+  getPhaseTimeouts?: () => Record<string, PhaseTimeoutBudgets>;
   /**
    * WR-310: relay-level global rate-limit snapshot (the live rate and
    * burst cap, current bucket level, FIFO waiter depth, and cumulative
@@ -13484,6 +13517,62 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   if (queue.getGlobalRateLimitStats() !== undefined) {
     server.getGlobalRateLimitStats = (): GlobalRateLimitStats => queue.getGlobalRateLimitStats()!;
   }
+
+  // WR-311: per-endpoint phase timeout budget runtime revision. The
+  // method is always set (like setDedupWindow above); with
+  // `phaseTimeouts` unconfigured it throws Error — enabling phase
+  // budgets needs a restart: the default sender captured no
+  // `phaseTimeouts` record at startup, so there is no live record a
+  // runtime revision could rewrite. A real revision is audited as
+  // `phase_timeout_revised` with the endpoint and the previous and
+  // current budgets; an empty or same-value patch is a silent no-op.
+  // The rewrite is in place on `opts.phaseTimeouts` — the sender
+  // holds the same record reference (passed by reference at
+  // construction, never spread or copied), so the next delivery
+  // resolves the new budgets; attempts already in flight keep the
+  // timers they armed.
+  server.setPhaseTimeouts = (targetUrl: string, patch: PhaseTimeoutRevision): PhaseTimeoutBudgets | undefined => {
+    if (opts.phaseTimeouts === undefined) {
+      throw new Error(
+        "setPhaseTimeouts: phaseTimeouts is not configured — enabling it requires a restart: " +
+          "the default sender captured no phaseTimeouts record at startup and a running server cannot start budgeting without one"
+      );
+    }
+    const record = opts.phaseTimeouts;
+    const previous = record[targetUrl] === undefined ? undefined : { ...record[targetUrl] };
+    // Validate-then-apply inside applyPhaseTimeoutRevision: an illegal
+    // patch throws RangeError and the live record is left completely
+    // intact.
+    const next = applyPhaseTimeoutRevision(previous, patch);
+    if (samePhaseTimeoutBudgets(previous, next)) {
+      return next === undefined ? undefined : { ...next };
+    }
+    if (next === undefined) {
+      delete record[targetUrl];
+    } else {
+      record[targetUrl] = next;
+    }
+    opts.auditLog.append({
+      event: "phase_timeout_revised",
+      endpoint: targetUrl,
+      previous: previous ?? null,
+      current: next ?? null,
+    });
+    return next === undefined ? undefined : { ...next };
+  };
+
+  // WR-311: live phase timeout budgets snapshot — a deep copy of the
+  // record, so callers can inspect (or mutate) it without touching the
+  // budgets the sender resolves per attempt.
+  server.getPhaseTimeouts = (): Record<string, PhaseTimeoutBudgets> => {
+    const snapshot: Record<string, PhaseTimeoutBudgets> = {};
+    if (opts.phaseTimeouts !== undefined) {
+      for (const [endpoint, budgets] of Object.entries(opts.phaseTimeouts)) {
+        snapshot[endpoint] = { ...budgets };
+      }
+    }
+    return snapshot;
+  };
 
   // WR-180: operator-plane rate-limiter snapshot (per-client sliding
   // windows). Only set when `operatorRateLimit` was configured.

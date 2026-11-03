@@ -11960,6 +11960,22 @@ attempt-total-timeout behavior untouched. All values are positive
 integer milliseconds with at least one phase per entry; invalid
 entries throw `RangeError` at startup.
 
+Live revision (WR-311): `server.setPhaseTimeouts(targetUrl, patch)`
+revises one endpoint's budgets in place — partial (omitted phases
+keep their live values), a phase set to `null` deletes that phase, and
+deleting the last phase removes the endpoint entry so the endpoint
+falls back to the attempt-total timeout behavior. The sender resolves
+the budgets per attempt from the same record the method rewrites, so
+the next delivery judges by the new values; an attempt already in
+flight keeps the timers it armed. An illegal patch throws `RangeError`
+and the live values are untouched; an empty or same-value patch is a
+silent no-op. A real revision is audited as `phase_timeout_revised`
+with the endpoint and the previous/current budgets (`null` when the
+endpoint had — or ends with — no entry). `server.getPhaseTimeouts()`
+snapshots the live record (a deep copy). With `phaseTimeouts` never
+configured the method throws `Error` — enabling phase budgets needs a
+restart.
+
 #### Adaptive outbound timeout (WR-166)
 
 Opt-in per-attempt timeout derived from each endpoint's recent

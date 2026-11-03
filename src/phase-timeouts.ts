@@ -87,6 +87,83 @@ export class PhaseTimeoutError extends Error {
 const PHASE_TIMEOUT_KEYS: readonly string[] = ["connectMs", "tlsMs", "firstByteMs", "bodyMs"];
 
 /**
+ * WR-311: a partial revision of one endpoint's phase timeout budgets.
+ * Omitted phases keep their live values; a phase set to `null` is
+ * deleted from the entry. Deleting the last phase removes the whole
+ * endpoint entry (the endpoint falls back to the attempt-total
+ * timeout behavior).
+ */
+export interface PhaseTimeoutRevision {
+  connectMs?: number | null;
+  tlsMs?: number | null;
+  firstByteMs?: number | null;
+  bodyMs?: number | null;
+}
+
+/**
+ * WR-311: merge a revision into the live budgets for one endpoint.
+ * Returns the merged budgets, or `undefined` when the last phase was
+ * deleted (the caller removes the endpoint entry). An empty patch
+ * returns the live budgets unchanged. Throws `RangeError` on an
+ * unknown phase name or a non-positive-integer budget — and the live
+ * budgets are never touched: validation runs before any merge, so a
+ * patch with one bad field voids the whole patch.
+ */
+export function applyPhaseTimeoutRevision(
+  current: PhaseTimeoutBudgets | undefined,
+  patch: PhaseTimeoutRevision
+): PhaseTimeoutBudgets | undefined {
+  if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+    throw new RangeError(
+      `phaseTimeouts revision must be an object of phase -> positive integer ms (or null to delete a phase), got ${String(patch)}`
+    );
+  }
+  for (const [key, value] of Object.entries(patch as Record<string, unknown>)) {
+    if (!PHASE_TIMEOUT_KEYS.includes(key)) {
+      throw new RangeError(
+        `phaseTimeouts revision has unknown phase "${key}" — expected one of ${PHASE_TIMEOUT_KEYS.join(", ")}`
+      );
+    }
+    if (value === undefined || value === null) continue;
+    if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
+      throw new RangeError(
+        `phaseTimeouts.${key} must be a positive integer (ms), got ${String(value)}`
+      );
+    }
+  }
+  const merged: PhaseTimeoutBudgets = { ...(current ?? {}) };
+  for (const [key, value] of Object.entries(patch as Record<string, unknown>)) {
+    if (value === undefined) continue;
+    if (value === null) {
+      delete merged[key as PhaseTimeoutPhase];
+    } else {
+      merged[key as PhaseTimeoutPhase] = value as number;
+    }
+  }
+  if (Object.keys(merged).length === 0) return undefined;
+  assertValidPhaseTimeoutBudgets(merged);
+  return merged;
+}
+
+/**
+ * WR-311: deep-equality for one endpoint's budgets (`undefined`
+ * means "no entry"). The server uses it to tell a real revision
+ * (audited) from a no-op re-affirmation (silent).
+ */
+export function samePhaseTimeoutBudgets(
+  a: PhaseTimeoutBudgets | undefined,
+  b: PhaseTimeoutBudgets | undefined
+): boolean {
+  if (a === undefined || b === undefined) return a === undefined && b === undefined;
+  return (
+    a.connectMs === b.connectMs &&
+    a.tlsMs === b.tlsMs &&
+    a.firstByteMs === b.firstByteMs &&
+    a.bodyMs === b.bodyMs
+  );
+}
+
+/**
  * Validate one `phaseTimeouts` entry. Throws `RangeError` on anything
  * invalid — fail fast at construction, never mid-delivery.
  */
