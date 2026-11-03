@@ -2879,6 +2879,21 @@ waiter via `releaseWaiters()`, whose liveness check bails it out instead of
 dispatching. Delayed dispatches increment `relay_global_rate_delayed_total`
 in the Prometheus exposition (only when the limit is configured).
 
+- **Live revision (WR-310)** — `server.setGlobalRateLimit({ messagesPerSec?, maxBurst? })`
+  revises the cap at runtime (partial — omitted fields keep their live
+  values), so tightening at peak or expanding at a trough no longer waits
+  for the next deploy. An illegal patch throws `RangeError` and the live
+  values are untouched; an empty patch (or values equal to the live ones)
+  is a no-op with no audit event. A real revision is audited as
+  `global_rate_revised` with `previous` / `current`
+  `{ messagesPerSec, maxBurst }`. Tightening clamps the unspent bucket to
+  the new cap (already-granted tokens are not revoked); waiters parked on
+  the gate are re-armed at the new rate. When the limit was never
+  configured the method throws `Error` — enabling the cap needs a
+  restart. `server.getGlobalRateLimitStats()` (set only when configured)
+  reports the live rate and burst, the bucket level, the waiter depth,
+  and the cumulative delayed count.
+
 ## Per-tenant outbound concurrency cap
 
 `globalMaxConcurrent` bounds in-flight deliveries across the whole

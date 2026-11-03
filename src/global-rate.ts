@@ -74,6 +74,18 @@ export interface GlobalRateLimitStats {
   availableTokens: number;
 }
 
+/**
+ * WR-310: partial runtime revision of the live rate limit. Omitted
+ * fields keep their live values; an empty patch is a no-op. Merged
+ * values are validated against the construction gates
+ * (`messagesPerSec` / `maxBurst` finite > 0) — an illegal patch throws
+ * `RangeError` and the live values are left untouched.
+ */
+export interface GlobalRateLimitRevision {
+  messagesPerSec?: number;
+  maxBurst?: number;
+}
+
 /** Validate a {@link GlobalRateLimitOptions}. Throws `RangeError` on anything invalid. */
 export function assertValidGlobalRateLimit(opts: unknown): void {
   if (opts === null || typeof opts !== "object" || Array.isArray(opts)) {
@@ -109,12 +121,18 @@ export function assertValidGlobalRateLimit(opts: unknown): void {
  * Callers must re-check their own liveness after `acquire()` resolves
  * (the queue may have stopped while they waited) — see
  * `releaseWaiters()`.
+ *
+ * WR-310: the rate and burst are revisable at runtime via `retune()`
+ * — tightening at peak / expanding at a trough no longer waits for
+ * the next deploy.
  */
 export class GlobalRateLimiter {
-  private readonly messagesPerSec: number;
-  private readonly maxBurst: number;
-  /** Tokens per millisecond. */
-  private readonly perMs: number;
+  /** Mutable (WR-310): the live rate, revised by `retune()`. */
+  private messagesPerSec: number;
+  /** Mutable (WR-310): the live burst cap, revised by `retune()`. */
+  private maxBurst: number;
+  /** Tokens per millisecond. Mutable (WR-310): tracks the live rate. */
+  private perMs: number;
   private readonly now: () => number;
   private readonly setTimer: (fn: () => void, ms: number) => unknown;
   private readonly clearTimer: (handle: unknown) => void;
@@ -218,6 +236,50 @@ export class GlobalRateLimiter {
   /** Cumulative dispatches that had to wait for a token. */
   delayedTotalCount(): number {
     return this.delayedTotal;
+  }
+
+  /** The live rate and burst cap (WR-310). */
+  current(): { messagesPerSec: number; maxBurst: number } {
+    return { messagesPerSec: this.messagesPerSec, maxBurst: this.maxBurst };
+  }
+
+  /**
+   * WR-310: revise the live rate and/or burst cap (partial — omitted
+   * fields keep their live values). Merge-then-validate reusing the
+   * construct-time gate (`assertValidGlobalRateLimit`): an illegal
+   * patch throws `RangeError` and the live values are left untouched.
+   *
+   * The bucket is settled at the old rate before the rate moves, so no
+   * refill is lost or double-counted across the revision. Tokens are
+   * clamped to the new cap — never above it — but already-granted
+   * tokens are not revoked (only the unspent balance is capped). When
+   * waiters are parked, the head timer is re-armed at the new rate: a
+   * timer computed at the old rate is stale.
+   *
+   * Returns the live values after the revision.
+   */
+  retune(patch: GlobalRateLimitRevision): { messagesPerSec: number; maxBurst: number } {
+    const nextMessagesPerSec = patch.messagesPerSec ?? this.messagesPerSec;
+    const nextMaxBurst = patch.maxBurst ?? this.maxBurst;
+    // Validate-then-apply: the merged values must pass the construction
+    // gates before either live value moves.
+    assertValidGlobalRateLimit({ messagesPerSec: nextMessagesPerSec, maxBurst: nextMaxBurst });
+    if (nextMessagesPerSec === this.messagesPerSec && nextMaxBurst === this.maxBurst) {
+      return this.current();
+    }
+    this.refill();
+    this.messagesPerSec = nextMessagesPerSec;
+    this.maxBurst = nextMaxBurst;
+    this.perMs = nextMessagesPerSec / 1000;
+    this.tokens = Math.min(this.tokens, this.maxBurst);
+    if (this.waiters.length > 0) {
+      if (this.headTimer !== undefined) {
+        this.clearTimer(this.headTimer);
+        this.headTimer = undefined;
+      }
+      this.armHeadTimer();
+    }
+    return this.current();
   }
 
   /** Dispatches currently queued FIFO for a token. */

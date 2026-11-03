@@ -233,6 +233,7 @@ import {
   GlobalRateLimiter,
   assertValidGlobalRateLimit,
   type GlobalRateLimitOptions,
+  type GlobalRateLimitRevision,
   type GlobalRateLimitStats,
 } from "./global-rate.ts";
 import {
@@ -595,7 +596,7 @@ export type {
   AdaptiveMaxDelayEndpointStats,
 } from "./adaptive-max-delay.ts";
 export { AdaptiveMaxDelay, assertValidAdaptiveMaxDelayOptions } from "./adaptive-max-delay.ts";
-export type { GlobalRateLimitOptions, GlobalRateLimitStats } from "./global-rate.ts";
+export type { GlobalRateLimitOptions, GlobalRateLimitRevision, GlobalRateLimitStats } from "./global-rate.ts";
 export { GlobalRateLimiter, assertValidGlobalRateLimit } from "./global-rate.ts";
 export type {
   TenantRateLimitEndpointOverride,
@@ -9196,6 +9197,26 @@ export class RetryQueue {
    */
   getGlobalRateLimitStats(): GlobalRateLimitStats | undefined {
     return this.globalRateLimiter?.stats();
+  }
+
+  /**
+   * WR-310: revise the relay-level global outbound rate limit at
+   * runtime (`messagesPerSec` / `maxBurst`, partial — omitted fields
+   * keep their live values). The next dispatch judges by the new
+   * values; waiters parked on the gate are re-armed at the new rate.
+   * An illegal patch throws `RangeError` and the live values are
+   * untouched; an empty patch (or values equal to the live ones) is a
+   * no-op. Throws `Error` when the limit was never configured —
+   * enabling the cap needs a restart.
+   */
+  setGlobalRateLimit(patch: GlobalRateLimitRevision): { messagesPerSec: number; maxBurst: number } {
+    if (this.globalRateLimiter === undefined) {
+      throw new Error(
+        "setGlobalRateLimit: global rate limit is not configured — enabling it requires a restart: " +
+          "the limiter is created at startup and a running relay cannot start capping without one"
+      );
+    }
+    return this.globalRateLimiter.retune(patch);
   }
 
   /**

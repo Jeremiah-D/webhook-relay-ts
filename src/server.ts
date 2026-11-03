@@ -66,6 +66,7 @@ import {
   type ResolvedHttpHardening,
 } from "./http-hardening.ts";
 import type { OrderedAuditEvent, OrderedModeOptions } from "./retry.ts";
+import type { GlobalRateLimitRevision, GlobalRateLimitStats } from "./retry.ts";
 import { parseCronExpression, CRON_HEADER } from "./cron.ts";
 import type { CompletionCallbackOptions } from "./callback.ts";
 import { createBoundAddressSelfCheck } from "./callback.ts";
@@ -5627,6 +5628,27 @@ export interface RelayServer extends Server {
    * needs a restart.
    */
   setOutboundKeepAlive?: (patch: OutboundKeepAliveRevision) => { maxSocketsPerHost: number; idleTimeoutMs: number };
+  /**
+   * WR-310: revise the relay-level global outbound rate limit at
+   * runtime (`messagesPerSec` / `maxBurst`, partial — omitted fields
+   * keep their live values). The next dispatch judges by the new
+   * values; waiters parked on the gate are re-armed at the new rate.
+   * An illegal patch throws `RangeError` and the live values are
+   * untouched; an empty patch (or values equal to the live ones) is a
+   * no-op with no audit event. A real revision is audited as
+   * `global_rate_revised` with `previous` / `current`
+   * `{ messagesPerSec, maxBurst }`, and returns the live values.
+   * Always set; throws `Error` when the limit was never configured —
+   * enabling the cap needs a restart.
+   */
+  setGlobalRateLimit?: (patch: GlobalRateLimitRevision) => { messagesPerSec: number; maxBurst: number };
+  /**
+   * WR-310: relay-level global rate-limit snapshot (the live rate and
+   * burst cap, current bucket level, FIFO waiter depth, and cumulative
+   * delayed dispatch count). Set only when `retry.globalRateLimit`
+   * was configured.
+   */
+  getGlobalRateLimitStats?: () => GlobalRateLimitStats;
   /**
    * WR-180: operator-plane rate-limiter snapshot (per-client sliding
    * windows). Set only when `operatorRateLimit` was configured.
@@ -13429,6 +13451,39 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     });
     return next;
   };
+
+  // WR-310: relay-level global outbound rate-limit runtime revision.
+  // The method is always set (like setDedupWindow above); with the
+  // limit unconfigured the queue throws Error — enabling the cap needs
+  // a restart. A real revision is audited as `global_rate_revised`
+  // with the previous and current rate/burst; an empty or same-value
+  // patch is a silent no-op.
+  server.setGlobalRateLimit = (patch: GlobalRateLimitRevision): { messagesPerSec: number; maxBurst: number } => {
+    const prevStats = queue.getGlobalRateLimitStats();
+    if (prevStats === undefined) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.setGlobalRateLimit(patch);
+    }
+    const previous = { messagesPerSec: prevStats.messagesPerSec, maxBurst: prevStats.maxBurst };
+    // Validate-then-apply inside retune: an illegal patch throws
+    // RangeError and the live values are left completely intact.
+    const next = queue.setGlobalRateLimit(patch);
+    if (next.messagesPerSec === previous.messagesPerSec && next.maxBurst === previous.maxBurst) {
+      return next;
+    }
+    opts.auditLog.append({
+      event: "global_rate_revised",
+      previous,
+      current: next,
+    });
+    return next;
+  };
+
+  // WR-310: relay-level global rate-limit snapshot. Only set when
+  // `retry.globalRateLimit` was configured.
+  if (queue.getGlobalRateLimitStats() !== undefined) {
+    server.getGlobalRateLimitStats = (): GlobalRateLimitStats => queue.getGlobalRateLimitStats()!;
+  }
 
   // WR-180: operator-plane rate-limiter snapshot (per-client sliding
   // windows). Only set when `operatorRateLimit` was configured.
