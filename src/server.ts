@@ -5665,6 +5665,21 @@ export interface RelayServer extends Server {
    */
   setGlobalConcurrency?: (maxConcurrent: number) => number;
   /**
+   * WR-314: revise the relay-level global retry budget at runtime
+   * (retries per minute). The next scheduled retry judges by the new
+   * budget; a retry already parked re-arms at the new refill horizon.
+   * Tightening clamps the token bucket to the new cap at once;
+   * widening never tops the bucket up. An illegal value throws
+   * `RangeError` and the live budget is untouched; a same-value
+   * revision is a no-op with no audit event. A real revision is
+   * audited as `retry_budget_revised` with `previous` / `current`
+   * budgets, and returns the live budget. Always set; throws `Error`
+   * when the budget was never configured — enabling it needs a
+   * restart. Endpoint overrides (WR-125) and the per-tenant budget
+   * (WR-200) are untouched.
+   */
+  setRetryBudget?: (retriesPerMinute: number) => number;
+  /**
    * WR-311: revise one endpoint's per-phase timeout budgets at runtime
    * (`targetUrl` exact match, partial — omitted phases keep their live
    * values, a phase set to `null` deletes that phase, deleting the last
@@ -13563,6 +13578,33 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // WR-313: relay-level global concurrency snapshot — always set; the
   // gate is always constructed.
   server.getGlobalConcurrencyStats = (): GlobalConcurrencyStats => queue.getGlobalConcurrencyStats();
+
+  // WR-314: relay-level global retry-budget runtime revision. The
+  // method is always set (like setGlobalRateLimit above); with the
+  // budget unconfigured the queue throws Error — enabling the budget
+  // needs a restart. A real revision is audited as
+  // `retry_budget_revised` with the previous and current budget; a
+  // same-value revision is a silent no-op.
+  server.setRetryBudget = (retriesPerMinute: number): number => {
+    const prevStats = queue.getRetryBudgetStats();
+    if (prevStats === undefined) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.setRetryBudget(retriesPerMinute);
+    }
+    const previous = prevStats.retriesPerMinute;
+    // Validate-then-apply inside retune: an illegal value throws
+    // RangeError and the live budget is left completely intact.
+    const next = queue.setRetryBudget(retriesPerMinute);
+    if (next === previous) {
+      return next;
+    }
+    opts.auditLog.append({
+      event: "retry_budget_revised",
+      previous,
+      current: next,
+    });
+    return next;
+  };
 
   // WR-311: per-endpoint phase timeout budget runtime revision. The
   // method is always set (like setDedupWindow above); with

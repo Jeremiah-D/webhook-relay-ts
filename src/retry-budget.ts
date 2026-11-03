@@ -48,9 +48,14 @@ export const DEFAULT_RETRY_BUDGET_PER_MINUTE = 6000;
  * retries (`retriesPerMinute`), refilled lazily. This is a protective
  * gate, not a failure: parked retries are rescheduled, not counted
  * against the item's attempt budget or the circuit breaker.
+ *
+ * Revisable at runtime via `retune()` (WR-314): the per-minute budget
+ * moves live, so an operator can tighten it mid-incident (hemostasis)
+ * or widen it once the downstream recovers, without a redeploy.
  */
 export class RetryBudget {
-  private readonly perMinute: number;
+  /** Mutable (WR-314): the live budget, revised by `retune()`. */
+  private perMinute: number;
   private tokens: number;
   private updatedMs: number;
   private readonly now: () => number;
@@ -69,6 +74,39 @@ export class RetryBudget {
 
   /** Configured per-minute budget. */
   limit(): number {
+    return this.perMinute;
+  }
+
+  /**
+   * WR-314: revise the per-minute budget live. An illegal value throws
+   * `RangeError` and the live budget and tokens are untouched;
+   * revising to the current value is a silent no-op.
+   *
+   * - Tightening takes effect at once: the bucket is refilled first
+   *   (against the old cap), then the token count is clamped to the
+   *   new cap — a full old bucket cannot keep admitting retries at
+   *   the old rate after a tightening.
+   * - Widening never tops the bucket up: tokens stay where they are
+   *   and refill lazily against the new cap, so a widening cannot
+   *   over-issue a minute's budget in one instant.
+   *
+   * `take()` / `msUntilToken()` / `limit()` / `remaining()` all read
+   * the live value, so the next scheduled retry judges by the new
+   * budget and an already-parked retry re-arms at the new refill
+   * horizon.
+   */
+  retune(newPerMinute: number): number {
+    if (!Number.isFinite(newPerMinute) || newPerMinute <= 0) {
+      throw new RangeError(`retriesPerMinute must be a finite number > 0, got ${newPerMinute}`);
+    }
+    if (newPerMinute === this.perMinute) {
+      return this.perMinute;
+    }
+    // Refill against the old cap first, then clamp to the new one:
+    // tightening bites immediately, widening adds no tokens.
+    this.refill();
+    this.perMinute = newPerMinute;
+    this.tokens = Math.min(this.tokens, newPerMinute);
     return this.perMinute;
   }
 

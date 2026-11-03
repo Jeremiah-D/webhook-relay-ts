@@ -9464,6 +9464,29 @@ export class RetryQueue {
   }
 
   /**
+   * WR-314: revise the relay-level global retry budget at runtime
+   * (retries per minute). The next scheduled retry judges by the new
+   * budget; a retry already parked re-arms at the new refill horizon
+   * (never dropped, never burned against the item's attempt budget,
+   * never touching the circuit breaker). Tightening clamps the token
+   * bucket to the new cap at once; widening never tops the bucket up.
+   * An illegal value throws `RangeError` and the live budget is
+   * untouched; revising to the current value is a no-op. Throws
+   * `Error` when the budget was never configured — enabling it needs
+   * a restart. Endpoint overrides (WR-125) and the per-tenant budget
+   * (WR-200) are untouched: only the global bucket is revised.
+   */
+  setRetryBudget(retriesPerMinute: number): number {
+    if (this.retryBudget === undefined) {
+      throw new Error(
+        "setRetryBudget: retry budget is not configured — enabling it requires a restart: " +
+          "the budget is created at startup and a running relay cannot start budgeting without one"
+      );
+    }
+    return this.retryBudget.retune(retriesPerMinute);
+  }
+
+  /**
    * Per-tenant dispatch gate snapshots (WR-140): one row per tenant that
    * has dispatched through the gate, in first-seen order — the
    * configured per-tenant cap, current in-flight dispatches, FIFO waiter

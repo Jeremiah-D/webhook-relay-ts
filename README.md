@@ -258,6 +258,17 @@ reliability primitives that matter for any signed-payload pipeline.
   records which budget parked the retry (`budgetScope:
   "endpoint" | "global"`). Illegal values throw `RangeError` at
   construction; without overrides the relay is byte-identical to before.
+  WR-314: the global budget is revisable live via
+  `server.setRetryBudget(retriesPerMinute)` — tightening clamps the
+  token bucket to the new cap at once (a full old bucket cannot keep
+  admitting retries at the old rate), widening never tops the bucket
+  up (tokens refill lazily against the new cap), a same-value revision
+  is a silent no-op, and a real revision is audited as
+  `retry_budget_revised` with `previous` / `current`. Illegal values
+  throw `RangeError` and leave the live budget untouched; revising
+  when the budget was never configured throws `Error` (enabling it
+  needs a restart). Endpoint overrides and the per-tenant budget are
+  untouched — only the global bucket is revised.
 - `src/tenant-retry-budget.ts` — *per-tenant* retry budget
   (`TenantRetryBudget`, WR-200): one lazily-created token bucket per
   tenant, each sized to `retriesPerMinute` per minute (default 6000,
