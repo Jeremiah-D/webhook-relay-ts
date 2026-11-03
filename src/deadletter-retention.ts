@@ -34,6 +34,36 @@ export interface DeadLetterRetentionOptions {
   clearTimer?: (handle: ReplayTimerHandle) => void;
 }
 
+/**
+ * Runtime revision patch for the dead-letter retention TTL and/or
+ * sweep interval (WR-315). Partial: omitted fields keep their live
+ * values; an empty patch changes nothing.
+ */
+export interface DeadLetterRetentionRevision {
+  /**
+   * New retention TTL. A number replaces the whole mode with a global
+   * TTL (any per-endpoint record is discarded — a mode switch). A
+   * record merges per endpoint into the live record: a value sets that
+   * endpoint's TTL, `null` deletes it (the endpoint falls back to
+   * never-expire); when the record empties, the sweeper goes idle.
+   * Overall `null` clears all TTLs and the sweeper goes idle until a
+   * later revision sets one.
+   */
+  retentionMs?: number | Record<string, number | null> | null;
+  /** New interval in ms between retention sweeps. */
+  sweepIntervalMs?: number;
+}
+
+/**
+ * Live dead-letter retention snapshot (WR-315): the live TTL — a
+ * global number, a per-endpoint record, or absent when the sweeper is
+ * idle — and the live sweep interval.
+ */
+export interface DeadLetterRetentionSnapshot {
+  retentionMs?: number | Record<string, number>;
+  sweepIntervalMs: number;
+}
+
 /** Payload of the `dead_letter_purged` audit event. */
 export interface DeadLetterPurgedEvent {
   event: "dead_letter_purged";
@@ -159,6 +189,11 @@ export interface DeadLetterRetentionOwner {
  * payload is never exposed, not even as metadata, and sealed
  * (encrypted) entries are purged sealed.
  *
+ * WR-315: the TTL and sweep interval are revisable at runtime via
+ * `retune()` — the next scheduled sweep (or a manual
+ * `purgeExpiredDeadLetters`) judges by the new values, no restart,
+ * no re-judged purges, and the WR-49 journal is never rewritten.
+ *
  * The sweep is purely additive to the existing dead-letter contract:
  * replay paths are untouched, and entries claimed by an in-progress
  * replay are skipped, never deleted from under it.
@@ -170,8 +205,19 @@ export class DeadLetterRetentionSweeper {
    * `deadLetterRetention` object without `retentionMs` keeps the legacy
    * no-purge behavior instead of failing startup.
    */
-  private readonly ttlFor: RetentionTtlFor | undefined;
-  private readonly sweepIntervalMs: number;
+  private ttlFor: RetentionTtlFor | undefined;
+  /**
+   * Mutable (WR-315): the live sweep interval, revised by `retune()`.
+   * `arm()` reads it on every arm, so a revised interval governs the
+   * next scheduled sweep.
+   */
+  private sweepIntervalMs: number;
+  /**
+   * Mutable (WR-315): the retained raw retention value — the source of
+   * truth for `current()` and for per-endpoint merges in `retune()`.
+   * `ttlFor` is only a closure and cannot reconstruct it.
+   */
+  private retentionMs: number | Record<string, number> | undefined;
   private readonly now: () => number;
   private readonly setTimer: (fn: () => void, ms: number) => ReplayTimerHandle;
   private readonly clearTimer: (handle: ReplayTimerHandle) => void;
@@ -181,7 +227,15 @@ export class DeadLetterRetentionSweeper {
   private timer?: ReplayTimerHandle;
 
   constructor(opts: DeadLetterRetentionOptions & { owner: DeadLetterRetentionOwner }) {
+    // resolveRetentionTtl validates first: an illegal value throws
+    // RangeError before any field is set.
     this.ttlFor = resolveRetentionTtl(opts.retentionMs);
+    this.retentionMs =
+      opts.retentionMs === undefined
+        ? undefined
+        : typeof opts.retentionMs === "number"
+          ? opts.retentionMs
+          : { ...opts.retentionMs };
     this.sweepIntervalMs = opts.sweepIntervalMs ?? 60_000;
     if (!Number.isFinite(this.sweepIntervalMs) || this.sweepIntervalMs <= 0) {
       throw new RangeError(
@@ -212,17 +266,167 @@ export class DeadLetterRetentionSweeper {
     return this.ttlFor !== undefined;
   }
 
-  /** Arm the sweep schedule. Idempotent; a no-op when no TTL is configured. */
+  /**
+   * Arm the sweep schedule. Idempotent. When no TTL is configured
+   * nothing is armed — but `started` is still recorded, so a later
+   * `retune()` that sets a TTL arms the schedule without a restart
+   * (WR-315): the queue asked the sweeper to run, it was just idle.
+   */
   start(): void {
-    if (this.started || this.ttlFor === undefined) return;
+    if (this.started) return;
     this.started = true;
-    this.arm();
+    if (this.ttlFor !== undefined) this.arm();
   }
 
   /** Disarm the sweep schedule. Idempotent. */
   stop(): void {
     this.started = false;
     this.clearPending();
+  }
+
+  /** The live retention TTL and sweep interval (WR-315). The record form is a copy — mutating it never touches the live values. */
+  current(): DeadLetterRetentionSnapshot {
+    return {
+      ...(this.retentionMs === undefined
+        ? {}
+        : {
+            retentionMs:
+              typeof this.retentionMs === "number" ? this.retentionMs : { ...this.retentionMs },
+          }),
+      sweepIntervalMs: this.sweepIntervalMs,
+    };
+  }
+
+  /**
+   * Revise the retention TTL and/or sweep interval in place (WR-315),
+   * without restarting the relay: an operator lengthens the TTL during
+   * an incident to preserve replay evidence, or shortens it to relieve
+   * storage pressure, and the next sweep judges by the new values.
+   *
+   * Semantics, deliberately fail-closed throughout:
+   *
+   *   - Partial: omitted fields keep their live values; an empty patch
+   *     (or values equal to the live ones) changes nothing. The merged
+   *     values are validated against the construction gates before
+   *     anything applies — an illegal patch throws `RangeError` and the
+   *     live TTLs, interval, and armed timer are left completely
+   *     untouched.
+   *   - `retentionMs` as a number replaces the whole mode with a global
+   *     TTL (any per-endpoint record is discarded); as a record it
+   *     merges per endpoint into the live record — a `null` value
+   *     deletes that endpoint's TTL (it falls back to never-expire),
+   *     and an emptied live record idles the sweeper. When the live
+   *     mode is a global number there is no live record to merge into,
+   *     so a record patch becomes the whole record (mode switch — the
+   *     global TTL is discarded), except a patch that only deletes:
+   *     it removes nothing, so the global stands. As overall `null`
+   *     it clears all TTLs: the sweeper goes idle, any armed timer is
+   *     cleared, but `started` stays true so a later revision re-arms.
+   *   - A revised interval re-arms the schedule when the sweeper is
+   *     started and enabled (the pending sweep is cleared and re-armed
+   *     at the new interval; `arm()` reads the live interval). A
+   *     retention-only revision leaves the armed timer alone — the next
+   *     scheduled sweep reads the live `ttlFor` anyway. When not
+   *     started, the next `start()` uses the new values.
+   *   - Effective timing: `sweepNow()` reads the live `ttlFor` on every
+   *     call, so shortening the TTL purges newly-expired entries on the
+   *     next sweep (or manual purge) and lengthening it delays the
+   *     purge. Entries already purged never come back — the WR-49
+   *     journal is on disk and is never rewritten. Replay-claim
+   *     skipping (WR-23/WR-31) and the failover logical-endpoint
+   *     keying are untouched.
+   *
+   * Returns the live values after the revision.
+   */
+  retune(patch: DeadLetterRetentionRevision): DeadLetterRetentionSnapshot {
+    // Validate-then-apply: the merged values are computed in full
+    // before any live field moves.
+    const nextIntervalMs = patch.sweepIntervalMs ?? this.sweepIntervalMs;
+    if (!Number.isFinite(nextIntervalMs) || nextIntervalMs <= 0) {
+      throw new RangeError(
+        `deadLetterRetention.sweepIntervalMs must be a finite number > 0, got ${String(patch.sweepIntervalMs)}`
+      );
+    }
+    const nextRetention = this.resolveNextRetention(patch.retentionMs);
+    const wasEnabled = this.ttlFor !== undefined;
+    const nextTtlFor = resolveRetentionTtl(nextRetention);
+    const nowEnabled = nextTtlFor !== undefined;
+    const intervalChanged = nextIntervalMs !== this.sweepIntervalMs;
+
+    this.retentionMs =
+      nextRetention === undefined
+        ? undefined
+        : typeof nextRetention === "number"
+          ? nextRetention
+          : { ...nextRetention };
+    this.ttlFor = nextTtlFor;
+    this.sweepIntervalMs = nextIntervalMs;
+    if (this.started) {
+      if (nowEnabled && (!wasEnabled || intervalChanged)) {
+        this.arm();
+      } else if (!nowEnabled && wasEnabled) {
+        // Disabled by this revision: clear the armed timer, but keep
+        // `started` so a later revision re-arms.
+        this.clearPending();
+      }
+      // Enabled throughout with an unchanged interval: the armed timer
+      // keeps its schedule — the next sweep reads the live ttlFor.
+    }
+    return this.current();
+  }
+
+  /**
+   * Merge a `retentionMs` patch value into the live retention, with
+   * full construction-gate validation. Pure computation — the live
+   * fields are untouched, so `retune()` stays validate-then-apply.
+   * Returns the merged retention (`undefined` = idle).
+   */
+  private resolveNextRetention(
+    patchRetention: DeadLetterRetentionRevision["retentionMs"]
+  ): number | Record<string, number> | undefined {
+    if (patchRetention === undefined) {
+      // Omitted: keep the live values (a copy for the record form).
+      return this.retentionMs === undefined
+        ? undefined
+        : typeof this.retentionMs === "number"
+          ? this.retentionMs
+          : { ...this.retentionMs };
+    }
+    if (patchRetention === null) return undefined;
+    if (typeof patchRetention === "number") {
+      assertTtl(patchRetention, "deadLetterRetention.retentionMs");
+      return patchRetention;
+    }
+    if (Array.isArray(patchRetention) || typeof patchRetention !== "object") {
+      throw new RangeError(
+        `deadLetterRetention.retentionMs must be a number, a Record<string, number | null>, or null, got ${String(patchRetention)}`
+      );
+    }
+    // Record patch: merge per endpoint into the live record. A null
+    // value deletes that endpoint's TTL; an emptied live record idles
+    // the sweeper. With a live global number there is no live record,
+    // so the patch record becomes the whole record (mode switch) — but
+    // a patch that only deletes against a global TTL deletes nothing
+    // (there is no per-endpoint TTL to remove), so the global stands.
+    const merged: Record<string, number> =
+      typeof this.retentionMs === "object" && this.retentionMs !== undefined
+        ? { ...this.retentionMs }
+        : {};
+    for (const [endpoint, ttl] of Object.entries(patchRetention)) {
+      if (endpoint.length === 0) {
+        throw new RangeError("deadLetterRetention.retentionMs keys must be non-empty endpoint URLs");
+      }
+      if (ttl === null) {
+        delete merged[endpoint];
+        continue;
+      }
+      assertTtl(ttl, `deadLetterRetention.retentionMs[${JSON.stringify(endpoint)}]`);
+      merged[endpoint] = ttl;
+    }
+    if (Object.keys(merged).length === 0) {
+      return typeof this.retentionMs === "number" ? this.retentionMs : undefined;
+    }
+    return merged;
   }
 
   /**

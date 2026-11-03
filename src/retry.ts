@@ -9,6 +9,8 @@ import {
   type DeadLetterPurgeResult,
   type DeadLetterPurgedEvent,
   type DeadLetterRetentionOptions,
+  type DeadLetterRetentionRevision,
+  type DeadLetterRetentionSnapshot,
 } from "./deadletter-retention.ts";
 import {
   StalePauseSweeper,
@@ -6332,6 +6334,36 @@ export class RetryQueue {
    */
   getRetentionSweeper(): DeadLetterRetentionSweeper | undefined {
     return this.retentionSweeper;
+  }
+
+  /**
+   * WR-315: revise the dead-letter retention TTL and/or sweep interval
+   * at runtime (`retentionMs` / `sweepIntervalMs`, partial — omitted
+   * fields keep their live values). The next scheduled sweep (or a
+   * manual `purgeExpiredDeadLetters`) judges by the new TTL; entries
+   * already purged never come back. An illegal patch throws `RangeError`
+   * and the live values are untouched; an empty patch (or values equal
+   * to the live ones) is a no-op. Throws `Error` when retention was
+   * never configured — enabling it needs a restart. The sweeper
+   * instance is created at startup and never replaced; only its
+   * internals are revised.
+   */
+  setDeadLetterRetention(patch: DeadLetterRetentionRevision): DeadLetterRetentionSnapshot {
+    if (this.retentionSweeper === undefined) {
+      throw new Error(
+        "setDeadLetterRetention: dead-letter retention is not configured — enabling it requires a restart: " +
+          "the sweeper is created at startup and a running relay cannot start retaining without one"
+      );
+    }
+    return this.retentionSweeper.retune(patch);
+  }
+
+  /**
+   * WR-315: live dead-letter retention snapshot (the live TTL and sweep
+   * interval). `undefined` when retention was never configured.
+   */
+  getDeadLetterRetention(): DeadLetterRetentionSnapshot | undefined {
+    return this.retentionSweeper?.current();
   }
 
   /**

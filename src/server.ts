@@ -83,7 +83,11 @@ import {
   type TenantBodyLimits,
 } from "./tenant-body-limit.ts";
 import type { AutoReplayOptions } from "./autoreplay.ts";
-import type { DeadLetterRetentionOptions } from "./deadletter-retention.ts";
+import type {
+  DeadLetterRetentionOptions,
+  DeadLetterRetentionRevision,
+  DeadLetterRetentionSnapshot,
+} from "./deadletter-retention.ts";
 import {
   DEAD_LETTER_EXPORT_ROW_LIMIT,
   InvalidExportCursorError,
@@ -5705,6 +5709,29 @@ export interface RelayServer extends Server {
    */
   getPhaseTimeouts?: () => Record<string, PhaseTimeoutBudgets>;
   /**
+   * WR-315: revise the dead-letter retention TTL and/or sweep interval
+   * at runtime (`retentionMs` / `sweepIntervalMs`, partial — omitted
+   * fields keep their live values). `retentionMs` as a number replaces
+   * the whole mode with a global TTL; as a record it merges per
+   * endpoint (a `null` value deletes that endpoint's TTL); as `null`
+   * it clears all TTLs and the sweeper goes idle until a later
+   * revision sets one. The next scheduled sweep (or a manual purge)
+   * judges by the new TTL; entries already purged never come back. An
+   * illegal patch throws `RangeError` and the live values are
+   * untouched; an empty patch (or values equal to the live ones) is a
+   * no-op with no audit event. A real revision is audited as
+   * `dead_letter_retention_revised` with `previous` / `current`
+   * snapshots, and returns the live values. Always set; throws `Error`
+   * when retention was never configured — enabling it needs a restart.
+   */
+  setDeadLetterRetention?: (patch: DeadLetterRetentionRevision) => DeadLetterRetentionSnapshot;
+  /**
+   * WR-315: live dead-letter retention snapshot (the live TTL — a
+   * global number or a per-endpoint record — and the sweep interval).
+   * Set only when `deadLetterRetention` was configured.
+   */
+  getDeadLetterRetention?: () => DeadLetterRetentionSnapshot;
+  /**
    * WR-310: relay-level global rate-limit snapshot (the live rate and
    * burst cap, current bucket level, FIFO waiter depth, and cumulative
    * delayed dispatch count). Set only when `retry.globalRateLimit`
@@ -5847,6 +5874,27 @@ export function checkIngestBatchItem(
     },
     body,
   };
+}
+
+/**
+ * WR-315: deep equality for dead-letter retention snapshots — the
+ * record form compares by endpoint set and TTL, so a merge that lands
+ * on the same values (or a patch that only deletes an absent endpoint)
+ * is a no-op with no audit event.
+ */
+function sameDeadLetterRetention(
+  a: DeadLetterRetentionSnapshot,
+  b: DeadLetterRetentionSnapshot
+): boolean {
+  if (a.sweepIntervalMs !== b.sweepIntervalMs) return false;
+  if (typeof a.retentionMs !== typeof b.retentionMs) return false;
+  if (a.retentionMs === undefined || typeof a.retentionMs === "number") {
+    return a.retentionMs === b.retentionMs;
+  }
+  const bRecord = b.retentionMs as Record<string, number>;
+  const aKeys = Object.keys(a.retentionMs);
+  if (aKeys.length !== Object.keys(bRecord).length) return false;
+  return aKeys.every((k) => bRecord[k] === a.retentionMs[k]);
 }
 
 /**
@@ -13661,6 +13709,38 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     }
     return snapshot;
   };
+
+  // WR-315: dead-letter retention TTL / sweep-interval runtime
+  // revision. The method is always set (like setDedupWindow above);
+  // with retention unconfigured the queue throws Error — enabling
+  // retention needs a restart. A real revision is audited as
+  // `dead_letter_retention_revised` with the previous and current
+  // snapshots; an empty or same-value patch is a silent no-op.
+  server.setDeadLetterRetention = (patch: DeadLetterRetentionRevision): DeadLetterRetentionSnapshot => {
+    const previous = queue.getDeadLetterRetention();
+    if (previous === undefined) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.setDeadLetterRetention(patch);
+    }
+    // Validate-then-apply inside retune: an illegal patch throws
+    // RangeError and the live values are left completely intact.
+    const next = queue.setDeadLetterRetention(patch);
+    if (sameDeadLetterRetention(previous, next)) {
+      return next;
+    }
+    opts.auditLog.append({
+      event: "dead_letter_retention_revised",
+      previous,
+      current: next,
+    });
+    return next;
+  };
+
+  // WR-315: live dead-letter retention snapshot. Only set when
+  // `deadLetterRetention` was configured.
+  if (queue.getDeadLetterRetention() !== undefined) {
+    server.getDeadLetterRetention = (): DeadLetterRetentionSnapshot => queue.getDeadLetterRetention()!;
+  }
 
   // WR-180: operator-plane rate-limiter snapshot (per-client sliding
   // windows). Only set when `operatorRateLimit` was configured.

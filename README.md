@@ -11783,6 +11783,23 @@ the purge is journaled, so a purged entry never resurrects after a
 restart. `RetryQueue.stop()` / `shutdown()` disarm the sweep: nothing is
 purged mid-shutdown.
 
+WR-315: the TTL and sweep interval are revisable live via
+`server.setDeadLetterRetention({ retentionMs?, sweepIntervalMs? })` —
+partial, so omitted fields keep their live values. `retentionMs` as a
+number replaces the whole mode with a global TTL; as a record it merges
+per endpoint (a `null` value deletes that endpoint's TTL, and an emptied
+record idles the sweeper); as overall `null` it clears all TTLs and the
+sweeper goes idle until a later revision sets one. The next scheduled
+sweep (or a manual purge) judges by the new TTL — shortening it purges
+newly-expired entries at once, lengthening it delays the purge — and a
+revised interval re-arms the schedule when the sweeper is running.
+`server.getDeadLetterRetention()` returns the live snapshot. An illegal
+patch throws `RangeError` and leaves the live values and the armed timer
+untouched; an empty or same-value patch is a silent no-op; a real revision
+is audited as `dead_letter_retention_revised` with `previous` / `current`.
+Revising when retention was never configured throws `Error` (enabling it
+needs a restart), and entries already purged never come back.
+
 **Operator surface** (same Bearer <redacted>, fail closed to 404 without
 `operatorToken`):
 
