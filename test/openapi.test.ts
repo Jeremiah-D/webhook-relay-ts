@@ -25,7 +25,7 @@ const OPERATOR_TOKEN = "openapi-operator-token";
  * updating the registry (and this snapshot) fails loudly instead of
  * silently drifting the published spec.
  */
-const INVENTORY: Array<[string, Array<"GET" | "POST" | "PUT" | "DELETE">]> = [
+const INVENTORY: Array<[string, Array<"GET" | "POST" | "PUT" | "PATCH" | "DELETE">]> = [
   ["/dead-letter", ["GET"]],
   ["/dead-letter/export", ["GET"]],
   ["/dead-letter/stats", ["GET"]],
@@ -40,7 +40,7 @@ const INVENTORY: Array<[string, Array<"GET" | "POST" | "PUT" | "DELETE">]> = [
   ["/audit", ["GET"]],
   ["/audit/verify", ["GET"]],
   ["/latency", ["GET"]],
-  ["/maintenance/windows", ["GET", "POST"]],
+  ["/maintenance/windows", ["GET", "POST", "PATCH", "DELETE"]],
   ["/slo-risk", ["GET"]],
   ["/endpoint-health", ["GET"]],
   ["/quorum", ["GET"]],
@@ -137,6 +137,7 @@ describe("WR-111 operator route registry", () => {
     assert.equal(requiredScopeForMethod("GET"), "read");
     assert.equal(requiredScopeForMethod("POST"), "admin");
     assert.equal(requiredScopeForMethod("PUT"), "admin");
+    assert.equal(requiredScopeForMethod("PATCH"), "admin");
     assert.equal(requiredScopeForMethod("DELETE"), "admin");
   });
 });
@@ -338,7 +339,12 @@ describe("WR-111 GET /openapi.json endpoint", () => {
     };
     for (const [path, methods] of INVENTORY) {
       const url = concrete[path] ?? path;
-      const wrong = methods.includes("GET") && methods.includes("POST") ? "DELETE" : methods.includes("GET") ? "POST" : "GET";
+      // Pick a method the route genuinely does not allow (the old
+      // GET/POST-only probe picked DELETE, which WR-316 now allows on
+      // /maintenance/windows).
+      const wrong = (["PUT", "DELETE", "PATCH", "POST", "GET"] as const).find(
+        (m) => !methods.includes(m)
+      )!;
       const res = await req(port, wrong, url, auth);
       assert.equal(
         res.status,

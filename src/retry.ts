@@ -10425,6 +10425,39 @@ export class RetryQueue {
     return this.maintenanceWindow?.clearEndpoint(endpoint) ?? false;
   }
 
+  /**
+   * WR-316: revise one one-shot maintenance window for an endpoint at
+   * runtime (the queue-level twin of the operator `PATCH
+   * /maintenance/windows`). The window is addressed by its stored
+   * (start, end); at least one of `newStart`/`newEnd` must be given.
+   * No match or an illegal patch throws `RangeError` and leaves the
+   * live table intact; a revision that overlaps a neighbour merges.
+   * Returns `null` when the maintenance-window feature is disabled.
+   */
+  reviseMaintenanceWindow(
+    endpoint: string,
+    key: { start: string; end: string },
+    patch: { newStart?: string; newEnd?: string }
+  ): { start: string; end: string; startMs: number; endMs: number } | null {
+    if (this.maintenanceWindow === undefined) return null;
+    return this.maintenanceWindow.reviseWindow(endpoint, key, patch);
+  }
+
+  /**
+   * WR-316: delete exactly one one-shot maintenance window for an
+   * endpoint at runtime (the queue-level twin of the operator `DELETE
+   * /maintenance/windows`). Returns `false` when the endpoint had no
+   * such window, and `null` when the maintenance-window feature is
+   * disabled.
+   */
+  cancelMaintenanceWindow(
+    endpoint: string,
+    key: { start: string; end: string }
+  ): boolean | null {
+    if (this.maintenanceWindow === undefined) return null;
+    return this.maintenanceWindow.cancelWindow(endpoint, key);
+  }
+
   /** Attempts parked because the endpoint's circuit was open. */
   circuitBlockedCount(): number {
     return this.circuitBlocked;

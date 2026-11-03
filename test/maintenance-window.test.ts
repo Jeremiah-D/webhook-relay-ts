@@ -60,6 +60,9 @@ function item(id: string, targetUrl: string, tenantId?: string) {
 describe("EndpointMaintenanceWindow validation", () => {
   it("accepts RFC3339 instants (Z, offsets, seconds, fractions)", () => {
     const w = new EndpointMaintenanceWindow({
+      // WR-316: pin the clock — without `now` the first read prunes
+      // these 2026-11-01–03 windows against the real wall clock.
+      now: () => T0,
       windows: {
         [URL_A]: [
           { start: "2026-11-01T02:00:00Z", end: "2026-11-01T06:00:00Z" },
@@ -145,6 +148,9 @@ describe("EndpointMaintenanceWindow gating", () => {
 
   it("merges overlapping and touching windows", () => {
     const w = new EndpointMaintenanceWindow({
+      // WR-316: pin the clock — without `now` the first read prunes
+      // these 2026-11-01 windows against the real wall clock.
+      now: () => T0,
       windows: {
         [URL_A]: [
           { start: iso(T0 + 3_600_000), end: iso(T0 + 4 * 3_600_000) },
@@ -168,6 +174,9 @@ describe("EndpointMaintenanceWindow gating", () => {
 
   it("keeps disjoint windows separate", () => {
     const w = new EndpointMaintenanceWindow({
+      // WR-316: pin the clock — without `now` the first read prunes
+      // these 2026-11-01 windows against the real wall clock.
+      now: () => T0,
       windows: {
         [URL_A]: [
           { start: iso(T0 + 3_600_000), end: iso(T0 + 4 * 3_600_000) },

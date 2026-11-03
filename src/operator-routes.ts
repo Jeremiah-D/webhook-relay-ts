@@ -19,7 +19,7 @@
  *   an `operatorKeys` ring entry): 404 when no operator credential is
  *   configured (fail-closed), 403 on a bad bearer.
  * - WR-82 scopes: GET routes need the `read` scope, mutating routes
- *   (POST/PUT/DELETE) need `admin`. The spec records this as the
+ *   (POST/PUT/PATCH/DELETE) need `admin`. The spec records this as the
  *   `x-required-scope` vendor extension on each operation.
  * - Declaration order matters where patterns overlap: `/endpoints/pause`,
  *   `/endpoints/resume`, `/endpoints/enable`, and the WR-230 bulk
@@ -30,7 +30,7 @@
  * Zero dependencies (pure data + string building).
  */
 
-export type OperatorHttpMethod = "GET" | "POST" | "PUT" | "DELETE";
+export type OperatorHttpMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
 
 /** One query parameter accepted by a route. All operator query params are optional. */
 export interface OperatorRouteQueryParam {
@@ -373,19 +373,22 @@ export const OPERATOR_ROUTES: readonly OperatorRoute[] = [
   {
     path: "/maintenance/windows",
     pattern: exact("/maintenance/windows"),
-    methods: ["GET", "POST"],
-    summary: "List or add one-shot maintenance windows",
+    methods: ["GET", "POST", "PATCH", "DELETE"],
+    summary: "List, add, revise, or cancel one-shot maintenance windows",
     description:
-      "WR-127: per-endpoint one-shot maintenance windows (RFC3339 start/end) — a downstream cutover's blackout window, orthogonal to the WR-52 daily quiet hours. Deliveries due inside a window are parked until it ends without consuming the retry budget, a quota token, or a circuit-breaker verdict. GET lists the live window table; POST adds one window.",
+      "WR-127: per-endpoint one-shot maintenance windows (RFC3339 start/end) — a downstream cutover's blackout window, orthogonal to the WR-52 daily quiet hours. Deliveries due inside a window are parked until it ends without consuming the retry budget, a quota token, or a circuit-breaker verdict. GET lists the live window table; POST adds one window. WR-316: PATCH revises one stored window (addressed by its live start/end, at least one of newStart/newEnd — a revision that overlaps a neighbour merges, and a real revision is audited as maintenance_window_revised); DELETE cancels exactly one stored window (audited as maintenance_window_cancelled).",
     okDescription:
-      "GET: array of { endpoint, windows: [{ start, end }], delayed, parked }. POST: { ok, window } for the added (possibly merged) window.",
+      "GET: array of { endpoint, windows: [{ start, end }], delayed, parked }. POST: { ok, window } for the added (possibly merged) window. PATCH: { ok, window } for the revised (possibly merged) window. DELETE: { ok: true, removed: true }.",
     requestBody: {
-      description: "One maintenance window to add for the endpoint.",
+      description:
+        "One maintenance window to add (POST), revise (PATCH: newStart/newEnd, at least one required), or cancel (DELETE) for the endpoint.",
       required: ["endpoint", "start", "end"],
       properties: {
         endpoint: { type: "string", description: "Exact targetUrl the window applies to." },
         start: { type: "string", description: 'Window start, RFC3339, e.g. "2026-11-01T02:00:00Z".' },
         end: { type: "string", description: "Window end, RFC3339; must be after start." },
+        newStart: { type: "string", description: "PATCH only: revised window start, RFC3339." },
+        newEnd: { type: "string", description: "PATCH only: revised window end, RFC3339." },
       },
     },
   },

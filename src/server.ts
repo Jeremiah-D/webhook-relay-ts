@@ -5732,6 +5732,35 @@ export interface RelayServer extends Server {
    */
   getDeadLetterRetention?: () => DeadLetterRetentionSnapshot;
   /**
+   * WR-316: revise one live one-shot maintenance window at runtime
+   * (`newStart` / `newEnd`, partial — omitted fields keep their live
+   * values). The window is addressed by its stored (start, end), as
+   * listed by `GET /maintenance/windows`. No match or an illegal patch
+   * throws `RangeError` and the live table is untouched; a revision
+   * that overlaps a neighbour merges with it. A real revision is
+   * audited as `maintenance_window_revised` with `previous` / `current`
+   * `{ start, end }` snapshots; a same-value revision is a silent
+   * no-op. Returns `null` when maintenance windows were never
+   * configured — enabling them needs a restart. Always set.
+   */
+  reviseMaintenanceWindow: (
+    endpoint: string,
+    key: { start: string; end: string },
+    patch: { newStart?: string; newEnd?: string }
+  ) => { start: string; end: string; startMs: number; endMs: number } | null;
+  /**
+   * WR-316: delete exactly one live one-shot maintenance window at
+   * runtime. The window is addressed by its stored (start, end).
+   * Returns `true` when a window was removed (audited as
+   * `maintenance_window_cancelled` with the endpoint and the removed
+   * window's start/end), `false` when no such window exists, and
+   * `null` when maintenance windows were never configured. Always set.
+   */
+  cancelMaintenanceWindow: (
+    endpoint: string,
+    key: { start: string; end: string }
+  ) => boolean | null;
+  /**
    * WR-310: relay-level global rate-limit snapshot (the live rate and
    * burst cap, current bucket level, FIFO waiter depth, and cumulative
    * delayed dispatch count). Set only when `retry.globalRateLimit`
@@ -8237,10 +8266,11 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       return;
     }
     // WR-82 scope check: every recognized GET operator path is read-only
-    // (`read` suffices), every recognized POST operator path is mutating
-    // (needs `admin`) — the method-allowed list above makes GET/POST
-    // disjoint across operator paths. A scopeless key is fail-closed: it
-    // authenticated above, but every operator path answers 403 here.
+    // (`read` suffices), every recognized mutating method (POST, PUT,
+    // PATCH, DELETE) needs `admin` — the method-allowed list above makes
+    // GET disjoint from the mutating methods across operator paths. A
+    // scopeless key is fail-closed: it authenticated above, but every
+    // operator path answers 403 here.
     if (!operatorMay(identity, req.method ?? "")) {
       respondJson(res, 403, { error: "forbidden" });
       return;
@@ -8651,6 +8681,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     if (isMaintenanceWindows) {
       // WR-127: `GET` lists the live one-shot maintenance windows per
       // endpoint (read scope); `POST` adds one window (admin scope).
+      // WR-316: `PATCH` revises one stored window and `DELETE` cancels
+      // one (both admin scope).
       if (req.method === "GET") {
         respondJson(res, 200, queue.getMaintenanceWindows());
         return;
@@ -8680,6 +8712,66 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       }
       if (typeof start !== "string" || typeof end !== "string") {
         respondJson(res, 400, { error: "start and end must be RFC3339 strings" });
+        return;
+      }
+      if (req.method === "PATCH") {
+        // WR-316: revise one stored window, addressed by its live
+        // (start, end). At least one of newStart/newEnd must be given;
+        // a RangeError (unknown window, illegal patch) is a 400 and the
+        // live table is untouched.
+        const { newStart, newEnd } = body;
+        if (newStart !== undefined && typeof newStart !== "string") {
+          respondJson(res, 400, { error: "newStart must be an RFC3339 string" });
+          return;
+        }
+        if (newEnd !== undefined && typeof newEnd !== "string") {
+          respondJson(res, 400, { error: "newEnd must be an RFC3339 string" });
+          return;
+        }
+        let revised: { start: string; end: string; startMs: number; endMs: number } | null;
+        try {
+          revised = server.reviseMaintenanceWindow(
+            endpoint,
+            { start, end },
+            { newStart, newEnd }
+          );
+        } catch (err) {
+          if (err instanceof RangeError) {
+            respondJson(res, 400, { error: (err as Error).message });
+            return;
+          }
+          throw err;
+        }
+        if (revised === null) {
+          respondJson(res, 404, { error: "maintenance windows are not enabled" });
+          return;
+        }
+        respondJson(res, 200, { ok: true, window: revised });
+        return;
+      }
+      if (req.method === "DELETE") {
+        // WR-316: cancel exactly one stored window, addressed by its
+        // live (start, end). An unknown window (or a disabled feature)
+        // is a 404; a removed window answers 200.
+        let removed: boolean | null;
+        try {
+          removed = server.cancelMaintenanceWindow(endpoint, { start, end });
+        } catch (err) {
+          if (err instanceof RangeError) {
+            respondJson(res, 400, { error: (err as Error).message });
+            return;
+          }
+          throw err;
+        }
+        if (removed === null) {
+          respondJson(res, 404, { error: "maintenance windows are not enabled" });
+          return;
+        }
+        if (!removed) {
+          respondJson(res, 404, { error: "no such maintenance window" });
+          return;
+        }
+        respondJson(res, 200, { ok: true, removed: true });
         return;
       }
       let added: { start: string; end: string; startMs: number; endMs: number } | null;
@@ -13741,6 +13833,52 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   if (queue.getDeadLetterRetention() !== undefined) {
     server.getDeadLetterRetention = (): DeadLetterRetentionSnapshot => queue.getDeadLetterRetention()!;
   }
+
+  // WR-316: single-window live revision / cancellation for one-shot
+  // maintenance windows. The queue does the validate-then-apply work
+  // (RangeError on no match or an illegal patch, live table untouched);
+  // this layer only owns the audit: a real revision appends
+  // `maintenance_window_revised` with the previous and current
+  // `{ start, end }`, a same-value revision is a silent no-op, and a
+  // removal appends `maintenance_window_cancelled`. A `null` from the
+  // queue means the feature was never configured — enabling it needs a
+  // restart.
+  server.reviseMaintenanceWindow = (
+    endpoint: string,
+    key: { start: string; end: string },
+    patch: { newStart?: string; newEnd?: string }
+  ): { start: string; end: string; startMs: number; endMs: number } | null => {
+    const revised = queue.reviseMaintenanceWindow(endpoint, key, patch);
+    if (revised === null) return null;
+    // The key is the revised window's stored boundary, so it is the
+    // previous snapshot; a revision that lands exactly on it changed
+    // nothing and stays silent.
+    if (revised.startMs === Date.parse(key.start) && revised.endMs === Date.parse(key.end)) {
+      return revised;
+    }
+    opts.auditLog.append({
+      event: "maintenance_window_revised",
+      endpoint,
+      previous: { start: key.start, end: key.end },
+      current: { start: revised.start, end: revised.end },
+    });
+    return revised;
+  };
+
+  server.cancelMaintenanceWindow = (
+    endpoint: string,
+    key: { start: string; end: string }
+  ): boolean | null => {
+    const removed = queue.cancelMaintenanceWindow(endpoint, key);
+    if (removed !== true) return removed; // null (disabled) or false (unknown): silent
+    opts.auditLog.append({
+      event: "maintenance_window_cancelled",
+      endpoint,
+      start: key.start,
+      end: key.end,
+    });
+    return true;
+  };
 
   // WR-180: operator-plane rate-limiter snapshot (per-client sliding
   // windows). Only set when `operatorRateLimit` was configured.

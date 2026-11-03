@@ -283,6 +283,88 @@ export class EndpointMaintenanceWindow {
   }
 
   /**
+   * Revise one stored window for `endpoint` at runtime (WR-316): the
+   * window is addressed by its stored (start, end) — windows have no
+   * id, so the caller addresses the merged window by its live
+   * boundaries as listed by {@link windowsFor} — and replaced with a
+   * patched one. At least one of `newStart`/`newEnd` must be given,
+   * and the new window must end after it starts (the `parseRfc3339` +
+   * `startMs < endMs` gate, the same as {@link addWindow}).
+   * Everything is validated before anything moves: no match or an
+   * illegal patch throws `RangeError` with the live table untouched.
+   * The old window is removed and the new one inserted through
+   * {@link parseWindow} + {@link merge}, so a revision that overlaps a
+   * neighbour merges with it, exactly like an add.
+   *
+   * The announcement flag follows the revised window: when it still
+   * covers `now` the flag carries over (no duplicate `opened`); when
+   * it moves wholly into the future the flag resets (its first park
+   * announces it once); when it ends at or before `now` the flag
+   * carries over so the next read prunes it and fires `closed` exactly
+   * once. Returns the window as stored (possibly merged with a
+   * neighbour).
+   */
+  reviseWindow(
+    endpoint: string,
+    key: { start: string; end: string },
+    patch: { newStart?: string; newEnd?: string }
+  ): { start: string; end: string; startMs: number; endMs: number } {
+    this.assertValidEndpoint(endpoint, "reviseWindow");
+    if (typeof patch !== "object" || patch === null || Array.isArray(patch)) {
+      throw new RangeError(
+        `reviseWindow: patch for ${JSON.stringify(endpoint)} must be { newStart?, newEnd? }`
+      );
+    }
+    const { newStart, newEnd } = patch as { newStart?: unknown; newEnd?: unknown };
+    if (newStart === undefined && newEnd === undefined) {
+      throw new RangeError(
+        `reviseWindow: patch for ${JSON.stringify(endpoint)} must change at least one of newStart/newEnd`
+      );
+    }
+    // Validate-then-apply (the addWindow convention): parse the key and
+    // the patched values, and check the new window's shape, before the
+    // live table moves at all.
+    const keyStartMs = parseRfc3339(key.start, "start", endpoint);
+    const keyEndMs = parseRfc3339(key.end, "end", endpoint);
+    const at = this.now();
+    this.prune(at);
+    const list = this.windows.get(endpoint) ?? [];
+    const idx = list.findIndex((w) => w.startMs === keyStartMs && w.endMs === keyEndMs);
+    if (idx === -1) {
+      throw new RangeError(
+        `reviseWindow: no maintenance window for ${JSON.stringify(endpoint)} starts at ${JSON.stringify(key.start)} and ends at ${JSON.stringify(key.end)}`
+      );
+    }
+    const old = list[idx];
+    const nextStartMs =
+      newStart === undefined ? old.startMs : parseRfc3339(newStart, "newStart", endpoint);
+    const nextEndMs = newEnd === undefined ? old.endMs : parseRfc3339(newEnd, "newEnd", endpoint);
+    if (nextStartMs >= nextEndMs) {
+      throw new RangeError(
+        `reviseWindow: revised maintenance window for ${JSON.stringify(endpoint)} must end after it starts`
+      );
+    }
+    const revised = this.parseWindow(
+      endpoint,
+      {
+        start: newStart === undefined ? old.start : (newStart as string).trim(),
+        end: newEnd === undefined ? old.end : (newEnd as string).trim(),
+      },
+      "reviseWindow"
+    );
+    // A window that still covers `now` keeps the old flag; one moved
+    // wholly into the future resets it; one whose end is at or before
+    // `now` keeps it so the next read prunes it and fires `closed`
+    // exactly once when it was announced.
+    revised.announced = nextStartMs > at ? false : old.announced;
+    const rest = list.filter((_, i) => i !== idx);
+    const merged = this.merge([...rest, revised]);
+    this.windows.set(endpoint, merged);
+    const stored = merged.find((x) => x.startMs <= nextStartMs && nextStartMs < x.endMs) ?? revised;
+    return { start: stored.start, end: stored.end, startMs: stored.startMs, endMs: stored.endMs };
+  }
+
+  /**
    * Add one window for `endpoint` at runtime (e.g. from the operator
    * `POST /maintenance/windows`). Invalid input throws `RangeError` and
    * leaves the current table intact. Returns the window as stored
@@ -301,6 +383,32 @@ export class EndpointMaintenanceWindow {
     this.windows.set(endpoint, list);
     const stored = list.find((x) => x.startMs <= w.startMs && w.startMs < x.endMs) ?? w;
     return { start: stored.start, end: stored.end, startMs: stored.startMs, endMs: stored.endMs };
+  }
+
+  /**
+   * Delete exactly one stored window for `endpoint` at runtime
+   * (WR-316): the window is addressed by its stored (start, end), as
+   * listed by {@link windowsFor}. An announced window that is active
+   * at `now` fires `maintenance_window_closed` exactly once (the
+   * clearEndpoint convention). Returns `false` when no such window
+   * exists — the table is untouched — and `true` when one was removed.
+   */
+  cancelWindow(endpoint: string, key: { start: string; end: string }): boolean {
+    this.assertValidEndpoint(endpoint, "cancelWindow");
+    const keyStartMs = parseRfc3339(key.start, "start", endpoint);
+    const keyEndMs = parseRfc3339(key.end, "end", endpoint);
+    const at = this.now();
+    this.prune(at);
+    const list = this.windows.get(endpoint);
+    if (list === undefined) return false;
+    const idx = list.findIndex((w) => w.startMs === keyStartMs && w.endMs === keyEndMs);
+    if (idx === -1) return false;
+    const [removed] = list.splice(idx, 1);
+    if (removed.announced && removed.startMs <= at && at < removed.endMs) {
+      this.emitTransition(endpoint, removed, "closed");
+    }
+    if (list.length === 0) this.windows.delete(endpoint);
+    return true;
   }
 
   /**

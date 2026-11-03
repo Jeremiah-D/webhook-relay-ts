@@ -340,6 +340,20 @@ reliability primitives that matter for any signed-payload pipeline.
   `getMaintenanceWindows()` reports live windows, park counts, and
   whether the endpoint is parked now; operators list and add windows at
   `GET` / `POST /maintenance/windows` (operator token required).
+  WR-316: one stored window can be revised live — `PATCH
+  /maintenance/windows` (`{ endpoint, start, end, newStart?,
+  newEnd? }`, addressed by its live boundaries; a revision that
+  overlaps a neighbour merges, an unknown window or illegal patch is a
+  400) or cancelled — `DELETE /maintenance/windows` (`{ endpoint,
+  start, end }`, 404 for an unknown window). Both are admin scope and
+  delegate to `server.reviseMaintenanceWindow()` /
+  `server.cancelMaintenanceWindow()`, audited as
+  `maintenance_window_revised` (with `previous` / `current`) and
+  `maintenance_window_cancelled`; same-value revisions are silent
+  no-ops. A delivery already parked when its window is revised is not
+  re-armed: it re-checks the live table when its timer fires, so a
+  shortened window flushes at the new end and an extended window
+  re-parks to it.
   RFC3339 validation is strict (`RangeError` on bad input); the clock
   is injectable for deterministic tests.
 - `src/latency.ts` — accepted→delivered latency SLO tracking
