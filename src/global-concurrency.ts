@@ -30,6 +30,10 @@
  *   waiters observe the stopped queue through the normal liveness check
  *   and bail out. No timers are involved (promise FIFO only), so there
  *   is nothing to unref.
+ * - Runtime revision (WR-313): `retune()` moves the cap live —
+ *   widening pumps out FIFO waiters at once, tightening never revokes
+ *   a held slot (new acquisitions queue until in-flight drains back to
+ *   the cap).
  */
 
 /** Snapshot of the relay-level global dispatch gate. */
@@ -68,7 +72,7 @@ export function assertGlobalConcurrencyLimit(globalMaxConcurrent: number): void 
  * once. Releases cascade to the next waiter, so no one hangs.
  */
 export class GlobalConcurrencyGate {
-  private readonly maxConcurrent: number;
+  private maxConcurrent: number;
   private inFlight = 0;
   private readonly waiters: Array<(release: () => void) => void> = [];
   private waitsTotal = 0;
@@ -80,6 +84,38 @@ export class GlobalConcurrencyGate {
 
   /** The configured cap (`Infinity` = unlimited). */
   cap(): number {
+    return this.maxConcurrent;
+  }
+
+  /**
+   * WR-313: revise the cap live. An illegal value throws `RangeError`
+   * and the live cap is untouched; the current cap is a silent no-op.
+   *
+   * - Tightening never revokes a held slot: in-flight dispatches run
+   *   to completion under the old cap. New acquisitions queue until
+   *   `inFlight` is back at (or below) the new cap — a release while
+   *   `inFlight` is still above the cap drains the count instead of
+   *   handing the slot to a waiter (see `release()`).
+   * - Widening pumps out waiters immediately, in FIFO order: each
+   *   grant takes a fresh slot (`inFlight += 1`) and resolves the
+   *   oldest waiter with the usual release function.
+   * - Revising to `Infinity` wakes every waiter; revising from
+   *   `Infinity` to a finite cap starts limiting at once, with
+   *   in-flight dispatches unaffected.
+   */
+  retune(newCap: number): number {
+    assertGlobalConcurrencyLimit(newCap);
+    if (newCap === this.maxConcurrent) {
+      return this.maxConcurrent;
+    }
+    this.maxConcurrent = newCap;
+    while (this.waiters.length > 0 && this.inFlight < this.maxConcurrent) {
+      // A fresh slot: the waiter takes it (in-flight grows), unlike
+      // release(), where the slot transfers and the count is unchanged.
+      this.inFlight += 1;
+      const next = this.waiters.shift()!;
+      next(() => this.release());
+    }
     return this.maxConcurrent;
   }
 
@@ -101,7 +137,13 @@ export class GlobalConcurrencyGate {
   }
 
   private release(): void {
-    const next = this.waiters.shift();
+    // WR-313: after a tightening retune the in-flight count can sit
+    // above the new cap. A release then drains the count instead of
+    // transferring the slot: a waiter is a new acquisition, and new
+    // acquisitions queue until inFlight is back at (or below) the cap.
+    // In steady state inFlight never exceeds the cap, so this guard
+    // changes nothing outside a retune.
+    const next = this.inFlight <= this.maxConcurrent ? this.waiters.shift() : undefined;
     if (next) {
       // Slot transfers from the releaser to the oldest waiter; the
       // in-flight count is unchanged (no increment here).

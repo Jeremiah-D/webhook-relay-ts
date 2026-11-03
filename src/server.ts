@@ -66,7 +66,7 @@ import {
   type ResolvedHttpHardening,
 } from "./http-hardening.ts";
 import type { OrderedAuditEvent, OrderedModeOptions } from "./retry.ts";
-import type { GlobalRateLimitRevision, GlobalRateLimitStats } from "./retry.ts";
+import type { GlobalConcurrencyStats, GlobalRateLimitRevision, GlobalRateLimitStats } from "./retry.ts";
 import { parseCronExpression, CRON_HEADER } from "./cron.ts";
 import type { CompletionCallbackOptions } from "./callback.ts";
 import { createBoundAddressSelfCheck } from "./callback.ts";
@@ -5651,6 +5651,20 @@ export interface RelayServer extends Server {
    */
   setGlobalRateLimit?: (patch: GlobalRateLimitRevision) => { messagesPerSec: number; maxBurst: number };
   /**
+   * WR-313: revise the relay-level global outbound concurrency cap at
+   * runtime (a positive integer, or `Infinity` for "no cap"). Widening
+   * wakes FIFO waiters immediately; tightening never revokes a held
+   * slot — new acquisitions queue until in-flight drains back to the
+   * cap. An illegal value throws `RangeError` and the live cap is
+   * untouched; a same-value revision is a no-op with no audit event.
+   * A real revision is audited as `global_concurrency_revised` with
+   * `previous` / `current` caps, and returns the live cap. Always set
+   * — the global gate is always constructed, so there is no
+   * "not configured" branch (unlike `setGlobalRateLimit`): the
+   * default `Infinity` cap revises like any other.
+   */
+  setGlobalConcurrency?: (maxConcurrent: number) => number;
+  /**
    * WR-311: revise one endpoint's per-phase timeout budgets at runtime
    * (`targetUrl` exact match, partial — omitted phases keep their live
    * values, a phase set to `null` deletes that phase, deleting the last
@@ -5682,6 +5696,12 @@ export interface RelayServer extends Server {
    * was configured.
    */
   getGlobalRateLimitStats?: () => GlobalRateLimitStats;
+  /**
+   * WR-313: relay-level global concurrency snapshot (the live cap,
+   * current in-flight dispatches, FIFO waiter depth, and cumulative
+   * waiter count). Always set — the global gate is always constructed.
+   */
+  getGlobalConcurrencyStats?: () => GlobalConcurrencyStats;
   /**
    * WR-180: operator-plane rate-limiter snapshot (per-client sliding
    * windows). Set only when `operatorRateLimit` was configured.
@@ -13517,6 +13537,32 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   if (queue.getGlobalRateLimitStats() !== undefined) {
     server.getGlobalRateLimitStats = (): GlobalRateLimitStats => queue.getGlobalRateLimitStats()!;
   }
+
+  // WR-313: relay-level global concurrency cap runtime revision. The
+  // method is always set (like setDedupWindow above); the global gate
+  // is always constructed, so there is no "not configured" branch — a
+  // revision from the default `Infinity` cap works like any other. A
+  // real revision is audited as `global_concurrency_revised` with the
+  // previous and current cap; a same-value revision is a silent no-op.
+  server.setGlobalConcurrency = (maxConcurrent: number): number => {
+    const previous = queue.getGlobalConcurrencyStats().maxConcurrent;
+    // Validate-then-apply inside retune: an illegal value throws
+    // RangeError and the live cap is left completely intact.
+    const next = queue.setGlobalConcurrency(maxConcurrent);
+    if (next === previous) {
+      return next;
+    }
+    opts.auditLog.append({
+      event: "global_concurrency_revised",
+      previous,
+      current: next,
+    });
+    return next;
+  };
+
+  // WR-313: relay-level global concurrency snapshot — always set; the
+  // gate is always constructed.
+  server.getGlobalConcurrencyStats = (): GlobalConcurrencyStats => queue.getGlobalConcurrencyStats();
 
   // WR-311: per-endpoint phase timeout budget runtime revision. The
   // method is always set (like setDedupWindow above); with

@@ -4257,7 +4257,7 @@ export class RetryQueue {
    * unconfigured behavior is byte-for-byte the pre-WR-51 behavior.
    */
   private readonly globalGate: GlobalConcurrencyGate;
-  private readonly globalMaxConcurrent: number;
+  private globalMaxConcurrent: number;
   /**
    * WR-166: adaptive outbound timeout (one instance, per-endpoint
    * windows inside). `undefined` when the feature is off — every feed
@@ -9360,6 +9360,24 @@ export class RetryQueue {
    */
   getGlobalConcurrencyStats(): GlobalConcurrencyStats {
     return this.globalGate.stats();
+  }
+
+  /**
+   * WR-313: revise the relay-level global concurrency cap live. The
+   * gate is always constructed, so there is no "not configured" branch
+   * — the default `Infinity` cap revises like any other. An illegal
+   * value throws `RangeError` and the live cap is untouched; the
+   * current cap is a no-op. Widening wakes FIFO waiters at once;
+   * tightening never revokes a held slot (new acquisitions queue until
+   * in-flight drains back to the cap). Returns the live cap. The
+   * mirrored `globalMaxConcurrent` field is kept in sync so the
+   * `relay_global_concurrency_wait_total` series appears/disappears
+   * with the live cap (`Infinity` = absent).
+   */
+  setGlobalConcurrency(maxConcurrent: number): number {
+    const next = this.globalGate.retune(maxConcurrent);
+    this.globalMaxConcurrent = next;
+    return next;
   }
 
   /**

@@ -2846,6 +2846,17 @@ queue.getGlobalConcurrencyStats();
   waiter count; the cumulative count is also exported as
   `relay_global_concurrency_wait_total` (present only when the cap is
   configured). Invalid values throw `RangeError` at construction.
+- **Runtime revision (WR-313)** — `server.setGlobalConcurrency(n)`
+  revises the cap live (a positive integer, or `Infinity` for "no
+  cap") and returns the live cap; the gate is always constructed, so
+  this works from the default unlimited cap too. Widening wakes FIFO
+  waiters immediately; tightening never revokes a held slot — new
+  acquisitions queue until in-flight drains back to the cap. An
+  illegal value throws `RangeError` with the live cap untouched; a
+  same-value revision is a silent no-op. A real revision is audited
+  as `global_concurrency_revised` with the previous/current cap, and
+  `relay_global_concurrency_wait_total` appears/disappears with the
+  live cap (`Infinity` = absent).
 - **Shutdown-safe** — the gate is promise-FIFO only (no timers, nothing
   to unref); `stop()`/`shutdown()` wake every waiter, whose liveness
   check bails it out instead of dispatching, so a shutdown waits only
