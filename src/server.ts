@@ -180,7 +180,7 @@ export type { HedgeAuditEvent, HedgedSender, HedgedSenderOptions } from "./hedge
 export { errorBudgetBurnAuditEvent };
 export type { BurnRateAlertInfo, ErrorBudgetBurnAuditEvent } from "./retry.ts";
 import type { ReplayGuard } from "./replay.ts";
-import { DeliveryDeduplicator, type DedupOptions } from "./dedup.ts";
+import { DeliveryDeduplicator, type DedupOptions, type DedupWindowRevision } from "./dedup.ts";
 import {
   SecretScanner,
   type SecretHit,
@@ -1963,6 +1963,11 @@ export interface RelayServerOptions {
    * trigger a duplicate business action. 202, not 409: upstream should
    * treat the event as handled. Off by default, so identical payloads keep
    * the legacy always-deliver behavior unless the operator opts in.
+   *
+   * Runtime revision (WR-308): `server.setDedupWindow(patch)` revises
+   * `windowMs` / `maxEntries` in place — the next intake judges by the
+   * new values, and the WR-119 doubled window for degraded senders is
+   * re-pushed to 2x the new main window.
    */
   dedup?: DedupOptions;
   /**
@@ -5589,6 +5594,20 @@ export interface RelayServer extends Server {
    * at startup.
    */
   updateInboundMtlsConfig?: (patch: InboundMtlsConfigPatch) => ConfigChange[];
+  /**
+   * WR-308: revise the inbound dedup window and/or cap at runtime
+   * (`windowMs` / `maxEntries`, partial — omitted fields keep their live
+   * values). The next intake judges by the new values; the WR-119
+   * doubled window for degraded senders is re-pushed to 2x the new main
+   * window with the same cap. An illegal patch throws `RangeError` and
+   * the live values are untouched; an empty patch (or values equal to
+   * the live ones) is a no-op with no audit event. A real revision is
+   * audited as `dedup_revised` with `previous` / `current`
+   * `{ windowMs, maxEntries }`, and returns the live values. Only set
+   * when `dedup` was configured at startup — otherwise it throws
+   * `Error`: enabling dedup needs a restart.
+   */
+  setDedupWindow?: (patch: DedupWindowRevision) => { windowMs: number; maxEntries: number };
   /**
    * WR-180: operator-plane rate-limiter snapshot (per-client sliding
    * windows). Set only when `operatorRateLimit` was configured.
@@ -13325,6 +13344,42 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       fields: changes.map((c) => c.field),
     });
     return changes;
+  };
+
+  // WR-308: inbound dedup window/cap runtime revision. The method is
+  // always set (like updateInboundMtlsConfig above); with dedup
+  // unconfigured it throws Error — enabling dedup needs a restart.
+  // A real revision is audited as `dedup_revised` with the previous and
+  // current window/cap; an empty or same-value patch is a silent no-op.
+  server.setDedupWindow = (patch: DedupWindowRevision): { windowMs: number; maxEntries: number } => {
+    if (deduplicator === undefined) {
+      throw new Error(
+        "setDedupWindow: inbound dedup is not configured — enabling it requires a restart: " +
+          "the deduplicator is created at startup and a running server cannot start suppressing without one"
+      );
+    }
+    const previous = deduplicator.current();
+    // Validate-then-apply inside retune: an illegal patch throws
+    // RangeError and the live values are left completely intact.
+    const next = deduplicator.retune(patch);
+    // WR-119 tightening (c): the degraded-sender shadow keeps 2x the
+    // live main window and the same cap, so a main-window revision
+    // re-pushes the shadow instead of leaving it on the stale window.
+    if (tightenedDeduplicator !== undefined) {
+      tightenedDeduplicator.retune({
+        ...(patch.windowMs !== undefined ? { windowMs: next.windowMs * 2 } : {}),
+        ...(patch.maxEntries !== undefined ? { maxEntries: next.maxEntries } : {}),
+      });
+    }
+    if (next.windowMs === previous.windowMs && next.maxEntries === previous.maxEntries) {
+      return next;
+    }
+    opts.auditLog.append({
+      event: "dedup_revised",
+      previous,
+      current: next,
+    });
+    return next;
   };
 
   // WR-180: operator-plane rate-limiter snapshot (per-client sliding

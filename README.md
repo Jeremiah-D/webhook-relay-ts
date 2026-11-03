@@ -3755,6 +3755,20 @@ const server = createRelayServer({
   owns its own durability (Redis persistence, …); combining both throws
   `RangeError` at startup, as does a `store` that does not implement the
   interface (`TypeError`).
+- **Runtime revision** — `server.setDedupWindow({ windowMs?, maxEntries? })`
+  revises the window and/or cap in place (partial — omitted fields keep
+  their live values): the next intake judges by the new values, no
+  restart, no re-judged admissions, and the WR-79 journal is never
+  rewritten. An illegal patch throws `RangeError` and leaves the live
+  values untouched; an empty or same-value patch is a silent no-op. A
+  real revision is audited as `dedup_revised` with `previous` /
+  `current` `{ windowMs, maxEntries }` and returns the live values. The
+  WR-119 doubled window for degraded senders is re-pushed to 2x the new
+  main window with the same cap. With a custom store the window still
+  revises but `maxEntries` is fail-closed (`RangeError` — the cap belongs
+  to the store). Without `dedup` configured the method throws `Error`:
+  enabling dedup needs a restart. `deduplicator.stats()` reports the
+  live `windowMs` / `maxEntries` alongside the counters.
 
 ## Payload gzip compression
 

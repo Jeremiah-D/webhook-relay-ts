@@ -54,7 +54,13 @@ describe("DeliveryDeduplicator", () => {
     assert.equal(await d.check(URL, hash), false);
     assert.equal(await d.check(URL, hash), true);
     assert.equal(await d.check(URL, hash), true); // every repeat stays suppressed
-    assert.deepEqual(await d.stats(), { checked: 3, suppressed: 2, tracked: 1 });
+    assert.deepEqual(await d.stats(), {
+      checked: 3,
+      suppressed: 2,
+      tracked: 1,
+      windowMs: 60_000,
+      maxEntries: 10_000,
+    });
   });
 
   it("different payloads and different endpoints are independent deliveries", async () => {

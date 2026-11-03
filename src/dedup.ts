@@ -74,6 +74,19 @@ export interface DedupOptions {
 /** Journal file name inside the journal directory. */
 export const DEDUP_JOURNAL_FILE = "dedup.jsonl";
 
+/**
+ * Partial dedup-window revision (WR-308): the runtime patch
+ * `DeliveryDeduplicator.retune()` / `RelayServer.setDedupWindow()`
+ * accept. Omitted fields keep their live values; an empty patch is a
+ * no-op. Merged values are validated against the construction gates
+ * (`windowMs` finite > 0, `maxEntries` an integer >= 1) — an illegal
+ * patch throws `RangeError` and the live values are left untouched.
+ */
+export interface DedupWindowRevision {
+  windowMs?: number;
+  maxEntries?: number;
+}
+
 /** Rewrite the journal when superseded lines reach this many appends. */
 const DEDUP_JOURNAL_COMPACT_THRESHOLD = 4096;
 
@@ -106,7 +119,8 @@ export interface DedupStore {
  * order so oldest-eviction drops the truly oldest pairs.
  */
 export class InMemoryDedupStore implements DedupStore {
-  private readonly maxEntries: number;
+  /** Mutable (WR-308): the live cap, revised by `retune()`. */
+  private maxEntries: number;
   /** Insertion-ordered: key -> ms timestamp when first seen. */
   private readonly seen = new Map<string, number>();
 
@@ -115,6 +129,21 @@ export class InMemoryDedupStore implements DedupStore {
       throw new RangeError(`maxEntries must be an integer >= 1, got ${opts.maxEntries}`);
     }
     this.maxEntries = opts.maxEntries;
+  }
+
+  /**
+   * Revise the eviction cap in place (WR-308). The merged value is
+   * validated against the construction gate — an illegal cap throws
+   * `RangeError` and the live cap is left untouched. A tightened cap
+   * takes effect on the next `checkAndRemember`, which evicts the
+   * oldest entries past the new cap; a widened cap simply admits more.
+   */
+  retune(opts: { maxEntries?: number }): void {
+    const next = opts.maxEntries ?? this.maxEntries;
+    if (!Number.isInteger(next) || next < 1) {
+      throw new RangeError(`maxEntries must be an integer >= 1, got ${opts.maxEntries}`);
+    }
+    this.maxEntries = next;
   }
 
   checkAndRemember(key: string, nowMs: number, windowMs: number): boolean {
@@ -378,14 +407,20 @@ class DedupJournal {
  * and `journalDir` are mutually exclusive: a custom store owns its own
  * durability (Redis persistence, …), `journalDir` is the default store's.
  *
+ * WR-308: the window and cap are revisable at runtime via `retune()` —
+ * the next `check()` judges by the new values, no restart, no re-judged
+ * admissions, and the WR-79 journal is never rewritten.
+ *
  * This is inbound-side dedup (the server checks before enqueueing), not a
  * replacement for the nonce/timestamp replay guard (`src/replay.ts`):
  * the guard rejects exact replays by header, the deduplicator suppresses
  * the same business event arriving under a new id.
  */
 export class DeliveryDeduplicator {
-  private readonly windowMs: number;
-  private readonly maxEntries: number;
+  /** Mutable (WR-308): the live window, revised by `retune()`. */
+  private windowMs: number;
+  /** Mutable (WR-308): the live cap, revised by `retune()`. */
+  private maxEntries: number;
   private readonly now: () => number;
   private readonly store: DedupStore;
   /**
@@ -446,6 +481,68 @@ export class DeliveryDeduplicator {
     }
   }
 
+  /** The live window and cap (WR-308). */
+  current(): { windowMs: number; maxEntries: number } {
+    return { windowMs: this.windowMs, maxEntries: this.maxEntries };
+  }
+
+  /**
+   * Revise the dedup window and/or cap in place (WR-308), without
+   * restarting the relay: an operator tightens the window during a
+   * retry storm or widens it while a flaky upstream re-pushes, and the
+   * next `check()` judges by the new values.
+   *
+   * Semantics, deliberately fail-closed throughout:
+   *
+   *   - Partial: omitted fields keep their live values; an empty patch
+   *     (or values equal to the live ones) changes nothing. Merged
+   *     values are validated against the construction gates before
+   *     anything applies — an illegal patch throws `RangeError` and the
+   *     live values are left completely untouched.
+   *   - The window takes effect on the next `check()`: `check()` passes
+   *     the live `windowMs` to the store on every call, so in-flight
+   *     admissions are never re-judged and already-suppressed events
+   *     are never revived. Tightening expires old pairs on their next
+   *     check; widening re-admits pairs the store still holds (lazy
+   *     expiry never deleted them) under the new window.
+   *   - The cap takes effect on the next `check()` too: the default
+   *     store evicts the oldest entries past the new cap there.
+   *     Widening simply admits more pairs.
+   *   - A custom store owns its own cap (WR-108): revising
+   *     `maxEntries` with one installed throws `RangeError` and
+   *     applies nothing. The window is still revisable — it is the
+   *     deduplicator, not the store, that passes `windowMs` per check.
+   *   - The journal (WR-79) is not rewritten: journaled pairs are
+   *     re-judged against the live window on the next check, exactly
+   *     like in-memory pairs.
+   *
+   * Returns the live values after the revision.
+   */
+  retune(patch: DedupWindowRevision): { windowMs: number; maxEntries: number } {
+    const nextWindowMs = patch.windowMs ?? this.windowMs;
+    const nextMaxEntries = patch.maxEntries ?? this.maxEntries;
+    // Validate-then-apply: the merged values must pass the construction
+    // gates before either live value moves.
+    if (!Number.isFinite(nextWindowMs) || nextWindowMs <= 0) {
+      throw new RangeError(`windowMs must be > 0, got ${patch.windowMs}`);
+    }
+    if (!Number.isInteger(nextMaxEntries) || nextMaxEntries < 1) {
+      throw new RangeError(`maxEntries must be an integer >= 1, got ${patch.maxEntries}`);
+    }
+    if (patch.maxEntries !== undefined && this.defaultStore === undefined) {
+      throw new RangeError(
+        "maxEntries cannot be revised with a custom DedupStore: the cap belongs to the store — " +
+          "revise the window only, or restart with a store whose cap fits"
+      );
+    }
+    this.windowMs = nextWindowMs;
+    if (patch.maxEntries !== undefined) {
+      this.defaultStore!.retune({ maxEntries: nextMaxEntries });
+    }
+    this.maxEntries = nextMaxEntries;
+    return this.current();
+  }
+
   /** SHA-256 hex digest of a payload (the stable half of the dedup key). */
   static hashPayload(payload: Buffer): string {
     return createHash("sha256").update(payload).digest("hex");
@@ -479,7 +576,9 @@ export class DeliveryDeduplicator {
   }
 
   /**
-   * Observability: pairs checked, duplicates suppressed, pairs tracked.
+   * Observability: pairs checked, duplicates suppressed, pairs tracked,
+   * and the live window/cap (WR-308 — `windowMs`/`maxEntries` always
+   * report the values the next `check()` will judge by).
    * `journal` is present only when `journalDir` was configured: pairs
    * restored at construction, journal lines skipped as corrupt during
    * recovery, journal writes that failed (counted, never thrown), and
@@ -490,6 +589,8 @@ export class DeliveryDeduplicator {
     checked: number;
     suppressed: number;
     tracked: number;
+    windowMs: number;
+    maxEntries: number;
     journal?: {
       recovered: number;
       corruptLines: number;
@@ -501,6 +602,8 @@ export class DeliveryDeduplicator {
       checked: this.checked,
       suppressed: this.suppressed,
       tracked: await this.store.size(),
+      windowMs: this.windowMs,
+      maxEntries: this.maxEntries,
     };
     if (this.journal === undefined) return base;
     return {
