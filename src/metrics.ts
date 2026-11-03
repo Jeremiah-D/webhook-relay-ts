@@ -317,6 +317,18 @@ export interface OutboundRateLimitMetricsInput {
 }
 
 /**
+ * One endpoint's bulkhead rejections (WR-312), in Prometheus label order.
+ */
+export interface BulkheadRejectedMetricsInput {
+  /** The endpoint whose bulkhead rejected the acquisition. */
+  endpoint: string;
+  /** Why it was rejected. */
+  reason: "queue_full" | "queue_timeout";
+  /** Cumulative rejections for this (endpoint, reason). */
+  rejected: number;
+}
+
+/**
  * One tenant's dispatch-gate waits (WR-140), in Prometheus label order.
  */
 export interface TenantConcurrencyWaitMetricsInput {
@@ -384,6 +396,13 @@ export interface MetricsInput {
   tenantRetryBudgetDepletedByTenant?: Array<{ tenant?: string; depleted: number }>;
   /** Present only when the relay-level global concurrency cap (WR-51) is configured (finite). */
   globalConcurrencyWaits?: number;
+  /**
+   * WR-312: per-(endpoint, reason) bulkhead rejection counts. Present
+   * only for endpoints that actually had a bulkhead rejection —
+   * activity-gated, so exposition is byte-identical to the pre-WR-312
+   * shape until the first rejection.
+   */
+  bulkheadRejected?: BulkheadRejectedMetricsInput[];
   /** Present only when the relay-level global outbound rate limit (WR-167) is configured. */
   globalRateDelayed?: number;
   /** Present only once a delivery has been parked for a future deliver_at (WR-57). */
@@ -1266,6 +1285,18 @@ export function renderPrometheus(input: MetricsInput): string {
     );
     lines.push("# TYPE relay_global_concurrency_wait_total counter");
     lines.push(`relay_global_concurrency_wait_total ${input.globalConcurrencyWaits}`);
+  }
+  if (input.bulkheadRejected !== undefined) {
+    lines.push(
+      "# HELP relay_bulkhead_rejected_total Deliveries rejected by a per-endpoint bulkhead (fail-fast backpressure; the payload is rescheduled, never dead-lettered for this reason alone)."
+    );
+    lines.push("# TYPE relay_bulkhead_rejected_total counter");
+    // WR-312: one series per (endpoint, reason) that actually rejected.
+    for (const row of input.bulkheadRejected) {
+      lines.push(
+        `relay_bulkhead_rejected_total{endpoint="${escapeLabelValue(row.endpoint)}",reason="${row.reason}"} ${row.rejected}`
+      );
+    }
   }
   if (input.globalRateDelayed !== undefined) {
     lines.push(

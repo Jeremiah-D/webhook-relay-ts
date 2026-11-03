@@ -2983,7 +2983,7 @@ const queue = new RetryQueue({
   first outcome is recorded; a gauge cannot hold Infinity). Invalid
   options throw `RangeError` at construction.
 
-## Per-endpoint bulkhead isolation (WR-227)
+## Per-endpoint bulkhead isolation (WR-227, wired in WR-312)
 
 The per-endpoint limiter (WR-06) waits unboundedly: when an endpoint
 saturates, excess dispatches queue FIFO forever — a slow downstream
@@ -2997,20 +2997,25 @@ is rejected with `queue_timeout`. Both rejections are audited
 downstream backpressure, so the payload follows the normal backoff
 lane and is never dead-lettered for this reason alone.
 
+The bulkhead is wired into the delivery path (WR-312), not a
+standalone library: configure it once under `retry.bulkhead` and every
+dispatch takes a slot from its endpoint's bulkhead after the
+per-endpoint limiter and before the sender — lane turn → global gate →
+tenant gate → per-endpoint limiter → **bulkhead** → sender.
+
 ```ts
-import { EndpointBulkheads } from "./src/bulkhead.ts";
-const bulkheads = new EndpointBulkheads({
-  maxConcurrent: 8, // in-flight cap per endpoint
-  maxQueue: 16, // bounded FIFO wait; 0 = reject past the cap at once
-  queueTimeoutMs: 5000, // waiter timeout → retryable rejection
+const queue = new RetryQueue({
+  bulkhead: {
+    maxConcurrent: 8, // in-flight cap per endpoint
+    maxQueue: 16, // bounded FIFO wait; 0 = reject past the cap at once
+    queueTimeoutMs: 5000, // waiter timeout → retryable rejection
+  },
 });
-const release = await bulkheads.acquire("https://downstream/hook");
-// ... dispatch ...
-release();
+// Or on the relay server: opts.retry.bulkhead (spread into RetryQueue).
 ```
 
-- **Isolation, not a global cap** — each endpoint gets its own
-  bulkhead (created lazily, endpoints that never appear cost
+- **Isolation, not a global cap** — each (tenant, endpoint) gets its
+  own bulkhead (created lazily, endpoints that never appear cost
   nothing), so saturating one downstream can neither block nor reject
   traffic to another. This is orthogonal to WR-51 (one shared cap
   across the whole relay) and to WR-140 (one cap per tenant across
@@ -3019,21 +3024,36 @@ release();
   the per-endpoint cap from outcomes, the bulkhead cap never moves;
   its novelty is what happens past the ceiling (bounded queue +
   fail-fast rejection + audit), not the ceiling itself.
-- **In-flight isolation, not a retry budget** — unlike WR-38, which
-  budgets retry *attempts*, the bulkhead budgets in-flight *slots*;
-  a rejection consumes no retry budget.
+- **Backpressure, not a failed attempt** — a rejection means the
+  endpoint was never contacted, so it consumes no attempt
+  (`entry.attempt` is untouched), records no breaker, health,
+  adaptive, failover, canary, weighted, or consistent-hash verdict,
+  and never dead-letters on its own (`maxAttempts` is judged against
+  the un-incremented count). The delivery takes the normal retryable
+  scheduling tail — backoff delay, WR-38 retry-budget gate,
+  `onAttemptFailed` audit, reschedule — with the WR-38 budget as the
+  backstop against unbounded rescheduling.
+- **Fast lane bypass** — urgent deliveries skip the bulkhead like they
+  skip the per-endpoint limiter; the global gate still applies.
 - **Fail-closed config** — a non-positive or non-integer cap, a
   negative queue bound, or a negative/non-finite timeout throws
   `RangeError` at construction; an uncapped bulkhead (`Infinity`) is
-  rejected rather than silently accepted.
+  rejected rather than silently accepted. Unconfigured, the feature is
+  off entirely and the relay behaves exactly as before.
 - **Release frees the oldest queued waiter** — the slot transfers
   (in-flight count unchanged) and the granted waiter's timeout is
   cleared, so it can never time out after being granted. Releases are
-  idempotent.
-- **Observability** — `stats()` reports one row per endpoint seen
-  (cap, queue bound, in-flight, queued depth, waits, rejections);
-  `rejections()` returns the audited trail (oldest first, capped at
-  the 1000 most recent).
+  idempotent. `stop()`/`shutdown()` wake every bulkhead waiter, which
+  then bails out on the post-acquire liveness check instead of
+  dispatching, so a stop never hangs on a bulkhead.
+- **Observability** — `getBulkheadStats()` reports one row per
+  (tenant, endpoint) seen (cap, queue bound, in-flight, queued depth,
+  waits, rejections); `getBulkheadRejections()` returns the audited
+  trail (oldest first, capped at the 1000 most recent per endpoint);
+  `relay_bulkhead_rejected_total{endpoint,reason}` counts rejections
+  in Prometheus exposition (activity-gated — absent until the first
+  rejection). The standalone module (`src/bulkhead.ts`,
+  `EndpointBulkheads`) is still usable directly for embedding.
 
 ## Slow-start recovery ramp (opt-in)
 

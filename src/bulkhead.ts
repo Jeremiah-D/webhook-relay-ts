@@ -297,6 +297,25 @@ export class EndpointBulkhead {
     }
   }
 
+  /**
+   * Fail-safe for `RetryQueue.stop()`/`shutdown()` (WR-312): wake every
+   * queued waiter with a no-op release. Woken waiters must re-check
+   * liveness (the queue is stopped) and bail out instead of dispatching
+   * — the no-op release keeps the in-flight count truthful since no slot
+   * was ever held. Each waiter's timeout timer is cleared, so a woken
+   * waiter can never later time out and reject. Waiters that arrive
+   * after this call queue normally; the queue only calls it while
+   * stopping, when no new dispatch should start anyway. Mirrors
+   * `GlobalConcurrencyGate.releaseWaiters`.
+   */
+  releaseWaiters(): void {
+    const pending = this.waiters.splice(0);
+    for (const waiter of pending) {
+      clearTimeout(waiter.timer);
+      waiter.resolve(() => {});
+    }
+  }
+
   /** Acquisitions currently holding a slot. */
   inFlightCount(): number {
     return this.inFlight;
@@ -375,6 +394,14 @@ export class EndpointBulkheads {
   /** One snapshot row per endpoint seen so far, in first-seen order. */
   stats(): BulkheadStats[] {
     return [...this.bulkheads.values()].map((b) => b.stats());
+  }
+
+  /**
+   * Wake every queued waiter across all endpoints (see
+   * {@link EndpointBulkhead.releaseWaiters}).
+   */
+  releaseWaiters(): void {
+    for (const b of this.bulkheads.values()) b.releaseWaiters();
   }
 
   /** The combined audited rejection trail across endpoints, oldest first. */

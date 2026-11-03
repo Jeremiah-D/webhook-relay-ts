@@ -20,6 +20,15 @@ import {
 } from "./stale-pause.ts";
 import { EndpointCircuitBreaker, type CircuitBreakerOptions, type CircuitState, type CircuitStats } from "./circuit.ts";
 import {
+  EndpointBulkheads,
+  BulkheadRejectedError,
+  assertBulkheadOptions,
+  type BulkheadOptions,
+  type BulkheadRejection,
+  type BulkheadRejectionReason,
+  type BulkheadStats,
+} from "./bulkhead.ts";
+import {
   EndpointAutoDisable,
   type DisableFailureOutcome,
   type EndpointAutoDisableOptions,
@@ -2600,6 +2609,24 @@ export interface RetryQueueOptions {
    */
   globalMaxConcurrent?: number;
   /**
+   * Per-endpoint bulkhead isolation (WR-312; see `src/bulkhead.ts`):
+   * each endpoint gets an independent in-flight cap plus a bounded FIFO
+   * queue. When the cap is hit, at most `maxQueue` acquisitions wait;
+   * the next one is rejected immediately (`queue_full`), and a waiter
+   * that sits longer than `queueTimeoutMs` is rejected with
+   * `queue_timeout`. Both rejections are transient downstream
+   * backpressure: the delivery is rescheduled on the normal backoff
+   * lane without consuming an attempt, a breaker verdict, or the retry
+   * budget — and never dead-lettered for this reason alone. The gate
+   * sits after the per-endpoint limiter and before the sender; the
+   * urgent lane bypasses it like the limiter. All three fields are
+   * required when the option is present; invalid values throw
+   * `RangeError` at construction. Disabled by default (`undefined`) —
+   * the relay then behaves exactly as before. Reachable over HTTP via
+   * `opts.retry.bulkhead` on the relay server.
+   */
+  bulkhead?: BulkheadOptions;
+  /**
    * Relay-level cap on the outbound dispatch *rate* across all
    * endpoints (see {@link GlobalRateLimiter}). Orthogonal to
    * `globalMaxConcurrent` (WR-51, bounds in-flight *count*) and to the
@@ -4213,6 +4240,17 @@ export class RetryQueue {
   private readonly limiters = new Map<string, EndpointConcurrencyLimiter>();
   private readonly maxConcurrentPerEndpoint: number;
   /**
+   * WR-312: per-tenant endpoint bulkheads, keyed by tenant (`""` =
+   * default). Each tenant gets its own per-endpoint fail-fast budget, so
+   * one tenant's saturated downstream can neither block nor reject
+   * another tenant's deliveries to the same URL. Instances are created
+   * lazily by `bulkheadsFor()` so tenants that never appear cost nothing.
+   */
+  private readonly bulkheads = new Map<string, EndpointBulkheads>();
+  private readonly bulkheadOptions?: BulkheadOptions;
+  /** WR-312: cumulative bulkhead rejections per (endpoint, reason) — see `renderMetrics`. */
+  private readonly bulkheadRejected = new Map<string, Map<BulkheadRejectionReason, number>>();
+  /**
    * WR-51: relay-level global dispatch gate (one instance — the cap is
    * relay-wide, across endpoints and tenants). Always constructed; with
    * the default `Infinity` cap every acquisition grants immediately, so
@@ -4406,6 +4444,10 @@ export class RetryQueue {
     // WR-51: invalid values throw here, at construction — never mid-delivery.
     this.globalMaxConcurrent = opts.globalMaxConcurrent ?? Infinity;
     this.globalGate = new GlobalConcurrencyGate(this.globalMaxConcurrent);
+    // WR-312: invalid values throw here, at construction — never mid-delivery.
+    // Unconfigured (`undefined`) means the bulkhead is off entirely.
+    this.bulkheadOptions = opts.bulkhead !== undefined ? { ...opts.bulkhead } : undefined;
+    if (this.bulkheadOptions !== undefined) assertBulkheadOptions(this.bulkheadOptions);
     // WR-167: invalid values throw here, at construction — never mid-delivery.
     this.globalRateLimiter =
       opts.globalRateLimit !== undefined ? new GlobalRateLimiter(opts.globalRateLimit) : undefined;
@@ -5287,6 +5329,23 @@ export class RetryQueue {
       this.limiters.set(key, l);
     }
     return l;
+  }
+
+  /**
+   * WR-312: the calling tenant's endpoint bulkheads; `undefined` when
+   * the bulkhead is off, so callers skip the gate entirely and behavior
+   * is byte-identical to the pre-WR-312 path. Instances are created
+   * lazily, like `limiterFor()` above.
+   */
+  private bulkheadsFor(tenant: string | undefined): EndpointBulkheads | undefined {
+    if (this.bulkheadOptions === undefined) return undefined;
+    const key = tenantInstanceKey(tenant);
+    let b = this.bulkheads.get(key);
+    if (b === undefined) {
+      b = new EndpointBulkheads(this.bulkheadOptions);
+      this.bulkheads.set(key, b);
+    }
+    return b;
   }
 
   /** WR-48: the calling tenant's latency tracker; `undefined` when latency tracking is off. */
@@ -6948,6 +7007,10 @@ export class RetryQueue {
     this.globalRateLimiter?.releaseWaiters();
     // WR-140: same for every tenant's gate waiters.
     this.tenantGates.releaseWaiters();
+    // WR-312: same for every tenant's bulkhead waiters — woken waiters
+    // bail out on the post-acquire liveness check, so a stop never
+    // leaves a deliver parked on a bulkhead across a restart.
+    for (const bulkheads of this.bulkheads.values()) bulkheads.releaseWaiters();
     // The timers are gone, so no retry fire-time is armed anymore; the
     // next start() (or a restart, via the journaled enqueue lines)
     // schedules fresh.
@@ -7030,6 +7093,11 @@ export class RetryQueue {
     this.globalRateLimiter?.releaseWaiters();
     // WR-140: same for every tenant's gate waiters.
     this.tenantGates.releaseWaiters();
+    // WR-312: same for every tenant's bulkhead waiters — woken waiters
+    // bail out on the post-acquire liveness check, so shutdown() waits
+    // only for deliveries genuinely in flight instead of hanging on a
+    // bulkhead.
+    for (const bulkheads of this.bulkheads.values()) bulkheads.releaseWaiters();
     this.durablePendingRetry.clear();
     // WR-83: best-effort OTLP export flush — bounded (1s) so a dead
     // collector can never pin shutdown; the exporter clears its own
@@ -8150,6 +8218,9 @@ export class RetryQueue {
     let releaseGlobalSlot: (() => void) | undefined;
     let releaseTenantSlot: (() => void) | undefined;
     let releaseLimiter: (() => void) | undefined;
+    // WR-312: declared outside the try for the same V8 scope reason as
+    // the releases above — the finally below must see it.
+    let releaseBulkhead: (() => void) | undefined;
     try {
       // The queue may have stopped, or the item may have been settled, while
       // we waited for a turn or a concurrency slot. Bail out; the releases
@@ -8257,6 +8328,49 @@ export class RetryQueue {
       // WR-150: a disable that landed while queued for the per-endpoint
       // limiter dead-letters instead of dispatching.
       if (this.deadLetterIfEndpointDisabled(entry, id, traceId, target, probe, breaker)) return;
+      // WR-312: per-endpoint bulkhead — the innermost gate, after the
+      // per-endpoint limiter and before the sender: the (tenant,
+      // endpoint) bulkhead sheds excess load fail-fast instead of
+      // queueing it unboundedly behind a slow downstream. The fast lane
+      // bypasses it like the limiter (an urgent delivery never waits
+      // behind queued normal deliveries). A rejection is backpressure,
+      // not a failed attempt: it is caught below and rescheduled
+      // without consuming an attempt, a breaker verdict, or the retry
+      // budget — and it never dead-letters on its own.
+      if (!fastLane) {
+        const bulkheads = this.bulkheadsFor(tenant);
+        if (bulkheads !== undefined) {
+          try {
+            releaseBulkhead = await bulkheads.acquire(target);
+          } catch (err) {
+            if (err instanceof BulkheadRejectedError) {
+              // The endpoint was never contacted: cancel the probe
+              // permit (no verdict — the attempt never ran) and take
+              // the normal retryable scheduling tail without
+              // incrementing the attempt count.
+              if (probe) breaker?.cancelProbe(target);
+              this.handleBulkheadRejection(entry, id, traceId, tenant, logicalEndpoint, target, err);
+              return;
+            }
+            throw err;
+          }
+          // The bulkhead may have queued us while the queue stopped or
+          // the endpoint paused: re-check liveness before touching the
+          // sender, exactly like the limiter above.
+          if ((!this.running && !force) || !this.queue.has(id)) {
+            if (probe) breaker?.cancelProbe(target);
+            return;
+          }
+          if (this.pausedEndpoints.has(logicalEndpoint)) {
+            if (probe) breaker?.cancelProbe(target);
+            this.park(id, 0);
+            return;
+          }
+          // WR-150: a disable that landed while queued for the bulkhead
+          // dead-letters instead of dispatching.
+          if (this.deadLetterIfEndpointDisabled(entry, id, traceId, target, probe, breaker)) return;
+        }
+      }
       // A normal dispatch earns the urgent lane its proportional deficit
       // (only while urgent demand is backlogged) — the DRR earning event.
       // Runs after the innermost gate granted (the per-endpoint limiter
@@ -8764,127 +8878,7 @@ export class RetryQueue {
         // "4xx"/"400" policy entry can restate but never soften the
         // instant dead-letter — and non-HTTP failures (no status code)
         // fall straight through to the normal schedule.
-        const statusEntry = this.matchStatusRetryEntry(logicalEndpoint, classified.statusCode);
-        const effectiveMaxAttempts = statusEntry?.maxAttempts ?? this.maxAttemptsFor(logicalEndpoint);
-        if (entry.attempt >= effectiveMaxAttempts) {
-          this.moveToDeadLetter(entry, id, err, classified, at, traceId, target);
-        } else {
-          // WR-178: a matched per-status entry prescribes this retry's
-          // delay. A downstream-supplied `Retry-After` (429/503) is never
-          // ignored — the two compose as a floor: the longer of the
-          // policy's delay and the downstream's explicit request wins
-          // (WR-30's "wins over every lane's own delay", as a max
-          // instead of a pure override).
-          const statusDelayMs =
-            statusEntry !== undefined ? statusRetryDelayMs(statusEntry, entry.attempt) : undefined;
-          let retryDelayMs = classified.retryAfterMs;
-          if (retryDelayMs !== undefined && statusDelayMs !== undefined) {
-            retryDelayMs = Math.max(statusDelayMs, retryDelayMs);
-          }
-          if (retryDelayMs === undefined) {
-            if (fastLane && this.urgentLimiter.take(target)) {
-              // Skip the exponential backoff: fixed fast-lane retry delay.
-              this.recordUrgentStat(target, "retried");
-              retryDelayMs = this.urgentRetryDelayMs;
-            } else {
-              if (fastLane) {
-                // Fast-lane retry would exceed the endpoint's urgent rate:
-                // degrade to normal backoff instead of dropping the delivery.
-                this.recordUrgentStat(target, "throttled");
-                entry.priority = "normal";
-              }
-              // WR-178: the status schedule replaces the normal backoff
-              // (WR-172 policy or WR-02 global) for this failure's
-              // status. The fast lane already took its fixed delay above
-              // and keeps it — per-item priority outranks the
-              // endpoint's status schedule, just as it outranks the
-              // global backoff.
-              retryDelayMs = statusDelayMs ?? this.delayForAttempt(entry.attempt, target, tenant, entry.id);
-            }
-          }
-          this.recordDelivery(tenant, target, "retried");
-          const retryingTraceSpan = this.traceSpanFor(entry, entry.attempt);
-          this.emitDeliveryEvent({
-            type: "retrying",
-            id: entry.id,
-            traceId,
-            ...(tenant === undefined ? {} : { tenant }),
-            targetUrl: target,
-            attempts: entry.attempt,
-            bytesOut: entry.payload.length,
-            at,
-            error,
-            ...(retryingTraceSpan === undefined ? {} : { traceSpan: retryingTraceSpan }),
-          });
-          // WR-38/WR-125: gate every newly scheduled retry on the retry
-          // budget. When the budget is exhausted the retry is parked
-          // until the next token refill instead of joining a retry
-          // storm: the failure above was already accounted (attempt +
-          // circuit), and the parking itself is neutral — it consumes
-          // neither another attempt, a budget token, nor a circuit
-          // event. Retries resume automatically when the budget refills.
-          // WR-125: an endpoint with a per-endpoint override gates on its
-          // own bucket first, then on the global budget — a storm on one
-          // endpoint parks only that endpoint's retries.
-          let scheduledDelayMs = retryDelayMs;
-          // WR-50: a retry for a paused endpoint parks without touching
-          // the global budget — `schedule()` below parks it, and the
-          // parking itself must consume neither a budget token, another
-          // attempt, nor a circuit event.
-          // WR-38/WR-125/WR-200: any configured budget gates the retry.
-            const budgetConfigured =
-              this.retryBudget !== undefined || this.tenantRetryBudget !== undefined;
-            const budgetGate =
-              budgetConfigured && !this.pausedEndpoints.has(logicalEndpoint)
-                ? this.gateRetryBudget(logicalEndpoint, tenant)
-                : { ok: true as const };
-          if (!budgetGate.ok) {
-            const waitMs = budgetGate.waitMs + this.random() * 50;
-            this.retryBudgetDepleted += 1;
-            // WR-125: the per-endpoint split is tracked only when
-            // overrides are configured — without them the relay renders
-            // byte-identical exposition to the pre-WR-125 shape.
-            if (this.retryBudgetEndpoints.size > 0) {
-              this.retryBudgetDepletedByEndpoint.set(
-                logicalEndpoint,
-                (this.retryBudgetDepletedByEndpoint.get(logicalEndpoint) ?? 0) + 1
-              );
-            }
-            // WR-200: the per-tenant split feeds
-            // relay_tenant_retry_budget_depleted_total{tenant} — one
-            // series per tenant that actually had a retry parked.
-            if (budgetGate.scope === "tenant") {
-              const tenantKey = tenant ?? "";
-              this.tenantRetryBudgetDepletedByTenant.set(
-                tenantKey,
-                (this.tenantRetryBudgetDepletedByTenant.get(tenantKey) ?? 0) + 1
-              );
-            }
-            this.onRetryBudgetDepleted?.({
-              id: entry.id,
-              traceId,
-              ...(tenant === undefined ? {} : { tenant }),
-              endpoint: target,
-              attempts: entry.attempt,
-              waitMs: Math.max(0, Math.round(waitMs)),
-              scope: budgetGate.scope,
-            });
-            scheduledDelayMs = waitMs;
-          }
-          // WR-43: report the failure after the final delay is known, so
-          // the audited `retrying` line carries the true scheduled delay
-          // (budget parking included).
-          this.onAttemptFailed?.({
-            id: entry.id,
-            traceId,
-            ...(tenant === undefined ? {} : { tenant }),
-            endpoint: target,
-            attempts: entry.attempt,
-            error,
-            nextDelayMs: Math.max(0, Math.round(scheduledDelayMs)),
-          });
-          this.schedule(id, scheduledDelayMs);
-        }
+        this.scheduleRetryAfterFailure(entry, id, traceId, tenant, logicalEndpoint, target, err, classified, at, fastLane);
       } finally {
         // WR-151: the attempt settled — end the per-attempt
         // `relay.delivery` span. When the delivery just reached a
@@ -8894,19 +8888,21 @@ export class RetryQueue {
         this.otelTracer?.endAttempt(entry, otelAttempt, otelAttemptOk, otelAttemptError);
       }
     } finally {
-      // Released in reverse acquisition order: the limiter slot first
-      // (innermost), then the tenant slot, then the global slot, then
-      // the turn. Each release hands its slot to that gate's oldest
-      // waiter, so the most-downstream waiter is served first and every
-      // slot brackets its attempt exactly (released once the attempt has
-      // settled: success, failure-scheduled, or dead-lettered). The turn
-      // goes last: gate waiters wake on microtasks, so at scheduler
-      // re-run time none has dispatched yet and the scheduler still sees
-      // every queued successor as backlogged — no transient dip that
-      // would work-conservingly release parked urgent turns one dispatch
-      // early (the WR-35 rationale, kept with the gates reordered).
+      // Released in reverse acquisition order: the bulkhead slot first
+      // (innermost), then the limiter slot, then the tenant slot, then
+      // the global slot, then the turn. Each release hands its slot to
+      // that gate's oldest waiter, so the most-downstream waiter is
+      // served first and every slot brackets its attempt exactly
+      // (released once the attempt has settled: success,
+      // failure-scheduled, or dead-lettered). The turn goes last: gate
+      // waiters wake on microtasks, so at scheduler re-run time none has
+      // dispatched yet and the scheduler still sees every queued
+      // successor as backlogged — no transient dip that would
+      // work-conservingly release parked urgent turns one dispatch early
+      // (the WR-35 rationale, kept with the gates reordered).
       // Undefined when a gate was never acquired (early bail-out or a
       // bypassed lane): nothing to release.
+      releaseBulkhead?.();
       releaseLimiter?.();
       releaseTenantSlot?.();
       releaseGlobalSlot?.();
@@ -8914,6 +8910,200 @@ export class RetryQueue {
     }
   }
 
+  /**
+   * WR-312: the shared retryable-scheduling tail — the normal backoff
+   * lane a failed attempt takes (after its attempt count and control-plane
+   * verdicts), and the bulkhead-rejection path takes without either.
+   * Judges `maxAttempts` against the attempt count as it stands: a
+   * bulkhead rejection never increments it, so a rejection alone can
+   * never exhaust the budget and dead-letter the item — the WR-38 retry
+   * budget is the backstop instead. A live policy shrink that already
+   * left `entry.attempt` at the cap still dead-letters, exactly as the
+   * normal path would after a real attempt.
+   */
+  private scheduleRetryAfterFailure(
+    entry: RetryItem & { attempt: number },
+    id: string,
+    traceId: string,
+    tenant: string | undefined,
+    logicalEndpoint: string,
+    target: string,
+    err: unknown,
+    classified: ClassifiedFailure,
+    at: string,
+    fastLane: boolean,
+  ): void {
+    const error = err instanceof Error ? err.message : String(err);
+    const statusEntry = this.matchStatusRetryEntry(logicalEndpoint, classified.statusCode);
+    const effectiveMaxAttempts = statusEntry?.maxAttempts ?? this.maxAttemptsFor(logicalEndpoint);
+    if (entry.attempt >= effectiveMaxAttempts) {
+      this.moveToDeadLetter(entry, id, err, classified, at, traceId, target);
+    } else {
+      // WR-178: a matched per-status entry prescribes this retry's
+      // delay. A downstream-supplied `Retry-After` (429/503) is never
+      // ignored — the two compose as a floor: the longer of the
+      // policy's delay and the downstream's explicit request wins
+      // (WR-30's "wins over every lane's own delay", as a max
+      // instead of a pure override).
+      const statusDelayMs =
+        statusEntry !== undefined ? statusRetryDelayMs(statusEntry, entry.attempt) : undefined;
+      let retryDelayMs = classified.retryAfterMs;
+      if (retryDelayMs !== undefined && statusDelayMs !== undefined) {
+        retryDelayMs = Math.max(statusDelayMs, retryDelayMs);
+      }
+      if (retryDelayMs === undefined) {
+        if (fastLane && this.urgentLimiter.take(target)) {
+          // Skip the exponential backoff: fixed fast-lane retry delay.
+          this.recordUrgentStat(target, "retried");
+          retryDelayMs = this.urgentRetryDelayMs;
+        } else {
+          if (fastLane) {
+            // Fast-lane retry would exceed the endpoint's urgent rate:
+            // degrade to normal backoff instead of dropping the delivery.
+            this.recordUrgentStat(target, "throttled");
+            entry.priority = "normal";
+          }
+          // WR-178: the status schedule replaces the normal backoff
+          // (WR-172 policy or WR-02 global) for this failure's
+          // status. The fast lane already took its fixed delay above
+          // and keeps it — per-item priority outranks the
+          // endpoint's status schedule, just as it outranks the
+          // global backoff.
+          retryDelayMs = statusDelayMs ?? this.delayForAttempt(entry.attempt, target, tenant, entry.id);
+        }
+      }
+      this.recordDelivery(tenant, target, "retried");
+      const retryingTraceSpan = this.traceSpanFor(entry, entry.attempt);
+      this.emitDeliveryEvent({
+        type: "retrying",
+        id: entry.id,
+        traceId,
+        ...(tenant === undefined ? {} : { tenant }),
+        targetUrl: target,
+        attempts: entry.attempt,
+        bytesOut: entry.payload.length,
+        at,
+        error,
+        ...(retryingTraceSpan === undefined ? {} : { traceSpan: retryingTraceSpan }),
+      });
+      // WR-38/WR-125: gate every newly scheduled retry on the retry
+      // budget. When the budget is exhausted the retry is parked
+      // until the next token refill instead of joining a retry
+      // storm: the failure above was already accounted (attempt +
+      // circuit), and the parking itself is neutral — it consumes
+      // neither another attempt, a budget token, nor a circuit
+      // event. Retries resume automatically when the budget refills.
+      // WR-125: an endpoint with a per-endpoint override gates on its
+      // own bucket first, then on the global budget — a storm on one
+      // endpoint parks only that endpoint's retries.
+      let scheduledDelayMs = retryDelayMs;
+      // WR-50: a retry for a paused endpoint parks without touching
+      // the global budget — `schedule()` below parks it, and the
+      // parking itself must consume neither a budget token, another
+      // attempt, nor a circuit event.
+      // WR-38/WR-125/WR-200: any configured budget gates the retry.
+        const budgetConfigured =
+          this.retryBudget !== undefined || this.tenantRetryBudget !== undefined;
+        const budgetGate =
+          budgetConfigured && !this.pausedEndpoints.has(logicalEndpoint)
+            ? this.gateRetryBudget(logicalEndpoint, tenant)
+            : { ok: true as const };
+      if (!budgetGate.ok) {
+        const waitMs = budgetGate.waitMs + this.random() * 50;
+        this.retryBudgetDepleted += 1;
+        // WR-125: the per-endpoint split is tracked only when
+        // overrides are configured — without them the relay renders
+        // byte-identical exposition to the pre-WR-125 shape.
+        if (this.retryBudgetEndpoints.size > 0) {
+          this.retryBudgetDepletedByEndpoint.set(
+            logicalEndpoint,
+            (this.retryBudgetDepletedByEndpoint.get(logicalEndpoint) ?? 0) + 1
+          );
+        }
+        // WR-200: the per-tenant split feeds
+        // relay_tenant_retry_budget_depleted_total{tenant} — one
+        // series per tenant that actually had a retry parked.
+        if (budgetGate.scope === "tenant") {
+          const tenantKey = tenant ?? "";
+          this.tenantRetryBudgetDepletedByTenant.set(
+            tenantKey,
+            (this.tenantRetryBudgetDepletedByTenant.get(tenantKey) ?? 0) + 1
+          );
+        }
+        this.onRetryBudgetDepleted?.({
+          id: entry.id,
+          traceId,
+          ...(tenant === undefined ? {} : { tenant }),
+          endpoint: target,
+          attempts: entry.attempt,
+          waitMs: Math.max(0, Math.round(waitMs)),
+          scope: budgetGate.scope,
+        });
+        scheduledDelayMs = waitMs;
+      }
+      // WR-43: report the failure after the final delay is known, so
+      // the audited `retrying` line carries the true scheduled delay
+      // (budget parking included).
+      this.onAttemptFailed?.({
+        id: entry.id,
+        traceId,
+        ...(tenant === undefined ? {} : { tenant }),
+        endpoint: target,
+        attempts: entry.attempt,
+        error,
+        nextDelayMs: Math.max(0, Math.round(scheduledDelayMs)),
+      });
+      this.schedule(id, scheduledDelayMs);
+    }
+  }
+
+  /**
+   * WR-312: a bulkhead rejection is backpressure, not a failed attempt.
+   * The endpoint was never contacted, so nothing is recorded against it
+   * — no breaker/health/adaptive/failover/canary/weighted/consistentHash
+   * verdict, no attempt increment, no dead letter on its own — and the
+   * delivery takes the normal retryable scheduling tail (backoff delay,
+   * WR-38 retry-budget gate, `onAttemptFailed` audit, `schedule`).
+   * `classifyFailure` maps the rejection to `retryable` via its default
+   * (no `failureClass` branch needed in `failure.ts`).
+   */
+  private handleBulkheadRejection(
+    entry: RetryItem & { attempt: number },
+    id: string,
+    traceId: string,
+    tenant: string | undefined,
+    logicalEndpoint: string,
+    target: string,
+    err: BulkheadRejectedError,
+  ): void {
+    this.recordBulkheadRejection(target, err.reason);
+    const classified = classifyFailure(err);
+    this.scheduleRetryAfterFailure(
+      entry,
+      id,
+      traceId,
+      tenant,
+      logicalEndpoint,
+      target,
+      err,
+      classified,
+      new Date().toISOString(),
+      false,
+    );
+  }
+
+  /**
+   * WR-312: count one bulkhead rejection for `renderMetrics`
+   * (`relay_bulkhead_rejected_total{endpoint,reason}`).
+   */
+  private recordBulkheadRejection(endpoint: string, reason: BulkheadRejectionReason): void {
+    let inner = this.bulkheadRejected.get(endpoint);
+    if (inner === undefined) {
+      inner = new Map<BulkheadRejectionReason, number>();
+      this.bulkheadRejected.set(endpoint, inner);
+    }
+    inner.set(reason, (inner.get(reason) ?? 0) + 1);
+  }
   /**
    * WR-76: expire one delivery whose end-to-end deadline passed before
    * its next dispatch. The expiry is audited (`delivery_deadline_exceeded`
@@ -9170,6 +9360,42 @@ export class RetryQueue {
    */
   getGlobalConcurrencyStats(): GlobalConcurrencyStats {
     return this.globalGate.stats();
+  }
+
+  /**
+   * WR-312: per-(tenant, endpoint) bulkhead snapshot — one row per
+   * endpoint seen so far, in first-seen order (cap, queue bound,
+   * in-flight, queued depth, waits, rejections). Rows carry `tenant`
+   * only when set. Empty when the bulkhead is off or nothing has
+   * acquired yet.
+   */
+  getBulkheadStats(): Array<BulkheadStats & { tenant?: string }> {
+    const out: Array<BulkheadStats & { tenant?: string }> = [];
+    for (const [key, bulkheads] of this.bulkheads) {
+      const tenant = key === "" ? undefined : key;
+      for (const row of bulkheads.stats()) {
+        out.push(tenant === undefined ? row : { ...row, tenant });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * WR-312: the combined audited bulkhead-rejection trail across tenants
+   * and endpoints, oldest first (a copy; each endpoint's trail is capped
+   * at the 1000 most recent by the module). Rows carry `tenant` only
+   * when set. Empty when the bulkhead is off or nothing has been
+   * rejected yet.
+   */
+  getBulkheadRejections(): Array<BulkheadRejection & { tenant?: string }> {
+    const out: Array<BulkheadRejection & { tenant?: string }> = [];
+    for (const [key, bulkheads] of this.bulkheads) {
+      const tenant = key === "" ? undefined : key;
+      for (const row of bulkheads.rejections()) {
+        out.push(tenant === undefined ? row : { ...row, tenant });
+      }
+    }
+    return out.sort((a, b) => a.atMs - b.atMs);
   }
 
   /**
@@ -9758,6 +9984,19 @@ export class RetryQueue {
       // counters.
       ...(this.globalMaxConcurrent !== Infinity
         ? { globalConcurrencyWaits: this.globalGate.waitedTotal() }
+        : {}),
+      // WR-312: activity-gated — the series stays absent until a
+      // bulkhead actually rejects, so a relay without the bulkhead (or
+      // without rejections) renders byte-identical exposition to the
+      // pre-WR-312 shape.
+      ...(this.bulkheadOptions !== undefined && this.bulkheadRejected.size > 0
+        ? {
+            bulkheadRejected: [...this.bulkheadRejected].flatMap(([endpoint, byReason]) =>
+              [...byReason]
+                .filter(([, rejected]) => rejected > 0)
+                .map(([reason, rejected]) => ({ endpoint, reason, rejected }))
+            ),
+          }
         : {}),
       // WR-167: the delayed-dispatch counter is exposed only when the
       // rate limit is configured — the default unlimited relay never
