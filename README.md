@@ -1111,6 +1111,28 @@ reliability primitives that matter for any signed-payload pipeline.
   free (Node does not re-evaluate queued requests on a cap change), so a
   scale-up shortens the queue for what comes next. Unset = the fixed cap,
   byte-identical behavior to before.
+- Live revision of the pool cap and idle timeout (WR-309):
+  `server.setOutboundKeepAlive({ maxSocketsPerHost?, idleTimeoutMs? })`
+  (partial — omitted fields keep their live values) revises the fixed
+  cap and the idle-reap cadence without a restart, so an operator can
+  raise the cap ahead of a peak and shorten reaping off-peak. The new
+  cap applies to agents created afterwards and updates every existing
+  origin's `agent.maxSockets` immediately (in-flight connections are
+  never touched); revising `idleTimeoutMs` rebuilds the reap timer (0
+  stops reaping). With adaptive sizing (WR-134) a revised
+  `maxSocketsPerHost` moves the adaptive upper bound when it was
+  defaulted at construction (an explicitly configured `maxSockets`
+  stays put) and the evaluator keeps moving the cap inside the new
+  interval. Merged values are validated against the construction gates
+  (`maxSocketsPerHost` a positive integer, `idleTimeoutMs` a
+  non-negative integer) — an illegal patch throws `RangeError` and the
+  live values are untouched; an empty or same-value patch is a silent
+  no-op. A real revision is audited as `outbound_keep_alive_revised`
+  with `previous` / `current` `{ maxSocketsPerHost, idleTimeoutMs }`,
+  and `pool.getStats()` reports the live values (plus the live adaptive
+  bounds when adaptive sizing is on). Throws `Error` when there is no
+  pool (`outboundKeepAlive: false` or a custom sender) — enabling
+  pooling needs a restart.
 - `src/warmup.ts` — outbound connection warm-up (WR-70): pre-connects the
   keep-alive pool to configured origins at startup so the first deliveries
   skip the TCP/TLS handshake. `warmupOutboundPool(pool, endpoints, cfg)`

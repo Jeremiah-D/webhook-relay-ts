@@ -363,7 +363,7 @@ import {
   resolveCertExpiryOptions,
   type CertExpiryOptions,
 } from "./cert-expiry.ts";
-import { OutboundConnectionPool, type KeepAlivePoolOptions } from "./keepalive.ts";
+import { OutboundConnectionPool, type KeepAlivePoolOptions, type OutboundKeepAliveRevision } from "./keepalive.ts";
 import { DnsCache, type DnsCacheOptions } from "./dns-cache.ts";
 import { DnsPin, type DnsPinMismatchInfo, type DnsPinOptions } from "./dns-pin.ts";
 import { warmupOutboundPool, resolveWarmupOptions } from "./warmup.ts";
@@ -5608,6 +5608,25 @@ export interface RelayServer extends Server {
    * `Error`: enabling dedup needs a restart.
    */
   setDedupWindow?: (patch: DedupWindowRevision) => { windowMs: number; maxEntries: number };
+  /**
+   * WR-309: revise the outbound keep-alive pool's fixed per-host cap
+   * and/or idle timeout at runtime (`maxSocketsPerHost` /
+   * `idleTimeoutMs`, partial — omitted fields keep their live values).
+   * The new cap applies to agents created afterwards and updates every
+   * existing origin's `agent.maxSockets` immediately (in-flight
+   * connections untouched); revising `idleTimeoutMs` rebuilds the reap
+   * timer (0 stops it). With adaptive sizing (WR-134) a revised
+   * `maxSocketsPerHost` moves the adaptive upper bound when it was
+   * defaulted at construction. An illegal patch throws `RangeError` and
+   * the live values are untouched; an empty patch (or values equal to
+   * the live ones) is a no-op with no audit event. A real revision is
+   * audited as `outbound_keep_alive_revised` with `previous` / `current`
+   * `{ maxSocketsPerHost, idleTimeoutMs }`, and returns the live values.
+   * Always set; throws `Error` when there is no pool
+   * (`outboundKeepAlive: false` or a custom sender) — enabling pooling
+   * needs a restart.
+   */
+  setOutboundKeepAlive?: (patch: OutboundKeepAliveRevision) => { maxSocketsPerHost: number; idleTimeoutMs: number };
   /**
    * WR-180: operator-plane rate-limiter snapshot (per-client sliding
    * windows). Set only when `operatorRateLimit` was configured.
@@ -13376,6 +13395,35 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     }
     opts.auditLog.append({
       event: "dedup_revised",
+      previous,
+      current: next,
+    });
+    return next;
+  };
+
+  // WR-309: outbound keep-alive pool cap / idle-timeout runtime
+  // revision. The method is always set (like setDedupWindow above);
+  // with pooling disabled it throws Error — enabling the pool needs a
+  // restart. A real revision is audited as
+  // `outbound_keep_alive_revised` with the previous and current
+  // cap/timeout; an empty or same-value patch is a silent no-op.
+  server.setOutboundKeepAlive = (patch: OutboundKeepAliveRevision): { maxSocketsPerHost: number; idleTimeoutMs: number } => {
+    const pool = defaultSender?.pool;
+    if (pool === undefined) {
+      throw new Error(
+        "setOutboundKeepAlive: outbound keep-alive pool is not configured — enabling it requires a restart: " +
+          "the pool is created at startup (or disabled with `outboundKeepAlive: false` / a custom sender)"
+      );
+    }
+    const previous = pool.current();
+    // Validate-then-apply inside retune: an illegal patch throws
+    // RangeError and the live values are left completely intact.
+    const next = pool.retune(patch);
+    if (next.maxSocketsPerHost === previous.maxSocketsPerHost && next.idleTimeoutMs === previous.idleTimeoutMs) {
+      return next;
+    }
+    opts.auditLog.append({
+      event: "outbound_keep_alive_revised",
       previous,
       current: next,
     });

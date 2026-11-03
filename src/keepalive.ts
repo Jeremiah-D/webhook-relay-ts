@@ -153,6 +153,20 @@ export interface KeepAlivePoolOptions {
 }
 
 /**
+ * Partial outbound keep-alive revision (WR-309): the runtime patch
+ * `OutboundConnectionPool.retune()` / `RelayServer.setOutboundKeepAlive()`
+ * accept. Omitted fields keep their live values; an empty patch is a
+ * no-op. Merged values are validated against the construction gates
+ * (`maxSocketsPerHost` a positive integer, `idleTimeoutMs` a
+ * non-negative integer, 0 disabling idle reaping) — an illegal patch
+ * throws `RangeError` and the live values are left untouched.
+ */
+export interface OutboundKeepAliveRevision {
+  maxSocketsPerHost?: number;
+  idleTimeoutMs?: number;
+}
+
+/**
  * Tuning for WR-134 adaptive per-origin socket-cap sizing. All values
  * are validated up front (`RangeError` on invalid values).
  */
@@ -361,6 +375,20 @@ export interface KeepAlivePoolStats {
   probeHits: number;
   probeMisses: number;
   /**
+   * WR-309: the live fixed per-host cap and idle timeout the next
+   * connection / reap cycle will use — revised in place by `retune()`.
+   */
+  maxSocketsPerHost: number;
+  idleTimeoutMs: number;
+  /**
+   * WR-309: the live adaptive bounds when adaptive sizing is enabled —
+   * `maxSockets` follows a revised `maxSocketsPerHost` when it was
+   * defaulted at construction (the WR-134 default-follow rule), and
+   * stays put when it was configured explicitly. Absent when adaptive
+   * sizing is disabled.
+   */
+  adaptive?: ResolvedAdaptiveSockets;
+  /**
    * WR-164: Happy Eyeballs race outcomes across the pool. Present only
    * when `happyEyeballs` is enabled (the activity-gated convention).
    */
@@ -442,21 +470,29 @@ export class OutboundConnectionPool {
   private readonly idleSince = new WeakMap<Socket, number>();
   /** SPKI fingerprint presented at handshake, per socket (TLS pin cache). */
   private readonly presentedPins = new WeakMap<Socket, string>();
-  private readonly reapTimer: ReturnType<typeof setInterval> | undefined;
+  /**
+   * WR-309: the idle reaper, rebuilt whenever `idleTimeoutMs` is
+   * revised (0 stops it) — mutable for that reason, unlike the
+   * adaptive timer, which is armed once at construction.
+   */
+  private reapTimer: ReturnType<typeof setInterval> | undefined;
   /** WR-134: adaptive cap evaluator; undefined when adaptive sizing is disabled. */
   private readonly adaptiveTimer: ReturnType<typeof setInterval> | undefined;
+  /**
+   * WR-309: whether the adaptive upper bound was defaulted at
+   * construction (`adaptiveSockets.maxSockets` omitted, so it followed
+   * `maxSocketsPerHost` per the WR-134 rule) — only then does a
+   * `maxSocketsPerHost` revision move it. An explicitly configured
+   * bound is the operator's own and stays put.
+   */
+  private readonly adaptiveMaxSocketsDefaulted: boolean;
   /** WR-164: race outcomes, shared by every raced agent in this pool. */
   private readonly happyEyeballsStats: HappyEyeballsStats = { races: 0, v6Wins: 0, v4Wins: 0 };
 
   constructor(opts: KeepAlivePoolOptions = {}) {
     this.opts = resolveKeepAlivePoolOptions(opts);
-    if (this.opts.idleTimeoutMs > 0) {
-      // Reap at most once per second; the timer is unref'd so an idle pool
-      // never pins process exit.
-      const everyMs = Math.max(100, Math.min(this.opts.idleTimeoutMs, 1000));
-      this.reapTimer = setInterval(() => this.reap(), everyMs);
-      this.reapTimer.unref();
-    }
+    this.adaptiveMaxSocketsDefaulted = opts.adaptiveSockets?.maxSockets === undefined;
+    this.armReapTimer();
     if (this.opts.adaptive !== undefined) {
       // Evaluate at most once per second, and no slower than the
       // configured cooldown — a move can never be due before the
@@ -465,6 +501,103 @@ export class OutboundConnectionPool {
       this.adaptiveTimer = setInterval(() => this.evaluateAdaptive(), everyMs);
       this.adaptiveTimer.unref();
     }
+  }
+
+  /**
+   * WR-309: (re)arm the idle reaper for the live `idleTimeoutMs`.
+   * Reap at most once per second; the timer is unref'd so an idle pool
+   * never pins process exit. `idleTimeoutMs` 0 stops the timer (idle
+   * reaping off, like construction). Called once at construction and
+   * again on every `idleTimeoutMs` revision.
+   */
+  private armReapTimer(): void {
+    if (this.reapTimer !== undefined) clearInterval(this.reapTimer);
+    this.reapTimer = undefined;
+    if (this.opts.idleTimeoutMs > 0) {
+      const everyMs = Math.max(100, Math.min(this.opts.idleTimeoutMs, 1000));
+      this.reapTimer = setInterval(() => this.reap(), everyMs);
+      this.reapTimer.unref();
+    }
+  }
+
+  /** The live fixed cap and idle timeout (WR-309). */
+  current(): { maxSocketsPerHost: number; idleTimeoutMs: number } {
+    return { maxSocketsPerHost: this.opts.maxSocketsPerHost, idleTimeoutMs: this.opts.idleTimeoutMs };
+  }
+
+  /**
+   * Revise the fixed per-host cap and/or the idle timeout in place
+   * (WR-309), without restarting the relay: an operator raises the cap
+   * ahead of a traffic peak or shortens idle reaping off-peak, and the
+   * next connection / reap cycle uses the new values.
+   *
+   * Semantics, deliberately fail-closed throughout:
+   *
+   *   - Partial: omitted fields keep their live values; an empty patch
+   *     (or values equal to the live ones) changes nothing. Merged
+   *     values are validated against the construction gates before
+   *     anything applies — an illegal patch throws `RangeError` and the
+   *     live values are left completely untouched.
+   *   - The new cap takes effect on the next connection: agents created
+   *     afterwards use it as their `maxSockets`, and every existing
+   *     origin's `agent.maxSockets` is updated to it immediately —
+   *     in-flight connections are never touched (Node only consults
+   *     `maxSockets` when opening a new socket).
+   *   - Revising `idleTimeoutMs` rebuilds the reap timer on the new
+   *     cadence; 0 stops it (idle reaping off, like construction).
+   *   - Adaptive sizing (WR-134): when enabled, revising
+   *     `maxSocketsPerHost` revises the adaptive upper bound — but only
+   *     when that bound was defaulted at construction (the WR-134
+   *     "maxSockets defaults to maxSocketsPerHost" rule, clamped to the
+   *     floor); an explicitly configured `maxSockets` is the operator's
+   *     own bound and stays put. Existing origins are clamped into the
+   *     new interval and the evaluator keeps moving the cap inside it
+   *     from queue pressure; excess idle sockets are left to the
+   *     evaluator's shrink / the idle reaper, never destroyed here.
+   *
+   * Returns the live values after the revision.
+   */
+  retune(patch: OutboundKeepAliveRevision): { maxSocketsPerHost: number; idleTimeoutMs: number } {
+    const nextMaxSockets = patch.maxSocketsPerHost ?? this.opts.maxSocketsPerHost;
+    const nextIdleTimeoutMs = patch.idleTimeoutMs ?? this.opts.idleTimeoutMs;
+    // Validate-then-apply: the merged values must pass the construction
+    // gates before either live value moves. (The retune gate for
+    // `idleTimeoutMs` is the integer form the spec pins — construction
+    // itself accepts any finite non-negative number.)
+    assertPositiveInt("maxSocketsPerHost", nextMaxSockets);
+    assertNonNegativeInt("idleTimeoutMs", nextIdleTimeoutMs);
+    if (nextMaxSockets === this.opts.maxSocketsPerHost && nextIdleTimeoutMs === this.opts.idleTimeoutMs) {
+      return this.current();
+    }
+    this.opts.maxSocketsPerHost = nextMaxSockets;
+    this.opts.idleTimeoutMs = nextIdleTimeoutMs;
+    const adaptive = this.opts.adaptive;
+    if (adaptive === undefined) {
+      for (const entry of this.entries.values()) {
+        entry.currentMaxSockets = nextMaxSockets;
+        entry.agent.maxSockets = nextMaxSockets;
+      }
+    } else {
+      if (this.adaptiveMaxSocketsDefaulted) {
+        // The default-follow rule: the adaptive upper bound tracks the
+        // fixed cap, but never below the floor.
+        adaptive.maxSockets = Math.max(adaptive.minSockets, nextMaxSockets);
+      }
+      // Clamp every origin into the (possibly new) interval; the
+      // evaluator keeps moving inside it from queue pressure.
+      for (const entry of this.entries.values()) {
+        const clamped = Math.min(
+          adaptive.maxSockets,
+          Math.max(adaptive.minSockets, entry.currentMaxSockets)
+        );
+        if (clamped !== entry.currentMaxSockets) {
+          entry.currentMaxSockets = clamped;
+          entry.agent.maxSockets = clamped;
+        }
+      }
+    }
+    this.armReapTimer();
+    return this.current();
   }
 
   /**
@@ -837,6 +970,11 @@ export class OutboundConnectionPool {
       reaped: endpoints.reduce((n, e) => n + e.reaped, 0),
       probeHits: endpoints.reduce((n, e) => n + e.probeHits, 0),
       probeMisses: endpoints.reduce((n, e) => n + e.probeMisses, 0),
+      // WR-309: the live fixed cap / idle timeout (revised by retune),
+      // and the live adaptive bounds when adaptive sizing is on.
+      maxSocketsPerHost: this.opts.maxSocketsPerHost,
+      idleTimeoutMs: this.opts.idleTimeoutMs,
+      ...(this.opts.adaptive !== undefined ? { adaptive: { ...this.opts.adaptive } } : {}),
       // WR-164: only when the feature is on — a pool without racing
       // exposes no new fields.
       ...(this.opts.happyEyeballs !== undefined ? { happyEyeballs: { ...this.happyEyeballsStats } } : {}),
