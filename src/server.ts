@@ -5688,6 +5688,29 @@ export interface RelayServer extends Server {
    */
   setRetryBudget?: (retriesPerMinute: number) => number;
   /**
+   * WR-324: revise the urgent fast-lane rate at runtime (the
+   * per-second token budget shared by every endpoint's bucket). The
+   * next urgent `take()` judges by the new rate; an urgent attempt
+   * already in flight is unaffected, and tokens already granted are
+   * never revoked. Tightening clamps every endpoint bucket to the
+   * new rate at once; widening never tops a bucket up. An illegal
+   * value throws `RangeError` and the live rate is untouched; a
+   * same-value revision is a no-op with no audit event. A real
+   * revision is audited as `urgent_rate_revised` with `previous` /
+   * `current` rates (the construction default 100 as first
+   * `previous`), and returns the live rate. Always set — the
+   * limiter is always constructed, so there is no "not configured"
+   * branch (unlike `setGlobalRateLimit`). No `endpoint` parameter:
+   * a single limiter, per-endpoint buckets sharing one rate. No
+   * `tenant` parameter.
+   */
+  setUrgentRate?: (ratePerSecond: number) => number;
+  /**
+   * WR-324: the live urgent fast-lane rate (per second). Always set —
+   * the limiter is always constructed.
+   */
+  getUrgentRate?: () => number;
+  /**
    * WR-311: revise one endpoint's per-phase timeout budgets at runtime
    * (`targetUrl` exact match, partial — omitted phases keep their live
    * values, a phase set to `null` deletes that phase, deleting the last
@@ -14161,6 +14184,35 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     });
     return next;
   };
+
+  // WR-324: relay-level urgent fast-lane rate runtime revision. The
+  // method is always set (like setGlobalConcurrency above); the
+  // limiter is always constructed (default 100/s), so there is no
+  // "not configured" branch — a revision from the default works like
+  // any other. A real revision is audited as `urgent_rate_revised`
+  // with the previous and current rate (the construction default on
+  // a first set); a same-value revision is a silent no-op. No
+  // endpoint parameter: a single limiter, per-endpoint buckets
+  // sharing one rate. No tenant parameter.
+  server.setUrgentRate = (ratePerSecond: number): number => {
+    const previous = queue.getUrgentRate();
+    // Validate-then-apply inside retune: an illegal value throws
+    // RangeError and the live rate is left completely intact.
+    const next = queue.setUrgentRate(ratePerSecond);
+    if (next === previous) {
+      return next;
+    }
+    opts.auditLog.append({
+      event: "urgent_rate_revised",
+      previous,
+      current: next,
+    });
+    return next;
+  };
+
+  // WR-324: relay-level urgent fast-lane rate snapshot — always set;
+  // the limiter is always constructed.
+  server.getUrgentRate = (): number => queue.getUrgentRate();
 
   // WR-311: per-endpoint phase timeout budget runtime revision. The
   // method is always set (like setDedupWindow above); with

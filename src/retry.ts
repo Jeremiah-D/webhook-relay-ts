@@ -3347,9 +3347,14 @@ export class EndpointConcurrencyLimiter {
  * tokens (burst == rate). Refills lazily on each `take`, so idle endpoints
  * cost nothing. A monotonic-ish clock is assumed; backward jumps are
  * clamped to zero refill rather than granting extra tokens.
+ *
+ * Revisable at runtime via `retune()` (WR-324): the per-second rate
+ * moves live, so an operator can tighten it mid-flood (hemostasis) or
+ * widen it once the downstream recovers, without a redeploy.
  */
 export class UrgentRateLimiter {
-  private readonly ratePerSecond: number;
+  /** Mutable (WR-324): the live rate, revised by `retune()`. */
+  private ratePerSecond: number;
   private readonly buckets = new Map<string, { tokens: number; updatedMs: number }>();
   private readonly now: () => number;
 
@@ -3359,6 +3364,49 @@ export class UrgentRateLimiter {
     }
     this.ratePerSecond = ratePerSecond;
     this.now = now;
+  }
+
+  /** Configured rate per second. */
+  rate(): number {
+    return this.ratePerSecond;
+  }
+
+  /**
+   * WR-324: revise the per-second rate live. An illegal value throws
+   * `RangeError` and the live rate and buckets are untouched;
+   * revising to the current value is a silent no-op.
+   *
+   * - Tightening takes effect at once: every bucket is refilled
+   *   first (against the old rate), then its token count is clamped
+   *   to the new rate — a full old bucket cannot keep admitting
+   *   urgent attempts at the old rate after a tightening.
+   * - Widening never tops a bucket up: tokens stay where they are
+   *   and refill lazily against the new rate, so a widening cannot
+   *   over-issue a second's budget in one instant.
+   *
+   * `take()` / `available()` / `rate()` all read the live value, so
+   * the next urgent admission judges by the new rate. An attempt
+   * already in flight keeps the token it took — granted tokens are
+   * never revoked, only future admissions are re-judged.
+   */
+  retune(newRate: number): number {
+    if (!Number.isFinite(newRate) || newRate <= 0) {
+      throw new RangeError(`maxUrgentPerSecond must be > 0, got ${newRate}`);
+    }
+    if (newRate === this.ratePerSecond) {
+      return this.ratePerSecond;
+    }
+    // Refill every bucket against the old rate first, then clamp to
+    // the new one: tightening bites immediately, widening adds no tokens.
+    const at = this.now();
+    for (const b of this.buckets.values()) {
+      const elapsedMs = Math.max(0, at - b.updatedMs);
+      b.tokens = Math.min(this.ratePerSecond, b.tokens + (elapsedMs * this.ratePerSecond) / 1000);
+      b.updatedMs = at;
+      b.tokens = Math.min(b.tokens, newRate);
+    }
+    this.ratePerSecond = newRate;
+    return this.ratePerSecond;
   }
 
   /**
@@ -9766,6 +9814,27 @@ export class RetryQueue {
   }
 
   /**
+   * WR-324: revise the urgent fast-lane rate live (the per-second
+   * token budget shared by every endpoint's bucket). The limiter is
+   * always constructed (default 100/s), so there is no "not
+   * configured" branch — a revision from the default works like any
+   * other. The next `take()` judges by the new rate; an urgent
+   * attempt already in flight is unaffected, and tokens already
+   * granted are never revoked. Tightening clamps every endpoint
+   * bucket to the new rate at once; widening never tops a bucket up.
+   * An illegal value throws `RangeError` and the live rate is
+   * untouched; revising to the current rate is a no-op. Returns the
+   * live rate. The limiter is the single source of truth for the
+   * rate — construction is the only reader of
+   * `opts.urgent.maxUrgentPerSecond`, so there is no separate
+   * constructor-default field to sync (unlike WR-313's
+   * `globalMaxConcurrent` mirror).
+   */
+  setUrgentRate(ratePerSecond: number): number {
+    return this.urgentLimiter.retune(ratePerSecond);
+  }
+
+  /**
    * Per-tenant dispatch gate snapshots (WR-140): one row per tenant that
    * has dispatched through the gate, in first-seen order — the
    * configured per-tenant cap, current in-flight dispatches, FIFO waiter
@@ -9774,6 +9843,11 @@ export class RetryQueue {
    */
   getTenantConcurrencyStats(): TenantConcurrencyStats[] {
     return this.tenantGates.stats();
+  }
+
+  /** WR-324: the live urgent fast-lane rate (per second). */
+  getUrgentRate(): number {
+    return this.urgentLimiter.rate();
   }
 
   /**

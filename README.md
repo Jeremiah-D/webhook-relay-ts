@@ -200,7 +200,18 @@ reliability primitives that matter for any signed-payload pipeline.
   of one second) — an empty bucket degrades the item to the normal lane
   instead of dropping it, which is the lane's abuse guard.
   `getUrgentStats()` reports per-endpoint `delivered` / `retried` /
-  `throttled` counters. Under sustained urgent load a per-endpoint
+  `throttled` counters. The rate is live-revisable without a restart
+  (WR-324): `RetryQueue.setUrgentRate(rate)` / `getUrgentRate()`, and
+  from the server `setUrgentRate(rate)` / `getUrgentRate()` (illegal
+  values throw `RangeError` and leave the live rate untouched; a
+  same-value revision is a silent no-op; a real revision is audited as
+  `urgent_rate_revised` with the previous / current rates, the
+  construction default 100 as first `previous`). A single limiter —
+  no endpoint parameter: per-endpoint buckets share one rate. The
+  next urgent `take()` judges by the new rate; an attempt already in
+  flight is unaffected and granted tokens are never revoked;
+  tightening clamps every endpoint bucket to the new rate at once,
+  widening never tops a bucket up. Under sustained urgent load a per-endpoint
   deficit round-robin scheduler (WR-35, `urgent.minNormalShare`, default
   20%, per-endpoint overridable via `setEndpointMinNormalShare()`)
   guarantees the normal lane at least that share of dispatch turns while
