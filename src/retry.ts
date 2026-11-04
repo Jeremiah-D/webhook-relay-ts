@@ -3462,6 +3462,21 @@ export interface LaneStats {
   guardActivations: number;
 }
 
+/**
+ * WR-323: live per-endpoint starvation-guard snapshot — the effective
+ * minimum normal share of dispatch turns and whether the endpoint
+ * carries a runtime override (vs the queue default). Lane counters
+ * (`normalTurns` / `urgentTurns` / `guardActivations`) stay on
+ * {@link LaneStats} via `getLaneStats()` and are deliberately not
+ * duplicated here.
+ */
+export interface MinNormalShareSnapshot {
+  /** Effective minimum normal share of dispatch turns, in (0, 1). */
+  minNormalShare: number;
+  /** Whether a runtime override is in force for this endpoint. */
+  overridden: boolean;
+}
+
 /** A delivery lane for the deficit round-robin dispatch scheduler. */
 export type Lane = "normal" | "urgent";
 
@@ -3534,6 +3549,13 @@ export class LaneScheduler {
   private readonly defaultShare: number;
   private readonly onActivation?: (event: StarvationGuardAuditEvent) => void;
   private readonly states = new Map<string, LaneEndpointState>();
+  /**
+   * WR-323: endpoints carrying a runtime share override. Tracked
+   * separately from `states` because `stateFor()` builds state on
+   * demand — mere observation (a turn taken) must not read as "was
+   * overridden". Recorded on set, cleared on clear.
+   */
+  private readonly overrides = new Set<string>();
 
   constructor(opts: LaneSchedulerOptions = {}) {
     const share = opts.minNormalShare ?? 0.2;
@@ -3566,13 +3588,72 @@ export class LaneScheduler {
   }
 
   /**
+   * WR-323: live starvation-guard snapshot for `endpoint` without
+   * creating state — an endpoint that has never taken a turn (and was
+   * never revised) reports the constructor default with
+   * `overridden: false` and stays unlisted by `stats()`, so merely
+   * reading an unseen endpoint never makes it "seen" (the WR-321
+   * getter is likewise read-only for per-endpoint state).
+   */
+  snapshotFor(endpoint: string): MinNormalShareSnapshot {
+    const st = this.states.get(endpoint);
+    if (st === undefined) {
+      return { minNormalShare: this.defaultShare, overridden: false };
+    }
+    return { minNormalShare: st.minNormalShare, overridden: this.overrides.has(endpoint) };
+  }
+
+  /**
+   * WR-323: the constructor-configured default share — the value an
+   * endpoint falls back to when its override is cleared (0.2 unless
+   * `minNormalShare` was configured). Read point for the clear path;
+   * `shareFor()` reports the effective value instead.
+   */
+  defaultMinNormalShare(): number {
+    return this.defaultShare;
+  }
+
+  /** WR-323: whether `endpoint` carries a runtime share override. */
+  hasEndpointMinNormalShareOverride(endpoint: string): boolean {
+    return this.overrides.has(endpoint);
+  }
+
+  /**
    * Override the minimum normal share for one endpoint at runtime.
    * Invalid values throw `RangeError` and leave the current share intact.
+   * The revision only changes the pacing from here on: already-earned
+   * `deficitUrgent` is not recomputed — each later normal dispatch
+   * earns `(1 - newShare) / newShare` turns at the new rate (see
+   * {@link LaneScheduler.recordNormalDispatch}) — and turns already
+   * granted (in flight) run to completion. The `pump()` re-runs the
+   * scheduler immediately: loosening the share (a lower value) lets a
+   * drained normal backlog release parked urgent turns work-conservingly
+   * at once instead of waiting for the next turn event, while
+   * tightening it constricts subsequent urgent grants.
    */
   setEndpointMinNormalShare(endpoint: string, minNormalShare: number): void {
     assertMinNormalShare(minNormalShare);
     this.stateFor(endpoint).minNormalShare = minNormalShare;
+    this.overrides.add(endpoint);
     this.pump(endpoint);
+  }
+
+  /**
+   * WR-323: drop one endpoint's runtime share override — it falls back
+   * to the constructor default. Only the share resets: `deficitUrgent`,
+   * parked waiters, and turn counters are left exactly as they are, and
+   * the endpoint's state is never deleted (an observed endpoint stays
+   * listed). Returns `true` when an override was actually removed,
+   * `false` when the endpoint carried none. The `pump()` re-runs the
+   * scheduler so a loosened default releases parked urgent turns at
+   * once, mirroring the setter.
+   */
+  clearEndpointMinNormalShare(endpoint: string): boolean {
+    if (!this.overrides.has(endpoint)) return false;
+    this.overrides.delete(endpoint);
+    this.stateFor(endpoint).minNormalShare = this.defaultShare;
+    this.pump(endpoint);
+    return true;
   }
 
   /**
@@ -3626,6 +3707,9 @@ export class LaneScheduler {
    * `(1 - minNormalShare) / minNormalShare` turns of deficit — but only
    * while urgent demand is actually backlogged (classic DRR grants quantum
    * to backlogged flows only; idle periods earn no retroactive credit).
+   * The share is read live here, so a runtime revision (WR-323) changes
+   * the earning rate from the next dispatch on without recomputing
+   * deficit already earned at the old rate.
    *
    * The pump runs *before* this dispatch leaves the undispatched set, so
    * a successor shifted out of the limiter queue mid-handoff still counts
@@ -9825,6 +9909,43 @@ export class RetryQueue {
    */
   setEndpointMinNormalShare(endpoint: string, minNormalShare: number): void {
     this.laneScheduler.setEndpointMinNormalShare(endpoint, minNormalShare);
+  }
+
+  /**
+   * WR-323: drop one endpoint's runtime share override — it falls back
+   * to the constructor default. Returns `true` when an override was
+   * actually removed, `false` when the endpoint carried none.
+   * Deficit, parked waiters, and turn counters are untouched.
+   */
+  clearEndpointMinNormalShare(endpoint: string): boolean {
+    return this.laneScheduler.clearEndpointMinNormalShare(endpoint);
+  }
+
+  /**
+   * WR-323: live starvation-guard snapshot for one endpoint — the
+   * effective minimum normal share and whether a runtime override is in
+   * force. An endpoint never revised reports the queue default with
+   * `overridden: false`; there is no "unconfigured" state.
+   */
+  getEndpointMinNormalShare(endpoint: string): MinNormalShareSnapshot {
+    // Read-only peek: an unseen endpoint reports the default without
+    // becoming "seen" (it stays unlisted by getMinNormalShares()).
+    return this.laneScheduler.snapshotFor(endpoint);
+  }
+
+  /**
+   * WR-323: live starvation-guard listing — every endpoint the lane
+   * scheduler has seen (revised or merely observed, in first-seen
+   * order), each with its effective share and override flag. An
+   * endpoint that has never taken a turn has no row; the per-endpoint
+   * getter above still reports the queue default for it.
+   */
+  getMinNormalShares(): Array<{ endpoint: string } & MinNormalShareSnapshot> {
+    return this.laneScheduler.stats().map((row) => ({
+      endpoint: row.endpoint,
+      minNormalShare: row.minNormalShare,
+      overridden: this.laneScheduler.hasEndpointMinNormalShareOverride(row.endpoint),
+    }));
   }
 
   /**

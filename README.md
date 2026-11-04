@@ -212,7 +212,23 @@ reliability primitives that matter for any signed-payload pipeline.
   double rate-limiting. Guard activations are counted in
   `relay_starvation_guard_activations{endpoint}` and audited as
   `starvation_guard_activated`; `getLaneStats()` reports per-endpoint
-  turns granted per lane. A second, admission-side guard caps how long the
+  turns granted per lane. The share is also live-revisable from the
+  server (WR-323, no restart, no tenant sharding — one shared scheduler
+  per queue, so one endpoint's share governs all tenants):
+  `reviseEndpointMinNormalShare(endpoint, share)` (illegal values throw
+  `RangeError` and leave the live share untouched; a same-value revision
+  is a silent no-op; a real revision is audited as
+  `min_normal_share_revised` with the endpoint and the previous /
+  current shares, the queue default as first `previous`),
+  `getEndpointMinNormalShare(endpoint)` /
+  `getMinNormalShares()` snapshots, and
+  `removeEndpointMinNormalShare(endpoint)` (audited as
+  `min_normal_share_removed`, `false` with no audit when the endpoint
+  carried no override). A revision only changes the pacing from then
+  on: deficit already earned is not recomputed, later normal dispatches
+  earn at the new rate, and turns already granted run to completion;
+  the setter's pump releases parked urgent turns at once once the normal
+  backlog has drained. A second, admission-side guard caps how long the
   fast lane may stay occupied in a row (WR-121,
   `urgent.maxConsecutiveUrgent`, disabled by default): after that many
   *consecutive* urgent admissions per endpoint, the next urgent item is

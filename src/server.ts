@@ -66,7 +66,7 @@ import {
   type ResolvedHttpHardening,
 } from "./http-hardening.ts";
 import type { OrderedAuditEvent, OrderedModeOptions } from "./retry.ts";
-import type { CircuitThresholdPatch, DeliveryWindowListEntry, DeliveryWindowSnapshot, EndpointConcurrencySnapshot, EndpointQuotaSnapshot, EndpointRetryPolicyRevision, GlobalConcurrencyStats, GlobalRateLimitRevision, GlobalRateLimitStats, HolidayCalendarConfig, HolidayCalendarSnapshot, ResolvedCircuitThresholds, ResolvedEndpointRetryPolicy, StatusRetryPolicyConfig } from "./retry.ts";
+import type { CircuitThresholdPatch, DeliveryWindowListEntry, DeliveryWindowSnapshot, EndpointConcurrencySnapshot, EndpointQuotaSnapshot, EndpointRetryPolicyRevision, GlobalConcurrencyStats, GlobalRateLimitRevision, GlobalRateLimitStats, HolidayCalendarConfig, HolidayCalendarSnapshot, MinNormalShareSnapshot, ResolvedCircuitThresholds, ResolvedEndpointRetryPolicy, StatusRetryPolicyConfig } from "./retry.ts";
 import {
   DEFAULT_STATUS_RETRY_MULTIPLIER,
   assertValidStatusRetryPolicy,
@@ -6028,6 +6028,52 @@ export interface RelayServer extends Server {
    * of named policies; this lists the per-endpoint *assignments*.)
    */
   getRetryPolicies: () => Array<{ endpoint: string } & ResolvedEndpointRetryPolicy>;
+  /**
+   * WR-323: revise one endpoint's live starvation-guard share at
+   * runtime — no restart. Tightening it (toward 1) protects the normal
+   * lane during an urgent flood; loosening it (toward 0) lets urgent
+   * drain faster. Only the dispatch order changes: nothing is shed, no
+   * urgent token is burned, and turns already granted (in flight) run
+   * to completion under the order they were accepted with. An illegal
+   * value throws `RangeError` and the live share is untouched; a
+   * same-value revision is a silent no-op. A real revision is audited
+   * as `min_normal_share_revised` with `endpoint` and the previous /
+   * current shares (the override or the queue default — the first
+   * revision audits the queue default as `previous`). Always set —
+   * the lane scheduler is always constructed, so an unrevised
+   * endpoint always reports the queue default and there is no "never
+   * configured" branch (unlike the circuit breaker). No `tenant`
+   * parameter: the lane scheduler is one shared instance per queue
+   * (not sharded per tenant like WR-319's breaker), so one endpoint's
+   * share governs all tenants. Returns the live snapshot.
+   */
+  reviseEndpointMinNormalShare: (endpoint: string, minNormalShare: number) => MinNormalShareSnapshot;
+  /**
+   * WR-323: remove one endpoint's live starvation-guard share override
+   * at runtime — the endpoint falls back to the queue default.
+   * Returns `true` when an override was removed (audited as
+   * `min_normal_share_removed` with the endpoint and the removed share
+   * as `previous`), `false` when the endpoint carried no override
+   * (silent, no audit). Always set. No `tenant` parameter — see
+   * `reviseEndpointMinNormalShare`.
+   */
+  removeEndpointMinNormalShare: (endpoint: string) => boolean;
+  /**
+   * WR-323: live starvation-guard snapshot for one endpoint — the
+   * effective minimum normal share and whether the endpoint carries a
+   * runtime override. An endpoint never revised reports the queue
+   * default with `overridden: false`, so the snapshot is always
+   * defined. Always set. No `tenant` parameter — see
+   * `reviseEndpointMinNormalShare`.
+   */
+  getEndpointMinNormalShare: (endpoint: string) => MinNormalShareSnapshot;
+  /**
+   * WR-323: live starvation-guard listing — every endpoint the lane
+   * scheduler has seen (revised or merely observed), each with its
+   * effective share and override flag. Always set. No `tenant`
+   * parameter — see `reviseEndpointMinNormalShare`.
+   */
+  getMinNormalShares: () => Array<{ endpoint: string } & MinNormalShareSnapshot>;
   /**
    * WR-316: revise one live one-shot maintenance window at runtime
    * (`newStart` / `newEnd`, partial — omitted fields keep their live
@@ -14607,6 +14653,63 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
 
   server.getRetryPolicies = (): Array<{ endpoint: string } & ResolvedEndpointRetryPolicy> =>
     queue.getEndpointRetryPolicies();
+
+  // WR-323: live per-endpoint starvation-guard share revision / removal /
+  // reads. The queue owns the validate-then-apply setter (RangeError on
+  // an illegal value, live share untouched; the setter's pump re-runs
+  // the scheduler immediately, so a loosened share releases parked
+  // urgent turns at once once the normal backlog has drained, and a
+  // tightened share constricts subsequent urgent grants — already-earned
+  // deficit is never recomputed, only the earning rate changes); this
+  // layer only owns the audit: a real revision appends
+  // `min_normal_share_revised` with the endpoint and the previous /
+  // current shares (the queue default on a first set), a same-value
+  // revision is a silent no-op, and a removal appends
+  // `min_normal_share_removed` with the endpoint and the removed share.
+  // Always set: the lane scheduler is always constructed, so an
+  // unrevised endpoint always reports the queue default — there is no
+  // "must restart" Error here (unlike the circuit breaker or the
+  // delivery window). No tenant parameter: the scheduler is one shared
+  // instance per queue, not sharded per tenant. In-flight turns are
+  // unaffected (they run to completion under the order they were
+  // accepted with).
+  server.reviseEndpointMinNormalShare = (
+    endpoint: string,
+    minNormalShare: number
+  ): MinNormalShareSnapshot => {
+    const previous = queue.getEndpointMinNormalShare(endpoint);
+    // Validate-then-apply inside setEndpointMinNormalShare: an illegal
+    // value throws RangeError and the live share is left completely intact.
+    queue.setEndpointMinNormalShare(endpoint, minNormalShare);
+    const current = queue.getEndpointMinNormalShare(endpoint);
+    if (current.minNormalShare === previous.minNormalShare) {
+      return current;
+    }
+    opts.auditLog.append({
+      event: "min_normal_share_revised",
+      endpoint,
+      previous: previous.minNormalShare,
+      current: current.minNormalShare,
+    });
+    return current;
+  };
+
+  server.removeEndpointMinNormalShare = (endpoint: string): boolean => {
+    const previous = queue.getEndpointMinNormalShare(endpoint);
+    if (!queue.clearEndpointMinNormalShare(endpoint)) return false;
+    opts.auditLog.append({
+      event: "min_normal_share_removed",
+      endpoint,
+      previous: previous.minNormalShare,
+    });
+    return true;
+  };
+
+  server.getEndpointMinNormalShare = (endpoint: string): MinNormalShareSnapshot =>
+    queue.getEndpointMinNormalShare(endpoint);
+
+  server.getMinNormalShares = (): Array<{ endpoint: string } & MinNormalShareSnapshot> =>
+    queue.getMinNormalShares();
 
   // WR-316: single-window live revision / cancellation for one-shot
   // maintenance windows. The queue does the validate-then-apply work
