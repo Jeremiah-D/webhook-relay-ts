@@ -113,13 +113,16 @@ export class EndpointQuota {
   /**
    * Milliseconds until one token is available for `endpoint` (0 when a
    * token is already available). Used to re-schedule a delayed attempt at
-   * the earliest honest moment.
+   * the earliest honest moment. The estimate divides by the endpoint's
+   * LIVE limit (`limit(endpoint)`, WR-322) — a runtime override raises
+   * or lowers the refill rate, so the wait shrinks or grows with it
+   * instead of staying pinned to the constructor default.
    */
   msUntilToken(endpoint: string): number {
     const b = this.refill(endpoint);
     if (b.tokens >= 1) return 0;
     const needed = 1 - b.tokens;
-    return Math.ceil((needed * 60_000) / this.perMinute);
+    return Math.ceil((needed * 60_000) / this.limit(endpoint));
   }
 }
 
@@ -130,4 +133,20 @@ export interface QuotaStats {
   tenant?: string;
   /** Attempts delayed (rescheduled) because the endpoint's budget was exhausted. */
   delayed: number;
+}
+
+/**
+ * WR-322: live per-endpoint delivery-quota snapshot. `limit` is the
+ * LIVE per-minute budget — the runtime override when one exists,
+ * otherwise the constructor default — and is what a revision audits as
+ * previous/current; there is no adaptive folding on quotas, so no
+ * configured/effective split (unlike WR-321's concurrency snapshot).
+ * `delayed` counts attempts rescheduled because the budget was
+ * exhausted (0 when none have been delayed yet); `hasOverride` reports
+ * whether the endpoint carries a runtime override.
+ */
+export interface EndpointQuotaSnapshot {
+  limit: number;
+  delayed: number;
+  hasOverride: boolean;
 }

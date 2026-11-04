@@ -166,7 +166,8 @@ export type {
   QuorumSatisfiedInfo,
   QuorumTargetDeadLetteredInfo,
 };
-import { EndpointQuota, type QuotaOptions, type QuotaStats } from "./quota.ts";
+import { EndpointQuota, type EndpointQuotaSnapshot, type QuotaOptions, type QuotaStats } from "./quota.ts";
+export type { EndpointQuotaSnapshot } from "./quota.ts";
 import {
   assertValidDeliveryDryRunOptions,
   assertValidEndpointDryRunConfig,
@@ -9528,6 +9529,50 @@ export class RetryQueue {
    */
   setEndpointConcurrency(endpoint: string, maxConcurrentPerEndpoint: number, tenant?: string): void {
     this.limiterFor(tenant).setEndpointMax(endpoint, maxConcurrentPerEndpoint);
+  }
+
+  /**
+   * WR-322: revise one endpoint's live per-minute delivery budget — a
+   * thin queue wrapper over `EndpointQuota.setEndpointLimit` (WR-15)
+   * so the server can reach the tenant-scoped quota instance.
+   * Validate-then-set: an illegal value throws `RangeError` and the
+   * live budget is untouched. Raising the limit lets lazy refills
+   * accrue faster toward the new cap; lowering it clamps the bucket
+   * on the next refill; queued/delayed attempts pick the new budget
+   * up at their next re-check — nothing in flight is cancelled.
+   * Returns `false` when endpoint quotas were never configured
+   * (enabling them needs a restart); the server turns that into the
+   * canonical "must restart" `Error`. `tenant` scopes to that
+   * tenant's quota instance; omitted means the default tenant.
+   */
+  setEndpointQuota(endpoint: string, deliveriesPerMinute: number, tenant?: string): boolean {
+    const quota = this.quotaFor(tenant);
+    if (quota === undefined) return false;
+    quota.setEndpointLimit(endpoint, deliveriesPerMinute);
+    return true;
+  }
+
+  /**
+   * WR-322: live per-endpoint delivery-quota snapshot — the live
+   * per-minute budget, the count of attempts delayed (rescheduled)
+   * because the budget was exhausted, and whether the endpoint
+   * carries a runtime override. `undefined` when endpoint quotas
+   * were never configured. `tenant` scopes to that tenant's quota
+   * instance; omitted means the default tenant.
+   */
+  getEndpointQuota(endpoint: string, tenant?: string): EndpointQuotaSnapshot | undefined {
+    const quota = this.quotaFor(tenant);
+    if (quota === undefined) return undefined;
+    const tenantKey = tenantInstanceKey(tenant);
+    const delayed =
+      this.getQuotaStats().find(
+        (s) => s.endpoint === endpoint && (s.tenant ?? "") === tenantKey
+      )?.delayed ?? 0;
+    return {
+      limit: quota.limit(endpoint),
+      delayed,
+      hasOverride: quota.hasEndpointOverride(endpoint),
+    };
   }
 
   /**

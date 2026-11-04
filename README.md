@@ -2177,6 +2177,38 @@ server.removeEndpointConcurrency("https://payments/hook");    // drop the overri
   three methods are `tenant`-scoped (omitted means the default
   tenant).
 
+### Live revision of endpoint delivery quotas (WR-322)
+
+The same live-revision family covers the per-endpoint delivery
+quota (WR-15) — the per-minute token budget that delays (never
+drops) over-budget attempts:
+
+```ts
+server.reviseEndpointQuota("https://payments/hook", 120); // raise the per-minute budget live
+server.reviseEndpointQuota("https://payments/hook", 30);  // tighten it live
+server.getEndpointQuota("https://payments/hook");         // { limit, delayed, hasOverride }
+server.removeEndpointQuota("https://payments/hook");      // drop the override, back to the constructor default
+```
+
+- **Validate, then apply** — an illegal value throws `RangeError`
+  and the live budget is untouched; a same-value revision is a silent
+  no-op. Revising while quotas were never configured throws `Error`
+  (enabling them needs a restart), and the getter is unset then.
+- **Audited** — a real revision appends `endpoint_quota_revised`
+  with `endpoint` and the previous / current per-minute budgets (the
+  constructor default on a first set — the quota has no adaptive
+  folding, so `limit` is the enforced value); a removal appends
+  `endpoint_quota_removed` with the removed budget as `previous` and
+  returns `true` (`false` when the endpoint carried no override).
+- **Effect timing** — raising the limit lets lazy refills accrue
+  faster toward the new cap; lowering it clamps the bucket on the
+  next refill; queued/delayed attempts pick the new budget up at
+  their next re-check. The revision itself grants or revokes no
+  tokens, and in-flight attempts are unaffected. The delay estimate
+  (`msUntilToken`) divides by the endpoint's live limit, so a raised
+  budget shortens the wait and a lowered one lengthens it. All three
+  methods are `tenant`-scoped (omitted means the default tenant).
+
 ## Declarative config snapshots (export / apply / rollback)
 
 The hot-reload layer above is imperative; the snapshot layer

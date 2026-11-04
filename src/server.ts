@@ -66,7 +66,7 @@ import {
   type ResolvedHttpHardening,
 } from "./http-hardening.ts";
 import type { OrderedAuditEvent, OrderedModeOptions } from "./retry.ts";
-import type { CircuitThresholdPatch, DeliveryWindowListEntry, DeliveryWindowSnapshot, EndpointConcurrencySnapshot, EndpointRetryPolicyRevision, GlobalConcurrencyStats, GlobalRateLimitRevision, GlobalRateLimitStats, HolidayCalendarConfig, HolidayCalendarSnapshot, ResolvedCircuitThresholds, ResolvedEndpointRetryPolicy, StatusRetryPolicyConfig } from "./retry.ts";
+import type { CircuitThresholdPatch, DeliveryWindowListEntry, DeliveryWindowSnapshot, EndpointConcurrencySnapshot, EndpointQuotaSnapshot, EndpointRetryPolicyRevision, GlobalConcurrencyStats, GlobalRateLimitRevision, GlobalRateLimitStats, HolidayCalendarConfig, HolidayCalendarSnapshot, ResolvedCircuitThresholds, ResolvedEndpointRetryPolicy, StatusRetryPolicyConfig } from "./retry.ts";
 import {
   DEFAULT_STATUS_RETRY_MULTIPLIER,
   assertValidStatusRetryPolicy,
@@ -5931,6 +5931,50 @@ export interface RelayServer extends Server {
    * limiter; omitted means the default tenant.
    */
   getEndpointConcurrency: (endpoint: string, tenant?: string) => EndpointConcurrencySnapshot;
+  /**
+   * WR-322: revise one endpoint's live per-minute delivery budget at
+   * runtime — no restart. Raising it lets lazy refills accrue faster
+   * toward the new cap; lowering it clamps the bucket on the next
+   * refill; queued/delayed attempts pick the new budget up at their
+   * next re-check — nothing in flight is cancelled and no tokens are
+   * granted or revoked by the revision itself. An illegal value
+   * throws `RangeError` and the live budget is untouched; a same-value
+   * revision is a silent no-op. A real revision is audited as
+   * `endpoint_quota_revised` with `endpoint` and the previous /
+   * current per-minute budgets (the override or the constructor
+   * default — the quota has no adaptive folding, so `limit` is the
+   * enforced value); the first revision audits the constructor
+   * default as `previous`. Always set; throws `Error` when endpoint
+   * quotas were never configured — enabling them needs a restart.
+   * `tenant` scopes to that tenant's quota instance; omitted means
+   * the default tenant. Returns the live snapshot.
+   */
+  reviseEndpointQuota: (
+    endpoint: string,
+    deliveriesPerMinute: number,
+    tenant?: string
+  ) => EndpointQuotaSnapshot;
+  /**
+   * WR-322: remove one endpoint's live delivery-quota override at
+   * runtime — the endpoint falls back to the constructor default.
+   * Returns `true` when an override was removed (audited as
+   * `endpoint_quota_removed` with the endpoint and the removed
+   * per-minute budget as `previous`), `false` when the endpoint
+   * carried no override (silent, no audit) — including when quotas
+   * were never configured. Always set. `tenant` scopes to that
+   * tenant's quota instance; omitted means the default tenant.
+   */
+  removeEndpointQuota: (endpoint: string, tenant?: string) => boolean;
+  /**
+   * WR-322: live delivery-quota snapshot for one endpoint — the live
+   * per-minute budget, the count of attempts delayed (rescheduled)
+   * because the budget was exhausted, and whether the endpoint
+   * carries a runtime override. Set only when endpoint quotas were
+   * configured (`undefined` otherwise — enabling them needs a
+   * restart). `tenant` scopes to that tenant's quota instance;
+   * omitted means the default tenant.
+   */
+  getEndpointQuota?: (endpoint: string, tenant?: string) => EndpointQuotaSnapshot | undefined;
   /**
    * WR-320: revise one endpoint's live retry policy at runtime — no
    * restart. The patch merges over the endpoint's live assignment: a
@@ -14414,6 +14458,66 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     endpoint: string,
     tenant?: string
   ): EndpointConcurrencySnapshot => queue.getEndpointConcurrency(endpoint, tenant);
+
+  // WR-322: live per-endpoint delivery-quota revision / removal /
+  // reads. The queue owns the validate-then-apply setter (RangeError on
+  // an illegal value, live budget untouched; a raise lets refills
+  // accrue faster toward the new cap, a cut clamps the bucket on the
+  // next refill, and no tokens are granted or revoked by the revision
+  // itself); this layer only owns the "must restart" Error (the queue
+  // setter returns false when quotas were never configured) and the
+  // audit: a real revision appends `endpoint_quota_revised` with the
+  // endpoint and the previous / current per-minute budgets (the
+  // constructor default on a first set), a same-value revision is a
+  // silent no-op, and a removal appends `endpoint_quota_removed` with
+  // the endpoint and the removed budget. Delayed attempts are never
+  // dropped — they re-check the new budget at their next attempt.
+  server.reviseEndpointQuota = (
+    endpoint: string,
+    deliveriesPerMinute: number,
+    tenant?: string
+  ): EndpointQuotaSnapshot => {
+    const previous = queue.getEndpointQuota(endpoint, tenant);
+    // Validate-then-apply inside setEndpointLimit: an illegal value
+    // throws RangeError and the live budget is left completely intact.
+    if (!queue.setEndpointQuota(endpoint, deliveriesPerMinute, tenant)) {
+      throw new Error(
+        "reviseEndpointQuota: endpoint quotas are not configured — enabling them requires a restart"
+      );
+    }
+    const current = queue.getEndpointQuota(endpoint, tenant)!;
+    if (previous !== undefined && current.limit === previous.limit) {
+      return current;
+    }
+    opts.auditLog.append({
+      event: "endpoint_quota_revised",
+      endpoint,
+      previous: previous?.limit,
+      current: current.limit,
+    });
+    return current;
+  };
+
+  server.removeEndpointQuota = (endpoint: string, tenant?: string): boolean => {
+    const previous = queue.getEndpointQuota(endpoint, tenant);
+    if (previous === undefined || !previous.hasOverride) return false;
+    queue.clearEndpointConfigOverride(tenant, endpoint, "quota");
+    opts.auditLog.append({
+      event: "endpoint_quota_removed",
+      endpoint,
+      previous: previous.limit,
+    });
+    return true;
+  };
+
+  // WR-322: live per-endpoint delivery-quota reads. Only set when
+  // endpoint quotas were configured.
+  if (queue.quotaConfigured()) {
+    server.getEndpointQuota = (
+      endpoint: string,
+      tenant?: string
+    ): EndpointQuotaSnapshot | undefined => queue.getEndpointQuota(endpoint, tenant);
+  }
 
   // WR-320: live retry-policy revision / removal / reads for one
   // endpoint. The queue owns the validate-then-apply setters; this
