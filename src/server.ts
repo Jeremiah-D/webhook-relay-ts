@@ -66,7 +66,7 @@ import {
   type ResolvedHttpHardening,
 } from "./http-hardening.ts";
 import type { OrderedAuditEvent, OrderedModeOptions } from "./retry.ts";
-import type { DeliveryWindowListEntry, DeliveryWindowSnapshot, GlobalConcurrencyStats, GlobalRateLimitRevision, GlobalRateLimitStats } from "./retry.ts";
+import type { DeliveryWindowListEntry, DeliveryWindowSnapshot, GlobalConcurrencyStats, GlobalRateLimitRevision, GlobalRateLimitStats, HolidayCalendarConfig, HolidayCalendarSnapshot } from "./retry.ts";
 import { parseCronExpression, CRON_HEADER } from "./cron.ts";
 import type { CompletionCallbackOptions } from "./callback.ts";
 import { createBoundAddressSelfCheck } from "./callback.ts";
@@ -5779,6 +5779,52 @@ export interface RelayServer extends Server {
    */
   getDeliveryWindows?: () => DeliveryWindowListEntry[];
   /**
+   * WR-318: set (or replace) one endpoint's live holiday calendar at
+   * runtime — no restart. The endpoint must already have a delivery
+   * window (the window itself is revised via `reviseDeliveryWindow`).
+   * A real revision is audited as `holiday_calendar_revised` with
+   * `endpoint`, `previous` (`undefined` when the endpoint had no
+   * calendar) and `current` snapshots; a same-value revision is a
+   * silent no-op. An invalid config (unknown strategy, non-calendar
+   * date, `holidayWindow` on `skip`/`defer`, empty region) or an
+   * endpoint with no window throws `RangeError` and the live calendar
+   * is untouched. Always set; throws `Error` when delivery windows
+   * were never configured — enabling them needs a restart. The next
+   * trigger re-reads the live calendar: widening (deleting a holiday
+   * or `skip` → `shrink`) never flushes an already-parked delivery
+   * early (it goes out when its old timer fires and the gate finds
+   * the day open), narrowing (a new holiday) re-parks on the next
+   * trigger to the new opening instant.
+   */
+  reviseEndpointHolidays: (
+    endpoint: string,
+    cfg: HolidayCalendarConfig
+  ) => HolidayCalendarSnapshot;
+  /**
+   * WR-318: remove one endpoint's live holiday calendar at runtime —
+   * the endpoint falls back to its plain delivery window. Returns
+   * `true` when a calendar was removed (audited as
+   * `holiday_calendar_removed` with the endpoint and the removed
+   * calendar as `previous`), `false` when no calendar was configured
+   * (silent, no audit) — including when the feature itself was never
+   * configured. Always set.
+   */
+  removeEndpointHolidays: (endpoint: string) => boolean;
+  /**
+   * WR-318: live holiday-calendar snapshot for one endpoint — the
+   * strategy, sorted dates, region, and explicit `holidayWindow` when
+   * set. `undefined` when the endpoint has no calendar. Set only
+   * when `retry.deliveryWindow` was configured.
+   */
+  getEndpointHolidays?: (endpoint: string) => HolidayCalendarSnapshot | undefined;
+  /**
+   * WR-318: live holiday-calendar listing — every endpoint with a
+   * configured calendar, each with its full snapshot, including
+   * endpoints whose window has never parked a delivery. Set only when
+   * `retry.deliveryWindow` was configured.
+   */
+  getHolidayCalendars?: () => Array<{ endpoint: string } & HolidayCalendarSnapshot>;
+  /**
    * WR-316: revise one live one-shot maintenance window at runtime
    * (`newStart` / `newEnd`, partial — omitted fields keep their live
    * values). The window is addressed by its stored (start, end), as
@@ -5971,6 +6017,25 @@ function sameDeadLetterRetention(
   const aKeys = Object.keys(a.retentionMs);
   if (aKeys.length !== Object.keys(bRecord).length) return false;
   return aKeys.every((k) => bRecord[k] === a.retentionMs[k]);
+}
+
+/**
+ * WR-318: deep equality for holiday-calendar snapshots — dates compare
+ * sorted item by item (the getter already sorts), plus region,
+ * strategy, and the explicit `holidayWindow` (absent on both sides
+ * means the default first-half shrink). A revision that lands on the
+ * same values is a no-op with no audit event.
+ */
+function sameHolidayCalendar(
+  a: HolidayCalendarSnapshot,
+  b: HolidayCalendarSnapshot
+): boolean {
+  if (a.region !== b.region) return false;
+  if (a.strategy !== b.strategy) return false;
+  if (a.holidayWindow !== b.holidayWindow) return false;
+  if (a.dates.length !== b.dates.length) return false;
+  const bSorted = [...b.dates].sort();
+  return a.dates.every((d, i) => d === bSorted[i]);
 }
 
 /**
@@ -13960,6 +14025,61 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // `retry.deliveryWindow` was configured.
   if (opts.retry?.deliveryWindow !== undefined) {
     server.getDeliveryWindows = (): DeliveryWindowListEntry[] => queue.getDeliveryWindows();
+  }
+
+  // WR-318: live holiday-calendar revision / removal for one endpoint.
+  // The queue does the validate-then-apply work (RangeError on an
+  // invalid config or an endpoint with no window, live calendar
+  // untouched); this layer only owns the "must restart" Error (the
+  // queue setter returns false when the feature was never configured)
+  // and the audit: a real revision appends `holiday_calendar_revised`
+  // with the endpoint and the previous (undefined on first set) /
+  // current snapshots, a same-value revision is a silent no-op, and a
+  // removal appends `holiday_calendar_removed` with the endpoint and
+  // the removed calendar. The delivery gate re-reads the live calendar
+  // on every trigger, so no timer is re-armed here.
+  server.reviseEndpointHolidays = (
+    endpoint: string,
+    cfg: HolidayCalendarConfig
+  ): HolidayCalendarSnapshot => {
+    const previous = queue.getEndpointDeliveryHolidays(endpoint);
+    if (!queue.setEndpointDeliveryHolidays(endpoint, cfg)) {
+      throw new Error(
+        "reviseEndpointHolidays: delivery windows are not configured — enabling them requires a restart"
+      );
+    }
+    const current = queue.getEndpointDeliveryHolidays(endpoint)!;
+    if (previous !== undefined && sameHolidayCalendar(previous, current)) {
+      return current;
+    }
+    opts.auditLog.append({
+      event: "holiday_calendar_revised",
+      endpoint,
+      previous,
+      current,
+    });
+    return current;
+  };
+
+  server.removeEndpointHolidays = (endpoint: string): boolean => {
+    const previous = queue.getEndpointDeliveryHolidays(endpoint);
+    if (!queue.deleteEndpointDeliveryHolidays(endpoint)) return false;
+    opts.auditLog.append({
+      event: "holiday_calendar_removed",
+      endpoint,
+      previous,
+    });
+    return true;
+  };
+
+  // WR-318: live holiday-calendar reads. Only set when
+  // `retry.deliveryWindow` was configured.
+  if (opts.retry?.deliveryWindow !== undefined) {
+    server.getEndpointHolidays = (
+      endpoint: string
+    ): HolidayCalendarSnapshot | undefined => queue.getEndpointDeliveryHolidays(endpoint);
+    server.getHolidayCalendars = (): Array<{ endpoint: string } & HolidayCalendarSnapshot> =>
+      queue.getDeliveryHolidays();
   }
 
   // WR-316: single-window live revision / cancellation for one-shot

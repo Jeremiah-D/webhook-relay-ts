@@ -108,11 +108,11 @@ import {
   type EndpointHealthStatsRow,
   type EndpointRecoveredInfo,
 } from "./endpoint-health.ts";
-import { EndpointDeliveryWindow, parseDeliveryWindowSpec, type DeliveryWindowListEntry, type DeliveryWindowOptions, type DeliveryWindowSnapshot, type DeliveryWindowStats, type HolidayCalendarConfig, type TimezoneWindowConfig } from "./delivery-window.ts";
+import { EndpointDeliveryWindow, parseDeliveryWindowSpec, type DeliveryWindowListEntry, type DeliveryWindowOptions, type DeliveryWindowSnapshot, type DeliveryWindowStats, type HolidayCalendarConfig, type HolidayCalendarSnapshot, type TimezoneWindowConfig } from "./delivery-window.ts";
 import { EndpointMaintenanceWindow, type MaintenanceWindowOptions, type MaintenanceWindowStats } from "./maintenance-window.ts";
 export { parseDeliveryWindowSpec, EndpointDeliveryWindow };
 export { EndpointMaintenanceWindow };
-export type { DeliveryWindowListEntry, DeliveryWindowOptions, DeliveryWindowSnapshot, DeliveryWindowStats, HolidayCalendarConfig, TimezoneWindowConfig };
+export type { DeliveryWindowListEntry, DeliveryWindowOptions, DeliveryWindowSnapshot, DeliveryWindowStats, HolidayCalendarConfig, HolidayCalendarSnapshot, TimezoneWindowConfig };
 export type { MaintenanceWindowOptions, MaintenanceWindowStats };
 import {
   ScheduledDeliveryQueue,
@@ -10412,6 +10412,35 @@ export class RetryQueue {
    */
   deleteEndpointDeliveryHolidays(endpoint: string): boolean {
     return this.deliveryWindow?.deleteEndpointHolidays(endpoint) ?? false;
+  }
+
+  /**
+   * WR-318: the live holiday-calendar snapshot for one endpoint.
+   * Reads the live module values, so a runtime revision is visible
+   * immediately. `undefined` when the feature is disabled or the
+   * endpoint has no calendar.
+   */
+  getEndpointDeliveryHolidays(endpoint: string): HolidayCalendarSnapshot | undefined {
+    if (this.deliveryWindow === undefined) return undefined;
+    return this.deliveryWindow.holidayInfo(endpoint);
+  }
+
+  /**
+   * WR-318: the live holiday calendar for every endpoint that has one,
+   * in first-configured order. Unlike `getDeliveryWindowStats` (which
+   * only lists endpoints with a park record and only carries the
+   * region/strategy), this lists every calendar-configured endpoint —
+   * including ones whose window has never parked a delivery — with the
+   * full snapshot (dates and explicit `holidayWindow` included).
+   */
+  getDeliveryHolidays(): Array<{ endpoint: string } & HolidayCalendarSnapshot> {
+    if (this.deliveryWindow === undefined) return [];
+    const rows: Array<{ endpoint: string } & HolidayCalendarSnapshot> = [];
+    for (const endpoint of this.deliveryWindow.endpoints()) {
+      const info = this.deliveryWindow.holidayInfo(endpoint);
+      if (info !== undefined) rows.push({ endpoint, ...info });
+    }
+    return rows;
   }
 
   /**

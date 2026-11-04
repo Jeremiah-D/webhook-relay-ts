@@ -345,7 +345,29 @@ reliability primitives that matter for any signed-payload pipeline.
   early (it goes out when its old timer fires and the gate finds the
   window open), narrowing re-parks on the next trigger to the new
   opening instant, and a park never consumes an attempt, quota, or
-  retry budget.
+  retry budget. WR-318 exposes the holiday-calendar layer the same
+  way, no restart: `reviseEndpointHolidays(endpoint, cfg)` /
+  `removeEndpointHolidays(endpoint)` — the endpoint must already have
+  a delivery window (the window itself is revised via
+  `reviseDeliveryWindow`); a real revision returns the live
+  `{ region?, strategy, dates, holidayWindow? }` snapshot and audits
+  `holiday_calendar_revised` with `endpoint`, `previous` (`undefined`
+  when the endpoint had no calendar) and `current`, a same-value
+  revision (dates compared sorted) is a silent no-op, and an invalid
+  config or an endpoint with no window throws `RangeError` with the
+  live calendar untouched. Removing a calendar audits
+  `holiday_calendar_removed` with the removed calendar as `previous`
+  and returns `true`, `false` with no audit when no calendar was set.
+  `getEndpointHolidays(endpoint)` / `getHolidayCalendars()` (set only
+  when `retry.deliveryWindow` was configured) read the live snapshots
+  — the listing covers every calendar-configured endpoint, including
+  ones whose window has never parked a delivery, with the full dates
+  and explicit `holidayWindow` (an absent `holidayWindow` means the
+  default first-half shrink, so a snapshot round-trips losslessly).
+  Effect timing follows the window: widening a calendar never flushes
+  an already-parked delivery early, narrowing re-parks on the next
+  trigger to the new opening instant, and removing the delivery window
+  also removes its calendar.
 - `src/maintenance-window.ts` — per-endpoint one-shot maintenance
   windows (WR-127): `retry: { maintenanceWindow: { windows: {
   "<targetUrl>": [{ start: "2026-11-01T02:00:00Z", end:

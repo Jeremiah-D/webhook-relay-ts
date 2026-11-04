@@ -406,9 +406,13 @@ export class EndpointDeliveryWindow {
   /**
    * WR-208: the holiday calendar for `endpoint`, or `undefined` when
    * none is configured. Dates are returned sorted, in `"YYYY-MM-DD"` form.
+   * WR-318: `holidayWindow` is the explicit shrink spec's raw string
+   * when one was configured — absent means the default first-half
+   * shrink (see `effectiveSpecForDate`), so a snapshot round-trips
+   * losslessly through `setEndpointHolidays`.
    */
   holidayInfo(endpoint: string):
-    | { region?: string; strategy: HolidayStrategy; dates: string[] }
+    | { region?: string; strategy: HolidayStrategy; dates: string[]; holidayWindow?: string }
     | undefined {
     const entry = this.holidays.get(endpoint);
     if (entry === undefined) return undefined;
@@ -416,6 +420,9 @@ export class EndpointDeliveryWindow {
       ...(entry.region === undefined ? {} : { region: entry.region }),
       strategy: entry.strategy,
       dates: [...entry.dates].sort(),
+      ...(entry.holidayWindowSpec === undefined
+        ? {}
+        : { holidayWindow: entry.holidayWindowSpec.raw }),
     };
   }
 
@@ -879,4 +886,19 @@ export interface DeliveryWindowSnapshot {
  */
 export interface DeliveryWindowListEntry extends DeliveryWindowSnapshot {
   open: boolean;
+}
+
+/**
+ * WR-318: one endpoint's live holiday-calendar snapshot — the strategy,
+ * the sorted holiday dates, the region label when set, and the explicit
+ * `holidayWindow` spec's raw string when one was configured (absent
+ * means the default first-half shrink). The same shape
+ * `holidayInfo()` returns; the queue/server getters surface it as the
+ * calendar's live value, and the listing form adds the endpoint.
+ */
+export interface HolidayCalendarSnapshot {
+  region?: string;
+  strategy: HolidayStrategy;
+  dates: string[];
+  holidayWindow?: string;
 }
