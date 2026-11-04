@@ -2106,6 +2106,44 @@ const queue = new RetryQueue({
   other patch. `queue.statusRetryPolicyFor(endpoint)` returns the live
   config as a detached copy.
 
+### Live revision of endpoint retry policies (WR-320)
+
+Both layers above are revisable from the server without a restart —
+the same live-revision family as the delivery window (WR-317),
+holiday calendar (WR-318), and circuit-breaker thresholds (WR-319):
+
+```ts
+server.reviseEndpointRetryPolicy("https://payments/hook", {
+  policyName: "patient",                                   // re-point the named layer
+  statusPolicy: { "429": { baseDelayMs: 5000, maxAttempts: 12 } }, // replace the status layer
+});
+server.reviseEndpointRetryPolicy("https://payments/hook", { policyName: null }); // detach one layer
+server.removeEndpointRetryPolicy("https://payments/hook"); // detach both layers
+server.getEndpointRetryPolicy("https://payments/hook");    // live snapshot, or undefined
+server.getRetryPolicies();                                 // every configured endpoint
+```
+
+- **Partial patches** — each layer is independent: a field left
+  `undefined` is untouched, `null` detaches that layer only.
+- **Validate both, then apply neither on failure** — an unknown
+  policy name or an illegal status config throws `RangeError` and
+  the live assignment is untouched (a patch carrying a valid layer
+  beside an illegal one moves neither).
+- **Audited** — a real revision appends `retry_policy_revised`
+  with `endpoint`, `previous` (empty when the endpoint had no policy
+  on either layer) and `current`; a same-value revision (including a
+  status policy whose selectors only changed order) is a silent
+  no-op. A removal appends `retry_policy_removed` with the removed
+  assignment as `previous` and returns `true` (`false` when the
+  endpoint had no policy on either layer).
+- **Effect timing** — the retry schedule is read at schedule time,
+  so an already-scheduled retry keeps the delay it was scheduled
+  with; the next retry after the revision uses the new policy. The
+  `accepted` audit event keeps stamping the policy name live at
+  acceptance. No `tenant` parameter: the queue's retry-policy maps
+  are keyed by endpoint alone, not per tenant (unlike WR-319's
+  tenant-scoped breaker).
+
 ## Declarative config snapshots (export / apply / rollback)
 
 The hot-reload layer above is imperative; the snapshot layer

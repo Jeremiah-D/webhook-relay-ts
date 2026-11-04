@@ -66,7 +66,11 @@ import {
   type ResolvedHttpHardening,
 } from "./http-hardening.ts";
 import type { OrderedAuditEvent, OrderedModeOptions } from "./retry.ts";
-import type { CircuitThresholdPatch, DeliveryWindowListEntry, DeliveryWindowSnapshot, GlobalConcurrencyStats, GlobalRateLimitRevision, GlobalRateLimitStats, HolidayCalendarConfig, HolidayCalendarSnapshot, ResolvedCircuitThresholds } from "./retry.ts";
+import type { CircuitThresholdPatch, DeliveryWindowListEntry, DeliveryWindowSnapshot, EndpointRetryPolicyRevision, GlobalConcurrencyStats, GlobalRateLimitRevision, GlobalRateLimitStats, HolidayCalendarConfig, HolidayCalendarSnapshot, ResolvedCircuitThresholds, ResolvedEndpointRetryPolicy, StatusRetryPolicyConfig } from "./retry.ts";
+import {
+  DEFAULT_STATUS_RETRY_MULTIPLIER,
+  assertValidStatusRetryPolicy,
+} from "./status-retry.ts";
 import { parseCronExpression, CRON_HEADER } from "./cron.ts";
 import type { CompletionCallbackOptions } from "./callback.ts";
 import { createBoundAddressSelfCheck } from "./callback.ts";
@@ -5887,6 +5891,59 @@ export interface RelayServer extends Server {
     tenant?: string
   ) => Array<{ endpoint: string } & { thresholds: ResolvedCircuitThresholds; overridden: boolean }>;
   /**
+   * WR-320: revise one endpoint's live retry policy at runtime — no
+   * restart. The patch merges over the endpoint's live assignment: a
+   * partial patch keeps the other layer, `policyName: null` detaches
+   * the named policy (back to the global backoff), `statusPolicy:
+   * null` detaches the per-status policy (back to the named/global
+   * schedule). Both layers are validated before either moves, so an
+   * unknown policy name or an illegal status config throws
+   * `RangeError` and the live assignment is untouched. A real revision
+   * is audited as `retry_policy_revised` with `endpoint`, `previous`
+   * (empty when the endpoint had no policy on either layer) and
+   * `current` snapshots; a same-value revision is a silent no-op.
+   * Always set — the named-policy registry is always present, so
+   * there is no "never configured" state (unlike the circuit breaker
+   * or the delivery window, enabling needs no restart). No `tenant`
+   * parameter: the queue's retry-policy maps are keyed by endpoint
+   * alone, not per tenant (unlike WR-319's tenant-scoped breaker).
+   * Effect: the retry schedule is read at schedule time, so an
+   * already-scheduled retry keeps the delay it was scheduled with
+   * (WR-178's rule); the next retry after the revision uses the new
+   * policy. The `accepted` audit event keeps stamping the policy
+   * name live at acceptance.
+   */
+  reviseEndpointRetryPolicy: (
+    endpoint: string,
+    patch: EndpointRetryPolicyRevision
+  ) => ResolvedEndpointRetryPolicy;
+  /**
+   * WR-320: remove one endpoint's live retry policy at runtime —
+   * both layers detach and the endpoint falls back to the global
+   * retry config. Returns `true` when a policy was removed on either
+   * layer (audited as `retry_policy_removed` with the endpoint and
+   * the removed assignment as `previous`), `false` when the endpoint
+   * had no policy on either layer (silent, no audit). Always set.
+   */
+  removeEndpointRetryPolicy: (endpoint: string) => boolean;
+  /**
+   * WR-320: live retry-policy snapshot for one endpoint — the named
+   * policy and/or per-status policy actually attached. `undefined`
+   * when the endpoint runs on the global retry config (no layer
+   * attached). Always set.
+   */
+  getEndpointRetryPolicy: (
+    endpoint: string
+  ) => ResolvedEndpointRetryPolicy | undefined;
+  /**
+   * WR-320: live retry-policy listing — every endpoint with a policy
+   * on either layer, each with its full live assignment, including
+   * endpoints whose policy has never governed a retry. Always set.
+   * (The queue's same-named `getRetryPolicies` lists the *registry*
+   * of named policies; this lists the per-endpoint *assignments*.)
+   */
+  getRetryPolicies: () => Array<{ endpoint: string } & ResolvedEndpointRetryPolicy>;
+  /**
    * WR-316: revise one live one-shot maintenance window at runtime
    * (`newStart` / `newEnd`, partial — omitted fields keep their live
    * values). The window is addressed by its stored (start, end), as
@@ -6117,6 +6174,41 @@ function sameCircuitThresholds(
     a.errorRateThreshold === b.errorRateThreshold &&
     a.errorRateMinSamples === b.errorRateMinSamples
   );
+}
+
+/**
+ * WR-320: deep equality for resolved endpoint retry policies — the
+ * named policy compares by value; the per-status policy compares
+ * selector-by-selector (key order is irrelevant — a revision that
+ * only reorders selectors is a no-op with no audit event).
+ */
+function sameEndpointRetryPolicy(
+  a: ResolvedEndpointRetryPolicy,
+  b: ResolvedEndpointRetryPolicy
+): boolean {
+  if (a.policyName !== b.policyName) return false;
+  return sameStatusRetryPolicy(a.statusPolicy, b.statusPolicy);
+}
+
+function sameStatusRetryPolicy(
+  a: StatusRetryPolicyConfig | undefined,
+  b: StatusRetryPolicyConfig | undefined
+): boolean {
+  if (a === undefined || b === undefined) return a === b;
+  const aKeys = Object.keys(a).sort();
+  const bKeys = Object.keys(b).sort();
+  if (aKeys.length !== bKeys.length) return false;
+  return aKeys.every((key, i) => {
+    if (key !== bKeys[i]) return false;
+    const ea = a[key];
+    const eb = b[key];
+    return (
+      ea.baseDelayMs === eb.baseDelayMs &&
+      ea.maxAttempts === eb.maxAttempts &&
+      (ea.multiplier ?? DEFAULT_STATUS_RETRY_MULTIPLIER) ===
+        (eb.multiplier ?? DEFAULT_STATUS_RETRY_MULTIPLIER)
+    );
+  });
 }
 
 /**
@@ -14226,6 +14318,95 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     ): Array<{ endpoint: string } & { thresholds: ResolvedCircuitThresholds; overridden: boolean }> =>
       queue.getCircuitBreakers(tenant);
   }
+
+  // WR-320: live retry-policy revision / removal / reads for one
+  // endpoint. The queue owns the validate-then-apply setters; this
+  // layer pre-validates *both* layers before either moves (an unknown
+  // policy name or an illegal status config throws RangeError and the
+  // live assignment is untouched — the two setters alone would leave
+  // a half-applied patch), then audits a real revision as
+  // `retry_policy_revised` with the endpoint and the previous /
+  // current snapshots; a same-value revision is a silent no-op, and
+  // a removal audits `retry_policy_removed` with the removed
+  // assignment. The retry schedule is read at schedule time, so an
+  // already-scheduled retry keeps its delay; the next retry after
+  // the revision uses the new policy. Always set: the named-policy
+  // registry is always present, so there is no "never configured"
+  // state to gate on.
+  const endpointRetryPolicySnapshot = (
+    endpoint: string
+  ): ResolvedEndpointRetryPolicy => {
+    const policyName = queue.retryPolicyFor(endpoint);
+    const statusPolicy = queue.statusRetryPolicyFor(endpoint);
+    return {
+      ...(policyName === undefined ? {} : { policyName }),
+      ...(statusPolicy === undefined ? {} : { statusPolicy }),
+    };
+  };
+
+  server.reviseEndpointRetryPolicy = (
+    endpoint: string,
+    patch: EndpointRetryPolicyRevision
+  ): ResolvedEndpointRetryPolicy => {
+    const previous = endpointRetryPolicySnapshot(endpoint);
+    // Validate both layers before either moves — a patch that
+    // re-points the named policy *and* carries an illegal status
+    // config must leave the live assignment completely intact.
+    if (
+      patch.policyName !== undefined &&
+      patch.policyName !== null &&
+      !queue.hasRetryPolicy(patch.policyName)
+    ) {
+      throw new RangeError(
+        `retry policy ${JSON.stringify(patch.policyName)} is not registered; register it with registerRetryPolicy() first`
+      );
+    }
+    if (patch.statusPolicy !== undefined && patch.statusPolicy !== null) {
+      assertValidStatusRetryPolicy(patch.statusPolicy);
+    }
+    if (patch.policyName !== undefined) {
+      if (patch.policyName === null) queue.clearEndpointRetryPolicy(endpoint);
+      else queue.setEndpointRetryPolicy(endpoint, patch.policyName);
+    }
+    if (patch.statusPolicy !== undefined) {
+      if (patch.statusPolicy === null) queue.clearEndpointStatusRetryPolicy(endpoint);
+      else queue.setEndpointStatusRetryPolicy(endpoint, patch.statusPolicy);
+    }
+    const current = endpointRetryPolicySnapshot(endpoint);
+    if (sameEndpointRetryPolicy(previous, current)) return current;
+    opts.auditLog.append({
+      event: "retry_policy_revised",
+      endpoint,
+      previous,
+      current,
+    });
+    return current;
+  };
+
+  server.removeEndpointRetryPolicy = (endpoint: string): boolean => {
+    const previous = endpointRetryPolicySnapshot(endpoint);
+    const namedRemoved = queue.clearEndpointRetryPolicy(endpoint);
+    const statusRemoved = queue.clearEndpointStatusRetryPolicy(endpoint);
+    if (!namedRemoved && !statusRemoved) return false;
+    opts.auditLog.append({
+      event: "retry_policy_removed",
+      endpoint,
+      previous,
+    });
+    return true;
+  };
+
+  server.getEndpointRetryPolicy = (
+    endpoint: string
+  ): ResolvedEndpointRetryPolicy | undefined => {
+    const snapshot = endpointRetryPolicySnapshot(endpoint);
+    return snapshot.policyName === undefined && snapshot.statusPolicy === undefined
+      ? undefined
+      : snapshot;
+  };
+
+  server.getRetryPolicies = (): Array<{ endpoint: string } & ResolvedEndpointRetryPolicy> =>
+    queue.getEndpointRetryPolicies();
 
   // WR-316: single-window live revision / cancellation for one-shot
   // maintenance windows. The queue does the validate-then-apply work

@@ -3688,6 +3688,30 @@ export interface TenantBudgetStats extends TenantBudgetStatsRow {
 }
 
 /**
+ * WR-320: a partial revision of one endpoint's live retry policy —
+ * the two layers are independent: `policyName` re-points (or, with
+ * `null`, detaches) the named WR-172 policy, `statusPolicy` replaces
+ * (or, with `null`, detaches) the WR-178 per-status policy. A field
+ * left `undefined` is untouched.
+ */
+export interface EndpointRetryPolicyRevision {
+  policyName?: string | null;
+  statusPolicy?: StatusRetryPolicyConfig | null;
+}
+
+/**
+ * WR-320: the live retry-policy snapshot for one endpoint — the
+ * layers actually attached. A layer is absent (`undefined`) when the
+ * endpoint runs on the global retry config (named layer) or the
+ * WR-172 / global schedule (status layer). `statusPolicy` is a
+ * detached normalized copy.
+ */
+export interface ResolvedEndpointRetryPolicy {
+  policyName?: string;
+  statusPolicy?: StatusRetryPolicyConfig;
+}
+
+/**
  * RetryQueue holds outbound deliveries and retries them with exponential
  * backoff + jitter. Items that exhaust `maxAttempts` are moved to an
  * in-memory dead-letter list for later inspection.
@@ -7278,6 +7302,15 @@ export class RetryQueue {
   }
 
   /**
+   * WR-320: whether `name` is a registered retry policy — the
+   * server-side revise path pre-validates with this so an unknown
+   * name throws before either retry-policy layer moves.
+   */
+  hasRetryPolicy(name: string): boolean {
+    return this.retryPolicyRegistry.has(name);
+  }
+
+  /**
    * WR-172: assign a registered policy to an endpoint (exact
    * `targetUrl`, the logical endpoint). Throws `RangeError` for an
    * unknown name — fail fast at configuration time, never mid-delivery.
@@ -7364,6 +7397,29 @@ export class RetryQueue {
    */
   getRetryPolicies(): NamedRetryPolicy[] {
     return this.retryPolicyRegistry.snapshot();
+  }
+
+  /**
+   * WR-320: the live per-endpoint retry-policy assignments — one
+   * row per endpoint carrying a named policy, a per-status policy,
+   * or both, in endpoint order. Endpoints on the global config are
+   * not listed. `statusPolicy` entries are detached normalized
+   * copies. (Unlike `getRetryPolicies`, which snapshots the
+   * *registry* of named policies, this lists the *assignments*.)
+   */
+  getEndpointRetryPolicies(): Array<{ endpoint: string } & ResolvedEndpointRetryPolicy> {
+    const endpoints = new Set<string>();
+    for (const endpoint of this.endpointRetryPolicy.keys()) endpoints.add(endpoint);
+    for (const endpoint of this.endpointStatusRetryPolicy.keys()) endpoints.add(endpoint);
+    return [...endpoints].sort().map((endpoint) => {
+      const policyName = this.endpointRetryPolicy.get(endpoint);
+      const statusPolicy = this.statusRetryPolicyFor(endpoint);
+      return {
+        endpoint,
+        ...(policyName === undefined ? {} : { policyName }),
+        ...(statusPolicy === undefined ? {} : { statusPolicy }),
+      };
+    });
   }
 
   /**
