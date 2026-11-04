@@ -323,7 +323,29 @@ reliability primitives that matter for any signed-payload pipeline.
   `setEndpointDeliveryWindow()` / `setEndpointTzDeliveryWindow()` /
   `setEndpointDeliveryHolidays()` / `deleteEndpointDeliveryHolidays()` /
   `deleteEndpointDeliveryWindow()` (deleting the window also deletes its
-  calendar). Injectable clock for deterministic tests.
+  calendar). Injectable clock for deterministic tests. WR-317 exposes
+  the same revisions on the relay server, no restart:
+  `reviseDeliveryWindow(endpoint, spec)` / `reviseTzDeliveryWindow(endpoint,
+  window, timezone)` return the live `{ endpoint, window, timezone? }`
+  snapshot and audit `quiet_hours_revised` with `endpoint`, `previous`
+  (`null` on first set) and `current` — a same-value revision is a
+  silent no-op, an invalid spec/timezone or a UTC/tz clash throws
+  `RangeError` with the live window untouched, and revising on a server
+  whose delivery windows were never configured throws `Error`
+  (enabling them needs a restart). `removeDeliveryWindow(endpoint)`
+  returns `true` and audits `quiet_hours_removed` with the removed
+  window as `previous` (also deleting its holiday calendar), `false`
+  with no audit when no window was set. `getDeliveryWindows()` (set
+  only when `retry.deliveryWindow` was configured) lists every
+  configured endpoint with its live spec and `open` flag — including
+  endpoints whose window has never parked a delivery, which
+  `getDeliveryWindowStats()` never lists. Effect timing: the delivery
+  gate re-reads the live window on every trigger and already-armed
+  timers are never re-armed — widening never flushes a parked delivery
+  early (it goes out when its old timer fires and the gate finds the
+  window open), narrowing re-parks on the next trigger to the new
+  opening instant, and a park never consumes an attempt, quota, or
+  retry budget.
 - `src/maintenance-window.ts` — per-endpoint one-shot maintenance
   windows (WR-127): `retry: { maintenanceWindow: { windows: {
   "<targetUrl>": [{ start: "2026-11-01T02:00:00Z", end:

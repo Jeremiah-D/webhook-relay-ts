@@ -66,7 +66,7 @@ import {
   type ResolvedHttpHardening,
 } from "./http-hardening.ts";
 import type { OrderedAuditEvent, OrderedModeOptions } from "./retry.ts";
-import type { GlobalConcurrencyStats, GlobalRateLimitRevision, GlobalRateLimitStats } from "./retry.ts";
+import type { DeliveryWindowListEntry, DeliveryWindowSnapshot, GlobalConcurrencyStats, GlobalRateLimitRevision, GlobalRateLimitStats } from "./retry.ts";
 import { parseCronExpression, CRON_HEADER } from "./cron.ts";
 import type { CompletionCallbackOptions } from "./callback.ts";
 import { createBoundAddressSelfCheck } from "./callback.ts";
@@ -5731,6 +5731,53 @@ export interface RelayServer extends Server {
    * Set only when `deadLetterRetention` was configured.
    */
   getDeadLetterRetention?: () => DeadLetterRetentionSnapshot;
+  /**
+   * WR-317: set (or replace) one endpoint's live UTC delivery window
+   * (quiet hours) at runtime — no restart. A real revision is audited
+   * as `quiet_hours_revised` with `endpoint`, `previous` (null when the
+   * endpoint had no window) and `current` snapshots; a same-value
+   * revision is a silent no-op. An invalid spec throws `RangeError`
+   * and the live window is untouched; an endpoint with a timezone
+   * window throws `RangeError` (UTC and timezone windows are mutually
+   * exclusive — remove it first). Always set; throws `Error` when
+   * delivery windows were never configured — enabling them needs a
+   * restart. The next trigger re-reads the live window: widening never
+   * flushes an already-parked delivery early (it goes out when its old
+   * timer fires and the gate finds the window open), narrowing re-parks
+   * on the next trigger to the new opening instant.
+   */
+  reviseDeliveryWindow: (endpoint: string, spec: string) => DeliveryWindowSnapshot;
+  /**
+   * WR-317: set (or replace) one endpoint's live timezone-aware
+   * delivery window at runtime (`window` in `"HH:MM-HH:MM"`, evaluated
+   * against the IANA zone's local wall clock). Same audit, no-op, and
+   * error semantics as `reviseDeliveryWindow`; an endpoint with a UTC
+   * window throws `RangeError` (mutual exclusion — remove it first).
+   * Always set; throws `Error` when delivery windows were never
+   * configured.
+   */
+  reviseTzDeliveryWindow: (
+    endpoint: string,
+    window: string,
+    timezone: string
+  ) => DeliveryWindowSnapshot;
+  /**
+   * WR-317: remove one endpoint's live delivery window at runtime — it
+   * becomes always deliverable. Returns `true` when a window was
+   * removed (audited as `quiet_hours_removed` with the endpoint and
+   * the removed window as `previous`), `false` when no window was
+   * configured (silent, no audit) — including when the feature itself
+   * was never configured. Removing the window also removes its holiday
+   * calendar, if any. Always set.
+   */
+  removeDeliveryWindow: (endpoint: string) => boolean;
+  /**
+   * WR-317: live delivery-window listing — every configured endpoint
+   * (UTC and timezone alike) with its spec and whether it is open
+   * right now, including endpoints whose window has never parked a
+   * delivery. Set only when `retry.deliveryWindow` was configured.
+   */
+  getDeliveryWindows?: () => DeliveryWindowListEntry[];
   /**
    * WR-316: revise one live one-shot maintenance window at runtime
    * (`newStart` / `newEnd`, partial — omitted fields keep their live
@@ -13832,6 +13879,87 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // `deadLetterRetention` was configured.
   if (queue.getDeadLetterRetention() !== undefined) {
     server.getDeadLetterRetention = (): DeadLetterRetentionSnapshot => queue.getDeadLetterRetention()!;
+  }
+
+  // WR-317: live delivery-window (quiet hours) revision / removal for
+  // one endpoint. The queue does the validate-then-apply work
+  // (RangeError on an invalid spec/timezone or a UTC/tz clash, live
+  // window untouched); this layer only owns the "must restart" Error
+  // (the queue setter returns false when the feature was never
+  // configured) and the audit: a real revision appends
+  // `quiet_hours_revised` with the endpoint and the previous (null on
+  // first set) / current snapshots, a same-value revision is a silent
+  // no-op, and a removal appends `quiet_hours_removed` with the
+  // endpoint and the removed window. The delivery gate re-reads the
+  // live window on every trigger, so no timer is re-armed here.
+  server.reviseDeliveryWindow = (endpoint: string, spec: string): DeliveryWindowSnapshot => {
+    const previous = queue.getEndpointDeliveryWindow(endpoint);
+    if (!queue.setEndpointDeliveryWindow(endpoint, spec)) {
+      throw new Error(
+        "reviseDeliveryWindow: delivery windows are not configured — enabling them requires a restart"
+      );
+    }
+    const current = queue.getEndpointDeliveryWindow(endpoint)!;
+    if (
+      previous !== undefined &&
+      previous.window === current.window &&
+      previous.timezone === undefined &&
+      current.timezone === undefined
+    ) {
+      return current;
+    }
+    opts.auditLog.append({
+      event: "quiet_hours_revised",
+      endpoint,
+      previous: previous ?? null,
+      current,
+    });
+    return current;
+  };
+
+  server.reviseTzDeliveryWindow = (
+    endpoint: string,
+    window: string,
+    timezone: string
+  ): DeliveryWindowSnapshot => {
+    const previous = queue.getEndpointDeliveryWindow(endpoint);
+    if (!queue.setEndpointTzDeliveryWindow(endpoint, window, timezone)) {
+      throw new Error(
+        "reviseTzDeliveryWindow: delivery windows are not configured — enabling them requires a restart"
+      );
+    }
+    const current = queue.getEndpointDeliveryWindow(endpoint)!;
+    if (
+      previous !== undefined &&
+      previous.window === current.window &&
+      previous.timezone === current.timezone
+    ) {
+      return current;
+    }
+    opts.auditLog.append({
+      event: "quiet_hours_revised",
+      endpoint,
+      previous: previous ?? null,
+      current,
+    });
+    return current;
+  };
+
+  server.removeDeliveryWindow = (endpoint: string): boolean => {
+    const previous = queue.getEndpointDeliveryWindow(endpoint);
+    if (!queue.deleteEndpointDeliveryWindow(endpoint)) return false;
+    opts.auditLog.append({
+      event: "quiet_hours_removed",
+      endpoint,
+      previous: previous ?? null,
+    });
+    return true;
+  };
+
+  // WR-317: live delivery-window listing. Only set when
+  // `retry.deliveryWindow` was configured.
+  if (opts.retry?.deliveryWindow !== undefined) {
+    server.getDeliveryWindows = (): DeliveryWindowListEntry[] => queue.getDeliveryWindows();
   }
 
   // WR-316: single-window live revision / cancellation for one-shot

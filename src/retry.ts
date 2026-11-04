@@ -108,11 +108,11 @@ import {
   type EndpointHealthStatsRow,
   type EndpointRecoveredInfo,
 } from "./endpoint-health.ts";
-import { EndpointDeliveryWindow, parseDeliveryWindowSpec, type DeliveryWindowOptions, type DeliveryWindowStats, type HolidayCalendarConfig, type TimezoneWindowConfig } from "./delivery-window.ts";
+import { EndpointDeliveryWindow, parseDeliveryWindowSpec, type DeliveryWindowListEntry, type DeliveryWindowOptions, type DeliveryWindowSnapshot, type DeliveryWindowStats, type HolidayCalendarConfig, type TimezoneWindowConfig } from "./delivery-window.ts";
 import { EndpointMaintenanceWindow, type MaintenanceWindowOptions, type MaintenanceWindowStats } from "./maintenance-window.ts";
 export { parseDeliveryWindowSpec, EndpointDeliveryWindow };
 export { EndpointMaintenanceWindow };
-export type { DeliveryWindowOptions, DeliveryWindowStats, HolidayCalendarConfig, TimezoneWindowConfig };
+export type { DeliveryWindowListEntry, DeliveryWindowOptions, DeliveryWindowSnapshot, DeliveryWindowStats, HolidayCalendarConfig, TimezoneWindowConfig };
 export type { MaintenanceWindowOptions, MaintenanceWindowStats };
 import {
   ScheduledDeliveryQueue,
@@ -10312,6 +10312,47 @@ export class RetryQueue {
       }
     }
     return rows;
+  }
+
+  /**
+   * WR-317: the live delivery-window snapshot for one endpoint (the
+   * configured spec, plus the IANA zone for timezone windows). Reads the
+   * live module values, so a runtime revision is visible immediately.
+   * `undefined` when the feature is disabled or the endpoint has no
+   * window.
+   */
+  getEndpointDeliveryWindow(endpoint: string): DeliveryWindowSnapshot | undefined {
+    if (this.deliveryWindow === undefined) return undefined;
+    const spec = this.deliveryWindow.specFor(endpoint);
+    if (spec === undefined) return undefined;
+    const timezone = this.deliveryWindow.timezoneFor(endpoint);
+    return {
+      endpoint,
+      window: spec.raw,
+      ...(timezone === undefined ? {} : { timezone }),
+    };
+  }
+
+  /**
+   * WR-317: the live delivery window for every configured endpoint (UTC
+   * and timezone alike, in first-configured order), each with whether it
+   * is open at the injected clock's current time. Unlike
+   * `getDeliveryWindowStats` (which only lists endpoints with a park
+   * record), this lists every configured endpoint — including ones whose
+   * window has never parked a delivery.
+   */
+  getDeliveryWindows(): DeliveryWindowListEntry[] {
+    if (this.deliveryWindow === undefined) return [];
+    return this.deliveryWindow.endpoints().map((endpoint) => {
+      const spec = this.deliveryWindow!.specFor(endpoint)!;
+      const timezone = this.deliveryWindow!.timezoneFor(endpoint);
+      return {
+        endpoint,
+        window: spec.raw,
+        ...(timezone === undefined ? {} : { timezone }),
+        open: this.deliveryWindow!.isOpen(endpoint),
+      };
+    });
   }
 
   /**

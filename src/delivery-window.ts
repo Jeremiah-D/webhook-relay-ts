@@ -860,3 +860,23 @@ export interface DeliveryWindowStats {
   /** Whether the window is open at the injected clock's current time. */
   open: boolean;
 }
+
+/**
+ * WR-317: one endpoint's live delivery-window snapshot — the window spec
+ * as configured plus the IANA zone when it is a timezone window. The
+ * `window` is the raw spec string (`"HH:MM-HH:MM"`); `timezone` is absent
+ * for UTC windows (the same shape split `DeliveryWindowStats` uses).
+ */
+export interface DeliveryWindowSnapshot {
+  endpoint: string;
+  window: string;
+  timezone?: string;
+}
+
+/**
+ * WR-317: one row of the live delivery-window listing — a snapshot plus
+ * whether the window is open at the injected clock's current time.
+ */
+export interface DeliveryWindowListEntry extends DeliveryWindowSnapshot {
+  open: boolean;
+}
