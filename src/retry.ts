@@ -1232,6 +1232,27 @@ export interface TenantRetryBudgetStats {
 }
 
 /**
+ * WR-326: one live per-tenant retry-budget revision. `tenant` is
+ * absent for the default domain (every tenant without an override);
+ * `scope` says which domain moved. `previous` is the effective rate
+ * before the revision (the override, or the default when there was
+ * none); on a read it equals the current rate. `overridden` says
+ * whether the tenant carries an explicit override after the call.
+ */
+export interface TenantRetryBudgetRevision {
+  /** Tenant id; absent for the default domain. */
+  tenant?: string;
+  /** Live retries-per-minute for the tenant (or the default domain). */
+  retriesPerMinute: number;
+  /** Effective retries-per-minute before the revision (a read: same as live). */
+  previous: number;
+  /** Which domain the revision (or read) addresses. */
+  scope: "default" | "tenant";
+  /** Whether the tenant carries an explicit override after the call. */
+  overridden: boolean;
+}
+
+/**
  * Fired once when an endpoint becomes blocked by a dependency, and once
  * when it recovers (WR-199, edge-triggered — not per parked dispatch).
  */
@@ -9819,6 +9840,89 @@ export class RetryQueue {
       );
     }
     return this.retryBudget.retune(retriesPerMinute);
+  }
+
+  /**
+   * WR-326: revise the per-tenant retry budget at runtime. With
+   * `tenant` omitted the default domain moves — the rate every tenant
+   * without an override gates on, retuning all their existing buckets
+   * in place; with a tenant given, that tenant's override moves (or
+   * is set), retuning its bucket in place when one exists. The next
+   * scheduled retry judges by the new budget; a retry already parked
+   * re-arms at the new refill horizon (never dropped, never burned
+   * against the item's attempt budget, never touching the circuit
+   * breaker). Tightening clamps the bucket to the new cap at once;
+   * widening never tops the bucket up. Check order: tenant id, then
+   * rate, then apply — an illegal tenant id (`TypeError`/`RangeError`)
+   * or rate (`RangeError`) leaves the live budget completely
+   * untouched; revising to the effective current rate is a no-op.
+   * Throws `Error` when the per-tenant budget was never configured —
+   * enabling it needs a restart. Other tenants, the global budget
+   * (WR-38/WR-314) and the endpoint overrides (WR-125) are untouched.
+   * Returns the live revision (previous = effective rate before).
+   */
+  reviseTenantRetryBudget(
+    tenant: string | undefined,
+    retriesPerMinute: number
+  ): TenantRetryBudgetRevision {
+    const budget = this.tenantRetryBudget;
+    if (budget === undefined) {
+      throw new Error(
+        "reviseTenantRetryBudget: tenant retry budget is not configured — enabling it requires a restart: " +
+          "the budget is created at startup and a running relay cannot start budgeting without one"
+      );
+    }
+    if (tenant === undefined) {
+      const previous = budget.defaultLimit();
+      const current = budget.reviseDefault(retriesPerMinute);
+      return { retriesPerMinute: current, previous, scope: "default", overridden: false };
+    }
+    const previous = budget.limitFor(tenant);
+    const current = budget.reviseTenant(tenant, retriesPerMinute);
+    // A same-value revision is a no-op that records no override, so
+    // read the flag live instead of assuming the revision set one.
+    return { tenant, retriesPerMinute: current, previous, scope: "tenant", overridden: budget.hasOverride(tenant) };
+  }
+
+  /**
+   * WR-326: live per-tenant retry-budget read — the effective rate for
+   * `tenant` (or the default domain when omitted) and whether the
+   * tenant carries an explicit override. Reads the live value without
+   * creating a bucket. `undefined` when the per-tenant budget was
+   * never configured.
+   */
+  getTenantRetryBudget(tenant?: string): TenantRetryBudgetRevision | undefined {
+    const budget = this.tenantRetryBudget;
+    if (budget === undefined) return undefined;
+    if (tenant === undefined) {
+      const current = budget.defaultLimit();
+      return { retriesPerMinute: current, previous: current, scope: "default", overridden: false };
+    }
+    const current = budget.limitFor(tenant);
+    return {
+      tenant,
+      retriesPerMinute: current,
+      previous: current,
+      scope: "tenant",
+      overridden: budget.hasOverride(tenant),
+    };
+  }
+
+  /**
+   * WR-326: remove one tenant's retry-budget override at runtime —
+   * the tenant falls back to the live default rate (its bucket, if
+   * any, is retuned in place to the default, token state preserved).
+   * Returns `false` when the per-tenant budget was never configured,
+   * when no tenant was given (the default rate cannot be removed,
+   * only revised), or when the tenant had no override; `true` when an
+   * override was removed. A malformed tenant id throws
+   * `TypeError`/`RangeError`.
+   */
+  removeTenantRetryBudget(tenant?: string): boolean {
+    const budget = this.tenantRetryBudget;
+    if (budget === undefined) return false;
+    if (tenant === undefined || tenant === "") return false;
+    return budget.removeTenant(tenant);
   }
 
   /**

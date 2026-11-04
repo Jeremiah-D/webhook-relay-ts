@@ -70,7 +70,8 @@ export const DEFAULT_TENANT_KEY = "";
  * retry queue reschedules it without consuming the attempt budget).
  */
 export class TenantRetryBudget {
-  private readonly defaultPerMinute: number;
+  /** Mutable (WR-326): the live default, revised by `reviseDefault()`. */
+  private defaultPerMinute: number;
   private readonly overrides = new Map<string, number>();
   private readonly buckets = new Map<string, RetryBudget>();
   private readonly now: () => number;
@@ -145,6 +146,81 @@ export class TenantRetryBudget {
     const b = this.buckets.get(this.key(tenant));
     if (b !== undefined) return b.limit();
     return this.overrides.get(this.key(tenant)) ?? this.defaultPerMinute;
+  }
+
+  /** Whether `tenant` carries an explicit override. */
+  hasOverride(tenant: string): boolean {
+    return this.overrides.has(tenant);
+  }
+
+  /**
+   * WR-326: revise the default per-minute budget live — the rate every
+   * tenant without an override gates on. An illegal value throws
+   * `RangeError` and the live default and buckets are untouched;
+   * revising to the current default is a silent no-op. Every already
+   * created bucket without an override is retuned in place (tightening
+   * clamps at once, widening never tops a bucket up); buckets with an
+   * override keep their own rate, and tenants not yet seen pick the
+   * new default up lazily at their first `take()`. Returns the live
+   * default.
+   */
+  reviseDefault(newPerMinute: number): number {
+    if (!Number.isFinite(newPerMinute) || newPerMinute <= 0) {
+      throw new RangeError(
+        `tenantRetryBudget.retriesPerMinute must be a finite number > 0, got ${newPerMinute}`
+      );
+    }
+    if (newPerMinute === this.defaultPerMinute) return this.defaultPerMinute;
+    this.defaultPerMinute = newPerMinute;
+    for (const [key, bucket] of this.buckets) {
+      if (this.overrides.has(key)) continue;
+      bucket.retune(newPerMinute);
+    }
+    return this.defaultPerMinute;
+  }
+
+  /**
+   * WR-326: revise (or set) one tenant's override live. The tenant id
+   * is validated first (`TypeError`/`RangeError` on a malformed id),
+   * then the rate (`RangeError` on an illegal value) — either failure
+   * leaves the live budget completely untouched. Revising to the
+   * tenant's effective current rate is a silent no-op (no override is
+   * recorded). Otherwise the override is recorded and an existing
+   * bucket is retuned in place (tightening clamps at once, widening
+   * never tops it up); a tenant not yet seen is only recorded, and
+   * its first `take()` builds a bucket at the new rate. Other tenants
+   * and the default are untouched. Returns the tenant's live rate.
+   */
+  reviseTenant(tenant: string, newPerMinute: number): number {
+    assertValidTenantId(tenant);
+    if (!Number.isFinite(newPerMinute) || newPerMinute <= 0) {
+      throw new RangeError(
+        `tenantRetryBudget.perTenantRetriesPerMinute[${JSON.stringify(tenant)}] must be a finite number > 0, got ${newPerMinute}`
+      );
+    }
+    const current = this.limitFor(tenant);
+    if (newPerMinute === current) return current;
+    this.overrides.set(tenant, newPerMinute);
+    const bucket = this.buckets.get(tenant);
+    if (bucket !== undefined) bucket.retune(newPerMinute);
+    return newPerMinute;
+  }
+
+  /**
+   * WR-326: remove one tenant's override — the tenant falls back to
+   * the live default rate. An existing bucket is retuned in place to
+   * the default (token state preserved, bucket kept), so in-flight
+   * retries are unaffected. Returns `true` when an override was
+   * removed, `false` when the tenant had none. A malformed tenant id
+   * throws `TypeError`/`RangeError`.
+   */
+  removeTenant(tenant: string): boolean {
+    assertValidTenantId(tenant);
+    if (!this.overrides.has(tenant)) return false;
+    this.overrides.delete(tenant);
+    const bucket = this.buckets.get(tenant);
+    if (bucket !== undefined) bucket.retune(this.defaultPerMinute);
+    return true;
   }
 
   /** Tenant ids with an explicit override. */

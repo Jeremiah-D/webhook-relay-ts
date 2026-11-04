@@ -66,7 +66,7 @@ import {
   type ResolvedHttpHardening,
 } from "./http-hardening.ts";
 import type { OrderedAuditEvent, OrderedModeOptions } from "./retry.ts";
-import type { BulkheadRevision, BulkheadRevisionSnapshot, CircuitThresholdPatch, DeliveryWindowListEntry, DeliveryWindowSnapshot, EndpointConcurrencySnapshot, EndpointQuotaSnapshot, EndpointRetryPolicyRevision, GlobalConcurrencyStats, GlobalRateLimitRevision, GlobalRateLimitStats, HolidayCalendarConfig, HolidayCalendarSnapshot, MinNormalShareSnapshot, ResolvedCircuitThresholds, ResolvedEndpointRetryPolicy, StatusRetryPolicyConfig } from "./retry.ts";
+import type { BulkheadRevision, BulkheadRevisionSnapshot, CircuitThresholdPatch, DeliveryWindowListEntry, DeliveryWindowSnapshot, EndpointConcurrencySnapshot, EndpointQuotaSnapshot, EndpointRetryPolicyRevision, GlobalConcurrencyStats, GlobalRateLimitRevision, GlobalRateLimitStats, HolidayCalendarConfig, HolidayCalendarSnapshot, MinNormalShareSnapshot, ResolvedCircuitThresholds, ResolvedEndpointRetryPolicy, StatusRetryPolicyConfig, TenantRetryBudgetRevision } from "./retry.ts";
 import {
   DEFAULT_STATUS_RETRY_MULTIPLIER,
   assertValidStatusRetryPolicy,
@@ -5687,6 +5687,47 @@ export interface RelayServer extends Server {
    * (WR-200) are untouched.
    */
   setRetryBudget?: (retriesPerMinute: number) => number;
+  /**
+   * WR-326: revise the per-tenant retry budget at runtime (retries
+   * per minute). With `tenant` omitted the default domain moves —
+   * the rate every tenant without an override gates on; with a tenant
+   * given, that tenant's override moves (or is set). The next
+   * scheduled retry judges by the new budget; a retry already parked
+   * re-arms at the new refill horizon. Tightening clamps the bucket
+   * to the new cap at once; widening never tops a bucket up. Check
+   * order: tenant id, then rate, then apply — an illegal tenant id
+   * (`TypeError`/`RangeError`) or rate (`RangeError`) leaves the live
+   * budget untouched; a same-value revision is a no-op with no audit
+   * event. A real revision is audited as
+   * `tenant_retry_budget_revised` with `tenant` (omitted for the
+   * default domain) / `scope` / `previous` / `current` rates, and
+   * returns the live revision. Always set; throws `Error` when the
+   * per-tenant budget was never configured — enabling it needs a
+   * restart. Other tenants, the global budget (WR-38/WR-314) and the
+   * endpoint overrides (WR-125) are untouched.
+   */
+  reviseTenantRetryBudget: (
+    tenant: string | undefined,
+    retriesPerMinute: number
+  ) => TenantRetryBudgetRevision;
+  /**
+   * WR-326: live per-tenant retry-budget read — the effective rate
+   * for `tenant` (or the default domain when omitted) and whether the
+   * tenant carries an explicit override. Only set when the
+   * per-tenant budget was configured; `undefined` otherwise.
+   */
+  getTenantRetryBudget?: (tenant?: string) => TenantRetryBudgetRevision | undefined;
+  /**
+   * WR-326: remove one tenant's retry-budget override at runtime —
+   * the tenant falls back to the live default rate. Returns `true`
+   * when an override was removed (audited as
+   * `tenant_retry_budget_removed` with `tenant` and the removed rate
+   * as `previous`), `false` when the per-tenant budget was never
+   * configured, when no tenant was given (the default rate cannot be
+   * removed, only revised), or when the tenant had no override.
+   * Always set.
+   */
+  removeTenantRetryBudget: (tenant: string) => boolean;
   /**
    * WR-324: revise the urgent fast-lane rate at runtime (the
    * per-second token budget shared by every endpoint's bucket). The
@@ -14250,6 +14291,66 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     });
     return next;
   };
+
+  // WR-326: per-tenant retry-budget runtime revision. The method is
+  // always set (like setRetryBudget above); with the budget
+  // unconfigured the queue throws Error — enabling the budget needs
+  // a restart. A real revision is audited as
+  // `tenant_retry_budget_revised` with the tenant (omitted for the
+  // default domain) / scope / previous / current rates (the
+  // constructor default on a first default-domain revision); a
+  // same-value revision is a silent no-op.
+  server.reviseTenantRetryBudget = (
+    tenant: string | undefined,
+    retriesPerMinute: number
+  ): TenantRetryBudgetRevision => {
+    const prevStats = queue.getTenantRetryBudgetStats();
+    if (prevStats === undefined) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseTenantRetryBudget(tenant, retriesPerMinute);
+    }
+    const previous = queue.getTenantRetryBudget(tenant)!;
+    // Validate-then-apply inside the queue revision: an illegal
+    // tenant id or rate throws and the live budget is left completely
+    // intact.
+    const next = queue.reviseTenantRetryBudget(tenant, retriesPerMinute);
+    if (next.retriesPerMinute === previous.retriesPerMinute) {
+      return next;
+    }
+    opts.auditLog.append({
+      event: "tenant_retry_budget_revised",
+      ...(tenant === undefined ? {} : { tenant }),
+      scope: next.scope,
+      previous: previous.retriesPerMinute,
+      current: next.retriesPerMinute,
+    });
+    return next;
+  };
+
+  // WR-326: per-tenant retry-budget removal. Always set; a missing
+  // budget, a missing tenant (the default rate cannot be removed,
+  // only revised), or a tenant without an override returns false
+  // silently. A real removal audits `tenant_retry_budget_removed`
+  // with the tenant and the removed rate as `previous`.
+  server.removeTenantRetryBudget = (tenant: string): boolean => {
+    const previous = queue.getTenantRetryBudget(tenant);
+    if (previous === undefined || !previous.overridden) return false;
+    queue.removeTenantRetryBudget(tenant);
+    opts.auditLog.append({
+      event: "tenant_retry_budget_removed",
+      tenant,
+      previous: previous.retriesPerMinute,
+    });
+    return true;
+  };
+
+  // WR-326: live per-tenant retry-budget reads. Only set when the
+  // per-tenant budget was configured.
+  if (queue.getTenantRetryBudgetStats() !== undefined) {
+    server.getTenantRetryBudget = (
+      tenant?: string
+    ): TenantRetryBudgetRevision | undefined => queue.getTenantRetryBudget(tenant);
+  }
 
   // WR-324: relay-level urgent fast-lane rate runtime revision. The
   // method is always set (like setGlobalConcurrency above); the

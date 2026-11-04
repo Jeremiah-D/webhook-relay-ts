@@ -314,7 +314,24 @@ reliability primitives that matter for any signed-payload pipeline.
   `retry_budget_depleted` with `budgetScope: "tenant"`; Prometheus gains
   `relay_tenant_retry_budget_depleted_total{tenant}` (one series per
   parked tenant; the default tenant-less tenant renders as an empty label
-  set). Orthogonal to WR-38 (cross-tenant master gate) and WR-137
+  set). Runtime revision (WR-326): `reviseTenantRetryBudget(tenant?,
+  retriesPerMinute)` moves the default domain (tenant omitted — every
+  tenant without an override, existing buckets retuned in place) or one
+  tenant's override (recorded live, its bucket retuned in place when one
+  exists); `getTenantRetryBudget(tenant?)` reads the live rate and the
+  override flag without creating a bucket (only set when the budget was
+  configured); `removeTenantRetryBudget(tenant)` drops an override so the
+  tenant falls back to the live default (its bucket retuned in place,
+  token state kept). Check order is tenant id, then rate, then apply —
+  an illegal value throws `RangeError` and the live budget is untouched;
+  a same-value revision is a silent no-op; revising when the budget was
+  never configured throws `Error` (enabling it needs a restart); the
+  default rate cannot be removed, only revised. Real revisions audit
+  `tenant_retry_budget_revised` with `tenant` (omitted for the default
+  domain) / `scope` / `previous` / `current`, removals audit
+  `tenant_retry_budget_removed` with `tenant` / `previous`. Tightening
+  clamps at once, widening never tops a bucket up; parked retries re-arm
+  at the new refill horizon. Orthogonal to WR-38 (cross-tenant master gate) and WR-137
   (per-tenant monthly *delivery* budget — a billing dimension, not a
   retry gate). Injectable clock for deterministic tests.
 - `src/delivery-window.ts` — per-endpoint delivery time windows ("quiet
