@@ -2144,6 +2144,39 @@ server.getRetryPolicies();                                 // every configured e
   are keyed by endpoint alone, not per tenant (unlike WR-319's
   tenant-scoped breaker).
 
+### Live revision of endpoint concurrency limits (WR-321)
+
+The same live-revision family covers the per-endpoint concurrency
+cap — the server-side counterpart to the WR-06 queue limiter and the
+WR-313 relay-level global cap:
+
+```ts
+server.reviseEndpointConcurrency("https://payments/hook", 5); // raise the cap live
+server.reviseEndpointConcurrency("https://payments/hook", 1); // tighten it live
+server.getEndpointConcurrency("https://payments/hook");       // { configuredLimit, effectiveLimit, inFlight, queued }
+server.removeEndpointConcurrency("https://payments/hook");    // drop the override, back to the queue default
+```
+
+- **Validate, then apply** — an illegal value throws `RangeError`
+  and the live limit is untouched; a same-value revision is a silent
+  no-op.
+- **Audited on the fixed limit** — a real revision appends
+  `endpoint_concurrency_revised` with `endpoint` and the previous /
+  current fixed limits (the override or the queue default — never the
+  folded effective value, so WR-94 adaptive / WR-148 ramp folding
+  stays out of the audit trail); a removal appends
+  `endpoint_concurrency_removed` with the removed fixed limit as
+  `previous` and returns `true` (`false` when the endpoint carried no
+  override).
+- **Effect timing** — raising the cap immediately grants slots to
+  queued waiters in FIFO order; lowering it never revokes in-flight
+  deliveries — new acquisitions queue until the count drains. The
+  snapshot's `effectiveLimit` is the folded value actually enforced
+  (`min(fixed, adaptive, ramp)`); an unrevised endpoint always
+  reports the queue default, so the getter is always defined. All
+  three methods are `tenant`-scoped (omitted means the default
+  tenant).
+
 ## Declarative config snapshots (export / apply / rollback)
 
 The hot-reload layer above is imperative; the snapshot layer

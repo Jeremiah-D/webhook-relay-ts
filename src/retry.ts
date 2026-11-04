@@ -3148,6 +3148,22 @@ function innerFor<K, V>(outer: Map<string, Map<K, V>>, tenant: string | undefine
 }
 
 /**
+ * WR-321: live per-endpoint concurrency snapshot. `configuredLimit`
+ * is the FIXED limit — the runtime override when one exists, otherwise
+ * the queue default — and is what a revision audits as
+ * previous/current; `effectiveLimit` is the folded value actually
+ * enforced (`min(fixed, adaptive, ramp)` — WR-94 / WR-148), so the two
+ * differ while adaptive concurrency or the slow-start ramp tightens the
+ * cap. `inFlight` / `queued` are the live counts for that endpoint.
+ */
+export interface EndpointConcurrencySnapshot {
+  configuredLimit: number;
+  effectiveLimit: number;
+  inFlight: number;
+  queued: number;
+}
+
+/**
  * Per-endpoint concurrency gate: at most `max` deliveries in flight to the
  * same endpoint (`targetUrl`) at once; excess acquisitions wait in FIFO
  * order. This keeps one slow or rate-limited downstream from being hammered
@@ -3204,6 +3220,18 @@ export class EndpointConcurrencyLimiter {
     const ramp = this.rampLimitFor?.(endpoint);
     if (ramp !== undefined) limit = Math.min(limit, ramp);
     return limit;
+  }
+
+  /**
+   * WR-321: the FIXED concurrency limit for `endpoint` — the runtime
+   * override when one exists, otherwise the queue default. Unlike
+   * `maxFor`, the WR-94 adaptive cap and WR-148 slow-start ramp never
+   * fold in here: the fixed value is what the server audits as
+   * previous/current on a revision, so a folded effective limit can
+   * never leak into the audit trail.
+   */
+  fixedMaxFor(endpoint: string): number {
+    return this.endpointMax.get(endpoint) ?? this.defaultMax;
   }
 
   /**
@@ -9466,6 +9494,40 @@ export class RetryQueue {
     const next = this.globalGate.retune(maxConcurrent);
     this.globalMaxConcurrent = next;
     return next;
+  }
+
+  /**
+   * WR-321: live per-endpoint concurrency snapshot — the configured
+   * (fixed) limit, the effective limit after WR-94 adaptive / WR-148
+   * ramp folding, and the live in-flight / queued counts for that
+   * (tenant, endpoint). An endpoint never revised reports the queue
+   * default as its configured limit — there is no "unconfigured"
+   * state. `tenant` scopes to that tenant's limiter; omitted means
+   * the default tenant.
+   */
+  getEndpointConcurrency(endpoint: string, tenant?: string): EndpointConcurrencySnapshot {
+    const limiter = this.limiterFor(tenant);
+    return {
+      configuredLimit: limiter.fixedMaxFor(endpoint),
+      effectiveLimit: limiter.maxFor(endpoint),
+      inFlight: limiter.inFlightCount(endpoint),
+      queued: limiter.queuedCount(endpoint),
+    };
+  }
+
+  /**
+   * WR-321: revise one endpoint's live concurrency limit — a thin
+   * queue wrapper over `EndpointConcurrencyLimiter.setEndpointMax`
+   * (WR-06) so the server can reach the tenant-scoped limiter.
+   * Validate-then-set: an illegal value throws `RangeError` and the
+   * live limit is untouched. Raising it immediately grants slots to
+   * queued waiters in FIFO order; lowering it never revokes running
+   * deliveries — new acquisitions queue until the count drains.
+   * `tenant` scopes to that tenant's limiter; omitted means the
+   * default tenant.
+   */
+  setEndpointConcurrency(endpoint: string, maxConcurrentPerEndpoint: number, tenant?: string): void {
+    this.limiterFor(tenant).setEndpointMax(endpoint, maxConcurrentPerEndpoint);
   }
 
   /**

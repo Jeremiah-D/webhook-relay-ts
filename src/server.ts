@@ -66,7 +66,7 @@ import {
   type ResolvedHttpHardening,
 } from "./http-hardening.ts";
 import type { OrderedAuditEvent, OrderedModeOptions } from "./retry.ts";
-import type { CircuitThresholdPatch, DeliveryWindowListEntry, DeliveryWindowSnapshot, EndpointRetryPolicyRevision, GlobalConcurrencyStats, GlobalRateLimitRevision, GlobalRateLimitStats, HolidayCalendarConfig, HolidayCalendarSnapshot, ResolvedCircuitThresholds, ResolvedEndpointRetryPolicy, StatusRetryPolicyConfig } from "./retry.ts";
+import type { CircuitThresholdPatch, DeliveryWindowListEntry, DeliveryWindowSnapshot, EndpointConcurrencySnapshot, EndpointRetryPolicyRevision, GlobalConcurrencyStats, GlobalRateLimitRevision, GlobalRateLimitStats, HolidayCalendarConfig, HolidayCalendarSnapshot, ResolvedCircuitThresholds, ResolvedEndpointRetryPolicy, StatusRetryPolicyConfig } from "./retry.ts";
 import {
   DEFAULT_STATUS_RETRY_MULTIPLIER,
   assertValidStatusRetryPolicy,
@@ -5890,6 +5890,47 @@ export interface RelayServer extends Server {
   getCircuitBreakers?: (
     tenant?: string
   ) => Array<{ endpoint: string } & { thresholds: ResolvedCircuitThresholds; overridden: boolean }>;
+  /**
+   * WR-321: revise one endpoint's live concurrency limit at runtime —
+   * no restart. Raising it immediately grants slots to queued waiters
+   * in FIFO order; lowering it never revokes in-flight deliveries —
+   * new acquisitions queue until the count drains. An illegal value
+   * throws `RangeError` and the live limit is untouched; a same-value
+   * revision is a silent no-op. A real revision is audited as
+   * `endpoint_concurrency_revised` with `endpoint` and the previous /
+   * current FIXED limits (the override or the queue default — never the
+   * folded effective value, so WR-94 adaptive / WR-148 ramp folding
+   * stays out of the audit trail); the first revision audits the queue
+   * default as `previous`. Always set — the limiter is always
+   * constructed, so an unrevised endpoint always reports the queue
+   * default and there is no "never configured" branch (unlike the
+   * circuit breaker). `tenant` scopes to that tenant's limiter;
+   * omitted means the default tenant. Returns the live snapshot.
+   */
+  reviseEndpointConcurrency: (
+    endpoint: string,
+    maxConcurrentPerEndpoint: number,
+    tenant?: string
+  ) => EndpointConcurrencySnapshot;
+  /**
+   * WR-321: remove one endpoint's live concurrency-limit override at
+   * runtime — the endpoint falls back to the queue default. Returns
+   * `true` when an override was removed (audited as
+   * `endpoint_concurrency_removed` with the endpoint and the removed
+   * fixed limit as `previous`), `false` when the endpoint carried no
+   * override (silent, no audit). Always set. `tenant` scopes to that
+   * tenant's limiter; omitted means the default tenant.
+   */
+  removeEndpointConcurrency: (endpoint: string, tenant?: string) => boolean;
+  /**
+   * WR-321: live concurrency snapshot for one endpoint — the configured
+   * (fixed) limit, the effective limit after adaptive / ramp folding,
+   * and the live in-flight / queued counts. An endpoint never revised
+   * reports the queue default as its configured limit, so the snapshot
+   * is always defined. Always set. `tenant` scopes to that tenant's
+   * limiter; omitted means the default tenant.
+   */
+  getEndpointConcurrency: (endpoint: string, tenant?: string) => EndpointConcurrencySnapshot;
   /**
    * WR-320: revise one endpoint's live retry policy at runtime — no
    * restart. The patch merges over the endpoint's live assignment: a
@@ -14318,6 +14359,61 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     ): Array<{ endpoint: string } & { thresholds: ResolvedCircuitThresholds; overridden: boolean }> =>
       queue.getCircuitBreakers(tenant);
   }
+
+  // WR-321: live per-endpoint concurrency-limit revision / removal /
+  // reads. The queue owns the validate-then-apply setter (RangeError on
+  // an illegal value, live limit untouched; a raise immediately grants
+  // queued waiters, a cut never revokes in-flight deliveries); this
+  // layer only owns the audit: a real revision appends
+  // `endpoint_concurrency_revised` with the endpoint and the previous /
+  // current FIXED limits (the override or the queue default — never the
+  // maxFor folded effective value, so adaptive / ramp folding stays out
+  // of the audit trail), a same-value revision is a silent no-op, and a
+  // removal appends `endpoint_concurrency_removed` with the endpoint
+  // and the removed fixed limit. Always set: the limiter is always
+  // constructed, so an unrevised endpoint always reports the queue
+  // default — there is no "must restart" Error here (unlike the
+  // circuit breaker or the delivery window). In-flight deliveries are
+  // unaffected (they run to completion under the limit they were
+  // accepted with).
+  server.reviseEndpointConcurrency = (
+    endpoint: string,
+    maxConcurrentPerEndpoint: number,
+    tenant?: string
+  ): EndpointConcurrencySnapshot => {
+    const previous = queue.getEndpointConcurrency(endpoint, tenant);
+    // Validate-then-apply inside setEndpointMax: an illegal value throws
+    // RangeError and the live limit is left completely intact.
+    queue.setEndpointConcurrency(endpoint, maxConcurrentPerEndpoint, tenant);
+    const current = queue.getEndpointConcurrency(endpoint, tenant);
+    if (current.configuredLimit === previous.configuredLimit) {
+      return current;
+    }
+    opts.auditLog.append({
+      event: "endpoint_concurrency_revised",
+      endpoint,
+      previous: previous.configuredLimit,
+      current: current.configuredLimit,
+    });
+    return current;
+  };
+
+  server.removeEndpointConcurrency = (endpoint: string, tenant?: string): boolean => {
+    const previous = queue.getEndpointConcurrency(endpoint, tenant);
+    if (!queue.endpointConfigOverrides(tenant, endpoint).maxConcurrentPerEndpoint) return false;
+    queue.clearEndpointConfigOverride(tenant, endpoint, "maxConcurrentPerEndpoint");
+    opts.auditLog.append({
+      event: "endpoint_concurrency_removed",
+      endpoint,
+      previous: previous.configuredLimit,
+    });
+    return true;
+  };
+
+  server.getEndpointConcurrency = (
+    endpoint: string,
+    tenant?: string
+  ): EndpointConcurrencySnapshot => queue.getEndpointConcurrency(endpoint, tenant);
 
   // WR-320: live retry-policy revision / removal / reads for one
   // endpoint. The queue owns the validate-then-apply setters; this
