@@ -20,7 +20,7 @@ import {
   type StalePauseOptions,
   type StalePauseSweepResult,
 } from "./stale-pause.ts";
-import { EndpointCircuitBreaker, type CircuitBreakerOptions, type CircuitState, type CircuitStats } from "./circuit.ts";
+import { EndpointCircuitBreaker, type CircuitBreakerOptions, type CircuitState, type CircuitStats, type CircuitThresholdPatch, type ResolvedCircuitThresholds } from "./circuit.ts";
 import {
   EndpointBulkheads,
   BulkheadRejectedError,
@@ -516,7 +516,7 @@ export type {
   EscalationPostResult,
 };
 
-export type { CircuitBreakerOptions, CircuitState, CircuitStats };
+export type { CircuitBreakerOptions, CircuitState, CircuitStats, CircuitThresholdPatch, ResolvedCircuitThresholds };
 export type { EndpointDependencyOptions } from "./endpoint-dependencies.ts";
 export { EndpointDependencyGraph } from "./endpoint-dependencies.ts";
 export type { SlowStartOptions, SlowStartEndpointStats };
@@ -10223,6 +10223,80 @@ export class RetryQueue {
       }
     }
     return out;
+  }
+
+  /**
+   * WR-319: revise one endpoint's live circuit-breaker thresholds at
+   * runtime — the queue-side setter behind
+   * `RelayServer.reviseEndpointCircuitBreaker`. The patch merges over
+   * the endpoint's live effective thresholds and the merged result is
+   * validated as a unit by the module setter — an illegal patch throws
+   * `RangeError` and the live thresholds are left completely intact.
+   * Returns `false` when the circuit breaker was never configured
+   * (enabling it needs a restart); the server turns that into the
+   * canonical "must restart" `Error`.
+   */
+  setEndpointCircuitBreaker(
+    endpoint: string,
+    patch: CircuitThresholdPatch,
+    tenant?: string
+  ): boolean {
+    const breaker = this.breakerFor(tenant);
+    if (breaker === undefined) return false;
+    breaker.setEndpointThresholds(endpoint, patch);
+    return true;
+  }
+
+  /**
+   * WR-319: the live effective circuit-breaker thresholds for one
+   * endpoint — constructor defaults merged with any runtime override —
+   * plus whether the endpoint carries an override. `undefined` when
+   * the circuit breaker was never configured. Reads the live module
+   * values, so a runtime revision is visible immediately.
+   */
+  getEndpointCircuitBreaker(
+    endpoint: string,
+    tenant?: string
+  ): { thresholds: ResolvedCircuitThresholds; overridden: boolean } | undefined {
+    const breaker = this.breakerFor(tenant);
+    if (breaker === undefined) return undefined;
+    return {
+      thresholds: breaker.thresholdsFor(endpoint),
+      overridden: breaker.hasEndpointOverride(endpoint),
+    };
+  }
+
+  /**
+   * WR-319: the live effective circuit-breaker thresholds for every
+   * endpoint the tenant's breaker knows about — endpoints carrying a
+   * runtime override plus endpoints it has observed (tripped or not),
+   * so an endpoint that was revised but never tripped still lists.
+   * Unlike `getCircuitStats` (which only lists endpoints with an
+   * observed record and carries state, not thresholds), this lists
+   * every configured-breaker endpoint with its full live thresholds
+   * and override flag. Empty when the feature is disabled or the
+   * tenant's breaker has seen nothing yet. Read-only: unlike the
+   * getter above it never creates the tenant's breaker instance.
+   */
+  getCircuitBreakers(
+    tenant?: string
+  ): Array<{ endpoint: string } & { thresholds: ResolvedCircuitThresholds; overridden: boolean }> {
+    const breaker = this.breakers.get(tenantInstanceKey(tenant));
+    if (breaker === undefined) return [];
+    const seen = new Set<string>();
+    const rows: Array<{ endpoint: string } & { thresholds: ResolvedCircuitThresholds; overridden: boolean }> = [];
+    const add = (endpoint: string): void => {
+      if (seen.has(endpoint)) return;
+      seen.add(endpoint);
+      rows.push({
+        endpoint,
+        thresholds: breaker.thresholdsFor(endpoint),
+        overridden: breaker.hasEndpointOverride(endpoint),
+      });
+    };
+    for (const endpoint of breaker.configuredEndpoints()) add(endpoint);
+    for (const row of breaker.stats()) add(row.endpoint);
+    return rows;
   }
 
   /**

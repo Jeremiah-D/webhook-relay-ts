@@ -66,7 +66,7 @@ import {
   type ResolvedHttpHardening,
 } from "./http-hardening.ts";
 import type { OrderedAuditEvent, OrderedModeOptions } from "./retry.ts";
-import type { DeliveryWindowListEntry, DeliveryWindowSnapshot, GlobalConcurrencyStats, GlobalRateLimitRevision, GlobalRateLimitStats, HolidayCalendarConfig, HolidayCalendarSnapshot } from "./retry.ts";
+import type { CircuitThresholdPatch, DeliveryWindowListEntry, DeliveryWindowSnapshot, GlobalConcurrencyStats, GlobalRateLimitRevision, GlobalRateLimitStats, HolidayCalendarConfig, HolidayCalendarSnapshot, ResolvedCircuitThresholds } from "./retry.ts";
 import { parseCronExpression, CRON_HEADER } from "./cron.ts";
 import type { CompletionCallbackOptions } from "./callback.ts";
 import { createBoundAddressSelfCheck } from "./callback.ts";
@@ -5825,6 +5825,68 @@ export interface RelayServer extends Server {
    */
   getHolidayCalendars?: () => Array<{ endpoint: string } & HolidayCalendarSnapshot>;
   /**
+   * WR-319: revise one endpoint's live circuit-breaker thresholds at
+   * runtime — no restart. The patch merges over the endpoint's live
+   * effective thresholds (a partial patch keeps the other live
+   * values); the merged result is validated as a unit, so an illegal
+   * patch throws `RangeError` and the live thresholds are untouched.
+   * A real revision is audited as `circuit_breaker_revised` with
+   * `endpoint`, `previous` (the effective defaults on a first set)
+   * and `current` snapshots; a same-value revision is a silent
+   * no-op. Always set; throws `Error` when the circuit breaker was
+   * never configured — enabling it needs a restart. An already-open
+   * endpoint is unaffected in state (`openedAtMs` / trips kept; the
+   * already-scheduled recheck is not re-armed, so it still wakes on
+   * the old cooldown) and a tightened cooldown applies from the next
+   * trip; a window shrink trims the stored outcomes at once and a
+   * `tripMode` switch trips on live history with no cold start.
+   * `tenant` scopes to that tenant's breaker; omitted means the
+   * default tenant.
+   */
+  reviseEndpointCircuitBreaker: (
+    endpoint: string,
+    patch: CircuitThresholdPatch,
+    tenant?: string
+  ) => ResolvedCircuitThresholds;
+  /**
+   * WR-319: remove one endpoint's live circuit-breaker threshold
+   * override at runtime — the endpoint falls back to the queue
+   * defaults. Returns `true` when an override was removed (audited
+   * as `circuit_breaker_removed` with the endpoint and the removed
+   * thresholds as `previous`), `false` when no override was
+   * configured (silent, no audit) — including when the feature
+   * itself was never configured. Always set. `tenant` scopes to
+   * that tenant's breaker; omitted means the default tenant.
+   */
+  removeEndpointCircuitBreaker: (endpoint: string, tenant?: string) => boolean;
+  /**
+   * WR-319: live effective circuit-breaker thresholds for one
+   * endpoint — constructor defaults merged with any runtime
+   * override — plus whether the endpoint carries an override. An
+   * endpoint never revised still reports the queue defaults with
+   * `overridden: false`; `undefined` only when the circuit breaker
+   * was never configured (unreachable while this method is set — it
+   * is only set when `retry.circuitBreaker` was configured — so in
+   * practice always defined). `tenant` scopes to that tenant's
+   * breaker; omitted means the default tenant.
+   */
+  getEndpointCircuitBreaker?: (
+    endpoint: string,
+    tenant?: string
+  ) => { thresholds: ResolvedCircuitThresholds; overridden: boolean } | undefined;
+  /**
+   * WR-319: live circuit-breaker threshold listing — every endpoint
+   * the tenant's breaker knows about (overridden or merely
+   * observed), each with its full live thresholds and override
+   * flag, including endpoints whose circuit has never tripped. Set
+   * only when `retry.circuitBreaker` was configured. `tenant`
+   * scopes to that tenant's breaker; omitted means the default
+   * tenant.
+   */
+  getCircuitBreakers?: (
+    tenant?: string
+  ) => Array<{ endpoint: string } & { thresholds: ResolvedCircuitThresholds; overridden: boolean }>;
+  /**
    * WR-316: revise one live one-shot maintenance window at runtime
    * (`newStart` / `newEnd`, partial — omitted fields keep their live
    * values). The window is addressed by its stored (start, end), as
@@ -6036,6 +6098,25 @@ function sameHolidayCalendar(
   if (a.dates.length !== b.dates.length) return false;
   const bSorted = [...b.dates].sort();
   return a.dates.every((d, i) => d === bSorted[i]);
+}
+
+/**
+ * WR-319: deep equality for resolved circuit-breaker thresholds —
+ * all six fields compare by value. A revision that lands on the
+ * same values is a no-op with no audit event.
+ */
+function sameCircuitThresholds(
+  a: ResolvedCircuitThresholds,
+  b: ResolvedCircuitThresholds
+): boolean {
+  return (
+    a.failureThreshold === b.failureThreshold &&
+    a.cooldownMs === b.cooldownMs &&
+    a.tripMode === b.tripMode &&
+    a.errorRateWindowSize === b.errorRateWindowSize &&
+    a.errorRateThreshold === b.errorRateThreshold &&
+    a.errorRateMinSamples === b.errorRateMinSamples
+  );
 }
 
 /**
@@ -14080,6 +14161,70 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     ): HolidayCalendarSnapshot | undefined => queue.getEndpointDeliveryHolidays(endpoint);
     server.getHolidayCalendars = (): Array<{ endpoint: string } & HolidayCalendarSnapshot> =>
       queue.getDeliveryHolidays();
+  }
+
+  // WR-319: live circuit-breaker threshold revision / removal for
+  // one endpoint. The queue does the validate-then-apply work
+  // (RangeError on an illegal merged patch, live thresholds
+  // untouched); this layer only owns the "must restart" Error (the
+  // queue setter returns false when the feature was never
+  // configured) and the audit: a real revision appends
+  // `circuit_breaker_revised` with the endpoint and the previous
+  // (the effective defaults on a first set) / current thresholds, a
+  // same-value revision is a silent no-op, and a removal appends
+  // `circuit_breaker_removed` with the endpoint and the removed
+  // thresholds. The breaker re-reads the live thresholds on every
+  // trip decision and cooldown check, so no timer is re-armed here —
+  // an already-open endpoint keeps its `openedAtMs` and wakes on
+  // its already-scheduled recheck.
+  server.reviseEndpointCircuitBreaker = (
+    endpoint: string,
+    patch: CircuitThresholdPatch,
+    tenant?: string
+  ): ResolvedCircuitThresholds => {
+    const previous = queue.getEndpointCircuitBreaker(endpoint, tenant);
+    if (!queue.setEndpointCircuitBreaker(endpoint, patch, tenant)) {
+      throw new Error(
+        "reviseEndpointCircuitBreaker: circuit breaker is not configured — enabling it requires a restart"
+      );
+    }
+    const current = queue.getEndpointCircuitBreaker(endpoint, tenant)!;
+    if (previous !== undefined && sameCircuitThresholds(previous.thresholds, current.thresholds)) {
+      return current.thresholds;
+    }
+    opts.auditLog.append({
+      event: "circuit_breaker_revised",
+      endpoint,
+      previous: previous?.thresholds,
+      current: current.thresholds,
+    });
+    return current.thresholds;
+  };
+
+  server.removeEndpointCircuitBreaker = (endpoint: string, tenant?: string): boolean => {
+    const previous = queue.getEndpointCircuitBreaker(endpoint, tenant);
+    if (previous === undefined || !previous.overridden) return false;
+    queue.clearEndpointConfigOverride(tenant, endpoint, "circuitBreaker");
+    opts.auditLog.append({
+      event: "circuit_breaker_removed",
+      endpoint,
+      previous: previous.thresholds,
+    });
+    return true;
+  };
+
+  // WR-319: live circuit-breaker threshold reads. Only set when
+  // `retry.circuitBreaker` was configured.
+  if (queue.circuitBreakerConfigured()) {
+    server.getEndpointCircuitBreaker = (
+      endpoint: string,
+      tenant?: string
+    ): { thresholds: ResolvedCircuitThresholds; overridden: boolean } | undefined =>
+      queue.getEndpointCircuitBreaker(endpoint, tenant);
+    server.getCircuitBreakers = (
+      tenant?: string
+    ): Array<{ endpoint: string } & { thresholds: ResolvedCircuitThresholds; overridden: boolean }> =>
+      queue.getCircuitBreakers(tenant);
   }
 
   // WR-316: single-window live revision / cancellation for one-shot

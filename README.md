@@ -900,7 +900,26 @@ reliability primitives that matter for any signed-payload pipeline.
   `circuitBreaker` patch); the window and the consecutive counter are
   maintained in both modes, so a switch trips on live history instead of
   a cold start. `relay_endpoint_circuit_error_rate{endpoint}` exposes the
-  rolling-window rate per error-rate-mode endpoint.
+  rolling-window rate per error-rate-mode endpoint. WR-319 adds the
+  server-side live revision: `reviseEndpointCircuitBreaker(endpoint,
+  patch, tenant?)` merges a `CircuitThresholdPatch` over the live
+  effective thresholds (illegal merged values throw `RangeError` and
+  leave the live thresholds untouched; a same-value revision is a
+  silent no-op) and audits `circuit_breaker_revised` with `endpoint`,
+  `previous` (the effective defaults on a first set) and `current`;
+  `getEndpointCircuitBreaker(endpoint, tenant?)` reports the live
+  thresholds plus whether the endpoint carries an override,
+  `getCircuitBreakers(tenant?)` lists every endpoint the tenant's
+  breaker knows about — overridden or merely observed, including
+  never-tripped ones — and `removeEndpointCircuitBreaker(endpoint,
+  tenant?)` drops the override (audited as
+  `circuit_breaker_removed`, `false` when there was none) so the
+  endpoint falls back to the queue defaults. Revising while a circuit
+  is open keeps its `openedAtMs` and does not re-arm its
+  already-scheduled recheck; a tightened cooldown applies from the
+  next trip. All four methods are `tenant`-scoped (omitted means the
+  default tenant); revising with the breaker unconfigured throws
+  `Error` — enabling it needs a restart.
 - `src/endpoint-disable.ts` — per-endpoint auto-disable gate
   (`EndpointAutoDisable`): `failureThreshold` (default 5) consecutive
   delivery failures auto-disable the endpoint — new deliveries
