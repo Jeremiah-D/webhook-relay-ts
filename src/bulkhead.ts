@@ -118,6 +118,21 @@ export interface BulkheadOptions {
   queueTimeoutMs: number;
 }
 
+/** WR-325: a partial bulkhead revision — one or more of the three limits; at least one field must be present. */
+export type BulkheadRevision = Partial<BulkheadOptions>;
+
+/**
+ * WR-325: snapshot returned by a bulkhead revision or getter — the
+ * live full options plus whether the endpoint carries a runtime
+ * override.
+ */
+export interface BulkheadRevisionSnapshot {
+  /** The live full options (the override or the constructor defaults). */
+  options: BulkheadOptions;
+  /** Whether the endpoint carries a runtime override. */
+  overridden: boolean;
+}
+
 /** Upper bound on the retained in-memory audit trail (oldest dropped first). */
 const MAX_AUDIT_ENTRIES = 1000;
 
@@ -190,7 +205,14 @@ interface Waiter {
  */
 export class EndpointBulkhead {
   private readonly endpoint: string;
-  private readonly options: BulkheadOptions;
+  /**
+   * WR-325: live options, not frozen — `retune()` replaces the whole
+   * object after validating the merged set, so `acquire()` (which
+   * reads the live values on every call) picks a revision up with no
+   * bulkhead rebuild and no disturbance to in-flight holders or
+   * already-queued waiters.
+   */
+  private options: BulkheadOptions;
   private inFlight = 0;
   private readonly waiters: Waiter[] = [];
   private waitsTotal = 0;
@@ -216,6 +238,46 @@ export class EndpointBulkhead {
   /** The configured queue bound. */
   queueBound(): number {
     return this.options.maxQueue;
+  }
+
+  /** The live full options (a copy). */
+  currentOptions(): BulkheadOptions {
+    return { ...this.options };
+  }
+
+  /**
+   * WR-325: revise the live limits at runtime — no restart, no
+   * rebuild. The patch merges over the live options and the merged
+   * set is validated as a unit by `assertBulkheadOptions`: an empty
+   * patch or an illegal value throws `RangeError` and the live
+   * options are left completely intact. A raise takes effect at the
+   * next `acquire()` and immediately grants queued waiters FIFO up
+   * to the new cap (reusing `release()`'s slot-transfer shape: the
+   * granted waiter's timer is cleared and it can never time out
+   * after the grant); a cut never revokes in-flight slots, never
+   * evicts already-queued waiters, and a `queueTimeoutMs` change
+   * only arms new waiters' timers — already-armed timers keep their
+   * old timeout. Returns the live options after the revision.
+   */
+  retune(patch: BulkheadRevision): BulkheadOptions {
+    if (Object.keys(patch).length === 0) {
+      throw new RangeError(
+        "bulkhead revision must change at least one of maxConcurrent, maxQueue, queueTimeoutMs"
+      );
+    }
+    const merged: BulkheadOptions = { ...this.options, ...patch };
+    assertBulkheadOptions(merged);
+    this.options = merged;
+    while (this.inFlight < this.options.maxConcurrent && this.waiters.length > 0) {
+      const next = this.waiters.shift()!;
+      // Free slot: the waiter now holds it (in-flight count rises by
+      // one per grant — unlike `release()`, where the slot transfers
+      // from the releaser and the count is unchanged).
+      clearTimeout(next.timer);
+      this.inFlight += 1;
+      next.resolve(this.onceRelease());
+    }
+    return { ...this.options };
   }
 
   /**
@@ -366,6 +428,13 @@ export class EndpointBulkhead {
  */
 export class EndpointBulkheads {
   private readonly options: BulkheadOptions;
+  /**
+   * WR-325: per-endpoint runtime overrides (the resolved effective
+   * options). An endpoint with an override keeps it across lazy
+   * creation: `bulkheadFor` builds from the override, and a live
+   * bulkhead is retuned in place when the override changes.
+   */
+  private readonly overrides = new Map<string, BulkheadOptions>();
   private readonly bulkheads = new Map<string, EndpointBulkhead>();
 
   constructor(options: BulkheadOptions) {
@@ -376,10 +445,73 @@ export class EndpointBulkheads {
   private bulkheadFor(endpoint: string): EndpointBulkhead {
     let b = this.bulkheads.get(endpoint);
     if (b === undefined) {
-      b = new EndpointBulkhead(endpoint, this.options);
+      b = new EndpointBulkhead(endpoint, this.overrides.get(endpoint) ?? this.options);
       this.bulkheads.set(endpoint, b);
     }
     return b;
+  }
+
+  /**
+   * WR-325: revise one endpoint's live bulkhead limits at runtime.
+   * The patch merges over the endpoint's live effective options and
+   * the merged set is validated as a unit — an empty patch or an
+   * illegal value throws `RangeError` and the live options are left
+   * completely intact. A live bulkhead is retuned in place (a raise
+   * immediately grants queued waiters FIFO); an endpoint never seen
+   * before only records the override, and its bulkhead is built from
+   * it lazily on first acquire. Returns the live full options.
+   */
+  revise(endpoint: string, patch: BulkheadRevision): BulkheadOptions {
+    if (Object.keys(patch).length === 0) {
+      throw new RangeError(
+        "bulkhead revision must change at least one of maxConcurrent, maxQueue, queueTimeoutMs"
+      );
+    }
+    const live = this.bulkheads.get(endpoint);
+    if (live !== undefined) {
+      const options = live.retune(patch);
+      this.overrides.set(endpoint, options);
+      return options;
+    }
+    const merged: BulkheadOptions = { ...this.optionsFor(endpoint).options, ...patch };
+    assertBulkheadOptions(merged);
+    this.overrides.set(endpoint, merged);
+    return { ...merged };
+  }
+
+  /**
+   * WR-325: the live effective options for `endpoint` — the runtime
+   * override when one exists, otherwise the constructor defaults —
+   * plus whether the endpoint carries an override. Read-only: never
+   * creates the endpoint's bulkhead.
+   */
+  optionsFor(endpoint: string): BulkheadRevisionSnapshot {
+    const override = this.overrides.get(endpoint);
+    if (override !== undefined) return { options: { ...override }, overridden: true };
+    const live = this.bulkheads.get(endpoint);
+    if (live !== undefined) return { options: live.currentOptions(), overridden: false };
+    return { options: { ...this.options }, overridden: false };
+  }
+
+  /**
+   * WR-325: drop the runtime override so `endpoint` falls back to
+   * the constructor defaults. A live bulkhead is retuned in place to
+   * the defaults (a raise back to a higher default cap immediately
+   * grants queued waiters FIFO, like any retune). Returns `true`
+   * when an override was removed, `false` when the endpoint carried
+   * none. Never throws for unknown endpoints.
+   */
+  clearEndpointOverride(endpoint: string): boolean {
+    if (!this.overrides.has(endpoint)) return false;
+    this.overrides.delete(endpoint);
+    const live = this.bulkheads.get(endpoint);
+    if (live !== undefined) live.retune({ ...this.options });
+    return true;
+  }
+
+  /** Endpoints carrying a runtime override. */
+  configuredEndpoints(): string[] {
+    return [...this.overrides.keys()];
   }
 
   /**

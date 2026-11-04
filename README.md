@@ -3250,9 +3250,11 @@ const queue = new RetryQueue({
   across the whole relay) and to WR-140 (one cap per tenant across
   that tenant's endpoints).
 - **Hard cap, not adaptive tuning** — unlike WR-94 AIMD, which moves
-  the per-endpoint cap from outcomes, the bulkhead cap never moves;
-  its novelty is what happens past the ceiling (bounded queue +
-  fail-fast rejection + audit), not the ceiling itself.
+  the per-endpoint cap from outcomes, the bulkhead cap never moves
+  from outcomes; its novelty is what happens past the ceiling (bounded
+  queue + fail-fast rejection + audit), not the ceiling itself. An
+  operator may still revise it at runtime (WR-325, above) — that is
+  an explicit retune, not outcome-driven drift.
 - **Backpressure, not a failed attempt** — a rejection means the
   endpoint was never contacted, so it consumes no attempt
   (`entry.attempt` is untouched), records no breaker, health,
@@ -3275,6 +3277,26 @@ const queue = new RetryQueue({
   idempotent. `stop()`/`shutdown()` wake every bulkhead waiter, which
   then bails out on the post-acquire liveness check instead of
   dispatching, so a stop never hangs on a bulkhead.
+- **Live revision (WR-325)** — `reviseEndpointBulkhead(endpoint,
+  patch, tenant?)` retunes one endpoint's limits at runtime, no
+  restart: the patch merges over the live options and is validated as
+  a unit (`RangeError` on an empty patch or an illegal value, live
+  options untouched; unconfigured, the canonical "must restart"
+  `Error`). A raise takes effect at the next `acquire()` and
+  immediately grants queued waiters FIFO up to the new cap; a cut
+  never revokes in-flight slots or evicts queued waiters, and a
+  `queueTimeoutMs` change only arms new waiters' timers. A real
+  revision is audited as `endpoint_bulkhead_revised` (endpoint,
+  previous/current full options — the constructor defaults on a first
+  set); a same-value revision is a silent no-op.
+  `removeEndpointBulkhead(endpoint, tenant?)` drops the override and
+  retunes the endpoint back to the constructor defaults (audited as
+  `endpoint_bulkhead_removed`); `getEndpointBulkhead(endpoint,
+  tenant?)` reports the live options plus the override flag, and is
+  only set when `retry.bulkhead` was configured. Revisions are
+  per-tenant: the default tenant and each named tenant hold
+  independent bulkheads. The urgent lane bypasses the bulkhead, so a
+  revision never changes urgent rates.
 - **Observability** — `getBulkheadStats()` reports one row per
   (tenant, endpoint) seen (cap, queue bound, in-flight, queued depth,
   waits, rejections); `getBulkheadRejections()` returns the audited

@@ -28,8 +28,11 @@ import {
   type BulkheadOptions,
   type BulkheadRejection,
   type BulkheadRejectionReason,
+  type BulkheadRevision,
+  type BulkheadRevisionSnapshot,
   type BulkheadStats,
 } from "./bulkhead.ts";
+export type { BulkheadRevision, BulkheadRevisionSnapshot } from "./bulkhead.ts";
 import {
   EndpointAutoDisable,
   type DisableFailureOutcome,
@@ -7619,6 +7622,11 @@ export class RetryQueue {
     return this.quotaDeliveriesPerMinute !== undefined;
   }
 
+  /** WR-325: whether the per-endpoint bulkhead subsystem is enabled (queue-level). */
+  bulkheadConfigured(): boolean {
+    return this.bulkheadOptions !== undefined;
+  }
+
   /**
    * Whether weighted dispatch is enabled for `endpoint`. Tenant-agnostic,
    * like `updateEndpointConfig`'s weighted path.
@@ -10581,6 +10589,63 @@ export class RetryQueue {
       }
     }
     return out;
+  }
+
+  /**
+   * WR-325: revise one endpoint's live bulkhead limits at runtime —
+   * the queue-side setter behind
+   * `RelayServer.reviseEndpointBulkhead`. The patch merges over the
+   * endpoint's live effective options and the merged result is
+   * validated as a unit — an illegal patch throws `RangeError` and
+   * the live options are left completely intact. A raise
+   * immediately grants queued waiters FIFO up to the new cap; a cut
+   * never revokes in-flight slots or evicts queued waiters. Returns
+   * `false` when the bulkhead was never configured (enabling it
+   * needs a restart); the server turns that into the canonical
+   * "must restart" `Error`.
+   */
+  setEndpointBulkhead(
+    endpoint: string,
+    patch: BulkheadRevision,
+    tenant?: string
+  ): boolean {
+    const bulkheads = this.bulkheadsFor(tenant);
+    if (bulkheads === undefined) return false;
+    bulkheads.revise(endpoint, patch);
+    return true;
+  }
+
+  /**
+   * WR-325: the live effective bulkhead options for one endpoint —
+   * constructor defaults merged with any runtime override — plus
+   * whether the endpoint carries an override. `undefined` when the
+   * bulkhead was never configured. Read-only: unlike the setter it
+   * never creates the tenant's bulkhead instance, so a read cannot
+   * conjure state. Reads the live module values, so a runtime
+   * revision is visible immediately.
+   */
+  getEndpointBulkhead(
+    endpoint: string,
+    tenant?: string
+  ): BulkheadRevisionSnapshot | undefined {
+    if (this.bulkheadOptions === undefined) return undefined;
+    const bulkheads = this.bulkheads.get(tenantInstanceKey(tenant));
+    if (bulkheads === undefined) {
+      return { options: { ...this.bulkheadOptions }, overridden: false };
+    }
+    return bulkheads.optionsFor(endpoint);
+  }
+
+  /**
+   * WR-325: drop one endpoint's bulkhead override so it falls back
+   * to the constructor defaults (a live bulkhead is retuned in place
+   * to the defaults). Returns `false` when the endpoint carried no
+   * override — including when the bulkhead was never configured.
+   */
+  clearEndpointBulkheadOverride(endpoint: string, tenant?: string): boolean {
+    const bulkheads = this.bulkheads.get(tenantInstanceKey(tenant));
+    if (bulkheads === undefined) return false;
+    return bulkheads.clearEndpointOverride(endpoint);
   }
 
   /**

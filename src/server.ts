@@ -66,7 +66,7 @@ import {
   type ResolvedHttpHardening,
 } from "./http-hardening.ts";
 import type { OrderedAuditEvent, OrderedModeOptions } from "./retry.ts";
-import type { CircuitThresholdPatch, DeliveryWindowListEntry, DeliveryWindowSnapshot, EndpointConcurrencySnapshot, EndpointQuotaSnapshot, EndpointRetryPolicyRevision, GlobalConcurrencyStats, GlobalRateLimitRevision, GlobalRateLimitStats, HolidayCalendarConfig, HolidayCalendarSnapshot, MinNormalShareSnapshot, ResolvedCircuitThresholds, ResolvedEndpointRetryPolicy, StatusRetryPolicyConfig } from "./retry.ts";
+import type { BulkheadRevision, BulkheadRevisionSnapshot, CircuitThresholdPatch, DeliveryWindowListEntry, DeliveryWindowSnapshot, EndpointConcurrencySnapshot, EndpointQuotaSnapshot, EndpointRetryPolicyRevision, GlobalConcurrencyStats, GlobalRateLimitRevision, GlobalRateLimitStats, HolidayCalendarConfig, HolidayCalendarSnapshot, MinNormalShareSnapshot, ResolvedCircuitThresholds, ResolvedEndpointRetryPolicy, StatusRetryPolicyConfig } from "./retry.ts";
 import {
   DEFAULT_STATUS_RETRY_MULTIPLIER,
   assertValidStatusRetryPolicy,
@@ -5999,6 +5999,56 @@ export interface RelayServer extends Server {
    */
   getEndpointQuota?: (endpoint: string, tenant?: string) => EndpointQuotaSnapshot | undefined;
   /**
+   * WR-325: revise one endpoint's live bulkhead limits at runtime —
+   * no restart. The patch merges over the endpoint's live effective
+   * options (a partial patch keeps the other live values); the
+   * merged result is validated as a unit, so an empty patch or an
+   * illegal value throws `RangeError` and the live options are
+   * untouched. A real revision is audited as
+   * `endpoint_bulkhead_revised` with `endpoint` and the previous /
+   * current full options (the constructor defaults on a first set);
+   * a same-value revision is a silent no-op. A raise takes effect
+   * at the next `acquire()` and immediately grants queued waiters
+   * FIFO up to the new cap; a cut never revokes in-flight slots or
+   * evicts queued waiters, and a `queueTimeoutMs` change only arms
+   * new waiters' timers. Always set; throws `Error` when the
+   * bulkhead was never configured — enabling it needs a restart.
+   * `tenant` scopes to that tenant's bulkheads; omitted means the
+   * default tenant. Returns the live snapshot.
+   */
+  reviseEndpointBulkhead: (
+    endpoint: string,
+    patch: BulkheadRevision,
+    tenant?: string
+  ) => BulkheadRevisionSnapshot;
+  /**
+   * WR-325: remove one endpoint's live bulkhead override at runtime
+   * — the endpoint falls back to the constructor defaults (a live
+   * bulkhead is retuned in place to the defaults). Returns `true`
+   * when an override was removed (audited as
+   * `endpoint_bulkhead_removed` with the endpoint and the removed
+   * options as `previous`), `false` when no override was configured
+   * (silent, no audit) — including when the feature itself was never
+   * configured. Always set. `tenant` scopes to that tenant's
+   * bulkheads; omitted means the default tenant.
+   */
+  removeEndpointBulkhead: (endpoint: string, tenant?: string) => boolean;
+  /**
+   * WR-325: live effective bulkhead options for one endpoint — the
+   * constructor defaults merged with any runtime override — plus
+   * whether the endpoint carries an override. An endpoint never
+   * revised still reports the queue defaults with `overridden:
+   * false`; `undefined` only when the bulkhead was never configured
+   * (unreachable while this method is set — it is only set when
+   * `retry.bulkhead` was configured — so in practice always
+   * defined). `tenant` scopes to that tenant's bulkheads; omitted
+   * means the default tenant.
+   */
+  getEndpointBulkhead?: (
+    endpoint: string,
+    tenant?: string
+  ) => BulkheadRevisionSnapshot | undefined;
+  /**
    * WR-320: revise one endpoint's live retry policy at runtime — no
    * restart. The patch merges over the endpoint's live assignment: a
    * partial patch keeps the other layer, `policyName: null` detaches
@@ -6327,6 +6377,22 @@ function sameCircuitThresholds(
     a.errorRateWindowSize === b.errorRateWindowSize &&
     a.errorRateThreshold === b.errorRateThreshold &&
     a.errorRateMinSamples === b.errorRateMinSamples
+  );
+}
+
+/**
+ * WR-325: deep equality for live bulkhead options — all three fields
+ * compare by value. A revision that lands on the same values is a
+ * no-op with no audit event.
+ */
+function sameBulkheadOptions(
+  a: BulkheadRevisionSnapshot["options"],
+  b: BulkheadRevisionSnapshot["options"]
+): boolean {
+  return (
+    a.maxConcurrent === b.maxConcurrent &&
+    a.maxQueue === b.maxQueue &&
+    a.queueTimeoutMs === b.queueTimeoutMs
   );
 }
 
@@ -14615,6 +14681,70 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       endpoint: string,
       tenant?: string
     ): EndpointQuotaSnapshot | undefined => queue.getEndpointQuota(endpoint, tenant);
+  }
+
+  // WR-325: live per-endpoint bulkhead revision / removal / reads.
+  // The queue owns the validate-then-apply setter (RangeError on an
+  // empty patch or an illegal merged value, live options untouched;
+  // a raise immediately grants queued waiters FIFO up to the new
+  // cap, a cut never revokes in-flight slots or evicts queued
+  // waiters, and a queueTimeoutMs change only arms new waiters'
+  // timers); this layer only owns the "must restart" Error (the
+  // queue setter returns false when the bulkhead was never
+  // configured) and the audit: a real revision appends
+  // `endpoint_bulkhead_revised` with the endpoint and the previous
+  // (the constructor defaults on a first set) / current full
+  // options, a same-value revision is a silent no-op, and a removal
+  // appends `endpoint_bulkhead_removed` with the endpoint and the
+  // removed options. `getBulkheadStats()` needs no change: it reads
+  // the live options through the same getter, so a revision is
+  // visible there immediately.
+  server.reviseEndpointBulkhead = (
+    endpoint: string,
+    patch: BulkheadRevision,
+    tenant?: string
+  ): BulkheadRevisionSnapshot => {
+    const previous = queue.getEndpointBulkhead(endpoint, tenant);
+    // Validate-then-apply inside setEndpointBulkhead: an illegal
+    // patch throws RangeError and the live options are left
+    // completely intact.
+    if (!queue.setEndpointBulkhead(endpoint, patch, tenant)) {
+      throw new Error(
+        "reviseEndpointBulkhead: bulkhead is not configured — enabling it requires a restart"
+      );
+    }
+    const current = queue.getEndpointBulkhead(endpoint, tenant)!;
+    if (previous !== undefined && sameBulkheadOptions(previous.options, current.options)) {
+      return current;
+    }
+    opts.auditLog.append({
+      event: "endpoint_bulkhead_revised",
+      endpoint,
+      previous: previous?.options,
+      current: current.options,
+    });
+    return current;
+  };
+
+  server.removeEndpointBulkhead = (endpoint: string, tenant?: string): boolean => {
+    const previous = queue.getEndpointBulkhead(endpoint, tenant);
+    if (previous === undefined || !previous.overridden) return false;
+    queue.clearEndpointBulkheadOverride(endpoint, tenant);
+    opts.auditLog.append({
+      event: "endpoint_bulkhead_removed",
+      endpoint,
+      previous: previous.options,
+    });
+    return true;
+  };
+
+  // WR-325: live per-endpoint bulkhead reads. Only set when
+  // `retry.bulkhead` was configured.
+  if (queue.bulkheadConfigured()) {
+    server.getEndpointBulkhead = (
+      endpoint: string,
+      tenant?: string
+    ): BulkheadRevisionSnapshot | undefined => queue.getEndpointBulkhead(endpoint, tenant);
   }
 
   // WR-320: live retry-policy revision / removal / reads for one
