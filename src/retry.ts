@@ -20,7 +20,7 @@ import {
   type StalePauseOptions,
   type StalePauseSweepResult,
 } from "./stale-pause.ts";
-import { EndpointCircuitBreaker, type CircuitBreakerOptions, type CircuitState, type CircuitStats, type CircuitThresholdPatch, type ResolvedCircuitThresholds } from "./circuit.ts";
+import { EndpointCircuitBreaker, type CircuitBreakerOptions, type CircuitProbeRevision, type CircuitState, type CircuitStats, type CircuitThresholdPatch, type ResolvedCircuitProbe, type ResolvedCircuitThresholds } from "./circuit.ts";
 import {
   EndpointBulkheads,
   BulkheadRejectedError,
@@ -524,7 +524,7 @@ export type {
   EscalationPostResult,
 };
 
-export type { CircuitBreakerOptions, CircuitState, CircuitStats, CircuitThresholdPatch, ResolvedCircuitThresholds };
+export type { CircuitBreakerOptions, CircuitProbeRevision, CircuitState, CircuitStats, CircuitThresholdPatch, ResolvedCircuitProbe, ResolvedCircuitThresholds };
 export type { EndpointDependencyOptions } from "./endpoint-dependencies.ts";
 export { EndpointDependencyGraph } from "./endpoint-dependencies.ts";
 export type { SlowStartOptions, SlowStartEndpointStats };
@@ -7732,6 +7732,11 @@ export class RetryQueue {
     }
     for (const [key, breaker] of this.breakers) {
       for (const endpoint of breaker.configuredEndpoints()) add(key === "" ? undefined : key, endpoint);
+      // WR-331: a probe-only endpoint is configured state too, so it
+      // joins the WR-88 snapshot keyspace even with no threshold
+      // override (its snapshot row carries no circuitBreaker section
+      // until a threshold override exists, matching limiter-only rows).
+      for (const endpoint of breaker.configuredProbeEndpoints()) add(key === "" ? undefined : key, endpoint);
     }
     for (const [key, quota] of this.quotas) {
       for (const endpoint of quota.configuredEndpoints()) add(key === "" ? undefined : key, endpoint);
@@ -7770,12 +7775,14 @@ export class RetryQueue {
   clearEndpointConfigOverride(
     tenant: string | undefined,
     endpoint: string,
-    field: "maxConcurrentPerEndpoint" | "circuitBreaker" | "quota"
+    field: "maxConcurrentPerEndpoint" | "circuitBreaker" | "circuitProbe" | "quota"
   ): void {
     if (field === "maxConcurrentPerEndpoint") {
       this.limiterFor(tenant).clearEndpointOverride(endpoint);
     } else if (field === "circuitBreaker") {
       this.breakerFor(tenant)?.clearEndpointOverride(endpoint);
+    } else if (field === "circuitProbe") {
+      this.breakerFor(tenant)?.clearEndpointProbeOverride(endpoint);
     } else {
       this.quotaFor(tenant)?.clearEndpointOverride(endpoint);
     }
@@ -10980,6 +10987,79 @@ export class RetryQueue {
       });
     };
     for (const endpoint of breaker.configuredEndpoints()) add(endpoint);
+    for (const row of breaker.stats()) add(row.endpoint);
+    return rows;
+  }
+
+  /**
+   * WR-331: revise one endpoint's live half-open probe knobs at
+   * runtime — the queue-side setter behind
+   * `RelayServer.reviseEndpointCircuitProbe`. The patch merges over
+   * the endpoint's live effective probe values and the merged result
+   * is validated as a unit by the module setter — an illegal patch
+   * (or an empty patch) throws `RangeError` and the live probe
+   * values are left completely intact. Returns `false` when the
+   * circuit breaker was never configured (enabling it needs a
+   * restart); the server turns that into the canonical "must
+   * restart" `Error`.
+   */
+  setEndpointCircuitProbe(
+    endpoint: string,
+    patch: CircuitProbeRevision,
+    tenant?: string
+  ): boolean {
+    const breaker = this.breakerFor(tenant);
+    if (breaker === undefined) return false;
+    breaker.setEndpointProbe(endpoint, patch);
+    return true;
+  }
+
+  /**
+   * WR-331: the live effective half-open probe knobs for one
+   * endpoint — constructor defaults merged with any runtime
+   * override — plus whether the endpoint carries a probe override.
+   * `undefined` when the circuit breaker was never configured.
+   * Reads the live module values, so a runtime revision is visible
+   * immediately. Never touches the threshold override.
+   */
+  getEndpointCircuitProbe(
+    endpoint: string,
+    tenant?: string
+  ): { probe: ResolvedCircuitProbe; overridden: boolean } | undefined {
+    const breaker = this.breakerFor(tenant);
+    if (breaker === undefined) return undefined;
+    return {
+      probe: breaker.probeFor(endpoint),
+      overridden: breaker.hasEndpointProbeOverride(endpoint),
+    };
+  }
+
+  /**
+   * WR-331: the live effective half-open probe knobs for every
+   * endpoint the tenant's breaker knows about — endpoints carrying
+   * a probe override plus endpoints it has observed (tripped or
+   * not), so an endpoint revised but never tripped still lists.
+   * Empty when the feature is disabled or the tenant's breaker has
+   * seen nothing yet. Read-only: unlike the getter above it never
+   * creates the tenant's breaker instance.
+   */
+  getCircuitProbes(
+    tenant?: string
+  ): Array<{ endpoint: string } & { probe: ResolvedCircuitProbe; overridden: boolean }> {
+    const breaker = this.breakers.get(tenantInstanceKey(tenant));
+    if (breaker === undefined) return [];
+    const seen = new Set<string>();
+    const rows: Array<{ endpoint: string } & { probe: ResolvedCircuitProbe; overridden: boolean }> = [];
+    const add = (endpoint: string): void => {
+      if (seen.has(endpoint)) return;
+      seen.add(endpoint);
+      rows.push({
+        endpoint,
+        probe: breaker.probeFor(endpoint),
+        overridden: breaker.hasEndpointProbeOverride(endpoint),
+      });
+    };
+    for (const endpoint of breaker.configuredProbeEndpoints()) add(endpoint);
     for (const row of breaker.stats()) add(row.endpoint);
     return rows;
   }

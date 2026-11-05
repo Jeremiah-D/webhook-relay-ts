@@ -66,7 +66,7 @@ import {
   type ResolvedHttpHardening,
 } from "./http-hardening.ts";
 import type { OrderedAuditEvent, OrderedModeOptions } from "./retry.ts";
-import type { BulkheadRevision, BulkheadRevisionSnapshot, CircuitThresholdPatch, DeliveryWindowListEntry, DeliveryWindowSnapshot, EndpointConcurrencySnapshot, EndpointQuotaSnapshot, EndpointRetryBudgetSnapshot, EndpointRetryPolicyRevision, GlobalConcurrencyStats, GlobalRateLimitRevision, GlobalRateLimitStats, HolidayCalendarConfig, HolidayCalendarSnapshot, MinNormalShareSnapshot, ResolvedCircuitThresholds, ResolvedEndpointRetryPolicy, StatusRetryPolicyConfig, TenantConcurrencySnapshot, TenantRetryBudgetRevision } from "./retry.ts";
+import type { BulkheadRevision, BulkheadRevisionSnapshot, CircuitProbeRevision, CircuitThresholdPatch, DeliveryWindowListEntry, DeliveryWindowSnapshot, EndpointConcurrencySnapshot, EndpointQuotaSnapshot, EndpointRetryBudgetSnapshot, EndpointRetryPolicyRevision, GlobalConcurrencyStats, GlobalRateLimitRevision, GlobalRateLimitStats, HolidayCalendarConfig, HolidayCalendarSnapshot, MinNormalShareSnapshot, ResolvedCircuitProbe, ResolvedCircuitThresholds, ResolvedEndpointRetryPolicy, StatusRetryPolicyConfig, TenantConcurrencySnapshot, TenantRetryBudgetRevision } from "./retry.ts";
 import {
   DEFAULT_STATUS_RETRY_MULTIPLIER,
   assertValidStatusRetryPolicy,
@@ -6081,6 +6081,67 @@ export interface RelayServer extends Server {
     tenant?: string
   ) => Array<{ endpoint: string } & { thresholds: ResolvedCircuitThresholds; overridden: boolean }>;
   /**
+   * WR-331: revise one endpoint's live half-open probe knobs at
+   * runtime — no restart. The patch merges over the endpoint's live
+   * effective probe values; an illegal patch (or an empty patch)
+   * throws `RangeError` and the live probe values are untouched. A
+   * real revision is audited as `circuit_probe_revised` with
+   * `endpoint`, `previous` (the constructor defaults on a first set)
+   * and `current` snapshots; a same-value revision is a silent
+   * no-op. Always set; throws `Error` when the circuit breaker was
+   * never configured — enabling it needs a restart. Probe knobs
+   * only govern recovery pacing (how many probes may fly at once,
+   * how long a parked attempt waits): they never change trip,
+   * cooldown, or window thresholds, an already-open endpoint keeps
+   * its state / `openedAtMs` / trips, in-flight probes are never
+   * cancelled by a revision, and an already-scheduled recheck is
+   * not re-armed. `tenant` scopes to that tenant's breaker;
+   * omitted means the default tenant.
+   */
+  reviseEndpointCircuitProbe: (
+    endpoint: string,
+    patch: CircuitProbeRevision,
+    tenant?: string
+  ) => ResolvedCircuitProbe;
+  /**
+   * WR-331: remove one endpoint's live half-open probe override at
+   * runtime — the endpoint falls back to the constructor defaults
+   * for probe knobs only; the threshold override is untouched.
+   * Returns `true` when a probe override was removed (audited as
+   * `circuit_probe_removed` with the endpoint and the removed probe
+   * values as `previous`), `false` when no probe override was
+   * configured (silent, no audit) — including when the feature
+   * itself was never configured. Always set. `tenant` scopes to
+   * that tenant's breaker; omitted means the default tenant.
+   */
+  removeEndpointCircuitProbe: (endpoint: string, tenant?: string) => boolean;
+  /**
+   * WR-331: live effective half-open probe knobs for one endpoint —
+   * constructor defaults merged with any runtime override — plus
+   * whether the endpoint carries a probe override. An endpoint
+   * never revised still reports the queue defaults with
+   * `overridden: false`; `undefined` only when the circuit breaker
+   * was never configured (unreachable while this method is set).
+   * `tenant` scopes to that tenant's breaker; omitted means the
+   * default tenant.
+   */
+  getEndpointCircuitProbe?: (
+    endpoint: string,
+    tenant?: string
+  ) => { probe: ResolvedCircuitProbe; overridden: boolean } | undefined;
+  /**
+   * WR-331: live half-open probe listing — every endpoint the
+   * tenant's breaker knows about (probe-overridden or merely
+   * observed), each with its full live probe knobs and override
+   * flag, including endpoints whose circuit has never tripped. Set
+   * only when `retry.circuitBreaker` was configured. `tenant`
+   * scopes to that tenant's breaker; omitted means the default
+   * tenant.
+   */
+  getCircuitProbes?: (
+    tenant?: string
+  ) => Array<{ endpoint: string } & { probe: ResolvedCircuitProbe; overridden: boolean }>;
+  /**
    * WR-321: revise one endpoint's live concurrency limit at runtime —
    * no restart. Raising it immediately grants slots to queued waiters
    * in FIFO order; lowering it never revokes in-flight deliveries —
@@ -6593,6 +6654,15 @@ function sameCircuitThresholds(
     a.errorRateThreshold === b.errorRateThreshold &&
     a.errorRateMinSamples === b.errorRateMinSamples
   );
+}
+
+/**
+ * WR-331: deep equality for resolved half-open probe knobs — both
+ * fields compare by value. A revision that lands on the same values
+ * is a no-op with no audit event.
+ */
+function sameCircuitProbe(a: ResolvedCircuitProbe, b: ResolvedCircuitProbe): boolean {
+  return a.halfOpenMaxInFlight === b.halfOpenMaxInFlight && a.halfOpenRetryMs === b.halfOpenRetryMs;
 }
 
 /**
@@ -15023,6 +15093,70 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       tenant?: string
     ): Array<{ endpoint: string } & { thresholds: ResolvedCircuitThresholds; overridden: boolean }> =>
       queue.getCircuitBreakers(tenant);
+  }
+
+  // WR-331: live half-open probe revision / removal for one
+  // endpoint. Mirrors the WR-319 threshold layer: the queue does
+  // the validate-then-apply work (RangeError on an illegal or empty
+  // patch, live probe values untouched); this layer only owns the
+  // "must restart" Error (the queue setter returns false when the
+  // feature was never configured) and the audit: a real revision
+  // appends `circuit_probe_revised` with the endpoint and the
+  // previous (the constructor defaults on a first set) / current
+  // probe knobs, a same-value revision is a silent no-op, and a
+  // removal appends `circuit_probe_removed` with the endpoint and
+  // the removed probe knobs. The breaker re-reads the live probe
+  // knobs on every `shouldAllow` / `retryInMs` call, so no timer is
+  // re-armed here — an already-open endpoint keeps its state,
+  // `openedAtMs` and trips, and in-flight probes settle as before.
+  server.reviseEndpointCircuitProbe = (
+    endpoint: string,
+    patch: CircuitProbeRevision,
+    tenant?: string
+  ): ResolvedCircuitProbe => {
+    const previous = queue.getEndpointCircuitProbe(endpoint, tenant);
+    if (!queue.setEndpointCircuitProbe(endpoint, patch, tenant)) {
+      throw new Error(
+        "reviseEndpointCircuitProbe: circuit breaker is not configured — enabling it requires a restart"
+      );
+    }
+    const current = queue.getEndpointCircuitProbe(endpoint, tenant)!;
+    if (previous !== undefined && sameCircuitProbe(previous.probe, current.probe)) {
+      return current.probe;
+    }
+    opts.auditLog.append({
+      event: "circuit_probe_revised",
+      endpoint,
+      previous: previous?.probe,
+      current: current.probe,
+    });
+    return current.probe;
+  };
+
+  server.removeEndpointCircuitProbe = (endpoint: string, tenant?: string): boolean => {
+    const previous = queue.getEndpointCircuitProbe(endpoint, tenant);
+    if (previous === undefined || !previous.overridden) return false;
+    queue.clearEndpointConfigOverride(tenant, endpoint, "circuitProbe");
+    opts.auditLog.append({
+      event: "circuit_probe_removed",
+      endpoint,
+      previous: previous.probe,
+    });
+    return true;
+  };
+
+  // WR-331: live half-open probe reads. Only set when
+  // `retry.circuitBreaker` was configured.
+  if (queue.circuitBreakerConfigured()) {
+    server.getEndpointCircuitProbe = (
+      endpoint: string,
+      tenant?: string
+    ): { probe: ResolvedCircuitProbe; overridden: boolean } | undefined =>
+      queue.getEndpointCircuitProbe(endpoint, tenant);
+    server.getCircuitProbes = (
+      tenant?: string
+    ): Array<{ endpoint: string } & { probe: ResolvedCircuitProbe; overridden: boolean }> =>
+      queue.getCircuitProbes(tenant);
   }
 
   // WR-321: live per-endpoint concurrency-limit revision / removal /

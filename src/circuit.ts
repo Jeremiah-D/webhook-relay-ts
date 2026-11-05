@@ -110,6 +110,23 @@ export interface CircuitThresholdPatch {
   errorRateMinSamples?: number;
 }
 
+/**
+ * Runtime-adjustable half-open probe knobs for one endpoint (WR-331).
+ * All fields optional; only the provided ones change. At least one
+ * field must be present — an empty patch is a `RangeError`, unlike
+ * the WR-319 threshold patch whose empty merge is a silent no-op.
+ */
+export interface CircuitProbeRevision {
+  halfOpenMaxInFlight?: number;
+  halfOpenRetryMs?: number;
+}
+
+/** Effective half-open probe knobs for one endpoint after merging runtime overrides. */
+export interface ResolvedCircuitProbe {
+  halfOpenMaxInFlight: number;
+  halfOpenRetryMs: number;
+}
+
 /** Effective thresholds for one endpoint after merging runtime overrides. */
 export interface ResolvedCircuitThresholds {
   failureThreshold: number;
@@ -248,6 +265,15 @@ export class EndpointCircuitBreaker {
    * instead of a cold start.
    */
   private readonly endpointOverrides = new Map<string, ResolvedCircuitThresholds>();
+  /**
+   * Per-endpoint half-open probe overrides installed at runtime
+   * (WR-331). Orthogonal to `endpointOverrides`: probe knobs never
+   * touch trip/cooldown thresholds, and threshold revisions never
+   * touch probe knobs. An endpoint without a probe override uses the
+   * constructor defaults; the constructor fields stay the default
+   * source and are never mutated by a revision.
+   */
+  private readonly endpointProbeOverrides = new Map<string, ResolvedCircuitProbe>();
 
   constructor(opts: CircuitBreakerOptions = {}) {
     const resolved = resolveCircuitThresholds(opts, "constructor", CIRCUIT_DEFAULTS);
@@ -321,6 +347,76 @@ export class EndpointCircuitBreaker {
   }
 
   /**
+   * Override the half-open probe knobs for one endpoint at runtime
+   * (WR-331). The patch merges over the endpoint's live effective
+   * probe values and the merged result is validated as a unit with
+   * the constructor's own rules — `halfOpenMaxInFlight` an integer
+   * >= 1, `halfOpenRetryMs` finite and > 0 — so an illegal patch
+   * throws `RangeError` and leaves the live probe values completely
+   * intact; an empty patch throws `RangeError` too. Tightening
+   * `halfOpenMaxInFlight` below the in-flight probe count never
+   * cancels probes already granted: `shouldAllow` simply grants no
+   * new permit until the count falls below the new limit. A changed
+   * `halfOpenRetryMs` only affects the next parked attempt's wait;
+   * already-scheduled rechecks are not re-armed.
+   */
+  setEndpointProbe(endpoint: string, patch: CircuitProbeRevision): void {
+    if (patch.halfOpenMaxInFlight === undefined && patch.halfOpenRetryMs === undefined) {
+      throw new RangeError(
+        "setEndpointProbe: at least one of halfOpenMaxInFlight / halfOpenRetryMs must be provided"
+      );
+    }
+    const current = this.probeFor(endpoint);
+    const halfOpenMaxInFlight = patch.halfOpenMaxInFlight ?? current.halfOpenMaxInFlight;
+    const halfOpenRetryMs = patch.halfOpenRetryMs ?? current.halfOpenRetryMs;
+    if (!Number.isInteger(halfOpenMaxInFlight) || halfOpenMaxInFlight < 1) {
+      throw new RangeError(
+        `setEndpointProbe: halfOpenMaxInFlight must be an integer >= 1, got ${patch.halfOpenMaxInFlight}`
+      );
+    }
+    if (!Number.isFinite(halfOpenRetryMs) || halfOpenRetryMs <= 0) {
+      throw new RangeError(
+        `setEndpointProbe: halfOpenRetryMs must be > 0, got ${patch.halfOpenRetryMs}`
+      );
+    }
+    this.endpointProbeOverrides.set(endpoint, { halfOpenMaxInFlight, halfOpenRetryMs });
+  }
+
+  /**
+   * Effective half-open probe knobs for `endpoint`: runtime overrides
+   * win over the constructor defaults.
+   */
+  probeFor(endpoint: string): ResolvedCircuitProbe {
+    const o = this.endpointProbeOverrides.get(endpoint);
+    return {
+      halfOpenMaxInFlight: o?.halfOpenMaxInFlight ?? this.halfOpenMaxInFlight,
+      halfOpenRetryMs: o?.halfOpenRetryMs ?? this.halfOpenRetryMs,
+    };
+  }
+
+  /** Whether `endpoint` carries a runtime probe override. */
+  hasEndpointProbeOverride(endpoint: string): boolean {
+    return this.endpointProbeOverrides.has(endpoint);
+  }
+
+  /**
+   * Drop the runtime probe override so `endpoint` falls back to the
+   * constructor defaults. Never throws for unknown endpoints and
+   * never touches the threshold override.
+   */
+  clearEndpointProbeOverride(endpoint: string): void {
+    this.endpointProbeOverrides.delete(endpoint);
+  }
+
+  /**
+   * Endpoints carrying a runtime probe override (WR-331). Used by the
+   * WR-88 config snapshot to enumerate the configured keyspace.
+   */
+  configuredProbeEndpoints(): string[] {
+    return [...this.endpointProbeOverrides.keys()];
+  }
+
+  /**
    * Effective thresholds for `endpoint`: runtime overrides win over the
    * constructor defaults.
    */
@@ -352,8 +448,9 @@ export class EndpointCircuitBreaker {
       }
       this.transition(endpoint, rec, "half_open");
     }
-    // half_open: exactly one probe at a time (up to halfOpenMaxInFlight).
-    if (rec.halfOpenInFlight < this.halfOpenMaxInFlight) {
+    // half_open: probes in flight up to the live halfOpenMaxInFlight
+    // (WR-331: the runtime probe override, or the constructor default).
+    if (rec.halfOpenInFlight < this.probeFor(endpoint).halfOpenMaxInFlight) {
       rec.halfOpenInFlight += 1;
       return { allowed: true, probe: true };
     }
@@ -425,7 +522,7 @@ export class EndpointCircuitBreaker {
   retryInMs(endpoint: string): number {
     const rec = this.records.get(endpoint);
     if (!rec || rec.state === "closed") return 0;
-    if (rec.state === "half_open") return this.halfOpenRetryMs;
+    if (rec.state === "half_open") return this.probeFor(endpoint).halfOpenRetryMs;
     return Math.max(0, (rec.openedAtMs ?? 0) + this.thresholdsFor(endpoint).cooldownMs - this.nowMs());
   }
 

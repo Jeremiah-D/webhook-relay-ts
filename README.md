@@ -985,7 +985,26 @@ reliability primitives that matter for any signed-payload pipeline.
   already-scheduled recheck; a tightened cooldown applies from the
   next trip. All four methods are `tenant`-scoped (omitted means the
   default tenant); revising with the breaker unconfigured throws
-  `Error` — enabling it needs a restart.
+  `Error` — enabling it needs a restart. WR-331 adds the server-side
+  live revision of the half-open probe knobs, orthogonal to WR-319
+  (thresholds vs. probe pacing, no shared fields):
+  `reviseEndpointCircuitProbe(endpoint, patch, tenant?)` merges a
+  `CircuitProbeRevision` (`halfOpenMaxInFlight`, `halfOpenRetryMs`;
+  an empty patch throws `RangeError`) over the live effective probe
+  values and audits `circuit_probe_revised` with `endpoint`,
+  `previous` (the constructor defaults on a first set) and `current`;
+  `getEndpointCircuitProbe(endpoint, tenant?)` reports the live probe
+  knobs plus whether the endpoint carries a probe override,
+  `getCircuitProbes(tenant?)` lists every endpoint the tenant's
+  breaker knows about, and `removeEndpointCircuitProbe(endpoint,
+  tenant?)` drops only the probe override (audited as
+  `circuit_probe_removed`, `false` when there was none) so the
+  endpoint falls back to the constructor defaults. Probe concurrency
+  only controls how many recovery probes may fly in parallel — it
+  never changes trip, cooldown, or window decisions; tightening it
+  below the in-flight count grants no new permit until the count
+  falls back, and a changed retry interval only affects the next
+  parked attempt's wait.
 - `src/endpoint-disable.ts` — per-endpoint auto-disable gate
   (`EndpointAutoDisable`): `failureThreshold` (default 5) consecutive
   delivery failures auto-disable the endpoint — new deliveries
