@@ -799,7 +799,21 @@ reliability primitives that matter for any signed-payload pipeline.
   requests are answered 429 with `retry-after` and audited as `rejected`
   (reason `tenant_rate_limited`), and denials are exported as
   `relay_inbound_tenant_limited_total{tenant}` (activity-gated — absent
-  until the first denial).
+  until the first denial). Live revision (WR-332): the shared per-tenant
+  budget is revisable without a restart via the in-process server
+  methods `reviseInboundTenantRateLimit(perSecond)` (or `undefined` to
+  disable limiting) and `getInboundTenantRateLimit()`. Tightening clamps
+  every live bucket's balance to the new cap at once; widening never
+  tops a bucket up. An illegal value throws `RangeError` and the live
+  value is untouched; revising to the live value is a silent no-op. A
+  real revision is audited as `inbound_tenant_rate_limit_revised` with
+  `previous` / `current` (`null` means unlimited). Revising a relay
+  that never configured the limit throws `Error` — first enabling it
+  still needs a restart. This is the inbound direction of the shared
+  per-tenant budget: WR-97 paces outbound delivery per (tenant,
+  endpoint), WR-329 revises the tenant-level *outbound* rate, and
+  WR-330 revises the per-endpoint *outbound* rate — same revise
+  pattern, different direction and scope.
 - `src/operator-ratelimit.ts` — operator-plane API rate limiting
   (`OperatorRateLimiter`): a per-client 60-second sliding window over every
   operator path (`/metrics`, `/audit`, `/deliveries/*`,
@@ -11687,7 +11701,10 @@ Per (tenant, endpoint), the relay isolates:
   against its own cap;
 - **inbound rate limiter** — per-`x-tenant-id` token bucket at intake
   (`inboundTenantRateLimit`), checked before signature verification so
-  one tenant's flood never burns verifier CPU meant for others;
+  one tenant's flood never burns verifier CPU meant for others. The
+  shared per-tenant budget is live-revisable without a restart
+  (`reviseInboundTenantRateLimit(perSecond)`, WR-332; `undefined`
+  disables limiting, audited as `inbound_tenant_rate_limit_revised`);
 - **delivery quota** — token buckets are per tenant;
 - **circuit breaker** — a tripped breaker only parks its own tenant's
   attempts (probes still feed every tenant's breaker, so shared-downstream

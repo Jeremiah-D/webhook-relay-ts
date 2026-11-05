@@ -5694,6 +5694,33 @@ export interface RelayServer extends Server {
    */
   getOutboundRateLimit?: () => { refillRps: number; burst: number } | undefined;
   /**
+   * WR-332: revise the live per-tenant inbound rate limit at runtime
+   * (`perSecond`, or `undefined` to disable limiting). The next
+   * `take()` judges by the new value; requests already answered 429
+   * keep their original retry-after, and in-flight (already verified)
+   * requests are unaffected. Tightening clamps every live bucket's
+   * unspent balance to the new cap at once (already-granted tokens
+   * are never revoked); widening never tops a bucket up. An illegal
+   * value throws `RangeError` and the live value is untouched; a
+   * same-value revision is a no-op with no audit event. A real
+   * revision is audited as `inbound_tenant_rate_limit_revised` with
+   * `previous` / `current` (the construction value as first
+   * `previous`; `null` means unlimited), and returns the live value.
+   * Always set; throws `Error` when the limit was never configured —
+   * enabling it needs a restart. The one value is the per-tenant
+   * budget shared by all tenants: each tenant's bucket is
+   * independent, but the budget value is shared (per-tenant
+   * differentiated budgets are a separate item).
+   */
+  reviseInboundTenantRateLimit?: (perSecond: number | undefined) => number | undefined;
+  /**
+   * WR-332: live per-tenant inbound rate-limit value — the per-second
+   * budget shared by all tenants (`undefined` = unlimited). Only set
+   * when `inboundTenantRateLimit` was configured; `undefined`
+   * otherwise.
+   */
+  getInboundTenantRateLimit?: () => number | undefined;
+  /**
    * WR-329: revise the live tenant-level outbound rate-limit defaults
    * at runtime (`burst` / `refillPerSecond` / `mode`, partial —
    * omitted fields keep their live values). The next `take()` /
@@ -14511,6 +14538,41 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   if (queue.getOutboundRateLimit() !== undefined) {
     server.getOutboundRateLimit = (): { refillRps: number; burst: number } =>
       queue.getOutboundRateLimit()!;
+  }
+
+  // WR-332: per-tenant inbound rate-limit runtime revision. The
+  // method is always set (like setGlobalRateLimit above); with the
+  // limit unconfigured it throws Error — enabling the cap needs a
+  // restart. A real revision is audited as
+  // `inbound_tenant_rate_limit_revised` with the previous and current
+  // per-second budget (the construction value as first `previous`;
+  // `null` means unlimited); a same-value revision is a silent no-op.
+  server.reviseInboundTenantRateLimit = (perSecond: number | undefined): number | undefined => {
+    if (inboundTenantRateLimiter === undefined) {
+      throw new Error(
+        "reviseInboundTenantRateLimit: inbound tenant rate limiting is not configured — enabling it requires a restart"
+      );
+    }
+    const prev = inboundTenantRateLimiter.perTenantLimit();
+    // Validate-then-apply inside retune: an illegal value throws
+    // RangeError and the live value is left completely intact.
+    const next = inboundTenantRateLimiter.retune(perSecond);
+    if (next === prev) {
+      return next;
+    }
+    opts.auditLog.append({
+      event: "inbound_tenant_rate_limit_revised",
+      previous: prev ?? null,
+      current: next ?? null,
+    });
+    return next;
+  };
+
+  // WR-332: live per-tenant inbound rate-limit value. Only set when
+  // `inboundTenantRateLimit` was configured.
+  if (inboundTenantRateLimiter !== undefined) {
+    server.getInboundTenantRateLimit = (): number | undefined =>
+      inboundTenantRateLimiter.perTenantLimit();
   }
 
   // WR-310: relay-level global rate-limit snapshot. Only set when

@@ -23,6 +23,12 @@
  * for deterministic tests. Invalid budgets throw `RangeError` at
  * construction. Unset = unlimited: the intake path is byte-identical.
  *
+ * WR-332: the shared per-tenant budget is live-revisable via
+ * `retune()` (and `server.reviseInboundTenantRateLimit()`): tightening
+ * clamps every live bucket's balance to the new cap at once, widening
+ * never tops a bucket up, and `undefined` disables limiting (buckets
+ * are retained but ignored, and re-enabling re-clamps via `refill()`).
+ *
  * Tenants are keyed by the already-validated `x-tenant-id` (WR-48
  * charset `[A-Za-z0-9_-]`, safe in labels and log lines). Requests
  * without the header never touch the limiter.
@@ -56,7 +62,8 @@ interface Bucket {
 }
 
 export class InboundTenantRateLimiter {
-  private readonly perTenant?: number;
+  /** Mutable (WR-332): the live shared per-tenant budget, revised by `retune()`. */
+  private perTenant?: number;
   private readonly buckets = new Map<string, Bucket>();
   private readonly now: () => number;
 
@@ -76,6 +83,55 @@ export class InboundTenantRateLimiter {
 
   /** The configured per-tenant budget (undefined = unlimited). */
   perTenantLimit(): number | undefined {
+    return this.perTenant;
+  }
+
+  /**
+   * WR-332: revise the live shared per-tenant budget (`undefined`
+   * disables limiting). Validate-then-apply reusing the construction
+   * gate: an illegal value (non-finite, <= 0, non-number) throws
+   * `RangeError` with the construction error text and the live value
+   * is left completely untouched. A revision equal to the live value
+   * (including `undefined` == `undefined`) is a silent no-op.
+   *
+   * Every live bucket is settled at the old rate before the value
+   * moves, so no refill is lost or double-counted across the revision;
+   * unspent balances are then clamped to the new cap — never above it
+   * — so tightening is immediately observable, while widening never
+   * tops a bucket up. Disabling retains the buckets but `take()`
+   * passes through while the limit is `undefined`; re-enabling
+   * re-clamps via `refill()`. The next `take()` judges by the new
+   * value; `retryAfterMs` is recomputed from the live rate on the
+   * next denial. Returns the live budget after the revision.
+   */
+  retune(perSecond: number | undefined): number | undefined {
+    if (
+      perSecond !== undefined &&
+      (!Number.isFinite(perSecond) || perSecond <= 0)
+    ) {
+      throw new RangeError(
+        `perTenantPerSecond must be a finite number > 0, got ${perSecond}`
+      );
+    }
+    if (perSecond === this.perTenant) {
+      return this.perTenant;
+    }
+    // Settle every live bucket at the old rate before the value moves.
+    const old = this.perTenant;
+    if (old !== undefined) {
+      for (const key of [...this.buckets.keys()]) {
+        this.refill(key, old);
+      }
+    }
+    this.perTenant = perSecond;
+    // Clamp unspent balances to the new cap at once (tightening is
+    // immediately observable); widening never tops a bucket up.
+    // Disabled buckets are retained but ignored until re-enabled.
+    if (perSecond !== undefined) {
+      for (const bucket of this.buckets.values()) {
+        bucket.tokens = Math.min(bucket.tokens, perSecond);
+      }
+    }
     return this.perTenant;
   }
 
