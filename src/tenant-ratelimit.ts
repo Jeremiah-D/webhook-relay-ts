@@ -102,6 +102,35 @@ export interface TenantRateLimitOptions {
   now?: () => number;
 }
 
+/**
+ * WR-329: a partial runtime revision of the tenant-level defaults
+ * (`burst` / `refillPerSecond` / `mode`). At least one field must be
+ * set — an empty patch `{}` is a `RangeError`. Omitted fields keep
+ * their live values. The merged values must pass the construction
+ * gates (`assertRate` / the mode check); an illegal patch throws
+ * `RangeError` and the live values are left completely untouched.
+ */
+export type TenantRateLimitRevision = Partial<
+  Pick<TenantRateLimitOptions, "burst" | "refillPerSecond" | "mode">
+>;
+
+/**
+ * WR-329: a point-in-time snapshot of the live tenant-level defaults,
+ * mode, and endpoint overrides. `endpoints` is a copy — mutating it
+ * never touches the live overrides. An endpoint absent from
+ * `endpoints` carries no override and falls back to the live defaults.
+ */
+export interface TenantRateLimitSnapshot {
+  /** The live tenant-level default burst. */
+  burst: number;
+  /** The live tenant-level default refill rate (tokens per second). */
+  refillPerSecond: number;
+  /** The live over-limit mode. */
+  mode: TenantRateLimitMode;
+  /** Per-endpoint overrides, keyed by exact `targetUrl` (a copy). */
+  endpoints: Record<string, TenantRateLimitEndpointOverride>;
+}
+
 export type TenantRateLimitVerdict =
   | { ok: true }
   | {
@@ -149,10 +178,13 @@ function assertRate(name: string, value: number | undefined, what: string): numb
  * budget is available immediately, then refills continuously.
  */
 export class TenantRateLimiter {
-  private readonly defaultBurst: number;
-  private readonly defaultRefillPerSecond: number;
+  // WR-329: the defaults and mode are live-revisable via `retune()`,
+  // so these are deliberately not `readonly` (the constructor still
+  // validates every value through the same gates).
+  private defaultBurst: number;
+  private defaultRefillPerSecond: number;
   private readonly endpointOverrides = new Map<string, { burst?: number; refillPerSecond?: number }>();
-  private readonly runMode: TenantRateLimitMode;
+  private runMode: TenantRateLimitMode;
   private readonly now: () => number;
   private readonly buckets = new Map<string, Bucket>();
   /** Cumulative denials per scope key (WR-48 `tenantScopeKey`). */
@@ -221,6 +253,192 @@ export class TenantRateLimiter {
   /** The refill rate in effect for `endpoint` (override wins over the tenant-level default). */
   refillPerSecondFor(endpoint: string): number {
     return this.endpointOverrides.get(endpoint)?.refillPerSecond ?? this.defaultRefillPerSecond;
+  }
+
+  /**
+   * WR-329: the live tenant-level defaults, mode, and endpoint
+   * overrides. `endpoints` is a copy — mutating it never touches the
+   * live overrides.
+   */
+  current(): TenantRateLimitSnapshot {
+    const endpoints: Record<string, TenantRateLimitEndpointOverride> = {};
+    for (const [endpoint, override] of this.endpointOverrides) {
+      endpoints[endpoint] = { ...override };
+    }
+    return {
+      burst: this.defaultBurst,
+      refillPerSecond: this.defaultRefillPerSecond,
+      mode: this.runMode,
+      endpoints,
+    };
+  }
+
+  /**
+   * WR-329: revise the live tenant-level defaults and/or mode
+   * (partial — omitted fields keep their live values). Merge-then-
+   * validate reusing the construction gates: an illegal patch throws
+   * `RangeError` and the live values are left completely untouched,
+   * and an empty patch is a `RangeError` (at least one field must be
+   * set). A patch equal to the live values is a silent no-op.
+   *
+   * Every live bucket is settled at the old rate before the values
+   * move (`refill()`), so no refill is lost or double-counted across
+   * the revision; unspent balances are then clamped to the new
+   * effective burst — never above it — but already-granted tokens are
+   * not revoked. `retryAfterMs` is recomputed from the live rate on
+   * the next denial. The next `take()` / `admitTenantDelivery()`
+   * judges by the new values; deliveries already rescheduled keep
+   * their original schedule.
+   *
+   * Returns the live snapshot after the revision.
+   */
+  retune(patch: TenantRateLimitRevision): TenantRateLimitSnapshot {
+    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new RangeError(`tenantRateLimit revision must be an object, got ${JSON.stringify(patch)}`);
+    }
+    if (patch.burst === undefined && patch.refillPerSecond === undefined && patch.mode === undefined) {
+      throw new RangeError(
+        "tenantRateLimit revision must set at least one of burst, refillPerSecond, mode"
+      );
+    }
+    const nextBurst = patch.burst ?? this.defaultBurst;
+    const nextRefillPerSecond = patch.refillPerSecond ?? this.defaultRefillPerSecond;
+    const nextMode = patch.mode ?? this.runMode;
+    // Validate-then-apply: the merged values must pass the
+    // construction gates before any live value moves.
+    assertRate("burst", nextBurst, "tenantRateLimit.burst");
+    assertRate("refillPerSecond", nextRefillPerSecond, "tenantRateLimit.refillPerSecond");
+    if (nextMode !== "queue" && nextMode !== "reject-429") {
+      throw new RangeError(
+        `tenantRateLimit.mode must be "queue" or "reject-429", got ${JSON.stringify(nextMode)}`
+      );
+    }
+    if (
+      nextBurst === this.defaultBurst &&
+      nextRefillPerSecond === this.defaultRefillPerSecond &&
+      nextMode === this.runMode
+    ) {
+      return this.current();
+    }
+    // Settle every live bucket at the old rate before the values move.
+    for (const key of [...this.buckets.keys()]) {
+      const { endpoint } = splitTenantScopeKey(key);
+      this.refill(key, endpoint);
+    }
+    this.defaultBurst = nextBurst;
+    this.defaultRefillPerSecond = nextRefillPerSecond;
+    this.runMode = nextMode;
+    // Clamp unspent balances to the new effective burst per scope
+    // (override-aware — an endpoint override still wins over the
+    // revised default).
+    for (const [key, bucket] of this.buckets) {
+      const { endpoint } = splitTenantScopeKey(key);
+      bucket.tokens = Math.min(bucket.tokens, this.burstFor(endpoint));
+    }
+    return this.current();
+  }
+
+  /**
+   * WR-329: revise one endpoint's override (partial — each set field
+   * wins over the tenant-level default for that endpoint only; unset
+   * fields keep falling back to the *live* defaults, so a later
+   * defaults revision still moves them). Only the fields given in
+   * the patch are recorded — the merged effective values are never
+   * stored as an override. An empty patch is a `RangeError`; an
+   * illegal value or endpoint throws `RangeError` and the live
+   * values are left completely untouched. Revising to the endpoint's
+   * effective current values is a silent no-op that records no
+   * override. The endpoint's live buckets are settled at the old
+   * rate before the override moves and their unspent balances are
+   * clamped to the new effective burst; other endpoints and the
+   * defaults are untouched. Returns the live snapshot after the
+   * revision.
+   */
+  retuneEndpoint(
+    endpoint: string,
+    patch: Partial<TenantRateLimitEndpointOverride>
+  ): TenantRateLimitSnapshot {
+    if (typeof endpoint !== "string" || endpoint.length === 0) {
+      throw new RangeError(`endpoint must be a non-empty target URL, got ${JSON.stringify(endpoint)}`);
+    }
+    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new RangeError(
+        `tenantRateLimit endpoint revision must be an object, got ${JSON.stringify(patch)}`
+      );
+    }
+    if (patch.burst === undefined && patch.refillPerSecond === undefined) {
+      throw new RangeError(
+        "tenantRateLimit endpoint revision must set at least one of burst, refillPerSecond"
+      );
+    }
+    const existing = this.endpointOverrides.get(endpoint);
+    const nextBurst = patch.burst ?? existing?.burst ?? this.defaultBurst;
+    const nextRefillPerSecond =
+      patch.refillPerSecond ?? existing?.refillPerSecond ?? this.defaultRefillPerSecond;
+    // Validate-then-apply: the merged effective values must pass the
+    // construction gates before any live value moves.
+    assertRate(
+      "burst",
+      nextBurst,
+      `tenantRateLimit.endpoints[${JSON.stringify(endpoint)}].burst`
+    );
+    assertRate(
+      "refillPerSecond",
+      nextRefillPerSecond,
+      `tenantRateLimit.endpoints[${JSON.stringify(endpoint)}].refillPerSecond`
+    );
+    if (nextBurst === this.burstFor(endpoint) && nextRefillPerSecond === this.refillPerSecondFor(endpoint)) {
+      return this.current();
+    }
+    // Settle this endpoint's live buckets at the old rate before the
+    // override moves.
+    for (const key of [...this.buckets.keys()]) {
+      const { endpoint: scopeEndpoint } = splitTenantScopeKey(key);
+      if (scopeEndpoint !== endpoint) continue;
+      this.refill(key, endpoint);
+    }
+    // Record only the fields this patch (and any earlier patch) set —
+    // unset fields keep falling back to the live defaults.
+    const stored: { burst?: number; refillPerSecond?: number } = { ...(existing ?? {}) };
+    if (patch.burst !== undefined) stored.burst = patch.burst;
+    if (patch.refillPerSecond !== undefined) stored.refillPerSecond = patch.refillPerSecond;
+    this.endpointOverrides.set(endpoint, stored);
+    // Clamp unspent balances to the new effective burst.
+    for (const [key, bucket] of this.buckets) {
+      const { endpoint: scopeEndpoint } = splitTenantScopeKey(key);
+      if (scopeEndpoint !== endpoint) continue;
+      bucket.tokens = Math.min(bucket.tokens, this.burstFor(endpoint));
+    }
+    return this.current();
+  }
+
+  /**
+   * WR-329: drop one endpoint's override so it falls back to the
+   * live tenant-level defaults (its buckets, if any, are settled at
+   * the override rate first and their unspent balances clamped to
+   * the default burst). Returns `false` when the endpoint carried no
+   * override. A malformed endpoint throws `RangeError`.
+   */
+  removeEndpointOverride(endpoint: string): boolean {
+    if (typeof endpoint !== "string" || endpoint.length === 0) {
+      throw new RangeError(`endpoint must be a non-empty target URL, got ${JSON.stringify(endpoint)}`);
+    }
+    if (!this.endpointOverrides.has(endpoint)) return false;
+    // Settle this endpoint's live buckets at the override rate before
+    // the override drops.
+    for (const key of [...this.buckets.keys()]) {
+      const { endpoint: scopeEndpoint } = splitTenantScopeKey(key);
+      if (scopeEndpoint !== endpoint) continue;
+      this.refill(key, endpoint);
+    }
+    this.endpointOverrides.delete(endpoint);
+    // Clamp unspent balances to the live default burst.
+    for (const [key, bucket] of this.buckets) {
+      const { endpoint: scopeEndpoint } = splitTenantScopeKey(key);
+      if (scopeEndpoint !== endpoint) continue;
+      bucket.tokens = Math.min(bucket.tokens, this.burstFor(endpoint));
+    }
+    return true;
   }
 
   private refill(key: string, endpoint: string): Bucket {

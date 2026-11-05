@@ -237,7 +237,12 @@ import {
   type OperatorRateLimitPlane,
   type OperatorRateLimitStats,
 } from "./operator-ratelimit.ts";
-import type { TenantRateLimitOptions } from "./tenant-ratelimit.ts";
+import type {
+  TenantRateLimitEndpointOverride,
+  TenantRateLimitOptions,
+  TenantRateLimitRevision,
+  TenantRateLimitSnapshot,
+} from "./tenant-ratelimit.ts";
 import type { OutboundRateLimitOptions } from "./outbound-ratelimit.ts";
 import type { DeliveryReceiptOptions } from "./delivery-receipt.ts";
 import { InboundIpAcl, IpAclMetrics, type IpAclOptions } from "./ip-acl.ts";
@@ -5658,6 +5663,61 @@ export interface RelayServer extends Server {
    * enabling the cap needs a restart.
    */
   setGlobalRateLimit?: (patch: GlobalRateLimitRevision) => { messagesPerSec: number; maxBurst: number };
+  /**
+   * WR-329: revise the live tenant-level outbound rate-limit defaults
+   * at runtime (`burst` / `refillPerSecond` / `mode`, partial —
+   * omitted fields keep their live values). The next `take()` /
+   * `admitTenantDelivery()` judges by the new values; deliveries
+   * already rescheduled keep their original schedule. Tightening
+   * clamps every live bucket's unspent balance to the new burst at
+   * once; widening never tops a bucket up. An illegal patch throws
+   * `RangeError` and the live values are untouched; an empty patch is
+   * a `RangeError`; a same-value revision is a no-op with no audit
+   * event. A real revision is audited as `tenant_rate_limit_revised`
+   * with `previous` / `current` `{ burst, refillPerSecond, mode }`
+   * (the construction defaults as first `previous`), and returns the
+   * live snapshot. Always set; throws `Error` when the limit was
+   * never configured — enabling it needs a restart. Endpoint
+   * overrides are untouched by a defaults revision; a `mode` switch
+   * only affects calls after the switch (dispatch still never
+   * re-checks in `reject-429` mode).
+   */
+  reviseTenantRateLimit?: (patch: TenantRateLimitRevision) => TenantRateLimitSnapshot;
+  /**
+   * WR-329: revise one endpoint's live rate-limit override at runtime
+   * (partial — each set field wins over the tenant-level default for
+   * that endpoint only; unset fields keep falling back to the *live*
+   * defaults). An endpoint without an override gets one. An illegal
+   * patch or endpoint throws `RangeError` and the live values are
+   * untouched; an empty patch is a `RangeError`; a revision to the
+   * endpoint's effective current values is a no-op with no audit
+   * event. A real revision is audited as
+   * `tenant_rate_limit_endpoint_revised` with `endpoint` and
+   * `previous` / `current` effective `{ burst, refillPerSecond }`
+   * (the live defaults as first `previous` when no override existed),
+   * and returns the live snapshot. Always set; throws `Error` when
+   * the limit was never configured — enabling it needs a restart.
+   * Other endpoints and the defaults are untouched.
+   */
+  reviseTenantRateLimitEndpoint?: (
+    endpoint: string,
+    patch: Partial<TenantRateLimitEndpointOverride>
+  ) => TenantRateLimitSnapshot;
+  /**
+   * WR-329: remove one endpoint's rate-limit override at runtime —
+   * the endpoint falls back to the live tenant-level defaults.
+   * Returns `true` when an override was removed (audited as
+   * `tenant_rate_limit_endpoint_removed` with `endpoint` and the
+   * removed override as `previous`), `false` when the limit was
+   * never configured or the endpoint had no override. Always set.
+   */
+  removeTenantRateLimitEndpoint: (endpoint: string) => boolean;
+  /**
+   * WR-329: live per-tenant outbound rate-limit snapshot — the
+   * tenant-level defaults, mode, and endpoint overrides. Only set
+   * when `tenantRateLimit` was configured; `undefined` otherwise.
+   */
+  getTenantRateLimit?: () => TenantRateLimitSnapshot | undefined;
   /**
    * WR-313: revise the relay-level global outbound concurrency cap at
    * runtime (a positive integer, or `Infinity` for "no cap"). Widening
@@ -14321,6 +14381,105 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // `retry.globalRateLimit` was configured.
   if (queue.getGlobalRateLimitStats() !== undefined) {
     server.getGlobalRateLimitStats = (): GlobalRateLimitStats => queue.getGlobalRateLimitStats()!;
+  }
+
+  // WR-329: per-tenant outbound rate-limit defaults runtime revision.
+  // The method is always set (like setGlobalRateLimit above); with the
+  // limit unconfigured the queue throws Error — enabling the cap needs
+  // a restart. A real revision is audited as `tenant_rate_limit_revised`
+  // with the previous and current burst / refill / mode (the
+  // construction defaults as first `previous`); an empty or same-value
+  // patch is a silent no-op.
+  server.reviseTenantRateLimit = (patch: TenantRateLimitRevision): TenantRateLimitSnapshot => {
+    const prev = queue.getTenantRateLimit();
+    if (prev === undefined) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseTenantRateLimit(patch);
+    }
+    // Validate-then-apply inside retune: an illegal patch throws
+    // RangeError and the live values are left completely intact.
+    const next = queue.reviseTenantRateLimit(patch);
+    if (
+      next.burst === prev.burst &&
+      next.refillPerSecond === prev.refillPerSecond &&
+      next.mode === prev.mode
+    ) {
+      return next;
+    }
+    opts.auditLog.append({
+      event: "tenant_rate_limit_revised",
+      previous: { burst: prev.burst, refillPerSecond: prev.refillPerSecond, mode: prev.mode },
+      current: { burst: next.burst, refillPerSecond: next.refillPerSecond, mode: next.mode },
+    });
+    return next;
+  };
+
+  // WR-329: per-endpoint tenant rate-limit override runtime revision.
+  // The method is always set; with the limit unconfigured the queue
+  // throws Error — enabling the cap needs a restart. A real revision
+  // is audited as `tenant_rate_limit_endpoint_revised` with the
+  // endpoint and the previous and current effective burst / refill
+  // (the live defaults as first `previous` when no override existed);
+  // an empty or same-effective-value patch is a silent no-op.
+  server.reviseTenantRateLimitEndpoint = (
+    endpoint: string,
+    patch: Partial<TenantRateLimitEndpointOverride>
+  ): TenantRateLimitSnapshot => {
+    const prev = queue.getTenantRateLimit();
+    if (prev === undefined) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseTenantRateLimitEndpoint(endpoint, patch);
+    }
+    const prevEffective = {
+      burst: prev.endpoints[endpoint]?.burst ?? prev.burst,
+      refillPerSecond: prev.endpoints[endpoint]?.refillPerSecond ?? prev.refillPerSecond,
+    };
+    // Validate-then-apply inside retuneEndpoint: an illegal patch or
+    // endpoint throws RangeError and the live values are left
+    // completely intact.
+    const next = queue.reviseTenantRateLimitEndpoint(endpoint, patch);
+    const nextEffective = {
+      burst: next.endpoints[endpoint]?.burst ?? next.burst,
+      refillPerSecond: next.endpoints[endpoint]?.refillPerSecond ?? next.refillPerSecond,
+    };
+    if (
+      nextEffective.burst === prevEffective.burst &&
+      nextEffective.refillPerSecond === prevEffective.refillPerSecond
+    ) {
+      return next;
+    }
+    opts.auditLog.append({
+      event: "tenant_rate_limit_endpoint_revised",
+      endpoint,
+      previous: prevEffective,
+      current: nextEffective,
+    });
+    return next;
+  };
+
+  // WR-329: per-endpoint tenant rate-limit override removal. Always
+  // set; a missing limit or an endpoint without an override returns
+  // false silently. A real removal audits
+  // `tenant_rate_limit_endpoint_removed` with the endpoint and the
+  // removed override as `previous`.
+  server.removeTenantRateLimitEndpoint = (endpoint: string): boolean => {
+    const prev = queue.getTenantRateLimit();
+    if (prev === undefined) return false;
+    const previous = prev.endpoints[endpoint];
+    if (previous === undefined) return false;
+    queue.removeTenantRateLimitEndpoint(endpoint);
+    opts.auditLog.append({
+      event: "tenant_rate_limit_endpoint_removed",
+      endpoint,
+      previous,
+    });
+    return true;
+  };
+
+  // WR-329: live per-tenant outbound rate-limit snapshot. Only set
+  // when `retry.tenantRateLimit` was configured.
+  if (queue.getTenantRateLimit() !== undefined) {
+    server.getTenantRateLimit = (): TenantRateLimitSnapshot => queue.getTenantRateLimit()!;
   }
 
   // WR-313: relay-level global concurrency cap runtime revision. The

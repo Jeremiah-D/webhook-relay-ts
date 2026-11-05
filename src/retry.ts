@@ -262,6 +262,8 @@ import {
   type TenantRateLimitEndpointOverride,
   type TenantRateLimitMode,
   type TenantRateLimitOptions,
+  type TenantRateLimitRevision,
+  type TenantRateLimitSnapshot,
   type TenantRateLimitStats,
   type TenantRateLimitVerdict,
 } from "./tenant-ratelimit.ts";
@@ -619,6 +621,8 @@ export type {
   TenantRateLimitEndpointOverride,
   TenantRateLimitMode,
   TenantRateLimitOptions,
+  TenantRateLimitRevision,
+  TenantRateLimitSnapshot,
   TenantRateLimitStats,
   TenantRateLimitVerdict,
 } from "./tenant-ratelimit.ts";
@@ -11726,6 +11730,83 @@ export class RetryQueue {
    */
   getTenantRateLimitStats(): TenantRateLimitStats[] | undefined {
     return this.tenantRateLimiter?.stats();
+  }
+
+  /**
+   * WR-329: revise the live tenant-level outbound rate-limit defaults
+   * (`burst` / `refillPerSecond` / `mode`, partial — omitted fields
+   * keep their live values). The next `take()` / `admitTenantDelivery()`
+   * judges by the new values; deliveries already rescheduled keep
+   * their original schedule, and in-flight attempts are unaffected.
+   * Tightening clamps every live bucket's unspent balance to the new
+   * burst at once; widening never tops a bucket up. An illegal patch
+   * throws `RangeError` and the live values are untouched; an empty
+   * patch is a `RangeError`; revising to the live values is a no-op.
+   * Throws `Error` when the limit was never configured — enabling it
+   * needs a restart. Endpoint overrides are untouched by a defaults
+   * revision (they still win per field); `mode` switches only affect
+   * calls after the switch. Returns the live snapshot.
+   */
+  reviseTenantRateLimit(patch: TenantRateLimitRevision): TenantRateLimitSnapshot {
+    const limiter = this.tenantRateLimiter;
+    if (limiter === undefined) {
+      throw new Error(
+        "reviseTenantRateLimit: tenant rate limit is not configured — enabling it requires a restart: " +
+          "the limiter is created at startup and a running relay cannot start capping without one"
+      );
+    }
+    return limiter.retune(patch);
+  }
+
+  /**
+   * WR-329: revise one endpoint's live rate-limit override
+   * (partial — each set field wins over the tenant-level default for
+   * that endpoint only; unset fields keep falling back to the *live*
+   * defaults). An endpoint without an override gets one; the next
+   * `take()` for that endpoint judges by the new effective values.
+   * Other endpoints and the defaults are untouched. An illegal patch
+   * or endpoint throws `RangeError` and the live values are untouched;
+   * an empty patch is a `RangeError`; revising to the endpoint's
+   * effective current values is a silent no-op that records no
+   * override. Throws `Error` when the limit was never configured —
+   * enabling it needs a restart. Returns the live snapshot.
+   */
+  reviseTenantRateLimitEndpoint(
+    endpoint: string,
+    patch: Partial<TenantRateLimitEndpointOverride>
+  ): TenantRateLimitSnapshot {
+    const limiter = this.tenantRateLimiter;
+    if (limiter === undefined) {
+      throw new Error(
+        "reviseTenantRateLimitEndpoint: tenant rate limit is not configured — enabling it requires a restart: " +
+          "the limiter is created at startup and a running relay cannot start capping without one"
+      );
+    }
+    return limiter.retuneEndpoint(endpoint, patch);
+  }
+
+  /**
+   * WR-329: drop one endpoint's rate-limit override so it falls back
+   * to the live tenant-level defaults (its buckets, if any, are
+   * settled and clamped in place). Returns `false` when the limit
+   * was never configured or when the endpoint carried no override;
+   * `true` when an override was removed. A malformed endpoint id
+   * throws `RangeError` when the limit is configured.
+   */
+  removeTenantRateLimitEndpoint(endpoint: string): boolean {
+    const limiter = this.tenantRateLimiter;
+    if (limiter === undefined) return false;
+    return limiter.removeEndpointOverride(endpoint);
+  }
+
+  /**
+   * WR-329: live per-tenant outbound rate-limit snapshot — the
+   * tenant-level defaults, mode, and endpoint overrides. `undefined`
+   * when the limit was never configured. Reads the live values, so a
+   * runtime revision is visible immediately.
+   */
+  getTenantRateLimit(): TenantRateLimitSnapshot | undefined {
+    return this.tenantRateLimiter?.current();
   }
 
   /**

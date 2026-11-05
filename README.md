@@ -3465,9 +3465,41 @@ const queue = new RetryQueue({
   omitted for the default tenant, per the WR-48 convention) and to OTLP
   as a `rate_limited` event carrying `relay.retry_after_ms`.
   `getTenantRateLimitStats()` exposes per-scope denial counts plus the
-  override-resolved `burst` / `refillPerSecond`. Invalid options throw
-  `RangeError` at construction; the clock is injectable for
-  deterministic tests.
+  override-resolved `burst` / `refillPerSecond`, read live — a runtime
+  revision below is reflected in the next row immediately. Invalid
+  options throw `RangeError` at construction; the clock is injectable
+  for deterministic tests.
+- **Runtime revision (WR-329)** — the defaults, the mode, and the
+  per-endpoint overrides are all revisable without a restart, via the
+  in-process server methods `reviseTenantRateLimit(patch)`,
+  `reviseTenantRateLimitEndpoint(endpoint, patch)`,
+  `removeTenantRateLimitEndpoint(endpoint)`, and the
+  `getTenantRateLimit()` snapshot. A patch is partial (omitted fields
+  keep their live values) and validated before it is applied — an
+  illegal value or an empty patch throws `RangeError` and the live
+  values are untouched; revising to the live values is a silent no-op.
+  Tightening the burst clamps every live bucket's unspent balance to
+  the new cap at once (already-granted tokens are never revoked);
+  widening never tops a bucket up. A defaults revision never touches
+  endpoint overrides, and an endpoint revision only moves that
+  endpoint's override — unset override fields keep falling back to the
+  *live* defaults, so a later defaults revision still moves them.
+  Removing an override drops the endpoint back to the live defaults. A
+  `mode` switch only affects calls after the switch: flipping to
+  `"reject-429"` makes the next intake answer 429, while a delivery
+  already admitted still dispatches (dispatch never re-checks);
+  flipping back to `"queue"` resumes dispatch pacing. Real revisions
+  are audited as `tenant_rate_limit_revised` (with `previous` /
+  `current` `{ burst, refillPerSecond, mode }`),
+  `tenant_rate_limit_endpoint_revised` (with `endpoint` and the
+  effective `previous` / `current` `{ burst, refillPerSecond }`), and
+  `tenant_rate_limit_endpoint_removed` (with `endpoint` and the removed
+  override as `previous`). Revising a relay that never configured the
+  limit throws `Error` — first enabling it still needs a restart. No
+  new Prometheus series. Three-way contrast: WR-310 revises the
+  relay-level *global* rate, WR-329 revises this *tenant-level*
+  outbound rate, and WR-322 revises *endpoint quotas* (the WR-15
+  per-minute budget) — three different gates.
 
 ## Per-endpoint outbound rate limiting
 
