@@ -11837,7 +11837,17 @@ the whole batch, and every flush is audited as `batch_flushed` with its
 size. Urgent items skip batching entirely (the fast lane must not wait).
 `stop()` flushes pending batches into the queue unscheduled (a later
 `start()` delivers them); `shutdown()` flushes them and grants each batch
-one immediate attempt before draining in-flight deliveries.
+one immediate attempt before draining in-flight deliveries. The merge
+config is revisable live via `setBatchConfig({ windowMs?, maxBatchSize? })`
+(`getBatchConfig()` reads the live values, returning `undefined` when
+batching was never configured; `setBatchConfig` throws a must-restart
+`Error` in that case): a window change only affects the next buffer — a
+timer already armed runs out on the old window — while tightening
+`maxBatchSize` flushes any buffer already over the new cap at once
+(loosening never flushes early). An illegal patch throws `RangeError` and
+leaves the live values untouched; an empty or same-value patch is a silent
+no-op, and a real revision is audited as `batch_config_revised` with
+`previous` / `current`.
 
 **Live event stream:** with an `operatorToken` set, `GET /events` opens a
 Server-Sent Events stream pushing `delivered` / `retrying` / `dead_letter`

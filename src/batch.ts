@@ -70,6 +70,18 @@ export interface BatchTimers {
   clearTimer: (handle: { clear(): void }) => void;
 }
 
+/**
+ * WR-333: partial patch for a live batch-merge revision. Omitted fields
+ * keep their live values; an empty patch is a no-op. Merged values are
+ * validated against the construction gates (`windowMs` finite > 0,
+ * `maxBatchSize` an integer >= 1) — an illegal patch throws `RangeError`
+ * and the live values are left untouched.
+ */
+export interface BatchConfigRevision {
+  windowMs?: number;
+  maxBatchSize?: number;
+}
+
 export interface ResolvedBatchOptions {
   windowMs: number;
   maxBatchSize: number;
@@ -183,5 +195,46 @@ export class BatchCollector {
   /** Flush every endpoint's buffer now. */
   flushAll(): void {
     for (const endpoint of this.endpoints()) this.flushEndpoint(endpoint);
+  }
+
+  /**
+   * WR-333: revise the live merge window and/or cap at runtime (partial —
+   * omitted fields keep their live values). The merged values are
+   * validated against the construction gates first — reusing the
+   * `resolveBatchOptions` error text — so an illegal patch throws
+   * `RangeError` and the live values are left completely untouched.
+   *
+   * A window change only affects the next buffer: a timer already armed
+   * runs out on the old window (WR-311 in-flight-timer precedent).
+   * Tightening `maxBatchSize` flushes any buffer already over the new
+   * cap at once (WR-329 bucket-clamping semantics); loosening never
+   * flushes early. Returns the live values after the revision.
+   */
+  retune(patch: BatchConfigRevision): { windowMs: number; maxBatchSize: number } {
+    const nextWindowMs = patch.windowMs ?? this.opts.windowMs;
+    const nextMaxBatchSize = patch.maxBatchSize ?? this.opts.maxBatchSize;
+    // Validate-then-apply: the merged values must pass the construction
+    // gates before either live value moves.
+    if (!Number.isFinite(nextWindowMs) || nextWindowMs <= 0) {
+      throw new RangeError(`batch.windowMs must be > 0, got ${patch.windowMs}`);
+    }
+    if (!Number.isInteger(nextMaxBatchSize) || nextMaxBatchSize < 1) {
+      throw new RangeError(`batch.maxBatchSize must be an integer >= 1, got ${patch.maxBatchSize}`);
+    }
+    // `opts` is `private readonly`, which only forbids reassigning the
+    // field — its properties are the live values and are rewritten here
+    // in place, so every holder of the same resolved object (notably
+    // `RetryQueue.batchResolved`) reads the new values immediately.
+    this.opts.windowMs = nextWindowMs;
+    this.opts.maxBatchSize = nextMaxBatchSize;
+    for (const endpoint of this.endpoints()) {
+      if (this.bufferedCount(endpoint) >= nextMaxBatchSize) this.flushEndpoint(endpoint);
+    }
+    return this.current();
+  }
+
+  /** Live merge window / cap snapshot. */
+  current(): { windowMs: number; maxBatchSize: number } {
+    return { windowMs: this.opts.windowMs, maxBatchSize: this.opts.maxBatchSize };
   }
 }

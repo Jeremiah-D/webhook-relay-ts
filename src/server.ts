@@ -193,6 +193,7 @@ export { errorBudgetBurnAuditEvent };
 export type { BurnRateAlertInfo, ErrorBudgetBurnAuditEvent } from "./retry.ts";
 import type { ReplayGuard } from "./replay.ts";
 import { DeliveryDeduplicator, type DedupOptions, type DedupWindowRevision } from "./dedup.ts";
+import type { BatchConfigRevision } from "./batch.ts";
 import {
   SecretScanner,
   type SecretHit,
@@ -5633,6 +5634,28 @@ export interface RelayServer extends Server {
    * `Error`: enabling dedup needs a restart.
    */
   setDedupWindow?: (patch: DedupWindowRevision) => { windowMs: number; maxEntries: number };
+  /**
+   * WR-333: revise the batch-merge config at runtime (`windowMs` /
+   * `maxBatchSize`, partial — omitted fields keep their live values).
+   * A window change only affects the next buffer (a timer already
+   * armed runs out on the old window); tightening `maxBatchSize`
+   * flushes any buffer already over the new cap at once, loosening
+   * never flushes early. An illegal patch throws `RangeError` and the
+   * live values are untouched; an empty patch (or values equal to the
+   * live ones) is a no-op with no audit event. A real revision is
+   * audited as `batch_config_revised` with `previous` / `current`
+   * `{ windowMs, maxBatchSize }`, and returns the live values. Always
+   * set; throws `Error` when batching was never configured — enabling
+   * it needs a restart.
+   */
+  setBatchConfig?: (patch: BatchConfigRevision) => { windowMs: number; maxBatchSize: number };
+  /**
+   * WR-333: live batch-merge config, or `undefined` when batching was
+   * never configured. Always set (unlike the conditionally-mounted
+   * getters): callers read `undefined` instead of testing for the
+   * method.
+   */
+  getBatchConfig?: () => { windowMs: number; maxBatchSize: number } | undefined;
   /**
    * WR-309: revise the outbound keep-alive pool's fixed per-host cap
    * and/or idle timeout at runtime (`maxSocketsPerHost` /
@@ -14447,6 +14470,40 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     });
     return next;
   };
+
+  // WR-333: batch-merge config runtime revision. The method is always
+  // set (like setDedupWindow above); with batching unconfigured the
+  // queue throws Error — enabling batching needs a restart. A real
+  // revision is audited as `batch_config_revised` with the previous and
+  // current window / cap (the construction values as first `previous`);
+  // an empty or same-value patch is a silent no-op.
+  server.setBatchConfig = (patch: BatchConfigRevision): { windowMs: number; maxBatchSize: number } => {
+    const prev = queue.getBatchConfig();
+    if (prev === undefined) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.setBatchConfig(patch);
+    }
+    const previous = { windowMs: prev.windowMs, maxBatchSize: prev.maxBatchSize };
+    // Validate-then-apply inside retune: an illegal patch throws
+    // RangeError and the live values are left completely intact.
+    const next = queue.setBatchConfig(patch);
+    if (next.windowMs === previous.windowMs && next.maxBatchSize === previous.maxBatchSize) {
+      return next;
+    }
+    opts.auditLog.append({
+      event: "batch_config_revised",
+      previous,
+      current: next,
+    });
+    return next;
+  };
+
+  // WR-333: live batch-merge config, or `undefined` when batching was
+  // never configured. Always set (unlike the conditionally-mounted
+  // getters): callers read `undefined` instead of testing for the
+  // method.
+  server.getBatchConfig = (): { windowMs: number; maxBatchSize: number } | undefined =>
+    queue.getBatchConfig();
 
   // WR-309: outbound keep-alive pool cap / idle-timeout runtime
   // revision. The method is always set (like setDedupWindow above);

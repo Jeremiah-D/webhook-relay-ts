@@ -293,6 +293,7 @@ import {
   BatchCollector,
   newBatchId,
   resolveBatchOptions,
+  type BatchConfigRevision,
   type BatchEnvelopeInput,
   type BatchOptions,
   type ResolvedBatchOptions,
@@ -653,7 +654,7 @@ export {
   dominantPhaseOf,
   LATENCY_PHASES,
 } from "./latency-phases.ts";
-export type { BatchEnvelopeInput, BatchOptions };
+export type { BatchConfigRevision, BatchEnvelopeInput, BatchOptions };
 export type { AutoReplayOptions, DeadLetterAutoReplayAuditEvent };
 export type {
   DeadLetterRetentionOptions,
@@ -6108,6 +6109,38 @@ export class RetryQueue {
       events: this.batchStats.get(endpoint)?.events ?? 0,
       buffered: this.batcher!.bufferedCount(endpoint),
     }));
+  }
+
+  /**
+   * WR-333: revise the live batch-merge config at runtime (merge window
+   * and/or cap, partial — omitted fields keep their live values). The
+   * next buffer judges by the new values; a timer already armed runs
+   * out on the old window, and tightening `maxBatchSize` flushes any
+   * buffer already over the new cap at once (see
+   * `BatchCollector.retune`). An illegal patch throws `RangeError` and
+   * the live config is untouched; revising to the current values is a
+   * no-op. Throws `Error` when batching was never configured —
+   * enabling it needs a restart. Returns the live values after the
+   * revision.
+   */
+  setBatchConfig(patch: BatchConfigRevision): { windowMs: number; maxBatchSize: number } {
+    if (this.batcher === undefined) {
+      throw new Error(
+        "setBatchConfig: batching is not configured — enabling it requires a restart: " +
+          "the collector is created at startup and a running relay cannot start batching without one"
+      );
+    }
+    return this.batcher.retune(patch);
+  }
+
+  /**
+   * WR-333: live batch-merge config, or `undefined` when batching was
+   * never configured. Reads the same resolved options object the
+   * collector rewrites in place, so the snapshot is always live.
+   */
+  getBatchConfig(): { windowMs: number; maxBatchSize: number } | undefined {
+    if (this.batchResolved === undefined) return undefined;
+    return { windowMs: this.batchResolved.windowMs, maxBatchSize: this.batchResolved.maxBatchSize };
   }
 
   /**
