@@ -3194,6 +3194,27 @@ queue.getTenantConcurrencyStats();
   `relay_tenant_concurrency_wait_total{tenant}` (activity-gated —
   absent until a tenant waits, and only when the cap is configured).
   Invalid values throw `RangeError` at construction.
+- **Live revision (WR-328)** — `server.reviseTenantConcurrency(tenant, maxConcurrent)`
+  revises one tenant's cap at runtime (a positive integer, or `Infinity`
+  for "no cap"), so a bursting tenant can be widened — or a noisy one
+  tightened — without restarting the relay. Widening wakes FIFO waiters
+  immediately; tightening never revokes a held slot (new acquisitions
+  queue until in-flight drains back to the cap). An illegal tenant id or
+  cap throws `RangeError` and the live caps are untouched; a same-value
+  revision is a no-op with no audit event. A real revision is audited as
+  `tenant_concurrency_revised` with `tenant` / `previous` / `current`
+  caps (the construction default as first `previous`); the empty string
+  is the default tenant. `server.getTenantConcurrency(tenant)` reports
+  the live cap and whether the tenant carries an override (an unrevised
+  tenant reports the construction default with `overridden: false`), and
+  `server.removeTenantConcurrency(tenant)` drops the override so the
+  tenant falls back to the default (audited as
+  `tenant_concurrency_removed`). Revising one tenant from an unconfigured
+  (`Infinity`) default works like any other — that tenant becomes capped
+  while the rest stay unlimited. Three independent revision dimensions:
+  WR-313 revises the relay-wide global cap, WR-321 revises one
+  endpoint's cap, and this revises one tenant's cap across all of that
+  tenant's endpoints; no new Prometheus series are added.
 - **Shutdown-safe** — promise-FIFO only (no timers, nothing to unref);
   `stop()`/`shutdown()` wake every tenant's waiters.
 

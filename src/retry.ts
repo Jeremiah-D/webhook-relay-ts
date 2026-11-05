@@ -385,6 +385,7 @@ import {
 } from "./global-concurrency.ts";
 import {
   TenantConcurrencyGates,
+  type TenantConcurrencySnapshot,
   type TenantConcurrencyStats,
 } from "./tenant-concurrency.ts";
 import {
@@ -565,6 +566,7 @@ export type {
 export type { ReplayEgressOptions };
 export { ReplayEgressGate, DEFAULT_REPLAY_EGRESS_RPS };
 export type { EndpointRetryBudgetSnapshot, RetryBudgetOptions } from "./retry-budget.ts";
+export type { TenantConcurrencySnapshot } from "./tenant-concurrency.ts";
 export { RetryBudget, DEFAULT_RETRY_BUDGET_PER_MINUTE } from "./retry-budget.ts";
 export type { TenantRetryBudgetOptions } from "./tenant-retry-budget.ts";
 export {
@@ -10056,6 +10058,55 @@ export class RetryQueue {
    */
   getTenantConcurrencyStats(): TenantConcurrencyStats[] {
     return this.tenantGates.stats();
+  }
+
+  /**
+   * WR-328: revise one tenant's live outbound concurrency cap — the
+   * queue-side setter behind `RelayServer.reviseTenantConcurrency`.
+   * The tenant gates are always constructed, so there is no "not
+   * configured" branch — revising one tenant from the default
+   * `Infinity` cap works like any other, and the other tenants stay
+   * unlimited. Check order: tenant id, then cap, then apply — an
+   * illegal tenant id or cap throws `RangeError` and the live caps
+   * are completely untouched; revising to the tenant's effective
+   * current cap is a silent no-op that records no override. The next
+   * `acquire()` judges by the new cap; in-flight dispatches are
+   * unaffected (tightening never revokes a held slot, widening pumps
+   * out FIFO waiters at once). Other tenants and the global gate
+   * (WR-51/WR-313) are untouched. Returns the live snapshot
+   * (`previous` = the effective cap before the revision — the
+   * construction default on a first revision).
+   */
+  reviseTenantConcurrency(tenant: string, maxConcurrent: number): TenantConcurrencySnapshot {
+    const before = this.tenantGates.getTenant(tenant);
+    const current = this.tenantGates.reviseTenant(tenant, maxConcurrent);
+    // A same-value revision is a no-op that records no override, so
+    // read the flag live instead of assuming the revision set one.
+    return { tenant, maxConcurrent: current, previous: before.maxConcurrent, overridden: this.tenantGates.hasOverride(tenant) };
+  }
+
+  /**
+   * WR-328: the live effective concurrency cap for one tenant — the
+   * tenant's own override when one exists, otherwise the construction
+   * default — plus whether the tenant carries an override. Read-only:
+   * unlike the setter it never creates a gate, so a read cannot
+   * conjure state. Reads the live values, so a runtime revision is
+   * visible immediately. `""` is the default tenant.
+   */
+  getTenantConcurrency(tenant: string): TenantConcurrencySnapshot {
+    const live = this.tenantGates.getTenant(tenant);
+    return { tenant, maxConcurrent: live.maxConcurrent, previous: live.maxConcurrent, overridden: live.overridden };
+  }
+
+  /**
+   * WR-328: drop one tenant's concurrency override so it falls back
+   * to the construction default cap (its gate, if any, is retuned in
+   * place to the default — in-flight dispatches and waiters are
+   * preserved). Returns `false` when the tenant carried no override.
+   * A malformed tenant id throws `RangeError`.
+   */
+  removeTenantConcurrency(tenant: string): boolean {
+    return this.tenantGates.removeTenant(tenant);
   }
 
   /** WR-324: the live urgent fast-lane rate (per second). */

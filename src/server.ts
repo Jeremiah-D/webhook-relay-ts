@@ -66,7 +66,7 @@ import {
   type ResolvedHttpHardening,
 } from "./http-hardening.ts";
 import type { OrderedAuditEvent, OrderedModeOptions } from "./retry.ts";
-import type { BulkheadRevision, BulkheadRevisionSnapshot, CircuitThresholdPatch, DeliveryWindowListEntry, DeliveryWindowSnapshot, EndpointConcurrencySnapshot, EndpointQuotaSnapshot, EndpointRetryBudgetSnapshot, EndpointRetryPolicyRevision, GlobalConcurrencyStats, GlobalRateLimitRevision, GlobalRateLimitStats, HolidayCalendarConfig, HolidayCalendarSnapshot, MinNormalShareSnapshot, ResolvedCircuitThresholds, ResolvedEndpointRetryPolicy, StatusRetryPolicyConfig, TenantRetryBudgetRevision } from "./retry.ts";
+import type { BulkheadRevision, BulkheadRevisionSnapshot, CircuitThresholdPatch, DeliveryWindowListEntry, DeliveryWindowSnapshot, EndpointConcurrencySnapshot, EndpointQuotaSnapshot, EndpointRetryBudgetSnapshot, EndpointRetryPolicyRevision, GlobalConcurrencyStats, GlobalRateLimitRevision, GlobalRateLimitStats, HolidayCalendarConfig, HolidayCalendarSnapshot, MinNormalShareSnapshot, ResolvedCircuitThresholds, ResolvedEndpointRetryPolicy, StatusRetryPolicyConfig, TenantConcurrencySnapshot, TenantRetryBudgetRevision } from "./retry.ts";
 import {
   DEFAULT_STATUS_RETRY_MULTIPLIER,
   assertValidStatusRetryPolicy,
@@ -5672,6 +5672,42 @@ export interface RelayServer extends Server {
    * default `Infinity` cap revises like any other.
    */
   setGlobalConcurrency?: (maxConcurrent: number) => number;
+  /**
+   * WR-328: revise one tenant's outbound concurrency cap at runtime
+   * (a positive integer, or `Infinity` for "no cap"). Widening wakes
+   * FIFO waiters immediately; tightening never revokes a held slot —
+   * new acquisitions queue until in-flight drains back to the cap.
+   * An illegal tenant id or cap throws `RangeError` and the live caps
+   * are untouched; a same-value revision is a no-op with no audit
+   * event. A real revision is audited as `tenant_concurrency_revised`
+   * with `tenant` / `previous` / `current` caps (the construction
+   * default as first `previous`), and returns the live snapshot.
+   * Always set — the tenant gates are always constructed, so there is
+   * no "not configured" branch (unlike `reviseTenantRetryBudget`):
+   * revising one tenant from the default `Infinity` cap works like
+   * any other, and the other tenants stay unlimited. The empty string
+   * is the default tenant. Other tenants, the global gate
+   * (WR-51/WR-313) and the per-endpoint limiter (WR-06/WR-321) are
+   * untouched.
+   */
+  reviseTenantConcurrency: (tenant: string, maxConcurrent: number) => TenantConcurrencySnapshot;
+  /**
+   * WR-328: live per-tenant concurrency read — the effective cap for
+   * `tenant` (the tenant's own override when one exists, otherwise
+   * the construction default) and whether the tenant carries an
+   * explicit override. Always set — the tenant gates are always
+   * constructed. The empty string is the default tenant.
+   */
+  getTenantConcurrency?: (tenant: string) => TenantConcurrencySnapshot | undefined;
+  /**
+   * WR-328: remove one tenant's concurrency override at runtime —
+   * the tenant falls back to the construction default cap. Returns
+   * `true` when an override was removed (audited as
+   * `tenant_concurrency_removed` with `tenant` and the removed cap
+   * as `previous`), `false` when the tenant had no override. Always
+   * set.
+   */
+  removeTenantConcurrency: (tenant: string) => boolean;
   /**
    * WR-314: revise the relay-level global retry budget at runtime
    * (retries per minute). The next scheduled retry judges by the new
@@ -14312,6 +14348,53 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // WR-313: relay-level global concurrency snapshot — always set; the
   // gate is always constructed.
   server.getGlobalConcurrencyStats = (): GlobalConcurrencyStats => queue.getGlobalConcurrencyStats();
+
+  // WR-328: per-tenant outbound concurrency cap runtime revision. The
+  // method is always set (like setGlobalConcurrency above); the tenant
+  // gates are always constructed, so there is no "not configured"
+  // branch — a revision from the default `Infinity` cap works like any
+  // other, and the other tenants stay unlimited. A real revision is
+  // audited as `tenant_concurrency_revised` with the tenant and the
+  // previous and current caps (the construction default as first
+  // previous); a same-value revision is a silent no-op.
+  server.reviseTenantConcurrency = (tenant: string, maxConcurrent: number): TenantConcurrencySnapshot => {
+    const previous = queue.getTenantConcurrency(tenant);
+    // Validate-then-apply inside the queue revision: an illegal tenant
+    // id or cap throws RangeError and the live caps are left completely
+    // intact.
+    const next = queue.reviseTenantConcurrency(tenant, maxConcurrent);
+    if (next.maxConcurrent === previous.maxConcurrent) {
+      return next;
+    }
+    opts.auditLog.append({
+      event: "tenant_concurrency_revised",
+      tenant,
+      previous: previous.maxConcurrent,
+      current: next.maxConcurrent,
+    });
+    return next;
+  };
+
+  // WR-328: per-tenant concurrency removal. Always set; a tenant
+  // without an override returns false silently. A real removal audits
+  // `tenant_concurrency_removed` with the tenant and the removed cap
+  // as `previous`.
+  server.removeTenantConcurrency = (tenant: string): boolean => {
+    const previous = queue.getTenantConcurrency(tenant);
+    if (!previous.overridden) return false;
+    queue.removeTenantConcurrency(tenant);
+    opts.auditLog.append({
+      event: "tenant_concurrency_removed",
+      tenant,
+      previous: previous.maxConcurrent,
+    });
+    return true;
+  };
+
+  // WR-328: live per-tenant concurrency reads. Always set; the tenant
+  // gates are always constructed.
+  server.getTenantConcurrency = (tenant: string): TenantConcurrencySnapshot | undefined =>
+    queue.getTenantConcurrency(tenant);
 
   // WR-314: relay-level global retry-budget runtime revision. The
   // method is always set (like setGlobalRateLimit above); with the

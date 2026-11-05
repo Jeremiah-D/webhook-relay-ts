@@ -37,7 +37,15 @@
  * - Tenant-less deliveries never touch this gate at all: with no
  *   `x-tenant-id` the dispatch path is byte-for-byte the pre-WR-140
  *   behavior (global gate + per-endpoint limiter only).
+ * - Runtime revision (WR-328): `retune()` moves one tenant's cap live
+ *   — widening pumps out FIFO waiters at once, tightening never revokes
+ *   a held slot (new acquisitions queue until in-flight drains back to
+ *   the cap) — and `TenantConcurrencyGates.reviseTenant()` records a
+ *   per-tenant override on top of the construction default, removable
+ *   with `removeTenant()` (the tenant falls back to the default cap).
  */
+
+import { assertValidTenantId } from "./tenant.ts";
 
 /** Snapshot of one tenant's dispatch gate. */
 export interface TenantConcurrencyStats {
@@ -68,6 +76,39 @@ export function assertTenantConcurrencyLimit(tenantMaxConcurrent: number): void 
 }
 
 /**
+ * WR-328: one live per-tenant concurrency revision. `tenant` is the
+ * tenant id (`""` = the default tenant, the WR-312/WR-48 convention).
+ * `maxConcurrent` is the live cap after the call; `previous` is the
+ * effective cap before the revision (on a read it equals the live cap);
+ * `overridden` says whether the tenant carries an explicit override
+ * after the call.
+ */
+export interface TenantConcurrencySnapshot {
+  /** Tenant id; `""` is the default tenant. */
+  tenant: string;
+  /** Live per-tenant cap (`Infinity` = unlimited). */
+  maxConcurrent: number;
+  /** Effective cap before the revision (a read: same as live). */
+  previous: number;
+  /** Whether the tenant carries an explicit override after the call. */
+  overridden: boolean;
+}
+
+/**
+ * Validate a tenant id for a concurrency revision (WR-328): a string
+ * (anything else is a `RangeError` — unlike `assertValidTenantId`,
+ * which throws `TypeError` for non-strings); the empty string is the
+ * default tenant; any other id follows the WR-48 charset rule.
+ */
+export function assertTenantConcurrencyTenant(tenant: string): void {
+  if (typeof tenant !== "string") {
+    throw new RangeError(`tenant must be a string, got ${typeof tenant}`);
+  }
+  if (tenant === "") return;
+  assertValidTenantId(tenant);
+}
+
+/**
  * One tenant's dispatch gate: at most `maxConcurrent` deliveries in
  * flight for this tenant across all its endpoints; excess acquisitions
  * wait in FIFO order.
@@ -78,7 +119,7 @@ export function assertTenantConcurrencyLimit(tenantMaxConcurrent: number): void 
  * once. Releases cascade to the next waiter, so no one hangs.
  */
 export class TenantConcurrencyGate {
-  private readonly maxConcurrent: number;
+  private maxConcurrent: number;
   private inFlight = 0;
   private readonly waiters: Array<(release: () => void) => void> = [];
   private waitsTotal = 0;
@@ -90,6 +131,40 @@ export class TenantConcurrencyGate {
 
   /** The configured cap (`Infinity` = unlimited). */
   cap(): number {
+    return this.maxConcurrent;
+  }
+
+  /**
+   * WR-328: revise the cap live — the same semantics as
+   * `GlobalConcurrencyGate.retune` (WR-313). An illegal value throws
+   * `RangeError` and the live cap is untouched; the current cap is a
+   * silent no-op.
+   *
+   * - Tightening never revokes a held slot: in-flight dispatches run
+   *   to completion under the old cap. New acquisitions queue until
+   *   `inFlight` is back at (or below) the new cap — a release while
+   *   `inFlight` is still above the cap drains the count instead of
+   *   handing the slot to a waiter (see `release()`).
+   * - Widening pumps out waiters immediately, in FIFO order: each
+   *   grant takes a fresh slot (`inFlight += 1`) and resolves the
+   *   oldest waiter with the usual release function.
+   * - Revising to `Infinity` wakes every waiter; revising from
+   *   `Infinity` to a finite cap starts limiting at once, with
+   *   in-flight dispatches unaffected.
+   */
+  retune(newCap: number): number {
+    assertTenantConcurrencyLimit(newCap);
+    if (newCap === this.maxConcurrent) {
+      return this.maxConcurrent;
+    }
+    this.maxConcurrent = newCap;
+    while (this.waiters.length > 0 && this.inFlight < this.maxConcurrent) {
+      // A fresh slot: the waiter takes it (in-flight grows), unlike
+      // release(), where the slot transfers and the count is unchanged.
+      this.inFlight += 1;
+      const next = this.waiters.shift()!;
+      next(() => this.release());
+    }
     return this.maxConcurrent;
   }
 
@@ -111,7 +186,13 @@ export class TenantConcurrencyGate {
   }
 
   private release(): void {
-    const next = this.waiters.shift();
+    // WR-328: after a tightening retune the in-flight count can sit
+    // above the new cap. A release then drains the count instead of
+    // transferring the slot: a waiter is a new acquisition, and new
+    // acquisitions queue until inFlight is back at (or below) the cap.
+    // In steady state inFlight never exceeds the cap, so this guard
+    // changes nothing outside a retune.
+    const next = this.inFlight <= this.maxConcurrent ? this.waiters.shift() : undefined;
     if (next) {
       // Slot transfers from the releaser to the oldest waiter; the
       // in-flight count is unchanged (no increment here).
@@ -167,11 +248,17 @@ export class TenantConcurrencyGate {
  * tenant's slots (the WR-48 isolation convention).
  *
  * The cap is validated once, at construction; every lazily created gate
- * inherits it.
+ * inherits it. WR-328 adds per-tenant overrides: `reviseTenant()`
+ * records one tenant's own live cap (a gate already dispatching is
+ * retuned in place, a tenant not yet seen is only recorded and its
+ * first gate is built at the new cap); `removeTenant()` drops the
+ * override and the tenant falls back to the construction default.
  */
 export class TenantConcurrencyGates {
   private readonly maxConcurrent: number;
   private readonly gates = new Map<string, TenantConcurrencyGate>();
+  /** WR-328: per-tenant live caps, keyed by tenant id (`""` = default tenant). */
+  private readonly overrides = new Map<string, number>();
 
   constructor(maxConcurrent: number = Infinity) {
     assertTenantConcurrencyLimit(maxConcurrent);
@@ -186,10 +273,75 @@ export class TenantConcurrencyGates {
   private gateFor(tenant: string): TenantConcurrencyGate {
     let g = this.gates.get(tenant);
     if (g === undefined) {
-      g = new TenantConcurrencyGate(this.maxConcurrent);
+      g = new TenantConcurrencyGate(this.overrides.get(tenant) ?? this.maxConcurrent);
       this.gates.set(tenant, g);
     }
     return g;
+  }
+
+  /**
+   * WR-328: revise (or set) one tenant's live cap. The tenant id is
+   * validated first (`RangeError` on a malformed id — including a
+   * non-string), then the cap (`RangeError` on an illegal value) —
+   * either failure leaves the live caps completely untouched.
+   * Revising to the tenant's effective current cap is a silent no-op
+   * (no override is recorded, no gate is created). Otherwise the
+   * override is recorded and an existing gate is retuned in place
+   * (tightening never revokes a held slot, widening pumps out FIFO
+   * waiters at once); a tenant not yet seen gets its gate built at
+   * the new cap on first dispatch. Other tenants and the default cap
+   * are untouched. Returns the tenant's live cap.
+   */
+  reviseTenant(tenant: string, newCap: number): number {
+    assertTenantConcurrencyTenant(tenant);
+    assertTenantConcurrencyLimit(newCap);
+    const existing = this.gates.get(tenant);
+    const current = existing?.cap() ?? this.overrides.get(tenant) ?? this.maxConcurrent;
+    if (newCap === current) return current;
+    this.overrides.set(tenant, newCap);
+    if (existing !== undefined) {
+      existing.retune(newCap);
+    } else {
+      this.gates.set(tenant, new TenantConcurrencyGate(newCap));
+    }
+    return newCap;
+  }
+
+  /**
+   * WR-328: the live effective cap for `tenant` and whether the tenant
+   * carries an explicit override. Read-only: unlike `reviseTenant` it
+   * never creates a gate, so a read cannot conjure state. A tenant
+   * never revised reports the construction default with
+   * `overridden: false`.
+   */
+  getTenant(tenant: string): { maxConcurrent: number; overridden: boolean } {
+    const gate = this.gates.get(tenant);
+    return {
+      maxConcurrent: gate?.cap() ?? this.overrides.get(tenant) ?? this.maxConcurrent,
+      overridden: this.overrides.has(tenant),
+    };
+  }
+
+  /** WR-328: whether `tenant` carries an explicit override. */
+  hasOverride(tenant: string): boolean {
+    return this.overrides.has(tenant);
+  }
+
+  /**
+   * WR-328: remove one tenant's override — the tenant falls back to
+   * the construction default cap. An existing gate is retuned in
+   * place to the default (in-flight dispatches and waiters are
+   * preserved: tightening drains, widening pumps out FIFO waiters).
+   * Returns `true` when an override was removed, `false` when the
+   * tenant had none. A malformed tenant id throws `RangeError`.
+   */
+  removeTenant(tenant: string): boolean {
+    assertTenantConcurrencyTenant(tenant);
+    if (!this.overrides.has(tenant)) return false;
+    this.overrides.delete(tenant);
+    const gate = this.gates.get(tenant);
+    if (gate !== undefined) gate.retune(this.maxConcurrent);
+    return true;
   }
 
   /**
