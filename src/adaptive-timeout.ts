@@ -87,6 +87,28 @@ export interface AdaptiveTimeoutOptions {
   now?: () => number;
 }
 
+/**
+ * WR-334: a partial revision of the adaptive timeout config
+ * (`baseTimeoutMs` / `marginRatio` / `minTimeoutMs` / `maxTimeoutMs` /
+ * `minSamples`, at least one field set). Omitted fields keep their live
+ * values; an empty patch is a `RangeError`.
+ */
+export type AdaptiveTimeoutRevision = Partial<
+  Pick<
+    AdaptiveTimeoutOptions,
+    "baseTimeoutMs" | "marginRatio" | "minTimeoutMs" | "maxTimeoutMs" | "minSamples"
+  >
+>;
+
+/** WR-334: live adaptive timeout config — the five formula inputs, after any revision. */
+export interface AdaptiveTimeoutConfig {
+  baseTimeoutMs: number;
+  marginRatio: number;
+  minTimeoutMs: number;
+  maxTimeoutMs: number;
+  minSamples: number;
+}
+
 /** Per-endpoint adaptive timeout view. All JSON-serializable. */
 export interface AdaptiveTimeoutEndpointStats {
   endpoint: string;
@@ -173,11 +195,15 @@ export function assertValidAdaptiveTimeoutOptions(opts: unknown): void {
  * via `timeoutFor()`.
  */
 export class AdaptiveTimeout {
-  private readonly baseTimeoutMs: number;
-  private readonly marginRatio: number;
-  private readonly minTimeoutMs: number;
-  private readonly maxTimeoutMs: number;
-  private readonly minSamples: number;
+  // WR-334: live-revisable via `retune()` (the constructor still
+  // validates every value through the same gates), so these are
+  // deliberately not `readonly`. `tracker` stays frozen: retune never
+  // touches the rolling samples or the sample window.
+  private baseTimeoutMs: number;
+  private marginRatio: number;
+  private minTimeoutMs: number;
+  private maxTimeoutMs: number;
+  private minSamples: number;
   private readonly tracker: LatencyTracker;
 
   constructor(opts: AdaptiveTimeoutOptions) {
@@ -194,6 +220,81 @@ export class AdaptiveTimeout {
       maxSamplesPerEndpoint: opts.maxSamplesPerEndpoint ?? 1024,
       now: opts.now,
     });
+  }
+
+  /**
+   * WR-334: revise the live config (partial — omitted fields keep
+   * their live values). Merge-then-validate reusing the construction
+   * gates (`assertValidAdaptiveTimeoutOptions`, including the
+   * `maxTimeoutMs >= minTimeoutMs` cross-check): an illegal patch
+   * throws `RangeError` and the live values are left completely
+   * untouched, and an empty patch is a `RangeError`. A patch equal to
+   * the live values is a silent no-op. The rolling samples are
+   * untouched — p99 is unchanged, only the formula inputs move — so
+   * the next `timeoutFor()` judges by the new values; deliveries
+   * already stamped keep their original cap, and in-flight attempts
+   * are unaffected. Raising `minSamples` can return a warm endpoint
+   * to cold (samples < new threshold → falls back to the new
+   * `baseTimeoutMs`); lowering keeps warm endpoints warm. Raising
+   * `baseTimeoutMs` does not affect warm endpoints' derived cap
+   * (only the cold fallback). Tightening `maxTimeoutMs` takes effect
+   * on the next dispatch immediately. Returns the live config after
+   * the revision.
+   */
+  retune(patch: AdaptiveTimeoutRevision): AdaptiveTimeoutConfig {
+    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new RangeError(
+        `adaptiveTimeout revision must be an object, got ${JSON.stringify(patch)}`
+      );
+    }
+    if (
+      patch.baseTimeoutMs === undefined &&
+      patch.marginRatio === undefined &&
+      patch.minTimeoutMs === undefined &&
+      patch.maxTimeoutMs === undefined &&
+      patch.minSamples === undefined
+    ) {
+      throw new RangeError(
+        "adaptiveTimeout revision must set at least one of baseTimeoutMs, marginRatio, minTimeoutMs, maxTimeoutMs, minSamples"
+      );
+    }
+    const next: AdaptiveTimeoutConfig = {
+      baseTimeoutMs: patch.baseTimeoutMs ?? this.baseTimeoutMs,
+      marginRatio: patch.marginRatio ?? this.marginRatio,
+      minTimeoutMs: patch.minTimeoutMs ?? this.minTimeoutMs,
+      maxTimeoutMs: patch.maxTimeoutMs ?? this.maxTimeoutMs,
+      minSamples: patch.minSamples ?? this.minSamples,
+    };
+    // Validate-then-apply: the merged values must pass the
+    // construction gates (including the max >= min cross-check)
+    // before any live value moves.
+    assertValidAdaptiveTimeoutOptions(next);
+    if (
+      next.baseTimeoutMs === this.baseTimeoutMs &&
+      next.marginRatio === this.marginRatio &&
+      next.minTimeoutMs === this.minTimeoutMs &&
+      next.maxTimeoutMs === this.maxTimeoutMs &&
+      next.minSamples === this.minSamples
+    ) {
+      return this.snapshot();
+    }
+    this.baseTimeoutMs = next.baseTimeoutMs;
+    this.marginRatio = next.marginRatio;
+    this.minTimeoutMs = next.minTimeoutMs;
+    this.maxTimeoutMs = next.maxTimeoutMs;
+    this.minSamples = next.minSamples;
+    return this.snapshot();
+  }
+
+  /** WR-334: live config snapshot (the five formula inputs). */
+  snapshot(): AdaptiveTimeoutConfig {
+    return {
+      baseTimeoutMs: this.baseTimeoutMs,
+      marginRatio: this.marginRatio,
+      minTimeoutMs: this.minTimeoutMs,
+      maxTimeoutMs: this.maxTimeoutMs,
+      minSamples: this.minSamples,
+    };
   }
 
   /** Mark a delivery accepted: starts its latency clock. */

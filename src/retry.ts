@@ -237,7 +237,9 @@ import {
 import {
   AdaptiveTimeout,
   assertValidAdaptiveTimeoutOptions,
+  type AdaptiveTimeoutConfig,
   type AdaptiveTimeoutOptions,
+  type AdaptiveTimeoutRevision,
 } from "./adaptive-timeout.ts";
 import {
   AdaptiveMaxDelay,
@@ -608,8 +610,10 @@ export {
   DEFAULT_ADAPTIVE_WINDOW_SIZE,
 } from "./adaptive-concurrency.ts";
 export type {
+  AdaptiveTimeoutConfig,
   AdaptiveTimeoutOptions,
   AdaptiveTimeoutEndpointStats,
+  AdaptiveTimeoutRevision,
 } from "./adaptive-timeout.ts";
 export { AdaptiveTimeout, AdaptiveTimeoutError, assertValidAdaptiveTimeoutOptions } from "./adaptive-timeout.ts";
 export type {
@@ -9839,6 +9843,38 @@ export class RetryQueue {
    */
   getAdaptiveTimeoutStats(): AdaptiveTimeoutEndpointStats[] {
     return this.adaptiveTimeout?.stats() ?? [];
+  }
+
+  /**
+   * WR-334: revise the live adaptive timeout config (partial —
+   * omitted fields keep their live values). The next dispatch stamps
+   * its cap from the new values; deliveries already stamped keep
+   * their original cap, and in-flight attempts are unaffected. An
+   * illegal patch throws `RangeError` and the live values are
+   * untouched; an empty patch is a `RangeError`; revising to the live
+   * values is a no-op. Throws `Error` when the timeout was never
+   * configured — enabling it needs a restart. The one config is
+   * shared by all endpoints. Returns the live config.
+   */
+  reviseAdaptiveTimeout(patch: AdaptiveTimeoutRevision): AdaptiveTimeoutConfig {
+    const adaptive = this.adaptiveTimeout;
+    if (adaptive === undefined) {
+      throw new Error(
+        "reviseAdaptiveTimeout: adaptive timeout is not configured — enabling it requires a restart: " +
+          "the timeout is created at startup and a running relay cannot start deriving p99 caps without one"
+      );
+    }
+    return adaptive.retune(patch);
+  }
+
+  /**
+   * WR-334: live adaptive timeout config — the five formula inputs
+   * shared by all endpoints. `undefined` when the feature was never
+   * configured. Reads the live values, so a runtime revision is
+   * visible immediately.
+   */
+  getAdaptiveTimeoutConfig(): AdaptiveTimeoutConfig | undefined {
+    return this.adaptiveTimeout?.snapshot();
   }
 
   /**

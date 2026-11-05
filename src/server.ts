@@ -130,6 +130,8 @@ import {
 import {
   AdaptiveTimeoutError,
   readAdaptiveTimeoutMs,
+  type AdaptiveTimeoutConfig,
+  type AdaptiveTimeoutRevision,
 } from "./adaptive-timeout.ts";
 import {
   PhaseTimeoutError,
@@ -5716,6 +5718,31 @@ export interface RelayServer extends Server {
    * when `outboundRateLimit` was configured; `undefined` otherwise.
    */
   getOutboundRateLimit?: () => { refillRps: number; burst: number } | undefined;
+  /**
+   * WR-334: revise the live adaptive timeout config at runtime
+   * (`baseTimeoutMs` / `marginRatio` / `minTimeoutMs` /
+   * `maxTimeoutMs` / `minSamples`, partial — omitted fields keep
+   * their live values). The next dispatch stamps its cap from the new
+   * values; deliveries already stamped keep their original cap, and
+   * in-flight attempts are unaffected. Raising `minSamples` can
+   * return a warm endpoint to cold (samples < new threshold → falls
+   * back to the new `baseTimeoutMs`); lowering keeps warm endpoints
+   * warm. An illegal patch throws `RangeError` and the live values
+   * are untouched; an empty patch is a `RangeError`; a same-value
+   * revision is a no-op with no audit event. A real revision is
+   * audited as `adaptive_timeout_revised` with `previous` / `current`
+   * (the construction values as first `previous`), and returns the
+   * live config. Always set; throws `Error` when the timeout was
+   * never configured — enabling it needs a restart. The one config is
+   * shared by all endpoints: there is no per-endpoint override.
+   */
+  reviseAdaptiveTimeout?: (patch: AdaptiveTimeoutRevision) => AdaptiveTimeoutConfig;
+  /**
+   * WR-334: live adaptive timeout config — the five formula inputs
+   * shared by all endpoints. Only set when `adaptiveTimeout` was
+   * configured; `undefined` otherwise.
+   */
+  getAdaptiveTimeoutConfig?: () => AdaptiveTimeoutConfig | undefined;
   /**
    * WR-332: revise the live per-tenant inbound rate limit at runtime
    * (`perSecond`, or `undefined` to disable limiting). The next
@@ -14595,6 +14622,48 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   if (queue.getOutboundRateLimit() !== undefined) {
     server.getOutboundRateLimit = (): { refillRps: number; burst: number } =>
       queue.getOutboundRateLimit()!;
+  }
+
+  // WR-334: adaptive timeout config runtime revision. The method is
+  // always set (like setGlobalRateLimit above); with the timeout
+  // unconfigured the queue throws Error — enabling it needs a
+  // restart. A real revision is audited as `adaptive_timeout_revised`
+  // with the previous and current config (the construction values as
+  // first `previous`); an empty or same-value patch is a silent
+  // no-op.
+  server.reviseAdaptiveTimeout = (
+    patch: AdaptiveTimeoutRevision
+  ): AdaptiveTimeoutConfig => {
+    const prev = queue.getAdaptiveTimeoutConfig();
+    if (prev === undefined) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseAdaptiveTimeout(patch);
+    }
+    // Validate-then-apply inside retune: an illegal patch throws
+    // RangeError and the live values are left completely intact.
+    const next = queue.reviseAdaptiveTimeout(patch);
+    if (
+      next.baseTimeoutMs === prev.baseTimeoutMs &&
+      next.marginRatio === prev.marginRatio &&
+      next.minTimeoutMs === prev.minTimeoutMs &&
+      next.maxTimeoutMs === prev.maxTimeoutMs &&
+      next.minSamples === prev.minSamples
+    ) {
+      return next;
+    }
+    opts.auditLog.append({
+      event: "adaptive_timeout_revised",
+      previous: prev,
+      current: next,
+    });
+    return next;
+  };
+
+  // WR-334: live adaptive timeout config. Only set when
+  // `retry.adaptiveTimeout` was configured.
+  if (queue.getAdaptiveTimeoutConfig() !== undefined) {
+    server.getAdaptiveTimeoutConfig = (): AdaptiveTimeoutConfig =>
+      queue.getAdaptiveTimeoutConfig()!;
   }
 
   // WR-332: per-tenant inbound rate-limit runtime revision. The

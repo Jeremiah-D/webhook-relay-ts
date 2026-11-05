@@ -12441,6 +12441,19 @@ const queue = new RetryQueue({
 });
 ```
 
+Live revision (WR-334): `server.reviseAdaptiveTimeout(patch)` revises the
+config at runtime (`baseTimeoutMs` / `marginRatio` / `minTimeoutMs` /
+`maxTimeoutMs` / `minSamples`, partial — omitted fields keep their live
+values); `server.getAdaptiveTimeoutConfig()` returns the live config
+(the getter is only mounted when the feature was configured). A revision
+affects only the next dispatch — the cap is recomputed per dispatch —
+while an in-flight attempt keeps the cap stamped on it at dispatch. An
+illegal patch throws `RangeError` and leaves the live config untouched;
+an empty or same-value patch is a silent no-op. A real revision is
+audited as `adaptive_timeout_revised` with `previous` / `current`.
+Enabling the feature when it was never configured still requires a
+restart.
+
 The timeout for an endpoint is `clamp(p99 * (1 + marginRatio), minTimeoutMs, maxTimeoutMs)` —
 slow endpoints get headroom against false kills, stable fast endpoints get
 tightened so a hung request cannot hold a pool slot. While cold (fewer than
