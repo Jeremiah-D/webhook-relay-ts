@@ -270,6 +270,7 @@ import {
 import {
   OutboundRateLimiter,
   type OutboundRateLimitOptions,
+  type OutboundRateLimitRevision,
   type OutboundRateLimitStats,
 } from "./outbound-ratelimit.ts";
 import {
@@ -629,6 +630,7 @@ export type {
 export { TenantRateLimiter } from "./tenant-ratelimit.ts";
 export type {
   OutboundRateLimitOptions,
+  OutboundRateLimitRevision,
   OutboundRateLimitStats,
 } from "./outbound-ratelimit.ts";
 export { OutboundRateLimiter } from "./outbound-ratelimit.ts";
@@ -11817,6 +11819,45 @@ export class RetryQueue {
    */
   getOutboundRateLimitStats(): OutboundRateLimitStats[] | undefined {
     return this.outboundRateLimiter?.stats();
+  }
+
+  /**
+   * WR-330: revise the live per-endpoint outbound rate limit
+   * (`refillRps` / `burst`, partial — omitted fields keep their live
+   * values). The next `take()` judges by the new values; deliveries
+   * already rescheduled keep their original schedule, and in-flight
+   * attempts are unaffected. Tightening clamps every live bucket's
+   * unspent balance to the new burst at once; widening never tops a
+   * bucket up. An illegal patch throws `RangeError` and the live
+   * values are untouched; an empty patch is a `RangeError`; revising
+   * to the live values is a no-op. Throws `Error` when the limit was
+   * never configured — enabling it needs a restart. The one pair of
+   * values is shared by all endpoints. Returns the live values.
+   */
+  reviseOutboundRateLimit(patch: OutboundRateLimitRevision): {
+    refillRps: number;
+    burst: number;
+  } {
+    const limiter = this.outboundRateLimiter;
+    if (limiter === undefined) {
+      throw new Error(
+        "reviseOutboundRateLimit: outbound rate limit is not configured — enabling it requires a restart: " +
+          "the limiter is created at startup and a running relay cannot start capping without one"
+      );
+    }
+    return limiter.retune(patch);
+  }
+
+  /**
+   * WR-330: live per-endpoint outbound rate-limit values — the single
+   * `refillRps` / `burst` pair shared by all endpoints. `undefined`
+   * when the limit was never configured. Reads the live values, so a
+   * runtime revision is visible immediately.
+   */
+  getOutboundRateLimit(): { refillRps: number; burst: number } | undefined {
+    const limiter = this.outboundRateLimiter;
+    if (limiter === undefined) return undefined;
+    return { refillRps: limiter.refillPerSecond(), burst: limiter.burstSize() };
   }
 
   /**

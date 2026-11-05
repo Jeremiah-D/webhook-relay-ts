@@ -3538,6 +3538,26 @@ const queue = new RetryQueue({
   counts plus the configured `refillRps` / `burst`. Invalid options
   throw `RangeError` at construction; the clock is injectable for
   deterministic tests.
+- **Runtime revision (WR-330)** — the shared `refillRps` / `burst`
+  pair is revisable without a restart, via the in-process server
+  methods `reviseOutboundRateLimit(patch)` and the
+  `getOutboundRateLimit()` snapshot. A patch is partial (omitted
+  fields keep their live values) and validated before it is applied —
+  an illegal value or an empty patch throws `RangeError` and the live
+  values are untouched; revising to the live values is a silent no-op.
+  Tightening the burst clamps every live bucket's unspent balance to
+  the new cap at once (already-granted tokens are never revoked);
+  widening never tops a bucket up. The next `take()` judges by the new
+  values; deliveries already rescheduled keep their original schedule
+  and are re-judged at the new rate on their next attempt, and
+  in-flight attempts are unaffected. A real revision is audited as
+  `outbound_rate_limit_revised` with `previous` / `current`
+  `{ refillRps, burst }`. Revising a relay that never configured the
+  limit throws `Error` — first enabling it still needs a restart. No
+  new Prometheus series. Three-way contrast: WR-310 revises the
+  relay-level *global* rate, WR-329 revises the *tenant-level*
+  outbound rate, and WR-330 revises this *endpoint-shared* outbound
+  rate — three different gates.
 
 ## Delivery receipts
 

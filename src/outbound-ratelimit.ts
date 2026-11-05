@@ -22,6 +22,15 @@ export interface OutboundRateLimitOptions {
   now?: () => number;
 }
 
+/**
+ * WR-330: a partial revision of the per-endpoint outbound rate limit
+ * (`refillRps` / `burst`, at least one field set). Omitted fields keep
+ * their live values; an empty patch is a `RangeError`.
+ */
+export type OutboundRateLimitRevision = Partial<
+  Pick<OutboundRateLimitOptions, "refillRps" | "burst">
+>;
+
 /** One endpoint's outbound rate-limit state, for stats/operators. */
 export interface OutboundRateLimitStats {
   /** Downstream endpoint (physical `targetUrl` at dispatch). */
@@ -63,8 +72,11 @@ function assertPositiveRate(name: string, value: number | undefined): number {
  */
 export class OutboundRateLimiter {
   private readonly inner: TenantRateLimiter;
-  private readonly refillRps: number;
-  private readonly burst: number;
+  // WR-330: live-revisable via `retune()` (the constructor still
+  // validates every value through the same gates), so these are
+  // deliberately not `readonly`.
+  private refillRps: number;
+  private burst: number;
 
   constructor(opts: OutboundRateLimitOptions) {
     if (opts === null || typeof opts !== "object" || Array.isArray(opts)) {
@@ -90,6 +102,51 @@ export class OutboundRateLimiter {
   /** The bucket capacity (max burst). */
   burstSize(): number {
     return this.burst;
+  }
+
+  /**
+   * WR-330: revise the live `refillRps` / `burst` (partial — omitted
+   * fields keep their live values). Merge-then-validate reusing the
+   * construction gates: an illegal patch throws `RangeError` and the
+   * live values are left completely untouched, and an empty patch is
+   * a `RangeError`. A patch equal to the live values is a silent
+   * no-op. The inner limiter (WR-329 `retune`) settles every live
+   * bucket at the old rate before the values move, then clamps
+   * unspent balances to the new burst — already-granted tokens are
+   * never revoked, and widening never tops a bucket up. The next
+   * `take()` judges by the new values; deliveries already
+   * rescheduled keep their original schedule, and in-flight attempts
+   * are unaffected. The one pair of values is shared by all
+   * endpoints — there is no per-endpoint override on this limiter.
+   * Returns the live values after the revision.
+   */
+  retune(patch: OutboundRateLimitRevision): { refillRps: number; burst: number } {
+    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new RangeError(
+        `outboundRateLimit revision must be an object, got ${JSON.stringify(patch)}`
+      );
+    }
+    if (patch.refillRps === undefined && patch.burst === undefined) {
+      throw new RangeError(
+        "outboundRateLimit revision must set at least one of refillRps, burst"
+      );
+    }
+    const nextRefillRps = patch.refillRps ?? this.refillRps;
+    const nextBurst = patch.burst ?? this.burst;
+    // Validate-then-apply: the merged values must pass the
+    // construction gates before any live value moves.
+    assertPositiveRate("refillRps", nextRefillRps);
+    assertPositiveRate("burst", nextBurst);
+    if (nextRefillRps === this.refillRps && nextBurst === this.burst) {
+      return { refillRps: this.refillRps, burst: this.burst };
+    }
+    // The inner defaults retune (WR-329) settles and clamps the
+    // buckets; it cannot fail here — the merged values already
+    // passed the same gates above.
+    this.inner.retune({ burst: nextBurst, refillPerSecond: nextRefillRps });
+    this.refillRps = nextRefillRps;
+    this.burst = nextBurst;
+    return { refillRps: this.refillRps, burst: this.burst };
   }
 
   /**

@@ -243,7 +243,10 @@ import type {
   TenantRateLimitRevision,
   TenantRateLimitSnapshot,
 } from "./tenant-ratelimit.ts";
-import type { OutboundRateLimitOptions } from "./outbound-ratelimit.ts";
+import type {
+  OutboundRateLimitOptions,
+  OutboundRateLimitRevision,
+} from "./outbound-ratelimit.ts";
 import type { DeliveryReceiptOptions } from "./delivery-receipt.ts";
 import { InboundIpAcl, IpAclMetrics, type IpAclOptions } from "./ip-acl.ts";
 import {
@@ -5663,6 +5666,33 @@ export interface RelayServer extends Server {
    * enabling the cap needs a restart.
    */
   setGlobalRateLimit?: (patch: GlobalRateLimitRevision) => { messagesPerSec: number; maxBurst: number };
+  /**
+   * WR-330: revise the live per-endpoint outbound rate limit at
+   * runtime (`refillRps` / `burst`, partial — omitted fields keep
+   * their live values). The next `take()` judges by the new values;
+   * deliveries already rescheduled keep their original schedule, and
+   * in-flight attempts are unaffected. Tightening clamps every live
+   * bucket's unspent balance to the new burst at once
+   * (already-granted tokens are never revoked); widening never tops a
+   * bucket up. An illegal patch throws `RangeError` and the live
+   * values are untouched; an empty patch is a `RangeError`; a
+   * same-value revision is a no-op with no audit event. A real
+   * revision is audited as `outbound_rate_limit_revised` with
+   * `previous` / `current` `{ refillRps, burst }` (the construction
+   * values as first `previous`), and returns the live values. Always
+   * set; throws `Error` when the limit was never configured —
+   * enabling the cap needs a restart. The one pair of values is
+   * shared by all endpoints: there is no per-endpoint override on
+   * this limiter (endpoint differentiation is WR-97's
+   * endpointOverrides, a different limiter).
+   */
+  reviseOutboundRateLimit?: (patch: OutboundRateLimitRevision) => { refillRps: number; burst: number };
+  /**
+   * WR-330: live per-endpoint outbound rate-limit values — the single
+   * `refillRps` / `burst` pair shared by all endpoints. Only set
+   * when `outboundRateLimit` was configured; `undefined` otherwise.
+   */
+  getOutboundRateLimit?: () => { refillRps: number; burst: number } | undefined;
   /**
    * WR-329: revise the live tenant-level outbound rate-limit defaults
    * at runtime (`burst` / `refillPerSecond` / `mode`, partial —
@@ -14376,6 +14406,42 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     });
     return next;
   };
+
+  // WR-330: per-endpoint outbound rate-limit runtime revision. The
+  // method is always set (like setGlobalRateLimit above); with the
+  // limit unconfigured the queue throws Error — enabling the cap
+  // needs a restart. A real revision is audited as
+  // `outbound_rate_limit_revised` with the previous and current
+  // refillRps / burst (the construction values as first `previous`);
+  // an empty or same-value patch is a silent no-op.
+  server.reviseOutboundRateLimit = (
+    patch: OutboundRateLimitRevision
+  ): { refillRps: number; burst: number } => {
+    const prev = queue.getOutboundRateLimit();
+    if (prev === undefined) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseOutboundRateLimit(patch);
+    }
+    // Validate-then-apply inside retune: an illegal patch throws
+    // RangeError and the live values are left completely intact.
+    const next = queue.reviseOutboundRateLimit(patch);
+    if (next.refillRps === prev.refillRps && next.burst === prev.burst) {
+      return next;
+    }
+    opts.auditLog.append({
+      event: "outbound_rate_limit_revised",
+      previous: prev,
+      current: next,
+    });
+    return next;
+  };
+
+  // WR-330: live per-endpoint outbound rate-limit values. Only set
+  // when `retry.outboundRateLimit` was configured.
+  if (queue.getOutboundRateLimit() !== undefined) {
+    server.getOutboundRateLimit = (): { refillRps: number; burst: number } =>
+      queue.getOutboundRateLimit()!;
+  }
 
   // WR-310: relay-level global rate-limit snapshot. Only set when
   // `retry.globalRateLimit` was configured.
