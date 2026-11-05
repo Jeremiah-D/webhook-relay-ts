@@ -134,6 +134,10 @@ import {
   type AdaptiveTimeoutRevision,
 } from "./adaptive-timeout.ts";
 import {
+  type AdaptiveMaxDelayConfig,
+  type AdaptiveMaxDelayRevision,
+} from "./adaptive-max-delay.ts";
+import {
   PhaseTimeoutError,
   applyPhaseTimeoutRevision,
   assertValidPhaseTimeoutBudgets,
@@ -5743,6 +5747,33 @@ export interface RelayServer extends Server {
    * configured; `undefined` otherwise.
    */
   getAdaptiveTimeoutConfig?: () => AdaptiveTimeoutConfig | undefined;
+  /**
+   * WR-335: revise the live adaptive max-delay config at runtime
+   * (`marginRatio` / `floorMs` / `ceilMs` / `minSamples` /
+   * `tightenFactor`, partial — omitted fields keep their live
+   * values). The next retry wait is bounded by the recomputed caps;
+   * waits already scheduled keep the cap computed when they were
+   * armed. Raising `minSamples` can return a warm endpoint to cold
+   * (samples < new threshold → falls back to the resting
+   * `maxDelayMs`); lowering keeps warm endpoints warm. An illegal
+   * patch throws `RangeError` and the live values are untouched; an
+   * empty patch is a `RangeError`; a same-value revision is a no-op
+   * with no audit event. A real revision is audited as
+   * `adaptive_max_delay_revised` with `previous` / `current` (the
+   * construction values as first `previous`), and returns the live
+   * config. Always set; throws `Error` when the cap was never
+   * configured — enabling it needs a restart. The one config is
+   * shared by all endpoints: there is no per-endpoint override. This
+   * caps the wait *between* attempts; WR-334 revises the per-attempt
+   * timeout cap instead.
+   */
+  reviseAdaptiveMaxDelay?: (patch: AdaptiveMaxDelayRevision) => AdaptiveMaxDelayConfig;
+  /**
+   * WR-335: live adaptive max-delay config — the five formula inputs
+   * shared by all endpoints. Only set when `adaptiveMaxDelay` was
+   * configured; `undefined` otherwise.
+   */
+  getAdaptiveMaxDelayConfig?: () => AdaptiveMaxDelayConfig | undefined;
   /**
    * WR-332: revise the live per-tenant inbound rate limit at runtime
    * (`perSecond`, or `undefined` to disable limiting). The next
@@ -14664,6 +14695,48 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   if (queue.getAdaptiveTimeoutConfig() !== undefined) {
     server.getAdaptiveTimeoutConfig = (): AdaptiveTimeoutConfig =>
       queue.getAdaptiveTimeoutConfig()!;
+  }
+
+  // WR-335: adaptive max-delay config runtime revision. The method is
+  // always set (like reviseAdaptiveTimeout above); with the cap
+  // unconfigured the queue throws Error — enabling it needs a
+  // restart. A real revision is audited as `adaptive_max_delay_revised`
+  // with the previous and current config (the construction values as
+  // first `previous`); an empty or same-value patch is a silent
+  // no-op.
+  server.reviseAdaptiveMaxDelay = (
+    patch: AdaptiveMaxDelayRevision
+  ): AdaptiveMaxDelayConfig => {
+    const prev = queue.getAdaptiveMaxDelayConfig();
+    if (prev === undefined) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseAdaptiveMaxDelay(patch);
+    }
+    // Validate-then-apply inside retune: an illegal patch throws
+    // RangeError and the live values are left completely intact.
+    const next = queue.reviseAdaptiveMaxDelay(patch);
+    if (
+      next.marginRatio === prev.marginRatio &&
+      next.floorMs === prev.floorMs &&
+      next.ceilMs === prev.ceilMs &&
+      next.minSamples === prev.minSamples &&
+      next.tightenFactor === prev.tightenFactor
+    ) {
+      return next;
+    }
+    opts.auditLog.append({
+      event: "adaptive_max_delay_revised",
+      previous: prev,
+      current: next,
+    });
+    return next;
+  };
+
+  // WR-335: live adaptive max-delay config. Only set when
+  // `retry.adaptiveMaxDelay` was configured.
+  if (queue.getAdaptiveMaxDelayConfig() !== undefined) {
+    server.getAdaptiveMaxDelayConfig = (): AdaptiveMaxDelayConfig =>
+      queue.getAdaptiveMaxDelayConfig()!;
   }
 
   // WR-332: per-tenant inbound rate-limit runtime revision. The

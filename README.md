@@ -12499,6 +12499,21 @@ single attempt while this caps the wait *between* attempts); named retry
 policies (WR-172) skip adaptation. The current cap per endpoint is exposed
 via `queue.getAdaptiveMaxDelayStats()` and `effectiveRetryConfig(url)`.
 
+Live revision (WR-335): `server.reviseAdaptiveMaxDelay(patch)` revises the
+config at runtime (`marginRatio` / `floorMs` / `ceilMs` / `minSamples` /
+`tightenFactor`, partial — omitted fields keep their live values);
+`server.getAdaptiveMaxDelayConfig()` returns the live config (the getter
+is only mounted when the feature was configured). A revision clears the
+adapted caps, so the next retry wait is bounded by the cap recomputed from
+the new formula — waits already scheduled keep the cap computed when they
+were armed, and the rolling samples (hence p99) are untouched. An illegal
+patch throws `RangeError` and leaves the live config untouched; an empty
+or same-value patch is a silent no-op. A real revision is audited as
+`adaptive_max_delay_revised` with `previous` / `current`. Enabling the
+feature when it was never configured still requires a restart. Unlike
+WR-334, which revises the per-attempt timeout cap, this revises the cap
+on the wait *between* attempts.
+
 ### Shadow-target dry-run mirroring
 
 Opt-in per-endpoint dry-run mirroring for the downstream-migration /

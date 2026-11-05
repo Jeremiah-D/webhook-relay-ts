@@ -244,7 +244,9 @@ import {
 import {
   AdaptiveMaxDelay,
   assertValidAdaptiveMaxDelayOptions,
+  type AdaptiveMaxDelayConfig,
   type AdaptiveMaxDelayOptions,
+  type AdaptiveMaxDelayRevision,
 } from "./adaptive-max-delay.ts";
 import {
   GlobalRateLimiter,
@@ -617,8 +619,10 @@ export type {
 } from "./adaptive-timeout.ts";
 export { AdaptiveTimeout, AdaptiveTimeoutError, assertValidAdaptiveTimeoutOptions } from "./adaptive-timeout.ts";
 export type {
+  AdaptiveMaxDelayConfig,
   AdaptiveMaxDelayOptions,
   AdaptiveMaxDelayEndpointStats,
+  AdaptiveMaxDelayRevision,
 } from "./adaptive-max-delay.ts";
 export { AdaptiveMaxDelay, assertValidAdaptiveMaxDelayOptions } from "./adaptive-max-delay.ts";
 export type { GlobalRateLimitOptions, GlobalRateLimitRevision, GlobalRateLimitStats } from "./global-rate.ts";
@@ -9884,6 +9888,38 @@ export class RetryQueue {
    */
   getAdaptiveMaxDelayStats(): AdaptiveMaxDelayEndpointStats[] {
     return this.adaptiveMaxDelay?.stats() ?? [];
+  }
+
+  /**
+   * WR-335: revise the live adaptive max-delay config (partial —
+   * omitted fields keep their live values). The next retry wait is
+   * bounded by the recomputed caps; waits already scheduled keep the
+   * cap computed when they were armed. An illegal patch throws
+   * `RangeError` and the live values are untouched; an empty patch is
+   * a `RangeError`; revising to the live values is a no-op. Throws
+   * `Error` when the cap was never configured — enabling it needs a
+   * restart. The one config is shared by all endpoints. Returns the
+   * live config.
+   */
+  reviseAdaptiveMaxDelay(patch: AdaptiveMaxDelayRevision): AdaptiveMaxDelayConfig {
+    const adaptive = this.adaptiveMaxDelay;
+    if (adaptive === undefined) {
+      throw new Error(
+        "reviseAdaptiveMaxDelay: adaptive max delay is not configured — enabling it requires a restart: " +
+          "the cap is created at startup and a running relay cannot start deriving p99 caps without one"
+      );
+    }
+    return adaptive.retune(patch);
+  }
+
+  /**
+   * WR-335: live adaptive max-delay config — the five formula inputs
+   * shared by all endpoints. `undefined` when the feature was never
+   * configured. Reads the live values, so a runtime revision is
+   * visible immediately.
+   */
+  getAdaptiveMaxDelayConfig(): AdaptiveMaxDelayConfig | undefined {
+    return this.adaptiveMaxDelay?.snapshot();
   }
 
   /**
