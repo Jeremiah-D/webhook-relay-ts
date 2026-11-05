@@ -210,7 +210,7 @@ import {
   EndpointDependencyGraph,
   type EndpointDependencyOptions,
 } from "./endpoint-dependencies.ts";
-import { RetryBudget, type RetryBudgetOptions } from "./retry-budget.ts";
+import { RetryBudget, type EndpointRetryBudgetSnapshot, type RetryBudgetOptions } from "./retry-budget.ts";
 import {
   TenantRetryBudget,
   type TenantRetryBudgetOptions,
@@ -564,7 +564,7 @@ export type {
 };
 export type { ReplayEgressOptions };
 export { ReplayEgressGate, DEFAULT_REPLAY_EGRESS_RPS };
-export type { RetryBudgetOptions } from "./retry-budget.ts";
+export type { EndpointRetryBudgetSnapshot, RetryBudgetOptions } from "./retry-budget.ts";
 export { RetryBudget, DEFAULT_RETRY_BUDGET_PER_MINUTE } from "./retry-budget.ts";
 export type { TenantRetryBudgetOptions } from "./tenant-retry-budget.ts";
 export {
@@ -4225,6 +4225,12 @@ export class RetryQueue {
   /** WR-38: global retry budget; undefined when disabled. */
   private readonly retryBudget?: RetryBudget;
   /**
+   * WR-327: clock shared by the global and per-endpoint retry budgets
+   * (injected for deterministic tests); a runtime-created endpoint
+   * bucket must read the same clock as the construction-time ones.
+   */
+  private readonly retryBudgetNow: () => number;
+  /**
    * WR-125: per-endpoint retry-budget overrides, keyed by exact
    * `targetUrl` (the logical endpoint, stable across WR-39 failover).
    * Each is an independent token bucket sharing the global clock;
@@ -5153,6 +5159,7 @@ export class RetryQueue {
     // default budget"; absent means disabled. RangeError comes from the
     // RetryBudget constructor on an illegal budget.
     const retryBudgetNow = opts.retryBudget?.now ?? Date.now;
+    this.retryBudgetNow = retryBudgetNow;
     this.retryBudget =
       opts.retryBudget !== undefined
         ? new RetryBudget(opts.retryBudget.retriesPerMinute, retryBudgetNow)
@@ -7648,6 +7655,11 @@ export class RetryQueue {
     return this.bulkheadOptions !== undefined;
   }
 
+  /** WR-327: whether the global retry budget is enabled (queue-level). */
+  retryBudgetConfigured(): boolean {
+    return this.retryBudget !== undefined;
+  }
+
   /**
    * Whether weighted dispatch is enabled for `endpoint`. Tenant-agnostic,
    * like `updateEndpointConfig`'s weighted path.
@@ -9923,6 +9935,95 @@ export class RetryQueue {
     if (budget === undefined) return false;
     if (tenant === undefined || tenant === "") return false;
     return budget.removeTenant(tenant);
+  }
+
+  /**
+   * WR-327: revise one endpoint's live retry-budget override at runtime
+   * — the queue-side setter behind
+   * `RelayServer.reviseEndpointRetryBudget`. The endpoint is the exact
+   * `targetUrl` (WR-125). An existing bucket is retuned in place via
+   * `RetryBudget.retune` (tightening clamps at once, widening never
+   * tops the bucket up); an endpoint without an override gets a new
+   * full-token bucket recorded in `retryBudgetEndpoints`, so its next
+   * scheduled retry gates on its own bucket first. Check order:
+   * configured, then endpoint, then rate, then apply — an unconfigured
+   * budget throws `Error` (enabling it needs a restart), an empty
+   * endpoint or an illegal rate throws `RangeError`, and either failure
+   * leaves the live budget completely untouched. Revising to the
+   * endpoint's effective current rate is a silent no-op that records
+   * no override. The next scheduled retry judges by the new budget; a
+   * retry already parked re-arms at the new refill horizon (never
+   * dropped, never burned against the item's attempt budget, never
+   * touching the circuit breaker). Other endpoints, the global budget
+   * (WR-38/WR-314) and the per-tenant budget (WR-200/WR-326) are
+   * untouched; the gate order endpoint → tenant → global is unchanged.
+   * Returns the live snapshot.
+   */
+  reviseEndpointRetryBudget(
+    endpoint: string,
+    retriesPerMinute: number
+  ): EndpointRetryBudgetSnapshot {
+    const global = this.retryBudget;
+    if (global === undefined) {
+      throw new Error(
+        "reviseEndpointRetryBudget: retry budget is not configured — enabling it requires a restart: " +
+          "the budget is created at startup and a running relay cannot start budgeting without one"
+      );
+    }
+    if (typeof endpoint !== "string" || endpoint.length === 0) {
+      throw new RangeError(
+        `endpoint must be a non-empty target URL, got ${JSON.stringify(endpoint)}`
+      );
+    }
+    if (!Number.isFinite(retriesPerMinute) || retriesPerMinute <= 0) {
+      throw new RangeError(
+        `retriesPerMinute must be a finite number > 0, got ${retriesPerMinute}`
+      );
+    }
+    const existing = this.retryBudgetEndpoints.get(endpoint);
+    const effective = existing?.limit() ?? global.limit();
+    if (retriesPerMinute === effective) {
+      // Same effective value: a no-op that records no override.
+      return { endpoint, retriesPerMinute: effective, overridden: existing !== undefined };
+    }
+    if (existing !== undefined) {
+      existing.retune(retriesPerMinute);
+      return { endpoint, retriesPerMinute: existing.limit(), overridden: true };
+    }
+    // A fresh override starts full, on the shared retry-budget clock.
+    const budget = new RetryBudget(retriesPerMinute, this.retryBudgetNow);
+    this.retryBudgetEndpoints.set(endpoint, budget);
+    return { endpoint, retriesPerMinute: budget.limit(), overridden: true };
+  }
+
+  /**
+   * WR-327: the live effective retry budget for one endpoint — the
+   * endpoint's own override when one exists, otherwise the global
+   * budget's rate — plus whether the endpoint carries an override.
+   * `undefined` when the retry budget was never configured. Read-only:
+   * unlike the setter it never creates a bucket, so a read cannot
+   * conjure state. Reads the live values, so a runtime revision is
+   * visible immediately.
+   */
+  getEndpointRetryBudget(endpoint: string): EndpointRetryBudgetSnapshot | undefined {
+    const global = this.retryBudget;
+    if (global === undefined) return undefined;
+    const override = this.retryBudgetEndpoints.get(endpoint);
+    if (override !== undefined) {
+      return { endpoint, retriesPerMinute: override.limit(), overridden: true };
+    }
+    return { endpoint, retriesPerMinute: global.limit(), overridden: false };
+  }
+
+  /**
+   * WR-327: drop one endpoint's retry-budget override so it falls back
+   * to the global budget alone (its bucket, if any, is deleted — the
+   * endpoint's stats row leaves `getRetryBudgetStats()` with it).
+   * Returns `false` when the endpoint carried no override — including
+   * when the budget was never configured.
+   */
+  removeEndpointRetryBudget(endpoint: string): boolean {
+    return this.retryBudgetEndpoints.delete(endpoint);
   }
 
   /**

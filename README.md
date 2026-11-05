@@ -295,7 +295,29 @@ reliability primitives that matter for any signed-payload pipeline.
   throw `RangeError` and leave the live budget untouched; revising
   when the budget was never configured throws `Error` (enabling it
   needs a restart). Endpoint overrides and the per-tenant budget are
-  untouched — only the global bucket is revised.
+  untouched — only the global bucket is revised. Runtime revision
+  (WR-327) covers the third dimension: `reviseEndpointRetryBudget(endpoint,
+  retriesPerMinute)` retunes one endpoint's override in place (an
+  endpoint without one gets a new full-token bucket) and
+  `getEndpointRetryBudget(endpoint)` reads the live effective rate plus
+  the override flag (an un-overridden endpoint reports the global rate
+  with `overridden: false`); `removeEndpointRetryBudget(endpoint)` drops
+  an override so the endpoint falls back to the global budget alone
+  (its stats row leaves with the bucket). Check order is endpoint,
+  then rate, then apply — an empty endpoint or an illegal rate throws
+  `RangeError` and the live budget is untouched; a same-value revision
+  is a silent no-op; revising when the budget was never configured
+  throws `Error` (enabling it needs a restart). Real revisions audit
+  `endpoint_retry_budget_revised` with `endpoint` / `previous` (the
+  first one is `undefined` — the endpoint had no override) / `current`,
+  removals audit `endpoint_retry_budget_removed` with `endpoint` /
+  `previous`. Tightening clamps at once, widening never tops a bucket
+  up; parked retries re-arm at the new refill horizon; an endpoint park
+  never consumes a tenant or global token. The three dimensions stay
+  distinct: WR-314 moves the global bucket, WR-326 moves the default
+  domain or one tenant's override, and this one moves one endpoint's
+  override — the gate order endpoint → tenant → global never changes,
+  and there is no tenant dimension to an endpoint budget.
 - `src/tenant-retry-budget.ts` — *per-tenant* retry budget
   (`TenantRetryBudget`, WR-200): one lazily-created token bucket per
   tenant, each sized to `retriesPerMinute` per minute (default 6000,

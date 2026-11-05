@@ -66,7 +66,7 @@ import {
   type ResolvedHttpHardening,
 } from "./http-hardening.ts";
 import type { OrderedAuditEvent, OrderedModeOptions } from "./retry.ts";
-import type { BulkheadRevision, BulkheadRevisionSnapshot, CircuitThresholdPatch, DeliveryWindowListEntry, DeliveryWindowSnapshot, EndpointConcurrencySnapshot, EndpointQuotaSnapshot, EndpointRetryPolicyRevision, GlobalConcurrencyStats, GlobalRateLimitRevision, GlobalRateLimitStats, HolidayCalendarConfig, HolidayCalendarSnapshot, MinNormalShareSnapshot, ResolvedCircuitThresholds, ResolvedEndpointRetryPolicy, StatusRetryPolicyConfig, TenantRetryBudgetRevision } from "./retry.ts";
+import type { BulkheadRevision, BulkheadRevisionSnapshot, CircuitThresholdPatch, DeliveryWindowListEntry, DeliveryWindowSnapshot, EndpointConcurrencySnapshot, EndpointQuotaSnapshot, EndpointRetryBudgetSnapshot, EndpointRetryPolicyRevision, GlobalConcurrencyStats, GlobalRateLimitRevision, GlobalRateLimitStats, HolidayCalendarConfig, HolidayCalendarSnapshot, MinNormalShareSnapshot, ResolvedCircuitThresholds, ResolvedEndpointRetryPolicy, StatusRetryPolicyConfig, TenantRetryBudgetRevision } from "./retry.ts";
 import {
   DEFAULT_STATUS_RETRY_MULTIPLIER,
   assertValidStatusRetryPolicy,
@@ -6089,6 +6089,54 @@ export interface RelayServer extends Server {
     endpoint: string,
     tenant?: string
   ) => BulkheadRevisionSnapshot | undefined;
+  /**
+   * WR-327: revise one endpoint's live retry-budget override at runtime
+   * — no restart. The endpoint is the exact `targetUrl` (WR-125). An
+   * existing override is retuned in place (tightening clamps the token
+   * bucket to the new cap at once, widening never tops it up); an
+   * endpoint without an override gets a new full-token bucket. The next
+   * scheduled retry judges by the new budget; a retry already parked
+   * re-arms at the new refill horizon. Check order: endpoint, then
+   * rate, then apply — an empty endpoint or an illegal rate throws
+   * `RangeError` and the live budget is untouched; a same-value
+   * revision is a silent no-op. A real revision is audited as
+   * `endpoint_retry_budget_revised` with `endpoint` and the previous /
+   * current rates (the first `previous` is `undefined` — the endpoint
+   * had no override). Always set; throws `Error` when the retry budget
+   * was never configured — enabling it needs a restart. Other
+   * endpoints, the global budget (WR-38/WR-314) and the per-tenant
+   * budget (WR-200/WR-326) are untouched; the gate order
+   * endpoint → tenant → global is unchanged. No `tenant` parameter:
+   * WR-125 overrides are keyed by endpoint alone. Returns the live
+   * snapshot.
+   */
+  reviseEndpointRetryBudget: (
+    endpoint: string,
+    retriesPerMinute: number
+  ) => EndpointRetryBudgetSnapshot;
+  /**
+   * WR-327: remove one endpoint's live retry-budget override at runtime
+   * — the endpoint falls back to the global budget alone (its bucket is
+   * deleted, so its stats row leaves `getRetryBudgetStats()`). Returns
+   * `true` when an override was removed (audited as
+   * `endpoint_retry_budget_removed` with the endpoint and the removed
+   * rate as `previous`), `false` when no override was configured
+   * (silent, no audit) — including when the budget itself was never
+   * configured. Always set.
+   */
+  removeEndpointRetryBudget: (endpoint: string) => boolean;
+  /**
+   * WR-327: live effective retry budget for one endpoint — the
+   * endpoint's own override when one exists, otherwise the global
+   * budget's rate — plus whether the endpoint carries an override.
+   * `undefined` only when the retry budget was never configured
+   * (unreachable while this method is set — it is only set when the
+   * budget was configured — so in practice always defined). Only set
+   * when the retry budget was configured.
+   */
+  getEndpointRetryBudget?: (
+    endpoint: string
+  ) => EndpointRetryBudgetSnapshot | undefined;
   /**
    * WR-320: revise one endpoint's live retry policy at runtime — no
    * restart. The patch merges over the endpoint's live assignment: a
@@ -14846,6 +14894,66 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       endpoint: string,
       tenant?: string
     ): BulkheadRevisionSnapshot | undefined => queue.getEndpointBulkhead(endpoint, tenant);
+  }
+
+  // WR-327: per-endpoint retry-budget runtime revision. The method is
+  // always set (like setRetryBudget above); with the budget
+  // unconfigured the queue throws Error — enabling the budget needs
+  // a restart. A real revision is audited as
+  // `endpoint_retry_budget_revised` with the endpoint and the previous
+  // (the first one is `undefined` — the endpoint had no override) /
+  // current rates; a same-value revision is a silent no-op.
+  server.reviseEndpointRetryBudget = (
+    endpoint: string,
+    retriesPerMinute: number
+  ): EndpointRetryBudgetSnapshot => {
+    const prevStats = queue.getRetryBudgetStats();
+    if (prevStats === undefined) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseEndpointRetryBudget(endpoint, retriesPerMinute);
+    }
+    const previous = queue.getEndpointRetryBudget(endpoint)!;
+    // Validate-then-apply inside the queue revision: an illegal
+    // endpoint or rate throws RangeError and the live budget is left
+    // completely intact.
+    const next = queue.reviseEndpointRetryBudget(endpoint, retriesPerMinute);
+    if (
+      next.retriesPerMinute === previous.retriesPerMinute &&
+      next.overridden === previous.overridden
+    ) {
+      return next;
+    }
+    opts.auditLog.append({
+      event: "endpoint_retry_budget_revised",
+      endpoint,
+      previous: previous.overridden ? previous.retriesPerMinute : undefined,
+      current: next.retriesPerMinute,
+    });
+    return next;
+  };
+
+  // WR-327: per-endpoint retry-budget removal. Always set; a missing
+  // budget or an endpoint without an override returns false silently.
+  // A real removal audits `endpoint_retry_budget_removed` with the
+  // endpoint and the removed rate as `previous`.
+  server.removeEndpointRetryBudget = (endpoint: string): boolean => {
+    const previous = queue.getEndpointRetryBudget(endpoint);
+    if (previous === undefined || !previous.overridden) return false;
+    queue.removeEndpointRetryBudget(endpoint);
+    opts.auditLog.append({
+      event: "endpoint_retry_budget_removed",
+      endpoint,
+      previous: previous.retriesPerMinute,
+    });
+    return true;
+  };
+
+  // WR-327: live per-endpoint retry-budget reads. Only set when the
+  // retry budget was configured.
+  if (queue.retryBudgetConfigured()) {
+    server.getEndpointRetryBudget = (
+      endpoint: string
+    ): EndpointRetryBudgetSnapshot | undefined => queue.getEndpointRetryBudget(endpoint);
   }
 
   // WR-320: live retry-policy revision / removal / reads for one

@@ -40,6 +40,22 @@ export interface RetryBudgetOptions {
   now?: () => number;
 }
 
+/**
+ * WR-327: one live per-endpoint retry-budget snapshot. `endpoint` is the
+ * exact `targetUrl` (WR-125); `retriesPerMinute` is the live effective
+ * rate — the endpoint's own override when one exists, otherwise the
+ * global budget's rate; `overridden` says whether the endpoint carries
+ * an explicit override.
+ */
+export interface EndpointRetryBudgetSnapshot {
+  /** Exact `targetUrl` of the endpoint. */
+  endpoint: string;
+  /** Live effective retries-per-minute for the endpoint. */
+  retriesPerMinute: number;
+  /** Whether the endpoint carries an explicit override. */
+  overridden: boolean;
+}
+
 /** Default global retry budget: generous enough to stay out of the way. */
 export const DEFAULT_RETRY_BUDGET_PER_MINUTE = 6000;
 
