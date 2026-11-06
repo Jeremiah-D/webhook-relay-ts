@@ -63,6 +63,28 @@ export interface DnsCacheOptions {
   resolve?: (hostname: string) => Promise<LookupAddress[]>;
 }
 
+/**
+ * Live snapshot of the three revisable {@link DnsCache} tunables (WR-342).
+ * Returned by {@link DnsCache.config} and `retune` — always a fresh
+ * object, never a live reference.
+ */
+export interface DnsCacheConfig {
+  /** How long a resolved entry stays fresh, in ms. */
+  ttlMs: number;
+  /** Wait after a failed background refresh before retrying, in ms. */
+  refreshBackoffMs: number;
+  /** Maximum hostnames held. */
+  maxHosts: number;
+}
+
+/**
+ * Partial revision of the three tunables (WR-342). Omitted fields keep
+ * their live values; an empty patch is a `RangeError`.
+ */
+export type DnsCacheRevision = Partial<
+  Pick<DnsCacheOptions, "ttlMs" | "refreshBackoffMs" | "maxHosts">
+>;
+
 /** Snapshot from {@link DnsCache.getStats}. */
 export interface DnsCacheStats {
   /** Hostnames currently cached. */
@@ -97,6 +119,21 @@ const DEFAULT_TTL_MS = 60_000;
 const DEFAULT_REFRESH_BACKOFF_MS = 5_000;
 const DEFAULT_MAX_HOSTS = 1024;
 
+/** The constructor's validation group for the three tunables (WR-342). */
+function assertDnsCacheTuning(ttlMs: unknown, refreshBackoffMs: unknown, maxHosts: unknown): void {
+  if (!Number.isFinite(ttlMs) || (ttlMs as number) <= 0) {
+    throw new RangeError(`DnsCache: ttlMs must be a finite number > 0, got ${ttlMs}`);
+  }
+  if (!Number.isFinite(refreshBackoffMs) || (refreshBackoffMs as number) < 0) {
+    throw new RangeError(
+      `DnsCache: refreshBackoffMs must be a finite number >= 0, got ${refreshBackoffMs}`
+    );
+  }
+  if (!Number.isInteger(maxHosts) || (maxHosts as number) <= 0) {
+    throw new RangeError(`DnsCache: maxHosts must be a positive integer, got ${maxHosts}`);
+  }
+}
+
 function dnsError(code: string, hostname: string): NodeJS.ErrnoException {
   const err = new Error(`${code} ${hostname}`) as NodeJS.ErrnoException;
   err.code = code;
@@ -114,9 +151,11 @@ function normalizeAddresses(records: LookupAddress[]): LookupAddress[] {
 }
 
 export class DnsCache {
-  private readonly ttlMs: number;
-  private readonly refreshBackoffMs: number;
-  private readonly maxHosts: number;
+  // WR-342: live-revisable via `retune()` — the constructor still
+  // validates, and retune re-runs the same gates on the merged values.
+  private ttlMs: number;
+  private refreshBackoffMs: number;
+  private maxHosts: number;
   private readonly now: () => number;
   private readonly resolve: (hostname: string) => Promise<LookupAddress[]>;
   private readonly entries = new Map<string, CacheEntry>();
@@ -128,21 +167,11 @@ export class DnsCache {
 
   constructor(opts: DnsCacheOptions = {}) {
     this.ttlMs = opts.ttlMs ?? DEFAULT_TTL_MS;
-    if (!Number.isFinite(this.ttlMs) || this.ttlMs <= 0) {
-      throw new RangeError(`DnsCache: ttlMs must be a finite number > 0, got ${opts.ttlMs}`);
-    }
     this.refreshBackoffMs = opts.refreshBackoffMs ?? DEFAULT_REFRESH_BACKOFF_MS;
-    if (!Number.isFinite(this.refreshBackoffMs) || this.refreshBackoffMs < 0) {
-      throw new RangeError(
-        `DnsCache: refreshBackoffMs must be a finite number >= 0, got ${opts.refreshBackoffMs}`
-      );
-    }
     this.maxHosts = opts.maxHosts ?? DEFAULT_MAX_HOSTS;
-    if (!Number.isInteger(this.maxHosts) || this.maxHosts <= 0) {
-      throw new RangeError(
-        `DnsCache: maxHosts must be a positive integer, got ${opts.maxHosts}`
-      );
-    }
+    // The constructor's validation group — retune re-runs these same
+    // gates on the merged values (WR-342).
+    assertDnsCacheTuning(this.ttlMs, this.refreshBackoffMs, this.maxHosts);
     if (opts.now !== undefined && typeof opts.now !== "function") {
       throw new RangeError("DnsCache: now must be a function");
     }
@@ -229,6 +258,71 @@ export class DnsCache {
       refreshFailures: this.refreshFailures,
       hitRate: total === 0 ? 0 : (this.hits + this.staleServed) / total,
     };
+  }
+
+  /**
+   * WR-342: live snapshot of the three tunables. A fresh object on
+   * every call — mutating it never touches the live config.
+   */
+  config(): DnsCacheConfig {
+    return {
+      ttlMs: this.ttlMs,
+      refreshBackoffMs: this.refreshBackoffMs,
+      maxHosts: this.maxHosts,
+    };
+  }
+
+  /**
+   * WR-342: revise the live tunables at runtime (partial — omitted
+   * fields keep their live values). The merged values are re-validated
+   * with the constructor's gates before anything moves, so an illegal
+   * patch throws `RangeError` and the live config is untouched; an
+   * empty or non-object patch is a `RangeError`; a same-value patch
+   * returns the live config without changing anything.
+   *
+   * Only future behaviour follows the new values: a new `ttlMs`
+   * governs later parses and background refreshes, while an entry
+   * already cached keeps its stamped `expiresAt`; a new
+   * `refreshBackoffMs` governs only the next failed refresh, and a
+   * refresh already in flight is unaffected. Shrinking `maxHosts`
+   * evicts the soonest-expiring entries until the cache fits the new
+   * cap; growing it leaves every entry in place.
+   */
+  retune(patch: DnsCacheRevision): DnsCacheConfig {
+    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new RangeError(`dnsCache revision must be an object, got ${JSON.stringify(patch)}`);
+    }
+    if (
+      patch.ttlMs === undefined &&
+      patch.refreshBackoffMs === undefined &&
+      patch.maxHosts === undefined
+    ) {
+      throw new RangeError(
+        "dnsCache revision must set at least one of ttlMs, refreshBackoffMs, maxHosts"
+      );
+    }
+    const next: DnsCacheConfig = {
+      ttlMs: patch.ttlMs ?? this.ttlMs,
+      refreshBackoffMs: patch.refreshBackoffMs ?? this.refreshBackoffMs,
+      maxHosts: patch.maxHosts ?? this.maxHosts,
+    };
+    // Validate-then-apply: the merged values must pass the construction
+    // gates before any live value moves.
+    assertDnsCacheTuning(next.ttlMs, next.refreshBackoffMs, next.maxHosts);
+    if (
+      next.ttlMs === this.ttlMs &&
+      next.refreshBackoffMs === this.refreshBackoffMs &&
+      next.maxHosts === this.maxHosts
+    ) {
+      return this.config();
+    }
+    this.ttlMs = next.ttlMs;
+    this.refreshBackoffMs = next.refreshBackoffMs;
+    this.maxHosts = next.maxHosts;
+    // A smaller cap evicts the soonest-expiring entries until the cache
+    // fits; a larger cap leaves every entry in place.
+    while (this.entries.size > this.maxHosts) this.evictSoonestExpiring();
+    return this.config();
   }
 
   /**

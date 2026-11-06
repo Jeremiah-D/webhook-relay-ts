@@ -11119,6 +11119,23 @@ const server = createRelayServer({
 - **Fail-fast** — invalid `ttlMs` / `refreshBackoffMs` / `maxHosts`
   throw `RangeError` at startup. Absent by default: with no `dnsCache`
   configured, every connection uses the OS resolver.
+- **Live revision (WR-342)** — `server.reviseDnsCache({ ttlMs,
+  refreshBackoffMs, maxHosts })` retunes the cache at runtime (partial
+  — omitted fields keep their live values) and returns the live config;
+  `server.getDnsCacheConfig()` reads it (only mounted when `dnsCache`
+  was configured). A new `ttlMs` governs only later parses and
+  background refreshes — an entry already cached keeps its stamped
+  expiry; a new `refreshBackoffMs` governs only the next failed
+  refresh. Shrinking `maxHosts` evicts the soonest-expiring entries
+  until the cache fits; growing it leaves every entry in place. An
+  illegal or empty patch throws `RangeError` and leaves the live config
+  untouched; a same-value revision is a silent no-op. A real revision
+  is audited as `dns_cache_revised` with `previous` / `current`. With
+  no cache configured, revising throws — enabling the cache needs a
+  restart. This revises the cache *configuration*; WR-92 is the cache
+  mechanism itself, WR-170 the DoH resolver it fronts, WR-194 the
+  resolution pinning above it, and WR-211 the SRV discovery that reads
+  through it.
 
 ## DNS resolution pinning (opt-in)
 

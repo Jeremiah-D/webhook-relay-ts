@@ -403,7 +403,12 @@ import {
   type CertExpiryOptions,
 } from "./cert-expiry.ts";
 import { OutboundConnectionPool, type KeepAlivePoolOptions, type OutboundKeepAliveRevision } from "./keepalive.ts";
-import { DnsCache, type DnsCacheOptions } from "./dns-cache.ts";
+import {
+  DnsCache,
+  type DnsCacheConfig,
+  type DnsCacheOptions,
+  type DnsCacheRevision,
+} from "./dns-cache.ts";
 import { DnsPin, type DnsPinMismatchInfo, type DnsPinOptions } from "./dns-pin.ts";
 import { warmupOutboundPool, resolveWarmupOptions } from "./warmup.ts";
 import { AuditSink, type AuditSinkOptions } from "./audit-sink.ts";
@@ -5919,6 +5924,32 @@ export interface RelayServer extends Server {
    * configured; `undefined` otherwise.
    */
   getAdaptiveBackoffConfig?: () => AdaptiveBackoffConfig | undefined;
+  /**
+   * WR-342: revise the live outbound DNS cache config at runtime
+   * (`ttlMs` / `refreshBackoffMs` / `maxHosts`, partial — omitted
+   * fields keep their live values). A new `ttlMs` governs only later
+   * parses and background refreshes — an entry already cached keeps
+   * its stamped `expiresAt`; a new `refreshBackoffMs` governs only
+   * the next failed refresh. Shrinking `maxHosts` evicts the
+   * soonest-expiring entries until the cache fits; growing it leaves
+   * every entry in place. An illegal patch throws `RangeError` and the
+   * live values are untouched; an empty patch is a `RangeError`; a
+   * same-value revision is a no-op with no audit event. A real
+   * revision is audited as `dns_cache_revised` with `previous` /
+   * `current` (the construction values as first `previous`), and
+   * returns the live config. Always set; throws `Error` when the DNS
+   * cache was never configured — enabling it needs a restart. This
+   * revises the cache configuration; WR-92 is the cache mechanism
+   * itself, WR-170 the DoH resolver it fronts, WR-194 the resolution
+   * pinning above it, and WR-211 the SRV discovery that reads
+   * through it.
+   */
+  reviseDnsCache?: (patch: DnsCacheRevision) => DnsCacheConfig;
+  /**
+   * WR-342: live outbound DNS cache config — the three cache tunables.
+   * Only set when `dnsCache` was configured; `undefined` otherwise.
+   */
+  getDnsCacheConfig?: () => DnsCacheConfig | undefined;
   /**
    * WR-336: revise the live hedge delay (`hedgeDelayMs`) at runtime.
    * The next dispatch arms its hedge timer on the new value; a timer
@@ -15104,6 +15135,44 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   if (queue.getAdaptiveBackoffConfig() !== undefined) {
     server.getAdaptiveBackoffConfig = (): AdaptiveBackoffConfig =>
       queue.getAdaptiveBackoffConfig()!;
+  }
+
+  // WR-342: outbound DNS cache config runtime revision. The method is
+  // always set (like reviseAdaptiveBackoff above); with the cache
+  // unconfigured the revision throws Error — enabling it needs a
+  // restart. A real revision is audited as `dns_cache_revised` with
+  // the previous and current config (the construction values as first
+  // `previous`); an empty or same-value patch is a silent no-op.
+  server.reviseDnsCache = (patch: DnsCacheRevision): DnsCacheConfig => {
+    if (sharedDnsCache === undefined) {
+      throw new Error(
+        "reviseDnsCache: DNS cache is not configured — enabling it requires a restart: " +
+          "the cache is created at startup and a running relay cannot start caching resolutions without one"
+      );
+    }
+    const prev = sharedDnsCache.config();
+    // Validate-then-apply inside retune: an illegal patch throws
+    // RangeError and the live values are left completely intact.
+    const next = sharedDnsCache.retune(patch);
+    if (
+      next.ttlMs === prev.ttlMs &&
+      next.refreshBackoffMs === prev.refreshBackoffMs &&
+      next.maxHosts === prev.maxHosts
+    ) {
+      return next;
+    }
+    opts.auditLog.append({
+      event: "dns_cache_revised",
+      previous: prev,
+      current: next,
+    });
+    return next;
+  };
+
+  // WR-342: live outbound DNS cache config. Only set when `dnsCache`
+  // was configured.
+  if (sharedDnsCache !== undefined) {
+    server.getDnsCacheConfig = (): DnsCacheConfig => sharedDnsCache.config();
   }
 
   // WR-336: live hedge-delay revision. Both methods are always set
