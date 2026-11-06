@@ -2788,6 +2788,22 @@ createRelayServer({
   senders that ignore the `signal` option degrade to abandon-the-loser
   semantics, documented in `src/hedged.ts`. Invalid `hedgeDelayMs`
   throws `RangeError` at startup.
+- **Live revision (WR-336)** — `server.reviseHedgeDelayMs(ms)`
+  revises the hedge delay at runtime; `server.getHedgeDelayMs()`
+  returns the live value (`undefined` when hedging was never
+  configured). The delay is a single value shared by all hedgeable
+  endpoints — one revision moves every endpoint at once, with no
+  per-endpoint override. Only the *next* dispatch's timer is affected:
+  a timer already armed finishes on the old delay, and in-flight
+  attempts are untouched. A same-value revision is a silent no-op; a
+  real revision is audited as `hedge_delay_revised` with `previous` /
+  `current`. An illegal value throws `RangeError` and leaves the live
+  value untouched. Hedging that was never configured (`enabled: false`
+  counts as unconfigured) cannot be switched on at runtime — enabling
+  it requires a restart. Unlike WR-330 (which revises the outbound
+  rate token bucket), WR-334 (the per-attempt timeout cap), and WR-335
+  (the adaptive backoff cap), this revises the tail-latency hedge
+  timer.
 
 ## Downstream error-budget burn-rate alerting (opt-in)
 

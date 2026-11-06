@@ -182,6 +182,18 @@ export function assertValidHedgedSenderOptions(options: HedgedSenderOptions): vo
  */
 export interface HedgedSender extends Sender {
   takeHedgedFlag?(deliveryId: string): boolean;
+  /**
+   * WR-336: revise the live hedge delay (ms) at runtime. The next
+   * dispatch arms its hedge timer on the new value; a timer already
+   * armed keeps the old delay, and in-flight attempts are unaffected.
+   * The value is a single global shared by all hedgeable endpoints.
+   * Throws `RangeError` (same text as construction) on a non-positive,
+   * non-integer, or non-finite value, leaving the live value untouched.
+   * Returns the revised live value. Absent on a bare sender.
+   */
+  retuneHedgeDelayMs?(delayMs: number): number;
+  /** WR-336: read the live hedge delay (ms). Absent on a bare sender. */
+  currentHedgeDelayMs?(): number;
 }
 
 /**
@@ -202,6 +214,14 @@ export function createHedgedSender(inner: Sender, options: HedgedSenderOptions):
   assertValidHedgedSenderOptions(options);
   /** Delivery ids that launched a hedge (take-and-clear via takeHedgedFlag). */
   const hedgedIds = new Set<string>();
+  /**
+   * WR-336: the live hedge delay. A mutable closure cell — the dispatch
+   * timer and the `onHedge` audit event read it at fire time, so a
+   * revision via `retuneHedgeDelayMs` moves the *next* dispatch's timer
+   * (and later audit events) while a timer already armed keeps the old
+   * delay. One value, shared by all hedgeable endpoints.
+   */
+  let hedgeDelayMs = options.hedgeDelayMs;
 
   const sender = function hedgedSender(
     item: RetryItem,
@@ -291,10 +311,11 @@ export function createHedgedSender(inner: Sender, options: HedgedSenderOptions):
           endpoint: item.targetUrl,
           id: item.id,
           ...(item.traceId !== undefined ? { traceId: item.traceId } : {}),
-          hedgeDelayMs: options.hedgeDelayMs,
+          // WR-336: the live value at fire time, not the construction value.
+          hedgeDelayMs,
         });
         launch(1);
-      }, options.hedgeDelayMs);
+      }, hedgeDelayMs);
       // A hedge timer must never pin process exit.
       timer.unref?.();
     });
@@ -305,6 +326,17 @@ export function createHedgedSender(inner: Sender, options: HedgedSenderOptions):
     hedgedIds.delete(deliveryId);
     return true;
   };
+
+  // WR-336: live hedge-delay revision. Validation reuses the
+  // construction-time check, so an illegal value throws the same
+  // RangeError text and the live cell is left untouched.
+  sender.retuneHedgeDelayMs = (delayMs: number): number => {
+    assertValidHedgedSenderOptions({ hedgeDelayMs: delayMs });
+    hedgeDelayMs = delayMs;
+    return hedgeDelayMs;
+  };
+
+  sender.currentHedgeDelayMs = (): number => hedgeDelayMs;
 
   return sender;
 }

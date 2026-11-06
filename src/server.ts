@@ -5775,6 +5775,29 @@ export interface RelayServer extends Server {
    */
   getAdaptiveMaxDelayConfig?: () => AdaptiveMaxDelayConfig | undefined;
   /**
+   * WR-336: revise the live hedge delay (`hedgeDelayMs`) at runtime.
+   * The next dispatch arms its hedge timer on the new value; a timer
+   * already armed keeps the old delay, and in-flight attempts (and
+   * their double-hit outcome) are unaffected. An illegal value throws
+   * `RangeError` and the live value is untouched; a same-value revision
+   * is a no-op with no audit event. A real revision is audited as
+   * `hedge_delay_revised` with `previous` / `current` (the construction
+   * value as first `previous`), and returns the live value. Always set;
+   * throws `Error` when hedging was never configured — enabling it needs
+   * a restart. The one delay is shared by all hedgeable endpoints:
+   * there is no per-endpoint override. Unlike WR-330 (which revises the
+   * outbound rate token bucket), WR-334 (the per-attempt timeout cap),
+   * and WR-335 (the adaptive backoff cap), this revises the tail-latency
+   * hedge timer.
+   */
+  reviseHedgeDelayMs?: (delayMs: number) => number;
+  /**
+   * WR-336: live hedge delay in ms — the single value shared by all
+   * hedgeable endpoints. Always set; `undefined` when hedging was never
+   * configured (`enabled: false` counts as unconfigured).
+   */
+  getHedgeDelayMs?: () => number | undefined;
+  /**
    * WR-332: revise the live per-tenant inbound rate limit at runtime
    * (`perSecond`, or `undefined` to disable limiting). The next
    * `take()` judges by the new value; requests already answered 429
@@ -14738,6 +14761,43 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     server.getAdaptiveMaxDelayConfig = (): AdaptiveMaxDelayConfig =>
       queue.getAdaptiveMaxDelayConfig()!;
   }
+
+  // WR-336: live hedge-delay revision. Both methods are always set
+  // (unlike the WR-334/WR-335 getters, which are only mounted when
+  // configured — the task contract is `getHedgeDelayMs()` returning
+  // `undefined` on an unconfigured relay). With hedging unconfigured
+  // the sender is the bare sender, so `retuneHedgeDelayMs` is absent
+  // and revising throws the canonical "must restart" Error (WR-330
+  // wording) — enabling hedging needs a restart. A real revision is
+  // audited as `hedge_delay_revised` with the previous and current
+  // delay (the construction value as first `previous`); a same-value
+  // revision is a silent no-op.
+  server.reviseHedgeDelayMs = (delayMs: number): number => {
+    const retune = hedgedSender.retuneHedgeDelayMs;
+    if (retune === undefined) {
+      throw new Error(
+        "reviseHedgeDelayMs: hedged requests are not configured — enabling them requires a restart: " +
+          "the hedged sender is created at startup and a running relay cannot start hedging without one"
+      );
+    }
+    const prev = hedgedSender.currentHedgeDelayMs!();
+    // Validate-then-apply inside retune: an illegal value throws
+    // RangeError and the live value is left completely intact.
+    const next = retune(delayMs);
+    if (next === prev) {
+      return next;
+    }
+    opts.auditLog.append({
+      event: "hedge_delay_revised",
+      previous: prev,
+      current: next,
+    });
+    return next;
+  };
+
+  // WR-336: live hedge delay. Always set; `undefined` when hedging was
+  // never configured (the bare sender has no delay cell).
+  server.getHedgeDelayMs = (): number | undefined => hedgedSender.currentHedgeDelayMs?.();
 
   // WR-332: per-tenant inbound rate-limit runtime revision. The
   // method is always set (like setGlobalRateLimit above); with the
