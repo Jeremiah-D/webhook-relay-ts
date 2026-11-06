@@ -4106,6 +4106,37 @@ operator tooling. Configuring `weightTuning` without `weighted`
 throws `RangeError` at startup — tuning with no targets is a
 configuration error, not a silent no-op.
 
+**Live revision (WR-340)** — the tuner's parameters are revisable at
+runtime without restarting the relay (which would drop the live queue
+and replay positions): `queue.reviseWeightTuning(patch)` /
+`relay.reviseWeightTuning(patch)` take a partial patch over the six
+inputs (`ewmaAlpha`, `maxStepRatio`, `hysteresisPoints`,
+`minWeightFloor`, `retuneEpsilon`, `retuneIntervalMs`); omitted fields
+keep their live values, and `queue.getWeightTuningConfig()` /
+`relay.getWeightTuningConfig()` read the live six. A revision only
+affects the next retune round — the EWMA-smoothed scores, baselines,
+and score references are untouched (no recompute, no re-baseline), and
+a manual weight change still re-baselines the tuner afterwards. A
+changed `retuneIntervalMs` re-arms the sweeper timer when it is
+running, so the next round follows the new rhythm; a round already
+fired is unaffected. An illegal patch throws `RangeError` and the live
+values are untouched; an empty patch is a `RangeError`; revising to
+the live values is a silent no-op. A real revision is audited as
+`weight_tuning_revised` with `previous` / `current` (the construction
+values as first `previous`). Revising a relay that never configured
+`weightTuning` throws `Error` — enabling tuning needs a restart. This
+is the tuner's parameters; WR-201 is the tuning mechanism itself,
+WR-66 the static weights underneath it, and WR-32 the manual weight
+hot-reload.
+
+```ts
+// Downstream B is flapping: tighten the step and raise the hysteresis
+// so shares stop oscillating, and let the EWMA track health faster.
+relay.reviseWeightTuning({ maxStepRatio: 0.1, hysteresisPoints: 10, ewmaAlpha: 0.5 });
+// Recovery: widen the step and sweep more often so shares return faster.
+relay.reviseWeightTuning({ maxStepRatio: 0.4, retuneIntervalMs: 15_000 });
+```
+
 ## Quorum fan-out: M-of-N downstream acknowledgement (opt-in)
 
 Where weighted mode answers "how is traffic *shared*", quorum fan-out

@@ -28,7 +28,7 @@ import {
   selectSignatureAlgorithmVerifier,
   type SignatureAlgorithmRule,
 } from "./signature-alg.ts";
-import { RetryQueue, errorBudgetBurnAuditEvent, type BurnRateAlertInfo, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type RetryItem, type Sender, type SenderCallOptions, type MaintenanceWindowTransition, type WeightsRetunedInfo } from "./retry.ts";
+import { RetryQueue, errorBudgetBurnAuditEvent, type BurnRateAlertInfo, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type RetryItem, type Sender, type SenderCallOptions, type MaintenanceWindowTransition, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
 import { parseDeliverAtHeader, DELIVER_AT_HEADER } from "./retry.ts";
 import type { ShadowDeliveredInfo, ShadowFailedInfo, ShadowTargetConfig, ShadowTargetsConfig } from "./retry.ts";
 import type {
@@ -5839,6 +5839,33 @@ export interface RelayServer extends Server {
    * otherwise.
    */
   getSlowStartConfig?: () => SlowStartConfig | undefined;
+  /**
+   * WR-340: revise the live adaptive weight-tuning parameters at
+   * runtime (`ewmaAlpha` / `maxStepRatio` / `hysteresisPoints` /
+   * `minWeightFloor` / `retuneEpsilon` / `retuneIntervalMs`, partial —
+   * omitted fields keep their live values). The five tuner inputs only
+   * affect the next retune round — the EWMA-smoothed scores, baselines,
+   * and score references are untouched, and a manual weight change still
+   * re-baselines the tuner. A changed `retuneIntervalMs` re-arms the
+   * sweeper timer when it is running, so the next round follows the new
+   * rhythm. An illegal patch throws `RangeError` and the live values are
+   * untouched; an empty patch is a `RangeError`; a same-value revision
+   * is a no-op with no audit event. A real revision is audited as
+   * `weight_tuning_revised` with `previous` / `current` (the
+   * construction values as first `previous`), and returns the live
+   * config. Always set; throws `Error` when weight tuning was never
+   * configured — enabling it needs a restart. This revises the tuner's
+   * parameters; WR-201 is the tuning mechanism itself, WR-66 the
+   * static weights underneath it, and WR-32 the manual weight
+   * hot-reload.
+   */
+  reviseWeightTuning?: (patch: WeightTuningRevision) => WeightTuningConfig;
+  /**
+   * WR-340: live adaptive weight-tuning config — the five tuner inputs
+   * plus the sweeper interval. Only set when `weightTuning` was
+   * configured; `undefined` otherwise.
+   */
+  getWeightTuningConfig?: () => WeightTuningConfig | undefined;
   /**
    * WR-339: revise the live adaptive backoff config at runtime
    * (`minBaseMs` / `maxBaseMs` / `upFactor` / `downFactor`, partial —
@@ -14932,6 +14959,45 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // `retry.slowStart` was configured.
   if (queue.getSlowStartConfig() !== undefined) {
     server.getSlowStartConfig = (): SlowStartConfig => queue.getSlowStartConfig()!;
+  }
+
+  // WR-340: adaptive weight-tuning config runtime revision. The method
+  // is always set (like reviseSlowStart above); with the tuner
+  // unconfigured the queue throws Error — enabling it needs a restart.
+  // A real revision is audited as `weight_tuning_revised` with the
+  // previous and current config (the construction values as first
+  // `previous`); an empty or same-value patch is a silent no-op.
+  server.reviseWeightTuning = (patch: WeightTuningRevision): WeightTuningConfig => {
+    const prev = queue.getWeightTuningConfig();
+    if (prev === undefined) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseWeightTuning(patch);
+    }
+    // Validate-then-apply inside reviseWeightTuning: an illegal patch
+    // throws RangeError and the live values are left completely intact.
+    const next = queue.reviseWeightTuning(patch);
+    if (
+      next.ewmaAlpha === prev.ewmaAlpha &&
+      next.maxStepRatio === prev.maxStepRatio &&
+      next.hysteresisPoints === prev.hysteresisPoints &&
+      next.minWeightFloor === prev.minWeightFloor &&
+      next.retuneEpsilon === prev.retuneEpsilon &&
+      next.retuneIntervalMs === prev.retuneIntervalMs
+    ) {
+      return next;
+    }
+    opts.auditLog.append({
+      event: "weight_tuning_revised",
+      previous: prev,
+      current: next,
+    });
+    return next;
+  };
+
+  // WR-340: live adaptive weight-tuning config. Only set when
+  // `retry.weightTuning` was configured.
+  if (queue.getWeightTuningConfig() !== undefined) {
+    server.getWeightTuningConfig = (): WeightTuningConfig => queue.getWeightTuningConfig()!;
   }
 
   // WR-339: adaptive backoff config runtime revision. The method is

@@ -164,6 +164,47 @@ export interface WeightTuningOptions {
   onWeightsRetuned?: (info: WeightsRetunedInfo) => void;
 }
 
+/**
+ * WR-340: live weight-tuner config — the five controller inputs, after
+ * any revision. The sweeper interval lives on the queue-level
+ * {@link WeightTuningConfig} instead.
+ */
+export interface WeightTunerConfig {
+  /** EWMA smoothing factor in (0, 1]. */
+  ewmaAlpha: number;
+  /** Single-round relative change bound in (0, 1]. */
+  maxStepRatio: number;
+  /** Hysteresis in score points, >= 0. */
+  hysteresisPoints: number;
+  /** Zero-health floor as baseline fraction in [0, 1). */
+  minWeightFloor: number;
+  /** Relative no-op threshold in [0, 1). */
+  retuneEpsilon: number;
+}
+
+/**
+ * WR-340: a partial revision of the tuner config (all five inputs, at
+ * least one field set). Omitted fields keep their live values; an empty
+ * patch is a `RangeError`.
+ */
+export type WeightTunerRevision = Partial<WeightTunerConfig>;
+
+/**
+ * WR-340: live queue-level weight-tuning config — the five tuner inputs
+ * plus the sweeper interval, after any revision.
+ */
+export interface WeightTuningConfig extends WeightTunerConfig {
+  /** Interval between retune rounds in ms; finite and > 0. */
+  retuneIntervalMs: number;
+}
+
+/**
+ * WR-340: a partial revision of the queue-level weight-tuning config
+ * (all six inputs, at least one field set). Omitted fields keep their
+ * live values; an empty patch is a `RangeError`.
+ */
+export type WeightTuningRevision = Partial<WeightTuningConfig>;
+
 interface EndpointTuneState {
   /** Operator-configured weights: the reference every round derives from. */
   baseline: Map<string, number>;
@@ -228,11 +269,16 @@ export class WeightTuner {
   private readonly dispatcher: WeightedDispatcher;
   private readonly healthOf: (endpoint: string, target: string) => number;
   private readonly now: () => number;
-  private readonly ewmaAlpha: number;
-  private readonly maxStepRatio: number;
-  private readonly hysteresisPoints: number;
-  private readonly minWeightFloor: number;
-  private readonly retuneEpsilon: number;
+  // WR-340: live-revisable via `retune(patch)` (the constructor still
+  // validates every value through the same gates), so these are
+  // deliberately not `readonly`. The per-endpoint `states` stay
+  // untouched by a revision — smoothed scores, baselines, and score
+  // references are never reset or recomputed.
+  private ewmaAlpha: number;
+  private maxStepRatio: number;
+  private hysteresisPoints: number;
+  private minWeightFloor: number;
+  private retuneEpsilon: number;
   private readonly onWeightsRetuned?: (info: WeightsRetunedInfo) => void;
   private readonly states = new Map<string, EndpointTuneState>();
 
@@ -268,13 +314,85 @@ export class WeightTuner {
   }
 
   /**
+   * WR-340: revise the live tuner parameters (partial — omitted fields
+   * keep their live values). Merge-then-validate reusing the
+   * construction gates: an illegal patch throws `RangeError` and the
+   * live values are left completely untouched, and an empty patch is a
+   * `RangeError`. A patch equal to the live values is a silent no-op.
+   * A real revision only affects the next retune round — the EWMA
+   * smoothing, hysteresis gate, target law, and step clamp all read
+   * the live values, while the smoothed scores, baselines, and score
+   * references are untouched (no recompute, no re-baseline). Returns
+   * the live config after the revision.
+   */
+  retune(patch: WeightTunerRevision): WeightTunerConfig;
+  /**
    * Run one tuning round for `endpoint`. Returns the audit record when
    * weights were applied, `undefined` when the round was a no-op (not
    * weighted, single target, manual change re-baselined, hysteresis
    * not reached, or changes below the no-op threshold). Manual weight
    * changes always win: they re-baseline the tuner and skip the round.
    */
-  retune(endpoint: string): WeightsRetunedInfo | undefined {
+  retune(endpoint: string): WeightsRetunedInfo | undefined;
+  retune(arg: WeightTunerRevision | string): WeightTunerConfig | WeightsRetunedInfo | undefined {
+    if (typeof arg !== "string") {
+      const patch = arg;
+      if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+        throw new RangeError(
+          `weightTuning revision must be an object, got ${JSON.stringify(patch)}`
+        );
+      }
+      if (
+        patch.ewmaAlpha === undefined &&
+        patch.maxStepRatio === undefined &&
+        patch.hysteresisPoints === undefined &&
+        patch.minWeightFloor === undefined &&
+        patch.retuneEpsilon === undefined
+      ) {
+        throw new RangeError(
+          "weightTuning revision must set at least one of ewmaAlpha, maxStepRatio, hysteresisPoints, minWeightFloor, retuneEpsilon"
+        );
+      }
+      // Merge-then-validate: the merged values must pass the
+      // construction gates before any live value moves.
+      const next: WeightTunerConfig = {
+        ewmaAlpha: checkAlpha("ewmaAlpha", patch.ewmaAlpha ?? this.ewmaAlpha, DEFAULT_WEIGHT_TUNE_EWMA_ALPHA),
+        maxStepRatio: checkAlpha(
+          "maxStepRatio",
+          patch.maxStepRatio ?? this.maxStepRatio,
+          DEFAULT_WEIGHT_TUNE_MAX_STEP_RATIO
+        ),
+        hysteresisPoints: checkHysteresis(patch.hysteresisPoints ?? this.hysteresisPoints),
+        minWeightFloor: checkUnitInterval(
+          "minWeightFloor",
+          patch.minWeightFloor ?? this.minWeightFloor,
+          DEFAULT_WEIGHT_TUNE_MIN_FLOOR,
+          true
+        ),
+        retuneEpsilon: checkUnitInterval(
+          "retuneEpsilon",
+          patch.retuneEpsilon ?? this.retuneEpsilon,
+          DEFAULT_WEIGHT_TUNE_EPSILON,
+          true
+        ),
+      };
+      if (
+        next.ewmaAlpha === this.ewmaAlpha &&
+        next.maxStepRatio === this.maxStepRatio &&
+        next.hysteresisPoints === this.hysteresisPoints &&
+        next.minWeightFloor === this.minWeightFloor &&
+        next.retuneEpsilon === this.retuneEpsilon
+      ) {
+        return this.snapshot();
+      }
+      this.ewmaAlpha = next.ewmaAlpha;
+      this.maxStepRatio = next.maxStepRatio;
+      this.hysteresisPoints = next.hysteresisPoints;
+      this.minWeightFloor = next.minWeightFloor;
+      this.retuneEpsilon = next.retuneEpsilon;
+      return this.snapshot();
+    }
+    const endpoint = arg;
     const row = this.dispatcher.stats().find((s) => s.endpoint === endpoint);
     if (row === undefined) return undefined;
     // A single target has no shares to tune — the ratio is degenerate.
@@ -365,6 +483,17 @@ export class WeightTuner {
     return info;
   }
 
+  /** WR-340: live tuner config snapshot (the five controller inputs). */
+  snapshot(): WeightTunerConfig {
+    return {
+      ewmaAlpha: this.ewmaAlpha,
+      maxStepRatio: this.maxStepRatio,
+      hysteresisPoints: this.hysteresisPoints,
+      minWeightFloor: this.minWeightFloor,
+      retuneEpsilon: this.retuneEpsilon,
+    };
+  }
+
   /** Run one tuning round for every weighted endpoint. */
   retuneAll(): WeightsRetunedInfo[] {
     const out: WeightsRetunedInfo[] = [];
@@ -409,7 +538,10 @@ export class WeightTuner {
  */
 export class WeightTuneSweeper {
   private readonly tuner: WeightTuner;
-  private readonly retuneIntervalMs: number;
+  // WR-340: live-revisable via `setRetuneIntervalMs`, so deliberately
+  // not `readonly`. `arm()` reads it on every arming, so a revision
+  // re-arms the schedule on the new interval.
+  private intervalMs: number;
   private readonly setTimer: (fn: () => void, ms: number) => { clear(): void };
   private readonly clearTimer: (handle: { clear(): void }) => void;
   private started = false;
@@ -427,7 +559,7 @@ export class WeightTuneSweeper {
       throw new RangeError(`weightTuning: retuneIntervalMs must be a finite number > 0, got ${String(opts.retuneIntervalMs)}`);
     }
     this.tuner = opts.tuner;
-    this.retuneIntervalMs = ms;
+    this.intervalMs = ms;
     this.setTimer =
       opts.setTimer ??
       ((fn, ms2) => {
@@ -441,6 +573,34 @@ export class WeightTuneSweeper {
   /** Whether the sweep schedule is currently armed. */
   isRunning(): boolean {
     return this.started && this.timer !== undefined;
+  }
+
+  /** WR-340: live retune interval in ms. */
+  retuneIntervalMs(): number {
+    return this.intervalMs;
+  }
+
+  /**
+   * WR-340: revise the retune interval at runtime. While the sweeper
+   * is running the pending timer is cleared and re-armed on the new
+   * interval, so the next round follows the new rhythm; a round
+   * already fired is unaffected (its callback re-arms itself on the
+   * new interval). While stopped only the value changes — the next
+   * `start()` arms on it. An illegal value throws `RangeError` and
+   * the live interval is untouched; revising to the live interval is
+   * a silent no-op.
+   */
+  setRetuneIntervalMs(ms: number): void {
+    if (!Number.isFinite(ms) || ms <= 0) {
+      throw new RangeError(`weightTuning: retuneIntervalMs must be a finite number > 0, got ${String(ms)}`);
+    }
+    if (ms === this.intervalMs) return;
+    this.intervalMs = ms;
+    if (this.timer !== undefined) {
+      this.clearTimer(this.timer);
+      this.timer = undefined;
+      this.arm();
+    }
   }
 
   /** Arm the retune schedule. Idempotent. */
@@ -476,6 +636,6 @@ export class WeightTuneSweeper {
       } finally {
         this.arm();
       }
-    }, this.retuneIntervalMs);
+    }, this.intervalMs);
   }
 }

@@ -395,9 +395,13 @@ import {
   WeightTuner,
   WeightTuneSweeper,
   type WeightsRetunedInfo,
+  type WeightTunerConfig,
   type WeightTunerOptions,
+  type WeightTunerRevision,
   type WeightTuneSweeperOptions,
+  type WeightTuningConfig,
   type WeightTuningOptions,
+  type WeightTuningRevision,
 } from "./weight-tuner.ts";
 import {
   GlobalConcurrencyGate,
@@ -568,9 +572,13 @@ export type {
 export { WeightTuner, WeightTuneSweeper };
 export type {
   WeightsRetunedInfo,
+  WeightTunerConfig,
   WeightTunerOptions,
+  WeightTunerRevision,
   WeightTuneSweeperOptions,
+  WeightTuningConfig,
   WeightTuningOptions,
+  WeightTuningRevision,
 };
 export { PayloadTransformer, PayloadTransformError, TemplateError };
 export type { PayloadTransformRules, TransformContext };
@@ -10137,6 +10145,94 @@ export class RetryQueue {
   getAdaptiveBackoffConfig(): AdaptiveBackoffConfig | undefined {
     if (this.adaptiveBackoffOpts === undefined) return undefined;
     return this.adaptiveBackoffFor(undefined)!.snapshot();
+  }
+
+  /**
+   * WR-340: revise the live adaptive weight-tuning parameters
+   * (partial — omitted fields keep their live values). The five tuner
+   * inputs only affect the next retune round — the EWMA-smoothed
+   * scores, baselines, and score references are untouched, and a
+   * manual weight change still re-baselines the tuner. A changed
+   * `retuneIntervalMs` re-arms the sweeper timer when it is running,
+   * so the next round follows the new rhythm; a round already fired
+   * is unaffected. An illegal patch throws `RangeError` and the live
+   * values are untouched; an empty patch is a `RangeError`; revising
+   * to the live values is a no-op. Throws `Error` when weight tuning
+   * was never configured — enabling it needs a restart. Returns the
+   * live config.
+   */
+  reviseWeightTuning(patch: WeightTuningRevision): WeightTuningConfig {
+    if (this.weightTuner === undefined || this.weightTuneSweeper === undefined) {
+      throw new Error(
+        "reviseWeightTuning: weight tuning is not configured — enabling it requires a restart: " +
+          "the tuner and sweeper are created at startup and a running relay cannot start tuning weights without them"
+      );
+    }
+    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new RangeError(`weightTuning revision must be an object, got ${JSON.stringify(patch)}`);
+    }
+    if (
+      patch.ewmaAlpha === undefined &&
+      patch.maxStepRatio === undefined &&
+      patch.hysteresisPoints === undefined &&
+      patch.minWeightFloor === undefined &&
+      patch.retuneEpsilon === undefined &&
+      patch.retuneIntervalMs === undefined
+    ) {
+      throw new RangeError(
+        "weightTuning revision must set at least one of ewmaAlpha, maxStepRatio, hysteresisPoints, minWeightFloor, retuneEpsilon, retuneIntervalMs"
+      );
+    }
+    // Validate-then-apply: the interval is checked first so a bad
+    // interval leaves the tuner untouched, and the tuner validates
+    // the merged five fields before any live value moves.
+    if (patch.retuneIntervalMs !== undefined) {
+      const ms = patch.retuneIntervalMs;
+      if (!Number.isFinite(ms) || ms <= 0) {
+        throw new RangeError(`weightTuning: retuneIntervalMs must be a finite number > 0, got ${String(ms)}`);
+      }
+    }
+    const tunerPatch: WeightTunerRevision = {
+      ewmaAlpha: patch.ewmaAlpha,
+      maxStepRatio: patch.maxStepRatio,
+      hysteresisPoints: patch.hysteresisPoints,
+      minWeightFloor: patch.minWeightFloor,
+      retuneEpsilon: patch.retuneEpsilon,
+    };
+    const hasTunerField =
+      tunerPatch.ewmaAlpha !== undefined ||
+      tunerPatch.maxStepRatio !== undefined ||
+      tunerPatch.hysteresisPoints !== undefined ||
+      tunerPatch.minWeightFloor !== undefined ||
+      tunerPatch.retuneEpsilon !== undefined;
+    let next: WeightTuningConfig;
+    if (hasTunerField) {
+      // The tuner retune is itself validate-then-apply; it throws
+      // before the sweeper interval moves.
+      const tuned = this.weightTuner.retune(tunerPatch);
+      next = { ...tuned, retuneIntervalMs: this.weightTuneSweeper.retuneIntervalMs() };
+    } else {
+      next = this.getWeightTuningConfig()!;
+    }
+    if (patch.retuneIntervalMs !== undefined) {
+      this.weightTuneSweeper.setRetuneIntervalMs(patch.retuneIntervalMs);
+      next = { ...next, retuneIntervalMs: this.weightTuneSweeper.retuneIntervalMs() };
+    }
+    return next;
+  }
+
+  /**
+   * WR-340: live adaptive weight-tuning config — the five tuner inputs
+   * plus the sweeper interval. `undefined` when the feature was never
+   * configured. Reads the live values, so a runtime revision is
+   * visible immediately.
+   */
+  getWeightTuningConfig(): WeightTuningConfig | undefined {
+    if (this.weightTuner === undefined || this.weightTuneSweeper === undefined) return undefined;
+    return {
+      ...this.weightTuner.snapshot(),
+      retuneIntervalMs: this.weightTuneSweeper.retuneIntervalMs(),
+    };
   }
 
   /**
