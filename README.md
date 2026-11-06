@@ -3320,6 +3320,26 @@ const queue = new RetryQueue({
   exports finite limits to Prometheus (activity-gated — absent until the
   first outcome is recorded; a gauge cannot hold Infinity). Invalid
   options throw `RangeError` at construction.
+- **Live revision (WR-337)** — `queue.reviseAdaptiveConcurrency(patch)` /
+  `relay.reviseAdaptiveConcurrency(patch)` retune the seven inputs at
+  runtime (partial — omitted fields keep their live values;
+  `queue.getAdaptiveConcurrencyConfig()` / `relay.getAdaptiveConcurrencyConfig()`
+  read them back). A lowered `maxLimit` (or raised `minLimit`) clamps
+  already-adapted limits at once, so the next dispatch gates on the new
+  bounds; a changed `initialLimit` only affects endpoints with no
+  adapted limit yet; a new `windowSize` applies from the next
+  full-window evaluation. The merged config must pass the construction
+  gates — including `maxLimit >= minLimit` and `initialLimit` inside
+  `[minLimit, maxLimit]`, so lowering `maxLimit` below the live
+  `initialLimit` needs both fields in one patch — or the whole patch is
+  a `RangeError` and nothing moves. An empty patch is a `RangeError`;
+  a same-value patch is a silent no-op; a real revision is audited as
+  `adaptive_concurrency_revised` with `previous` / `current`. The one
+  config is shared by all tenants (every per-tenant controller is
+  retuned in place; tenants born later start from the revised values).
+  Revising the feature when it was never configured throws `Error` —
+  enabling it needs a restart. This tunes the steady-state AIMD cap;
+  WR-321 revises the fixed cap, WR-338 the breaker-recovery ramp.
 
 ## Per-endpoint bulkhead isolation (WR-227, wired in WR-312)
 

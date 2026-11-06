@@ -138,6 +138,10 @@ import {
   type AdaptiveMaxDelayRevision,
 } from "./adaptive-max-delay.ts";
 import {
+  type AdaptiveConcurrencyConfig,
+  type AdaptiveConcurrencyRevision,
+} from "./adaptive-concurrency.ts";
+import {
   PhaseTimeoutError,
   applyPhaseTimeoutRevision,
   assertValidPhaseTimeoutBudgets,
@@ -5774,6 +5778,33 @@ export interface RelayServer extends Server {
    * configured; `undefined` otherwise.
    */
   getAdaptiveMaxDelayConfig?: () => AdaptiveMaxDelayConfig | undefined;
+  /**
+   * WR-337: revise the live adaptive concurrency config at runtime
+   * (`minLimit` / `maxLimit` / `initialLimit` / `increaseStep` /
+   * `decreaseFactor` / `failureRateThreshold` / `windowSize`, partial —
+   * omitted fields keep their live values). A lowered `maxLimit` (or
+   * raised `minLimit`) clamps already-adapted limits at once, so the
+   * next dispatch gates on the new bounds; a changed `initialLimit`
+   * only affects endpoints with no adapted limit yet; a new `windowSize`
+   * applies from the next full-window evaluation. An illegal patch
+   * throws `RangeError` and the live values are untouched; an empty
+   * patch is a `RangeError`; a same-value revision is a no-op with no
+   * audit event. A real revision is audited as
+   * `adaptive_concurrency_revised` with `previous` / `current` (the
+   * construction values as first `previous`), and returns the live
+   * config. Always set; throws `Error` when adaptive concurrency was
+   * never configured — enabling it needs a restart. The one config is
+   * shared by all tenants: there is no per-tenant override. This tunes
+   * the steady-state AIMD cap; WR-321 revises the fixed cap instead,
+   * and WR-338 revises the breaker-recovery ramp.
+   */
+  reviseAdaptiveConcurrency?: (patch: AdaptiveConcurrencyRevision) => AdaptiveConcurrencyConfig;
+  /**
+   * WR-337: live adaptive concurrency config — the seven AIMD inputs
+   * shared by all tenants. Only set when `adaptiveConcurrency` was
+   * configured; `undefined` otherwise.
+   */
+  getAdaptiveConcurrencyConfig?: () => AdaptiveConcurrencyConfig | undefined;
   /**
    * WR-336: revise the live hedge delay (`hedgeDelayMs`) at runtime.
    * The next dispatch arms its hedge timer on the new value; a timer
@@ -14760,6 +14791,50 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   if (queue.getAdaptiveMaxDelayConfig() !== undefined) {
     server.getAdaptiveMaxDelayConfig = (): AdaptiveMaxDelayConfig =>
       queue.getAdaptiveMaxDelayConfig()!;
+  }
+
+  // WR-337: adaptive concurrency config runtime revision. The method is
+  // always set (like reviseAdaptiveMaxDelay above); with the controller
+  // unconfigured the queue throws Error — enabling it needs a
+  // restart. A real revision is audited as `adaptive_concurrency_revised`
+  // with the previous and current config (the construction values as
+  // first `previous`); an empty or same-value patch is a silent
+  // no-op.
+  server.reviseAdaptiveConcurrency = (
+    patch: AdaptiveConcurrencyRevision
+  ): AdaptiveConcurrencyConfig => {
+    const prev = queue.getAdaptiveConcurrencyConfig();
+    if (prev === undefined) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseAdaptiveConcurrency(patch);
+    }
+    // Validate-then-apply inside retune: an illegal patch throws
+    // RangeError and the live values are left completely intact.
+    const next = queue.reviseAdaptiveConcurrency(patch);
+    if (
+      next.minLimit === prev.minLimit &&
+      next.maxLimit === prev.maxLimit &&
+      next.initialLimit === prev.initialLimit &&
+      next.increaseStep === prev.increaseStep &&
+      next.decreaseFactor === prev.decreaseFactor &&
+      next.failureRateThreshold === prev.failureRateThreshold &&
+      next.windowSize === prev.windowSize
+    ) {
+      return next;
+    }
+    opts.auditLog.append({
+      event: "adaptive_concurrency_revised",
+      previous: prev,
+      current: next,
+    });
+    return next;
+  };
+
+  // WR-337: live adaptive concurrency config. Only set when
+  // `retry.adaptiveConcurrency` was configured.
+  if (queue.getAdaptiveConcurrencyConfig() !== undefined) {
+    server.getAdaptiveConcurrencyConfig = (): AdaptiveConcurrencyConfig =>
+      queue.getAdaptiveConcurrencyConfig()!;
   }
 
   // WR-336: live hedge-delay revision. Both methods are always set

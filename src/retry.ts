@@ -258,8 +258,10 @@ import {
 import {
   AdaptiveConcurrencyController,
   assertAdaptiveConcurrencyOptions,
+  type AdaptiveConcurrencyConfig,
   type AdaptiveConcurrencyEndpointStats,
   type AdaptiveConcurrencyOptions,
+  type AdaptiveConcurrencyRevision,
 } from "./adaptive-concurrency.ts";
 import {
   TenantRateLimiter,
@@ -599,8 +601,10 @@ export {
   DEFAULT_ADAPTIVE_DOWN_FACTOR,
 } from "./adaptive-backoff.ts";
 export type {
+  AdaptiveConcurrencyConfig,
   AdaptiveConcurrencyOptions,
   AdaptiveConcurrencyEndpointStats,
+  AdaptiveConcurrencyRevision,
 } from "./adaptive-concurrency.ts";
 export {
   AdaptiveConcurrencyController,
@@ -4260,8 +4264,8 @@ export class RetryQueue {
   private readonly adaptiveBackoffOpts?: AdaptiveBackoffOptions;
   /** WR-59: per-tenant adaptive backoff controllers (WR-48 scoping). */
   private readonly adaptiveBackoffs = new Map<string, AdaptiveBackoffController>();
-  /** WR-94: adaptive concurrency options; undefined when disabled. */
-  private readonly adaptiveConcurrencyOpts?: AdaptiveConcurrencyOptions;
+  /** WR-94: adaptive concurrency options; undefined when disabled. WR-337: live-revisable — `reviseAdaptiveConcurrency` replaces this with the merged options so tenants born later start from the revised values. */
+  private adaptiveConcurrencyOpts?: AdaptiveConcurrencyOptions;
   /** WR-97: the shared per-(tenant, endpoint) outbound rate limiter; undefined when disabled. */
   private readonly tenantRateLimiter?: TenantRateLimiter;
   /** WR-154: the shared per-endpoint outbound token-bucket rate limiter; undefined when disabled. */
@@ -9920,6 +9924,76 @@ export class RetryQueue {
    */
   getAdaptiveMaxDelayConfig(): AdaptiveMaxDelayConfig | undefined {
     return this.adaptiveMaxDelay?.snapshot();
+  }
+
+  /**
+   * WR-337: revise the live adaptive concurrency config (partial —
+   * omitted fields keep their live values). The next dispatch gates on
+   * the retuned limits; a lowered ceiling (or raised floor) clamps
+   * already-adapted limits at once. An illegal patch throws
+   * `RangeError` and the live values are untouched; an empty patch is
+   * a `RangeError`; revising to the live values is a no-op. Throws
+   * `Error` when adaptive concurrency was never configured — enabling
+   * it needs a restart. The one config is shared by all tenants:
+   * every per-tenant controller is retuned in place, and tenants born
+   * later start from the revised values. Returns the live config.
+   */
+  reviseAdaptiveConcurrency(patch: AdaptiveConcurrencyRevision): AdaptiveConcurrencyConfig {
+    if (this.adaptiveConcurrencyOpts === undefined) {
+      throw new Error(
+        "reviseAdaptiveConcurrency: adaptive concurrency is not configured — enabling it requires a restart: " +
+          "the controller is created at startup and a running relay cannot start adapting limits without one"
+      );
+    }
+    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new RangeError(
+        `adaptiveConcurrency revision must be an object, got ${JSON.stringify(patch)}`
+      );
+    }
+    // Validate-then-apply across every live per-tenant controller: an
+    // illegal patch must leave all of them untouched, so the merged
+    // config is checked against each controller's own live values
+    // before any retune runs. The merged config always carries a
+    // concrete maxLimit, so the default-ceiling argument is inert here
+    // (each controller's own retune passes its construction default).
+    for (const controller of this.adaptiveConcurrencies.values()) {
+      const live = controller.snapshot();
+      assertAdaptiveConcurrencyOptions(
+        {
+          minLimit: patch.minLimit ?? live.minLimit,
+          maxLimit: patch.maxLimit ?? live.maxLimit,
+          initialLimit: patch.initialLimit ?? live.initialLimit,
+          increaseStep: patch.increaseStep ?? live.increaseStep,
+          decreaseFactor: patch.decreaseFactor ?? live.decreaseFactor,
+          failureRateThreshold: patch.failureRateThreshold ?? live.failureRateThreshold,
+          windowSize: patch.windowSize ?? live.windowSize,
+        },
+        Infinity
+      );
+    }
+    // The default controller always exists once the feature is on
+    // (created eagerly at construction); retune it first so the
+    // returned config is the live one.
+    const primary = this.adaptiveConcurrencyFor(undefined)!;
+    const next = primary.retune(patch);
+    for (const controller of this.adaptiveConcurrencies.values()) {
+      if (controller !== primary) controller.retune(patch);
+    }
+    // Tenants born later start from the revised values (explicit values
+    // win; an unset maxLimit keeps defaulting to the fixed cap).
+    this.adaptiveConcurrencyOpts = { ...this.adaptiveConcurrencyOpts, ...patch };
+    return next;
+  }
+
+  /**
+   * WR-337: live adaptive concurrency config — the seven AIMD inputs
+   * shared by all tenants. `undefined` when the feature was never
+   * configured. Reads the live values, so a runtime revision is
+   * visible immediately.
+   */
+  getAdaptiveConcurrencyConfig(): AdaptiveConcurrencyConfig | undefined {
+    if (this.adaptiveConcurrencyOpts === undefined) return undefined;
+    return this.adaptiveConcurrencyFor(undefined)!.snapshot();
   }
 
   /**

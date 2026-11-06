@@ -94,6 +94,35 @@ export interface AdaptiveConcurrencyOptions {
   windowSize?: number;
 }
 
+/**
+ * WR-337: a partial revision of the adaptive concurrency config (all
+ * seven inputs, at least one field set). Omitted fields keep their
+ * live values; an empty patch is a `RangeError`.
+ */
+export type AdaptiveConcurrencyRevision = Partial<
+  Pick<
+    AdaptiveConcurrencyOptions,
+    | "minLimit"
+    | "maxLimit"
+    | "initialLimit"
+    | "increaseStep"
+    | "decreaseFactor"
+    | "failureRateThreshold"
+    | "windowSize"
+  >
+>;
+
+/** WR-337: live adaptive concurrency config — the seven inputs, after any revision. */
+export interface AdaptiveConcurrencyConfig {
+  minLimit: number;
+  maxLimit: number;
+  initialLimit: number;
+  increaseStep: number;
+  decreaseFactor: number;
+  failureRateThreshold: number;
+  windowSize: number;
+}
+
 /** One endpoint's adaptive concurrency state. */
 export interface AdaptiveConcurrencyEndpointStats {
   /** The endpoint (physical `targetUrl`) this row describes. */
@@ -191,19 +220,26 @@ export function assertAdaptiveConcurrencyOptions(
  * deterministic by construction.
  */
 export class AdaptiveConcurrencyController {
-  private readonly minLimit: number;
-  private readonly maxLimit: number;
-  private readonly increaseStep: number;
-  private readonly decreaseFactor: number;
-  private readonly failureRateThreshold: number;
-  private readonly windowSize: number;
-  private readonly initialLimit: number;
+  // WR-337: live-revisable via `retune()` (the constructor still
+  // validates every value through the same gates), so these are
+  // deliberately not `readonly`. `limits`/`windows` stay untouched by
+  // retune except for the bounds clamp below.
+  private minLimit: number;
+  private maxLimit: number;
+  private increaseStep: number;
+  private decreaseFactor: number;
+  private failureRateThreshold: number;
+  private windowSize: number;
+  private initialLimit: number;
+  /** Ceiling default the constructor was given (the queue's fixed cap). */
+  private readonly defaultMaxLimit: number;
   private readonly limits = new Map<string, number>();
   /** Recent outcomes per endpoint: `true` = success, `false` = failure. */
   private readonly windows = new Map<string, boolean[]>();
 
   constructor(opts: AdaptiveConcurrencyOptions = {}, defaultMaxLimit: number = Infinity) {
     const cfg = assertAdaptiveConcurrencyOptions(opts, defaultMaxLimit);
+    this.defaultMaxLimit = defaultMaxLimit;
     this.minLimit = cfg.minLimit;
     this.maxLimit = cfg.maxLimit;
     this.initialLimit = cfg.initialLimit;
@@ -211,6 +247,97 @@ export class AdaptiveConcurrencyController {
     this.decreaseFactor = cfg.decreaseFactor;
     this.failureRateThreshold = cfg.failureRateThreshold;
     this.windowSize = cfg.windowSize;
+  }
+
+  /**
+   * WR-337: revise the live config (partial — omitted fields keep their
+   * live values). Merge-then-validate reusing the construction gates
+   * (`assertAdaptiveConcurrencyOptions`, including the `maxLimit >=
+   * minLimit` and `initialLimit ∈ [minLimit, maxLimit]` cross-checks):
+   * an illegal patch throws `RangeError` and the live values are left
+   * completely untouched (including the adapted limits and the outcome
+   * windows), and an empty patch is a `RangeError`. A patch equal to
+   * the live values is a silent no-op. A real revision updates the
+   * seven inputs in place and clamps every endpoint's adapted limit
+   * into the new `[minLimit, maxLimit]` at once — a lowered ceiling
+   * (or a raised floor) takes effect immediately, without waiting for
+   * the next full window. A changed `initialLimit` only affects
+   * endpoints with no adapted limit yet (`limitFor` falls back to it);
+   * adapted limits are never reset. Outcome windows are untouched: a
+   * new `windowSize` applies from the next full-window evaluation, so
+   * lowering it to at or below the current partial-window length makes
+   * the next outcome trigger one evaluation. Returns the live config
+   * after the revision.
+   */
+  retune(patch: AdaptiveConcurrencyRevision): AdaptiveConcurrencyConfig {
+    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new RangeError(
+        `adaptiveConcurrency revision must be an object, got ${JSON.stringify(patch)}`
+      );
+    }
+    if (
+      patch.minLimit === undefined &&
+      patch.maxLimit === undefined &&
+      patch.initialLimit === undefined &&
+      patch.increaseStep === undefined &&
+      patch.decreaseFactor === undefined &&
+      patch.failureRateThreshold === undefined &&
+      patch.windowSize === undefined
+    ) {
+      throw new RangeError(
+        "adaptiveConcurrency revision must set at least one of minLimit, maxLimit, initialLimit, increaseStep, decreaseFactor, failureRateThreshold, windowSize"
+      );
+    }
+    const next: AdaptiveConcurrencyConfig = {
+      minLimit: patch.minLimit ?? this.minLimit,
+      maxLimit: patch.maxLimit ?? this.maxLimit,
+      initialLimit: patch.initialLimit ?? this.initialLimit,
+      increaseStep: patch.increaseStep ?? this.increaseStep,
+      decreaseFactor: patch.decreaseFactor ?? this.decreaseFactor,
+      failureRateThreshold: patch.failureRateThreshold ?? this.failureRateThreshold,
+      windowSize: patch.windowSize ?? this.windowSize,
+    };
+    // Validate-then-apply: the merged values must pass the construction
+    // gates (including the cross-checks) before any live value moves.
+    assertAdaptiveConcurrencyOptions(next, this.defaultMaxLimit);
+    if (
+      next.minLimit === this.minLimit &&
+      next.maxLimit === this.maxLimit &&
+      next.initialLimit === this.initialLimit &&
+      next.increaseStep === this.increaseStep &&
+      next.decreaseFactor === this.decreaseFactor &&
+      next.failureRateThreshold === this.failureRateThreshold &&
+      next.windowSize === this.windowSize
+    ) {
+      return this.snapshot();
+    }
+    this.minLimit = next.minLimit;
+    this.maxLimit = next.maxLimit;
+    this.initialLimit = next.initialLimit;
+    this.increaseStep = next.increaseStep;
+    this.decreaseFactor = next.decreaseFactor;
+    this.failureRateThreshold = next.failureRateThreshold;
+    this.windowSize = next.windowSize;
+    // Adapted limits are stale under the new bounds: clamp them into
+    // [minLimit, maxLimit] in place. Windows are untouched — the new
+    // windowSize applies from the next full-window evaluation.
+    for (const [endpoint, limit] of this.limits) {
+      this.limits.set(endpoint, Math.min(this.maxLimit, Math.max(this.minLimit, limit)));
+    }
+    return this.snapshot();
+  }
+
+  /** WR-337: live config snapshot (the seven AIMD inputs). */
+  snapshot(): AdaptiveConcurrencyConfig {
+    return {
+      minLimit: this.minLimit,
+      maxLimit: this.maxLimit,
+      initialLimit: this.initialLimit,
+      increaseStep: this.increaseStep,
+      decreaseFactor: this.decreaseFactor,
+      failureRateThreshold: this.failureRateThreshold,
+      windowSize: this.windowSize,
+    };
   }
 
   /**
