@@ -12437,6 +12437,27 @@ expirations are counted in
 dead-letter replay starts a fresh delivery cycle with a fresh deadline.
 Off by default; invalid values throw `RangeError` at construction.
 
+#### Live revision of the delivery deadline (WR-341)
+
+The deadline configuration itself is live-revisable — no restart:
+`RetryQueue.reviseDeliveryDeadline(patch)` / `RelayServer.reviseDeliveryDeadline(patch)`
+(`getDeliveryDeadlineConfig()` returns the live snapshot), audited as
+`delivery_deadline_revised` with `previous` / `current`. The patch is
+partial — `deadlines` merges per endpoint (a number sets that endpoint's
+deadline, `null` deletes it), `propagateBudget` / `minAttemptBudgetMs`
+merge the same way, omitted fields keep their live values. A new
+deadline governs the next dispatch (elapsed still counts from queue
+admission — lengthening can revive a delivery about to expire,
+shortening can expire it at the next dispatch); a budget already stamped
+on an in-flight wire copy is unaffected. Deleting the last endpoint
+leaves an empty deadlines map — the feature stays configured, it does
+not switch off. An illegal patch throws `RangeError` and leaves the live
+values untouched; an empty patch is a `RangeError`; a same-value revision
+is a silent no-op. A relay started without `deliveryDeadline` cannot
+enable it at runtime — that still needs a restart. This revises the
+deadline *configuration*; WR-76 is the deadline mechanism itself and
+WR-99 the budget propagation it tunes.
+
 #### Deadline-budget propagation (WR-99)
 
 The WR-76 deadline above expires a delivery at the next dispatch once
@@ -12466,7 +12487,10 @@ SLO pool:
 
 Custom (injected) senders ignore `deadlineBudgetMs` — the queue-side
 expiry still bounds the delivery, only the per-attempt cap is lost.
-Set `propagateBudget: false` to keep the exact WR-76 behavior.
+Set `propagateBudget: false` to keep the exact WR-76 behavior. Both
+knobs (and the deadlines themselves) are live-revisable via
+`reviseDeliveryDeadline` (WR-341, previous subsection) — a new deadline
+governs the next dispatch, a stamped in-flight budget is unaffected.
 
 #### Per-endpoint phase timeout budgets (WR-143)
 

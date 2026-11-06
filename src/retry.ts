@@ -1710,6 +1710,34 @@ export interface DeliveryDeadlineOptions {
   now?: () => number;
 }
 
+/**
+ * WR-341: live delivery-deadline config — a snapshot of the three live
+ * values. `deadlines` is a plain record (a copy of the live map), never
+ * the live Map itself, so callers cannot mutate the queue's state.
+ */
+export interface DeliveryDeadlineConfig {
+  /** Per-endpoint deadline in ms: exact `targetUrl` -> milliseconds. */
+  deadlines: Record<string, number>;
+  /** Whether the remaining budget is stamped on each dispatch's wire copy. */
+  propagateBudget: boolean;
+  /** Dispatch floor in ms — remaining budget at or below this expires without a call. */
+  minAttemptBudgetMs: number;
+}
+
+/**
+ * WR-341: partial revision of the live delivery-deadline config.
+ * `deadlines` merges per endpoint: a number sets that endpoint's
+ * deadline, `null` deletes it — deleting the last endpoint leaves an
+ * empty map, and the feature stays configured (it does not switch
+ * off). The two knobs merge the same way; omitted fields keep their
+ * live values.
+ */
+export interface DeliveryDeadlineRevision {
+  deadlines?: Record<string, number | null>;
+  propagateBudget?: boolean;
+  minAttemptBudgetMs?: number;
+}
+
 /** Fired when a delivery's end-to-end deadline expires before delivery (WR-76). */
 export interface DeliveryDeadlineExceededInfo {
   /** Delivery id. */
@@ -4230,20 +4258,22 @@ export class RetryQueue {
   private readonly deliveryWindowStats = new Map<string, Map<string, number>>();
   /** WR-127: per-(tenant, endpoint) in-window park counts. */
   private readonly maintenanceWindowStats = new Map<string, Map<string, number>>();
-  /** WR-76: per-endpoint delivery deadline in ms (exact logical `targetUrl` match); undefined when disabled. */
+  /** WR-76: per-endpoint delivery deadline in ms (exact logical `targetUrl` match); undefined when disabled. WR-341: live-revisable — `reviseDeliveryDeadline` clears and refills this map in place, so the field stays readonly. */
   private readonly deliveryDeadlines?: Map<string, number>;
   /** WR-76: clock for the deadline; defaults to `Date.now`. Injectable for deterministic tests. */
   private readonly deadlineNow: () => number;
   /**
    * WR-99: whether the remaining budget is stamped on each dispatch's
    * wire copy so the sender can cap the per-attempt call. Default true.
+   * WR-341: live-revisable via `reviseDeliveryDeadline`.
    */
-  private readonly deadlinePropagateBudget: boolean;
+  private deadlinePropagateBudget: boolean;
   /**
    * WR-99: dispatch floor in ms — remaining budget at or below this
    * expires the delivery without issuing the outbound call.
+   * WR-341: live-revisable via `reviseDeliveryDeadline`.
    */
-  private readonly deadlineMinAttemptBudgetMs: number;
+  private deadlineMinAttemptBudgetMs: number;
   private readonly onDeliveryDeadlineExceeded?: (info: DeliveryDeadlineExceededInfo) => void;
   /** WR-80: cron occurrence audit hook. */
   private readonly onScheduledFired?: (event: ScheduledFiredEvent) => void;
@@ -9102,9 +9132,10 @@ export class RetryQueue {
           // failure, so there is no failure signal to feed the breaker
           // (mirroring the WR-76 "never attempted" neutrality).
           entry.attempt += 1;
-          // `deliveryDeadlines` is construction-time only, so a stamped
-          // budget always has its deadline here; the `?? 0` is purely
-          // defensive.
+          // WR-341: deadlines are live-revisable, so a deadline deleted
+          // after its budget was stamped leaves no entry here; the
+          // `?? 0` covers that case — the stamped budget still fired,
+          // so the delivery still expires with its actual attempt count.
           const dl = this.deliveryDeadlines?.get(logicalEndpoint) ?? 0;
           this.expireDeliveryDeadline(
             entry,
@@ -10232,6 +10263,100 @@ export class RetryQueue {
     return {
       ...this.weightTuner.snapshot(),
       retuneIntervalMs: this.weightTuneSweeper.retuneIntervalMs(),
+    };
+  }
+
+  /**
+   * WR-341: revise the live delivery-deadline config (partial —
+   * omitted fields keep their live values; `deadlines` merges per
+   * endpoint, a `null` value deletes that endpoint's deadline). The
+   * merged config is validated with the same checks as construction
+   * (per-endpoint finite > 0, `assertValidDeadlineBudgetOptions` for
+   * the two knobs); an illegal patch throws `RangeError` and the live
+   * values are untouched. An empty patch is a `RangeError`; revising
+   * to the live values is a no-op. Throws `Error` when delivery
+   * deadlines were never configured — enabling them needs a restart.
+   * A new deadline governs the next dispatch (elapsed still counts
+   * from queue admission — lengthening can revive a delivery about to
+   * expire, shortening can expire it at the next dispatch); a budget
+   * already stamped on an in-flight wire copy is unaffected. Deleting
+   * the last endpoint leaves an empty map — the feature stays
+   * configured. Returns the live config.
+   */
+  reviseDeliveryDeadline(patch: DeliveryDeadlineRevision): DeliveryDeadlineConfig {
+    if (this.deliveryDeadlines === undefined) {
+      throw new Error(
+        "reviseDeliveryDeadline: delivery deadlines are not configured — enabling it requires a restart: " +
+          "the per-endpoint deadlines are created at startup and a running relay cannot start enforcing SLOs without them"
+      );
+    }
+    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new RangeError(`deliveryDeadline revision must be an object, got ${JSON.stringify(patch)}`);
+    }
+    if (patch.deadlines !== undefined) {
+      const raw = patch.deadlines;
+      if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+        throw new RangeError("deliveryDeadline.deadlines must be a record of targetUrl -> ms or null");
+      }
+    }
+    const hasDeadlines = patch.deadlines !== undefined && Object.keys(patch.deadlines).length > 0;
+    if (
+      !hasDeadlines &&
+      patch.propagateBudget === undefined &&
+      patch.minAttemptBudgetMs === undefined
+    ) {
+      throw new RangeError(
+        "deliveryDeadline revision must set at least one of deadlines, propagateBudget, minAttemptBudgetMs"
+      );
+    }
+    // Validate-then-apply: build the merged deadlines first and check
+    // the whole merged config with the construction-time rules, so an
+    // illegal patch leaves the live map and both knobs untouched.
+    const merged = new Map(this.deliveryDeadlines);
+    if (patch.deadlines !== undefined) {
+      for (const [endpoint, ms] of Object.entries(patch.deadlines)) {
+        if (endpoint.length === 0) {
+          throw new RangeError("deliveryDeadline.deadlines keys must be non-empty endpoint URLs");
+        }
+        if (ms === null) {
+          merged.delete(endpoint);
+          continue;
+        }
+        if (typeof ms !== "number" || !Number.isFinite(ms) || ms <= 0) {
+          throw new RangeError(
+            `deliveryDeadline.deadlines[${JSON.stringify(endpoint)}] must be a finite number > 0, got ${String(ms)}`
+          );
+        }
+        merged.set(endpoint, ms);
+      }
+    }
+    const nextPropagateBudget = patch.propagateBudget ?? this.deadlinePropagateBudget;
+    const nextMinAttemptBudgetMs = patch.minAttemptBudgetMs ?? this.deadlineMinAttemptBudgetMs;
+    assertValidDeadlineBudgetOptions({
+      propagateBudget: nextPropagateBudget,
+      minAttemptBudgetMs: nextMinAttemptBudgetMs,
+    });
+    // Apply in place: the map field stays readonly (clear + refill),
+    // the two knobs are plain live fields.
+    this.deliveryDeadlines.clear();
+    for (const [endpoint, ms] of merged) this.deliveryDeadlines.set(endpoint, ms);
+    this.deadlinePropagateBudget = nextPropagateBudget;
+    this.deadlineMinAttemptBudgetMs = nextMinAttemptBudgetMs;
+    return this.getDeliveryDeadlineConfig()!;
+  }
+
+  /**
+   * WR-341: live delivery-deadline config — the per-endpoint deadlines
+   * as a snapshot record (never the live Map), plus the two WR-99
+   * knobs. `undefined` when the feature was never configured. Reads
+   * the live values, so a runtime revision is visible immediately.
+   */
+  getDeliveryDeadlineConfig(): DeliveryDeadlineConfig | undefined {
+    if (this.deliveryDeadlines === undefined) return undefined;
+    return {
+      deadlines: Object.fromEntries(this.deliveryDeadlines),
+      propagateBudget: this.deadlinePropagateBudget,
+      minAttemptBudgetMs: this.deadlineMinAttemptBudgetMs,
     };
   }
 

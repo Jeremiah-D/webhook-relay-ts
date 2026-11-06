@@ -28,7 +28,7 @@ import {
   selectSignatureAlgorithmVerifier,
   type SignatureAlgorithmRule,
 } from "./signature-alg.ts";
-import { RetryQueue, errorBudgetBurnAuditEvent, type BurnRateAlertInfo, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type RetryItem, type Sender, type SenderCallOptions, type MaintenanceWindowTransition, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
+import { RetryQueue, errorBudgetBurnAuditEvent, type BurnRateAlertInfo, type DeliveryDeadlineConfig, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type RetryItem, type Sender, type SenderCallOptions, type MaintenanceWindowTransition, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
 import { parseDeliverAtHeader, DELIVER_AT_HEADER } from "./retry.ts";
 import type { ShadowDeliveredInfo, ShadowFailedInfo, ShadowTargetConfig, ShadowTargetsConfig } from "./retry.ts";
 import type {
@@ -5866,6 +5866,32 @@ export interface RelayServer extends Server {
    * configured; `undefined` otherwise.
    */
   getWeightTuningConfig?: () => WeightTuningConfig | undefined;
+  /**
+   * WR-341: revise the live delivery-deadline config at runtime
+   * (`deadlines` merges per endpoint — a number sets, `null` deletes
+   * that endpoint's deadline; `propagateBudget` / `minAttemptBudgetMs`,
+   * partial — omitted fields keep their live values). A new deadline
+   * governs the next dispatch (elapsed still counts from queue
+   * admission); a budget already stamped on an in-flight wire copy is
+   * unaffected; deleting the last endpoint leaves an empty map — the
+   * feature stays configured. An illegal patch throws `RangeError` and
+   * the live values are untouched; an empty patch is a `RangeError`; a
+   * same-value revision is a no-op with no audit event. A real revision
+   * is audited as `delivery_deadline_revised` with `previous` /
+   * `current` (the construction values as first `previous`), and returns
+   * the live config. Always set; throws `Error` when delivery deadlines
+   * were never configured — enabling them needs a restart. This revises
+   * the deadline configuration; WR-76 is the deadline mechanism itself,
+   * WR-99 the budget propagation it tunes, and WR-143 the per-attempt
+   * phase budgets inside one attempt.
+   */
+  reviseDeliveryDeadline?: (patch: DeliveryDeadlineRevision) => DeliveryDeadlineConfig;
+  /**
+   * WR-341: live delivery-deadline config — the per-endpoint deadlines
+   * as a snapshot record plus the two WR-99 knobs. Only set when
+   * `deliveryDeadline` was configured; `undefined` otherwise.
+   */
+  getDeliveryDeadlineConfig?: () => DeliveryDeadlineConfig | undefined;
   /**
    * WR-339: revise the live adaptive backoff config at runtime
    * (`minBaseMs` / `maxBaseMs` / `upFactor` / `downFactor`, partial —
@@ -14998,6 +15024,45 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // `retry.weightTuning` was configured.
   if (queue.getWeightTuningConfig() !== undefined) {
     server.getWeightTuningConfig = (): WeightTuningConfig => queue.getWeightTuningConfig()!;
+  }
+
+  // WR-341: delivery-deadline config runtime revision. The method is
+  // always set (like reviseWeightTuning above); with deadlines
+  // unconfigured the queue throws Error — enabling them needs a restart.
+  // A real revision is audited as `delivery_deadline_revised` with the
+  // previous and current config (the construction values as first
+  // `previous`); an empty or same-value patch is a silent no-op.
+  server.reviseDeliveryDeadline = (patch: DeliveryDeadlineRevision): DeliveryDeadlineConfig => {
+    const prev = queue.getDeliveryDeadlineConfig();
+    if (prev === undefined) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseDeliveryDeadline(patch);
+    }
+    // Validate-then-apply inside reviseDeliveryDeadline: an illegal patch
+    // throws RangeError and the live values are left completely intact.
+    const next = queue.reviseDeliveryDeadline(patch);
+    const sameDeadlines =
+      Object.keys(prev.deadlines).length === Object.keys(next.deadlines).length &&
+      Object.entries(next.deadlines).every(([endpoint, ms]) => prev.deadlines[endpoint] === ms);
+    if (
+      sameDeadlines &&
+      next.propagateBudget === prev.propagateBudget &&
+      next.minAttemptBudgetMs === prev.minAttemptBudgetMs
+    ) {
+      return next;
+    }
+    opts.auditLog.append({
+      event: "delivery_deadline_revised",
+      previous: prev,
+      current: next,
+    });
+    return next;
+  };
+
+  // WR-341: live delivery-deadline config. Only set when
+  // `retry.deliveryDeadline` was configured.
+  if (queue.getDeliveryDeadlineConfig() !== undefined) {
+    server.getDeliveryDeadlineConfig = (): DeliveryDeadlineConfig => queue.getDeliveryDeadlineConfig()!;
   }
 
   // WR-339: adaptive backoff config runtime revision. The method is
