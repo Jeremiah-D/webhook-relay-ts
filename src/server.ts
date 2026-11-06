@@ -138,6 +138,10 @@ import {
   type AdaptiveMaxDelayRevision,
 } from "./adaptive-max-delay.ts";
 import {
+  type AdaptiveBackoffConfig,
+  type AdaptiveBackoffRevision,
+} from "./adaptive-backoff.ts";
+import {
   type AdaptiveConcurrencyConfig,
   type AdaptiveConcurrencyRevision,
 } from "./adaptive-concurrency.ts";
@@ -5835,6 +5839,33 @@ export interface RelayServer extends Server {
    * otherwise.
    */
   getSlowStartConfig?: () => SlowStartConfig | undefined;
+  /**
+   * WR-339: revise the live adaptive backoff config at runtime
+   * (`minBaseMs` / `maxBaseMs` / `upFactor` / `downFactor`, partial —
+   * omitted fields keep their live values). Retuning clamps every
+   * endpoint's adapted base into the new `[minBaseMs, maxBaseMs]` at
+   * once, so the next retry wait is computed from the new bounds; a
+   * changed `upFactor` / `downFactor` only affects the next outcome's
+   * step size, and outcome streaks are untouched. An illegal patch
+   * throws `RangeError` and the live values are untouched; an empty
+   * patch is a `RangeError`; a same-value revision is a no-op with no
+   * audit event. A real revision is audited as
+   * `adaptive_backoff_revised` with `previous` / `current` (the
+   * construction values as first `previous`), and returns the live
+   * config. Always set; throws `Error` when adaptive backoff was
+   * never configured — enabling it needs a restart. The one config is
+   * shared by all tenants: there is no per-tenant override. This
+   * tunes the retry-wait base; WR-335 revises the wait cap formula
+   * instead, WR-337 the steady-state AIMD concurrency cap, and
+   * WR-338 the breaker-recovery ramp.
+   */
+  reviseAdaptiveBackoff?: (patch: AdaptiveBackoffRevision) => AdaptiveBackoffConfig;
+  /**
+   * WR-339: live adaptive backoff config — the four backoff inputs
+   * shared by all tenants. Only set when `adaptiveBackoff` was
+   * configured; `undefined` otherwise.
+   */
+  getAdaptiveBackoffConfig?: () => AdaptiveBackoffConfig | undefined;
   /**
    * WR-336: revise the live hedge delay (`hedgeDelayMs`) at runtime.
    * The next dispatch arms its hedge timer on the new value; a timer
@@ -14901,6 +14932,47 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // `retry.slowStart` was configured.
   if (queue.getSlowStartConfig() !== undefined) {
     server.getSlowStartConfig = (): SlowStartConfig => queue.getSlowStartConfig()!;
+  }
+
+  // WR-339: adaptive backoff config runtime revision. The method is
+  // always set (like reviseSlowStart above); with the controller
+  // unconfigured the queue throws Error — enabling it needs a
+  // restart. A real revision is audited as `adaptive_backoff_revised`
+  // with the previous and current config (the construction values as
+  // first `previous`); an empty or same-value patch is a silent
+  // no-op.
+  server.reviseAdaptiveBackoff = (
+    patch: AdaptiveBackoffRevision
+  ): AdaptiveBackoffConfig => {
+    const prev = queue.getAdaptiveBackoffConfig();
+    if (prev === undefined) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseAdaptiveBackoff(patch);
+    }
+    // Validate-then-apply inside retune: an illegal patch throws
+    // RangeError and the live values are left completely intact.
+    const next = queue.reviseAdaptiveBackoff(patch);
+    if (
+      next.minBaseMs === prev.minBaseMs &&
+      next.maxBaseMs === prev.maxBaseMs &&
+      next.upFactor === prev.upFactor &&
+      next.downFactor === prev.downFactor
+    ) {
+      return next;
+    }
+    opts.auditLog.append({
+      event: "adaptive_backoff_revised",
+      previous: prev,
+      current: next,
+    });
+    return next;
+  };
+
+  // WR-339: live adaptive backoff config. Only set when
+  // `retry.adaptiveBackoff` was configured.
+  if (queue.getAdaptiveBackoffConfig() !== undefined) {
+    server.getAdaptiveBackoffConfig = (): AdaptiveBackoffConfig =>
+      queue.getAdaptiveBackoffConfig()!;
   }
 
   // WR-336: live hedge-delay revision. Both methods are always set

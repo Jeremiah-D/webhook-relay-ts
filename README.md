@@ -175,6 +175,25 @@ reliability primitives that matter for any signed-payload pipeline.
   exponent, jitter strategy, and cap keep working as before; it composes
   orthogonally with the global retry budget (WR-38, which gates first),
   and `getAdaptiveBackoffStats()` exposes each endpoint's current base.
+  Live revision (WR-339): `queue.reviseAdaptiveBackoff(patch)` /
+  `relay.reviseAdaptiveBackoff(patch)` retune the four inputs at runtime
+  (partial — omitted fields keep their live values;
+  `queue.getAdaptiveBackoffConfig()` / `relay.getAdaptiveBackoffConfig()`
+  read them back). Retuning clamps already-adapted bases into the new
+  `[minBaseMs, maxBaseMs]` at once, so the next retry wait is computed
+  from the new bounds; a changed `upFactor` / `downFactor` only affects
+  the next outcome's step size, and outcome streaks are untouched. The
+  merged config must pass the construction gates — including
+  `maxBaseMs >= minBaseMs` — or the whole patch is a `RangeError` and
+  nothing moves. An empty patch is a `RangeError`; a same-value patch is
+  a silent no-op; a real revision is audited as
+  `adaptive_backoff_revised` with `previous` / `current`. The one config
+  is shared by all tenants (every per-tenant controller is retuned in
+  place; tenants born later start from the revised values). Revising the
+  feature when it was never configured throws `Error` — enabling it needs
+  a restart. This revises the retry-wait base; WR-335 revises the wait
+  cap formula instead, WR-337 the steady-state AIMD concurrency cap, and
+  WR-338 the breaker-recovery ramp.
   The opt-in adaptive concurrency (`adaptiveConcurrency`, WR-94, off by
   default) adds an outcome-driven AIMD cap per endpoint — additive
   increase per healthy outcome window, multiplicative decrease per
@@ -11578,7 +11597,17 @@ written to the audit log, so the log is the machine's trace.
   consecutive retryable failures double it toward `maxBaseMs` (a sick
   downstream is retried progressively less often), successes halve it
   back toward `minBaseMs` (recovery is quick); the current base per
-  endpoint is exposed via `queue.getAdaptiveBackoffStats()`. When the circuit breaker is enabled and
+  endpoint is exposed via `queue.getAdaptiveBackoffStats()`. The four
+  inputs are live-revisable (WR-339):
+  `queue.reviseAdaptiveBackoff(patch)` / `relay.reviseAdaptiveBackoff(patch)`
+  retune them at runtime — retuning clamps already-adapted bases into the
+  new `[minBaseMs, maxBaseMs]` at once, so the next retry wait is computed
+  from the new bounds, while a changed `upFactor` / `downFactor` only
+  affects the next outcome's step size; a real revision is audited as
+  `adaptive_backoff_revised` with `previous` / `current`, and revising
+  when adaptive backoff was never configured throws `Error` (enabling it
+  needs a restart). This revises the retry-wait base; WR-335 revises the
+  wait cap formula instead. When the circuit breaker is enabled and
   the endpoint's circuit is open, the attempt is *parked* instead: it is
   rescheduled after the remaining cooldown without consuming the retry
   budget (still `delivering`, audited via `circuit_open` on the trip).

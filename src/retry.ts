@@ -238,8 +238,11 @@ import {
 } from "./status-retry.ts";
 import {
   AdaptiveBackoffController,
+  assertAdaptiveBackoffOptions,
+  type AdaptiveBackoffConfig,
   type AdaptiveBackoffEndpointStats,
   type AdaptiveBackoffOptions,
+  type AdaptiveBackoffRevision,
 } from "./adaptive-backoff.ts";
 import {
   AdaptiveTimeout,
@@ -599,9 +602,15 @@ export {
   normalizeStatusRetryPolicy,
   statusRetryDelayMs,
 } from "./status-retry.ts";
-export type { AdaptiveBackoffOptions, AdaptiveBackoffEndpointStats } from "./adaptive-backoff.ts";
+export type {
+  AdaptiveBackoffConfig,
+  AdaptiveBackoffOptions,
+  AdaptiveBackoffEndpointStats,
+  AdaptiveBackoffRevision,
+} from "./adaptive-backoff.ts";
 export {
   AdaptiveBackoffController,
+  assertAdaptiveBackoffOptions,
   DEFAULT_ADAPTIVE_MIN_BASE_MS,
   DEFAULT_ADAPTIVE_MAX_BASE_MS,
   DEFAULT_ADAPTIVE_UP_FACTOR,
@@ -4269,8 +4278,8 @@ export class RetryQueue {
   private readonly retryBudgetEndpoints = new Map<string, RetryBudget>();
   /** WR-125: retries parked because the budget was exhausted, per logical endpoint. */
   private readonly retryBudgetDepletedByEndpoint = new Map<string, number>();
-  /** WR-59: adaptive backoff options; undefined when disabled. */
-  private readonly adaptiveBackoffOpts?: AdaptiveBackoffOptions;
+  /** WR-59: adaptive backoff options; undefined when disabled. WR-339: live-revisable — `reviseAdaptiveBackoff` replaces this with the merged options so tenants born later start from the revised values. */
+  private adaptiveBackoffOpts?: AdaptiveBackoffOptions;
   /** WR-59: per-tenant adaptive backoff controllers (WR-48 scoping). */
   private readonly adaptiveBackoffs = new Map<string, AdaptiveBackoffController>();
   /** WR-94: adaptive concurrency options; undefined when disabled. WR-337: live-revisable — `reviseAdaptiveConcurrency` replaces this with the merged options so tenants born later start from the revised values. */
@@ -10065,6 +10074,69 @@ export class RetryQueue {
   getSlowStartConfig(): SlowStartConfig | undefined {
     if (this.slowStartOpts === undefined) return undefined;
     return this.slowStartFor(undefined)!.snapshot();
+  }
+
+  /**
+   * WR-339: revise the live adaptive backoff config (partial —
+   * omitted fields keep their live values). Retuning clamps every
+   * endpoint's adapted base into the new `[minBaseMs, maxBaseMs]` at
+   * once, so the next retry wait is computed from the new bounds; a
+   * changed `upFactor`/`downFactor` only affects the next outcome's
+   * step size. An illegal patch throws `RangeError` and the live
+   * values are untouched; an empty patch is a `RangeError`; revising
+   * to the live values is a no-op. Throws `Error` when adaptive
+   * backoff was never configured — enabling it needs a restart. The
+   * one config is shared by all tenants: every per-tenant controller
+   * is retuned in place, and tenants born later start from the
+   * revised values. Returns the live config.
+   */
+  reviseAdaptiveBackoff(patch: AdaptiveBackoffRevision): AdaptiveBackoffConfig {
+    if (this.adaptiveBackoffOpts === undefined) {
+      throw new Error(
+        "reviseAdaptiveBackoff: adaptive backoff is not configured — enabling it requires a restart: " +
+          "the controller is created at startup and a running relay cannot start adapting bases without one"
+      );
+    }
+    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new RangeError(
+        `adaptiveBackoff revision must be an object, got ${JSON.stringify(patch)}`
+      );
+    }
+    // Validate-then-apply across every live per-tenant controller: an
+    // illegal patch must leave all of them untouched, so the merged
+    // config is checked against each controller's own live values
+    // before any retune runs.
+    for (const controller of this.adaptiveBackoffs.values()) {
+      const live = controller.snapshot();
+      assertAdaptiveBackoffOptions(this.baseDelayMs, {
+        minBaseMs: patch.minBaseMs ?? live.minBaseMs,
+        maxBaseMs: patch.maxBaseMs ?? live.maxBaseMs,
+        upFactor: patch.upFactor ?? live.upFactor,
+        downFactor: patch.downFactor ?? live.downFactor,
+      });
+    }
+    // The default controller always exists once the feature is on
+    // (created eagerly at construction); retune it first so the
+    // returned config is the live one.
+    const primary = this.adaptiveBackoffFor(undefined)!;
+    const next = primary.retune(patch);
+    for (const controller of this.adaptiveBackoffs.values()) {
+      if (controller !== primary) controller.retune(patch);
+    }
+    // Tenants born later start from the revised values.
+    this.adaptiveBackoffOpts = { ...this.adaptiveBackoffOpts, ...patch };
+    return next;
+  }
+
+  /**
+   * WR-339: live adaptive backoff config — the four backoff inputs
+   * shared by all tenants. `undefined` when the feature was never
+   * configured. Reads the live values, so a runtime revision is
+   * visible immediately.
+   */
+  getAdaptiveBackoffConfig(): AdaptiveBackoffConfig | undefined {
+    if (this.adaptiveBackoffOpts === undefined) return undefined;
+    return this.adaptiveBackoffFor(undefined)!.snapshot();
   }
 
   /**

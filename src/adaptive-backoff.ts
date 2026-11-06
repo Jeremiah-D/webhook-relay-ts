@@ -61,6 +61,23 @@ export interface AdaptiveBackoffOptions {
   downFactor?: number;
 }
 
+/**
+ * WR-339: a partial revision of the adaptive backoff config (all four
+ * inputs, at least one field set). Omitted fields keep their live
+ * values; an empty patch is a `RangeError`.
+ */
+export type AdaptiveBackoffRevision = Partial<
+  Pick<AdaptiveBackoffOptions, "minBaseMs" | "maxBaseMs" | "upFactor" | "downFactor">
+>;
+
+/** WR-339: live adaptive backoff config — the four inputs, after any revision. */
+export interface AdaptiveBackoffConfig {
+  minBaseMs: number;
+  maxBaseMs: number;
+  upFactor: number;
+  downFactor: number;
+}
+
 /** One endpoint's adaptive backoff state. */
 export interface AdaptiveBackoffEndpointStats {
   /** The endpoint (physical `targetUrl`) this row describes. */
@@ -75,7 +92,7 @@ export interface AdaptiveBackoffEndpointStats {
   consecutiveSuccesses: number;
 }
 
-function assertAdaptiveBackoffOptions(
+export function assertAdaptiveBackoffOptions(
   initialBaseMs: number,
   opts: AdaptiveBackoffOptions
 ): { minBaseMs: number; maxBaseMs: number; upFactor: number; downFactor: number } {
@@ -113,10 +130,15 @@ function assertAdaptiveBackoffOptions(
  * outcome sequence always yields the same bases.
  */
 export class AdaptiveBackoffController {
-  private readonly minBaseMs: number;
-  private readonly maxBaseMs: number;
-  private readonly upFactor: number;
-  private readonly downFactor: number;
+  // WR-339: live-revisable via `retune()` (the constructor still
+  // validates every value through the same gates), so these are
+  // deliberately not `readonly`. `bases`/`consecutiveFailures`/
+  // `consecutiveSuccesses` stay untouched by retune except for the
+  // bounds clamp below.
+  private minBaseMs: number;
+  private maxBaseMs: number;
+  private upFactor: number;
+  private downFactor: number;
   /**
    * The resting base, read live: endpoints with no recorded outcomes use
    * it, so a queue-level hot-reload of `baseDelayMs` (WR-32) stays in
@@ -136,6 +158,81 @@ export class AdaptiveBackoffController {
     this.downFactor = downFactor;
     this.initialBase =
       typeof initialBaseMs === "function" ? initialBaseMs : () => initialBaseMs;
+  }
+
+  /**
+   * WR-339: revise the live config (partial — omitted fields keep their
+   * live values). Merge-then-validate reusing the construction gates
+   * (`assertAdaptiveBackoffOptions`, including the `maxBaseMs >=
+   * minBaseMs` cross-check): an illegal patch throws `RangeError` and
+   * the live values are left completely untouched (including the
+   * adapted bases and the streaks), and an empty patch is a
+   * `RangeError`. A patch equal to the live values is a silent no-op.
+   * A real revision updates the four inputs in place and clamps every
+   * endpoint's adapted base into the new `[minBaseMs, maxBaseMs]` at
+   * once — a lowered ceiling (or a raised floor) takes effect
+   * immediately, without waiting for the next outcome. Changed
+   * `upFactor`/`downFactor` only affect the next outcome's step size;
+   * the current bases are never recomputed. Outcome streaks are
+   * untouched: the next outcome still counts on the original streak.
+   * Endpoints with no recorded outcome keep using the resting base
+   * (`initialBase`, still read live). Returns the live config after
+   * the revision.
+   */
+  retune(patch: AdaptiveBackoffRevision): AdaptiveBackoffConfig {
+    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new RangeError(
+        `adaptiveBackoff revision must be an object, got ${JSON.stringify(patch)}`
+      );
+    }
+    if (
+      patch.minBaseMs === undefined &&
+      patch.maxBaseMs === undefined &&
+      patch.upFactor === undefined &&
+      patch.downFactor === undefined
+    ) {
+      throw new RangeError(
+        "adaptiveBackoff revision must set at least one of minBaseMs, maxBaseMs, upFactor, downFactor"
+      );
+    }
+    const next: AdaptiveBackoffConfig = {
+      minBaseMs: patch.minBaseMs ?? this.minBaseMs,
+      maxBaseMs: patch.maxBaseMs ?? this.maxBaseMs,
+      upFactor: patch.upFactor ?? this.upFactor,
+      downFactor: patch.downFactor ?? this.downFactor,
+    };
+    // Validate-then-apply: the merged values must pass the construction
+    // gates (including the cross-check) before any live value moves.
+    assertAdaptiveBackoffOptions(this.initialBase(), next);
+    if (
+      next.minBaseMs === this.minBaseMs &&
+      next.maxBaseMs === this.maxBaseMs &&
+      next.upFactor === this.upFactor &&
+      next.downFactor === this.downFactor
+    ) {
+      return this.snapshot();
+    }
+    this.minBaseMs = next.minBaseMs;
+    this.maxBaseMs = next.maxBaseMs;
+    this.upFactor = next.upFactor;
+    this.downFactor = next.downFactor;
+    // Adapted bases are stale under the new bounds: clamp them into
+    // [minBaseMs, maxBaseMs] in place. Streaks are untouched — the next
+    // outcome still counts on the original streak.
+    for (const [endpoint, base] of this.bases) {
+      this.bases.set(endpoint, Math.min(this.maxBaseMs, Math.max(this.minBaseMs, base)));
+    }
+    return this.snapshot();
+  }
+
+  /** WR-339: live config snapshot (the four backoff inputs). */
+  snapshot(): AdaptiveBackoffConfig {
+    return {
+      minBaseMs: this.minBaseMs,
+      maxBaseMs: this.maxBaseMs,
+      upFactor: this.upFactor,
+      downFactor: this.downFactor,
+    };
   }
 
   /**
