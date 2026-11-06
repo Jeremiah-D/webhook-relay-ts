@@ -63,6 +63,22 @@ export interface SlowStartOptions {
   maxLimit?: number;
 }
 
+/**
+ * WR-338: a partial revision of the slow-start config (all three
+ * inputs, at least one field set). Omitted fields keep their live
+ * values; an empty patch is a `RangeError`.
+ */
+export type SlowStartRevision = Partial<
+  Pick<SlowStartOptions, "curve" | "floor" | "maxLimit">
+>;
+
+/** WR-338: live slow-start config — the three inputs, after any revision. */
+export interface SlowStartConfig {
+  curve: SlowStartCurve;
+  floor: number;
+  maxLimit: number;
+}
+
 /** One endpoint's slow-start ramp state. */
 export interface SlowStartEndpointStats {
   /** The endpoint (physical `targetUrl`) this row describes. */
@@ -116,9 +132,13 @@ export function assertSlowStartOptions(opts: SlowStartOptions): {
  * `stats` snapshots it. No clock, no randomness.
  */
 export class SlowStartController {
-  private readonly curve: SlowStartCurve;
-  private readonly floor: number;
-  private readonly maxLimit: number;
+  // WR-338: live-revisable via `retune()` (the constructor still
+  // validates every value through the same gates), so these are
+  // deliberately not `readonly`. `ramps` stays untouched by retune
+  // except for the floor lift / ceiling completion below.
+  private curve: SlowStartCurve;
+  private floor: number;
+  private maxLimit: number;
   /**
    * Endpoints currently mid-ramp, mapped to their present limit. An
    * endpoint with no entry runs at the full limit (`maxLimit`).
@@ -130,6 +150,87 @@ export class SlowStartController {
     this.curve = cfg.curve;
     this.floor = cfg.floor;
     this.maxLimit = cfg.maxLimit;
+  }
+
+  /**
+   * WR-338: revise the live config (partial — omitted fields keep their
+   * live values). Merge-then-validate reusing the construction gates
+   * (`assertSlowStartOptions`, including the `maxLimit >= floor`
+   * cross-check): an illegal patch throws `RangeError` and the live
+   * values are left completely untouched (including the active ramps),
+   * and an empty patch is a `RangeError`. A patch equal to the live
+   * values is a silent no-op. A real revision updates the three inputs
+   * in place: a changed `curve` only affects the next success step (a
+   * ramp keeps the height it already climbed); a raised `floor`
+   * immediately lifts any active ramp sitting below it; a lowered
+   * `floor` leaves ramp heights alone — the next mid-ramp failure
+   * falls back to the new floor; a lowered `maxLimit` completes at
+   * once any active ramp already at or above it (the entry is dropped
+   * and the endpoint runs at the full limit, the same completion shape
+   * as a ramp climbing into its ceiling); a raised `maxLimit` lets
+   * ramps keep climbing toward the new ceiling. A new breaker-close
+   * event starts its ramp at the new floor on the new curve. Other
+   * active ramp state is untouched — ramps are never reset. Returns
+   * the live config after the revision.
+   */
+  retune(patch: SlowStartRevision): SlowStartConfig {
+    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new RangeError(
+        `slowStart revision must be an object, got ${JSON.stringify(patch)}`
+      );
+    }
+    if (
+      patch.curve === undefined &&
+      patch.floor === undefined &&
+      patch.maxLimit === undefined
+    ) {
+      throw new RangeError(
+        "slowStart revision must set at least one of curve, floor, maxLimit"
+      );
+    }
+    const next: SlowStartConfig = {
+      curve: patch.curve ?? this.curve,
+      floor: patch.floor ?? this.floor,
+      maxLimit: patch.maxLimit ?? this.maxLimit,
+    };
+    // Validate-then-apply: the merged values must pass the construction
+    // gates (including the maxLimit >= floor cross-check) before any
+    // live value moves.
+    assertSlowStartOptions(next);
+    if (
+      next.curve === this.curve &&
+      next.floor === this.floor &&
+      next.maxLimit === this.maxLimit
+    ) {
+      return this.snapshot();
+    }
+    this.curve = next.curve;
+    this.floor = next.floor;
+    this.maxLimit = next.maxLimit;
+    // A raised floor lifts ramps sitting below it; a lowered ceiling
+    // completes ramps already at or above it. The cross-check
+    // guarantees floor <= maxLimit, so a ramp lifted to the floor can
+    // only complete when floor == maxLimit — exactly the ceiling.
+    for (const [endpoint, limit] of this.ramps) {
+      if (limit < this.floor) {
+        this.ramps.set(endpoint, this.floor);
+      }
+    }
+    for (const [endpoint, limit] of this.ramps) {
+      if (limit >= this.maxLimit) {
+        this.ramps.delete(endpoint);
+      }
+    }
+    return this.snapshot();
+  }
+
+  /** WR-338: live config snapshot (the three ramp inputs). */
+  snapshot(): SlowStartConfig {
+    return {
+      curve: this.curve,
+      floor: this.floor,
+      maxLimit: this.maxLimit,
+    };
   }
 
   /**

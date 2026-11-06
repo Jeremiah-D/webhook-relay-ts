@@ -46,7 +46,14 @@ import {
   type QueueDepthStatsRow,
 } from "./queue-depth.ts";
 import { OtelTracer, type OtelTracingOptions, type OtelTracingStats } from "./otel-tracing.ts";
-import { SlowStartController, type SlowStartOptions, type SlowStartEndpointStats } from "./slowstart.ts";
+import {
+  SlowStartController,
+  assertSlowStartOptions,
+  type SlowStartConfig,
+  type SlowStartOptions,
+  type SlowStartEndpointStats,
+  type SlowStartRevision,
+} from "./slowstart.ts";
 import {
   ReplayIdempotencyGuard,
   type ReplayIdempotencyOptions,
@@ -534,7 +541,7 @@ export type {
 export type { CircuitBreakerOptions, CircuitProbeRevision, CircuitState, CircuitStats, CircuitThresholdPatch, ResolvedCircuitProbe, ResolvedCircuitThresholds };
 export type { EndpointDependencyOptions } from "./endpoint-dependencies.ts";
 export { EndpointDependencyGraph } from "./endpoint-dependencies.ts";
-export type { SlowStartOptions, SlowStartEndpointStats };
+export type { SlowStartConfig, SlowStartOptions, SlowStartEndpointStats, SlowStartRevision };
 export type { ReplayIdempotencyOptions, ReplayIdempotencyStats };
 export type {
   BurnRateAlertInfo,
@@ -3984,8 +3991,10 @@ export class RetryQueue {
   /**
    * WR-148: per-tenant slow-start ramp controllers, keyed by tenant
    * instance key; `undefined` options mean the feature is off.
+   * WR-338: live-revisable — `reviseSlowStart` replaces this with the
+   * merged options so tenants born later start from the revised values.
    */
-  private readonly slowStartOpts?: SlowStartOptions;
+  private slowStartOpts?: SlowStartOptions;
   private readonly slowStarts = new Map<string, SlowStartController>();
   /**
    * WR-149: per-tenant replay-idempotency guards, keyed by tenant
@@ -9994,6 +10003,68 @@ export class RetryQueue {
   getAdaptiveConcurrencyConfig(): AdaptiveConcurrencyConfig | undefined {
     if (this.adaptiveConcurrencyOpts === undefined) return undefined;
     return this.adaptiveConcurrencyFor(undefined)!.snapshot();
+  }
+
+  /**
+   * WR-338: revise the live slow-start config (partial — omitted
+   * fields keep their live values). A raised `floor` lifts active
+   * ramps sitting below it at once; a lowered `maxLimit` completes
+   * active ramps already at or above it at once; a changed `curve`
+   * only affects the next success step, and a new breaker-close event
+   * starts its ramp at the new floor on the new curve. An illegal
+   * patch throws `RangeError` and the live values are untouched; an
+   * empty patch is a `RangeError`; revising to the live values is a
+   * no-op. Throws `Error` when slow start was never configured —
+   * enabling it needs a restart. The one config is shared by all
+   * tenants: every per-tenant controller is retuned in place, and
+   * tenants born later start from the revised values. Returns the
+   * live config.
+   */
+  reviseSlowStart(patch: SlowStartRevision): SlowStartConfig {
+    if (this.slowStartOpts === undefined) {
+      throw new Error(
+        "reviseSlowStart: slow start is not configured — enabling it requires a restart: " +
+          "the controller is created at startup and a running relay cannot start pacing recoveries without one"
+      );
+    }
+    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new RangeError(`slowStart revision must be an object, got ${JSON.stringify(patch)}`);
+    }
+    // Validate-then-apply across every live per-tenant controller: an
+    // illegal patch must leave all of them untouched, so the merged
+    // config is checked against each controller's own live values
+    // before any retune runs.
+    for (const controller of this.slowStarts.values()) {
+      const live = controller.snapshot();
+      assertSlowStartOptions({
+        curve: patch.curve ?? live.curve,
+        floor: patch.floor ?? live.floor,
+        maxLimit: patch.maxLimit ?? live.maxLimit,
+      });
+    }
+    // The default controller always exists once the feature is on
+    // (created eagerly at construction); retune it first so the
+    // returned config is the live one.
+    const primary = this.slowStartFor(undefined)!;
+    const next = primary.retune(patch);
+    for (const controller of this.slowStarts.values()) {
+      if (controller !== primary) controller.retune(patch);
+    }
+    // Tenants born later start from the revised values (explicit values
+    // win; an unset maxLimit keeps defaulting to the fixed cap).
+    this.slowStartOpts = { ...this.slowStartOpts, ...patch };
+    return next;
+  }
+
+  /**
+   * WR-338: live slow-start config — the three ramp inputs shared by
+   * all tenants. `undefined` when the feature was never configured.
+   * Reads the live values, so a runtime revision is visible
+   * immediately.
+   */
+  getSlowStartConfig(): SlowStartConfig | undefined {
+    if (this.slowStartOpts === undefined) return undefined;
+    return this.slowStartFor(undefined)!.snapshot();
   }
 
   /**

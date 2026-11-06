@@ -142,6 +142,10 @@ import {
   type AdaptiveConcurrencyRevision,
 } from "./adaptive-concurrency.ts";
 import {
+  type SlowStartConfig,
+  type SlowStartRevision,
+} from "./slowstart.ts";
+import {
   PhaseTimeoutError,
   applyPhaseTimeoutRevision,
   assertValidPhaseTimeoutBudgets,
@@ -5805,6 +5809,32 @@ export interface RelayServer extends Server {
    * configured; `undefined` otherwise.
    */
   getAdaptiveConcurrencyConfig?: () => AdaptiveConcurrencyConfig | undefined;
+  /**
+   * WR-338: revise the live slow-start config at runtime (`curve` /
+   * `floor` / `maxLimit`, partial — omitted fields keep their live
+   * values). A raised `floor` lifts active ramps sitting below it at
+   * once; a lowered `maxLimit` completes active ramps already at or
+   * above it at once; a changed `curve` only affects the next success
+   * step, and a new breaker-close event starts its ramp at the new
+   * floor on the new curve. An illegal patch throws `RangeError` and
+   * the live values are untouched; an empty patch is a `RangeError`;
+   * a same-value revision is a no-op with no audit event. A real
+   * revision is audited as `slow_start_revised` with `previous` /
+   * `current` (the construction values as first `previous`), and
+   * returns the live config. Always set; throws `Error` when slow
+   * start was never configured — enabling it needs a restart. The one
+   * config is shared by all tenants: there is no per-tenant override.
+   * This paces breaker-recovery ramps; WR-337 revises the steady-state
+   * AIMD cap instead, and EB-332 is the other repo's subscription-level
+   * slow start, a different mechanism.
+   */
+  reviseSlowStart?: (patch: SlowStartRevision) => SlowStartConfig;
+  /**
+   * WR-338: live slow-start config — the three ramp inputs shared by
+   * all tenants. Only set when `slowStart` was configured; `undefined`
+   * otherwise.
+   */
+  getSlowStartConfig?: () => SlowStartConfig | undefined;
   /**
    * WR-336: revise the live hedge delay (`hedgeDelayMs`) at runtime.
    * The next dispatch arms its hedge timer on the new value; a timer
@@ -14835,6 +14865,42 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   if (queue.getAdaptiveConcurrencyConfig() !== undefined) {
     server.getAdaptiveConcurrencyConfig = (): AdaptiveConcurrencyConfig =>
       queue.getAdaptiveConcurrencyConfig()!;
+  }
+
+  // WR-338: slow-start config runtime revision. The method is always
+  // set (like reviseAdaptiveConcurrency above); with the controller
+  // unconfigured the queue throws Error — enabling it needs a
+  // restart. A real revision is audited as `slow_start_revised` with
+  // the previous and current config (the construction values as first
+  // `previous`); an empty or same-value patch is a silent no-op.
+  server.reviseSlowStart = (patch: SlowStartRevision): SlowStartConfig => {
+    const prev = queue.getSlowStartConfig();
+    if (prev === undefined) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseSlowStart(patch);
+    }
+    // Validate-then-apply inside retune: an illegal patch throws
+    // RangeError and the live values are left completely intact.
+    const next = queue.reviseSlowStart(patch);
+    if (
+      next.curve === prev.curve &&
+      next.floor === prev.floor &&
+      next.maxLimit === prev.maxLimit
+    ) {
+      return next;
+    }
+    opts.auditLog.append({
+      event: "slow_start_revised",
+      previous: prev,
+      current: next,
+    });
+    return next;
+  };
+
+  // WR-338: live slow-start config. Only set when
+  // `retry.slowStart` was configured.
+  if (queue.getSlowStartConfig() !== undefined) {
+    server.getSlowStartConfig = (): SlowStartConfig => queue.getSlowStartConfig()!;
   }
 
   // WR-336: live hedge-delay revision. Both methods are always set

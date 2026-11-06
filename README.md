@@ -3483,6 +3483,26 @@ const queue = new RetryQueue({
   endpoint's current limit, floor, ceiling, and curve (`tenant` only
   when set; absent rows run at the full limit). Invalid options throw
   `RangeError` at construction.
+- **Live revision (WR-338)** — `queue.reviseSlowStart(patch)` /
+  `relay.reviseSlowStart(patch)` retune the three inputs at runtime
+  (partial — omitted fields keep their live values;
+  `queue.getSlowStartConfig()` / `relay.getSlowStartConfig()` read
+  them back). A raised `floor` lifts active ramps sitting below it at
+  once, so the next dispatch gates on the new recovery start; a
+  lowered `maxLimit` completes active ramps already at or above it at
+  once; a changed `curve` only affects the next success step, and a
+  new breaker-close event starts its ramp at the new floor on the new
+  curve. The merged config must pass the construction gates —
+  including `maxLimit >= floor` — or the whole patch is a `RangeError`
+  and nothing moves. An empty patch is a `RangeError`; a same-value
+  patch is a silent no-op; a real revision is audited as
+  `slow_start_revised` with `previous` / `current`. The one config is
+  shared by all tenants (every per-tenant controller is retuned in
+  place; tenants born later start from the revised values). Revising
+  the feature when it was never configured throws `Error` — enabling
+  it needs a restart. This paces breaker-recovery ramps; WR-337
+  revises the steady-state AIMD cap instead, and EB-332 is the other
+  repo's subscription-level slow start, a different mechanism.
 
 ## Per-tenant outbound rate limiting
 
