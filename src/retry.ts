@@ -1,6 +1,8 @@
 import {
   DeadLetterAutoReplayer,
   type AutoReplayOptions,
+  type AutoReplayScheduleConfig,
+  type AutoReplayScheduleRevision,
   type DeadLetterAutoReplayAuditEvent,
 } from "./autoreplay.ts";
 import {
@@ -691,7 +693,7 @@ export {
   LATENCY_PHASES,
 } from "./latency-phases.ts";
 export type { BatchConfigRevision, BatchEnvelopeInput, BatchOptions };
-export type { AutoReplayOptions, DeadLetterAutoReplayAuditEvent };
+export type { AutoReplayOptions, AutoReplayScheduleConfig, AutoReplayScheduleRevision, DeadLetterAutoReplayAuditEvent };
 export type {
   DeadLetterRetentionOptions,
   DeadLetterPurgedEvent,
@@ -6458,6 +6460,36 @@ export class RetryQueue {
    */
   getAutoReplayer(): DeadLetterAutoReplayer | undefined {
     return this.autoReplayer;
+  }
+
+  /**
+   * WR-344: revise the live dead-letter auto-replay schedule cadence
+   * (partial — omitted fields keep their live values). A running
+   * scheduler re-arms its pending timer on the new cadence; a paused
+   * or rounds-exhausted scheduler only stores the values until
+   * `resume()`. An illegal patch throws `RangeError` and the live
+   * values are untouched; an empty patch is a `RangeError`; revising
+   * to the live values is a no-op. Throws `Error` when auto replay
+   * was never configured — enabling it needs a restart. Returns the
+   * live config.
+   */
+  reviseAutoReplaySchedule(patch: AutoReplayScheduleRevision): AutoReplayScheduleConfig {
+    if (this.autoReplayer === undefined) {
+      throw new Error(
+        "reviseAutoReplaySchedule: auto replay is not configured — enabling it requires a restart"
+      );
+    }
+    return this.autoReplayer.retune(patch);
+  }
+
+  /**
+   * WR-344: live dead-letter auto-replay schedule cadence — the three
+   * round-rhythm inputs. `undefined` when auto replay was never
+   * configured. Reads the live values, so a runtime revision is
+   * visible immediately.
+   */
+  getAutoReplayScheduleConfig(): AutoReplayScheduleConfig | undefined {
+    return this.autoReplayer?.config();
   }
 
   /**

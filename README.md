@@ -12225,6 +12225,26 @@ poison-only) dead letter stops being polled aggressively.
   even when the scheduler was never configured (`enabled: false`); the
   control endpoints answer 404 in that case.
 
+**Live cadence revision (WR-344).** The round cadence
+(`intervalMs` / `maxRounds` / `maxIntervalMs`) is revisable at runtime
+without a restart — `relay.reviseAutoReplaySchedule({ intervalMs: 10_000 })`
+(or `queue.reviseAutoReplaySchedule(patch)` on a raw queue) — and
+`relay.getAutoReplayScheduleConfig()` reads the live values. A running
+scheduler re-arms its pending timer on the new cadence, so the next
+round waits on the revised values (and `nextRunAt` updates); only the
+next round's wait is affected — a round already in flight finishes
+against the `maxRounds` it started with, and the counters
+(`consecutiveEmptyRounds`, `totalReplayed`) are never reset by a
+revision. A paused scheduler only stores the values until `resume()`,
+and a rounds-exhausted scheduler only stores them until `resume()`
+resets the counters and re-arms. Revising to the live values is a
+silent no-op; a real revision audits `auto_replay_schedule_revised`
+with `previous` / `current`. Enabling auto-replay itself still needs a
+restart: on a relay where it was never configured, revising throws and
+the getter is not mounted. This revises the round cadence only — the
+replay-egress rate (WR-343) is a separate control on the same replay
+path.
+
 The round timer is unref'd, so a configured scheduler never pins the
 process open, and `RetryQueue.stop()` / `shutdown()` cancel any pending
 round — a round never fires mid-shutdown and re-queues dead letters the

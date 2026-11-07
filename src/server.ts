@@ -86,7 +86,11 @@ import {
   resolveTenantBodyBudget,
   type TenantBodyLimits,
 } from "./tenant-body-limit.ts";
-import type { AutoReplayOptions } from "./autoreplay.ts";
+import type {
+  AutoReplayOptions,
+  AutoReplayScheduleConfig,
+  AutoReplayScheduleRevision,
+} from "./autoreplay.ts";
 import type {
   DeadLetterRetentionOptions,
   DeadLetterRetentionRevision,
@@ -5985,6 +5989,34 @@ export interface RelayServer extends Server {
    * `minTlsVersions` was configured; `undefined` otherwise.
    */
   getTlsMinVersion?: (endpoint: string) => MinTlsVersion | undefined;
+  /**
+   * WR-344: revise the live dead-letter auto-replay schedule cadence
+   * at runtime (`intervalMs` / `maxRounds` / `maxIntervalMs`, partial
+   * — omitted fields keep their live values). A running scheduler
+   * re-arms its pending timer on the new cadence, so the next round
+   * waits on the revised values; a round already in flight finishes
+   * against the `maxRounds` it started with, and a paused or
+   * rounds-exhausted scheduler only stores the values until
+   * `resume()`. Counters (`consecutiveEmptyRounds`, `totalReplayed`)
+   * are never reset by a revision. An illegal patch throws
+   * `RangeError` and the live values are untouched; an empty patch is
+   * a `RangeError`; a same-value revision is a silent no-op with no
+   * audit event. A real revision is audited as
+   * `auto_replay_schedule_revised` with `previous` / `current` (the
+   * construction values as first `previous` — the defaults
+   * 60_000/10/3_600_000 when unset), and returns the live config.
+   * Always set; throws `Error` when auto replay was never configured
+   * — enabling it needs a restart. This revises the round cadence;
+   * WR-343 revises the replay-egress rate instead, and WR-31 is the
+   * scheduler mechanism itself.
+   */
+  reviseAutoReplaySchedule: (patch: AutoReplayScheduleRevision) => AutoReplayScheduleConfig;
+  /**
+   * WR-344: live dead-letter auto-replay schedule cadence — the three
+   * round-rhythm inputs. Only set when `autoReplay` was configured;
+   * `undefined` otherwise.
+   */
+  getAutoReplayScheduleConfig?: () => AutoReplayScheduleConfig | undefined;
   /**
    * WR-336: revise the live hedge delay (`hedgeDelayMs`) at runtime.
    * The next dispatch arms its hedge timer on the new value; a timer
@@ -15262,6 +15294,47 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   if (opts.minTlsVersions !== undefined) {
     server.getTlsMinVersion = (endpoint: string): MinTlsVersion | undefined =>
       opts.minTlsVersions![endpoint];
+  }
+
+  // WR-344: dead-letter auto-replay schedule cadence runtime revision.
+  // The method is always set (like reviseAdaptiveBackoff above); with
+  // auto replay unconfigured the queue throws Error — enabling it
+  // needs a restart. A real revision is audited as
+  // `auto_replay_schedule_revised` with the previous and current
+  // config (the construction values as first `previous` — the
+  // defaults 60_000/10/3_600_000 when unset); an empty or same-value
+  // patch is a silent no-op.
+  server.reviseAutoReplaySchedule = (
+    patch: AutoReplayScheduleRevision
+  ): AutoReplayScheduleConfig => {
+    const prev = queue.getAutoReplayScheduleConfig();
+    if (prev === undefined) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseAutoReplaySchedule(patch);
+    }
+    // Validate-then-apply inside retune: an illegal patch throws
+    // RangeError and the live values are left completely intact.
+    const next = queue.reviseAutoReplaySchedule(patch);
+    if (
+      next.intervalMs === prev.intervalMs &&
+      next.maxRounds === prev.maxRounds &&
+      next.maxIntervalMs === prev.maxIntervalMs
+    ) {
+      return next;
+    }
+    opts.auditLog.append({
+      event: "auto_replay_schedule_revised",
+      previous: prev,
+      current: next,
+    });
+    return next;
+  };
+
+  // WR-344: live dead-letter auto-replay schedule cadence. Only set
+  // when `autoReplay` was configured.
+  if (queue.getAutoReplayScheduleConfig() !== undefined) {
+    server.getAutoReplayScheduleConfig = (): AutoReplayScheduleConfig =>
+      queue.getAutoReplayScheduleConfig()!;
   }
 
   // WR-336: live hedge-delay revision. Both methods are always set

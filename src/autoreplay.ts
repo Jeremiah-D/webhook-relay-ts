@@ -46,6 +46,32 @@ export interface AutoReplayOptions {
   clearTimer?: (handle: ReplayTimerHandle) => void;
 }
 
+/**
+ * WR-344: partial live revision of the auto-replay schedule cadence —
+ * the three round-rhythm inputs (`intervalMs` / `maxRounds` /
+ * `maxIntervalMs`). Omitted fields keep their live values; `enabled`
+ * is deliberately absent — enabling/disabling still needs a restart.
+ */
+export interface AutoReplayScheduleRevision {
+  /** Base interval in ms between rounds; must be a finite number > 0. */
+  intervalMs?: number;
+  /** Consecutive empty rounds tolerated before stopping; integer >= 1. */
+  maxRounds?: number;
+  /** Cap in ms for the exponential backoff wait; finite, > 0, >= `intervalMs`. */
+  maxIntervalMs?: number;
+}
+
+/**
+ * WR-344: the three live cadence inputs of the auto-replay schedule,
+ * all required — the snapshot `DeadLetterAutoReplayer.config()` returns
+ * and `retune()` accepts partial patches of.
+ */
+export interface AutoReplayScheduleConfig {
+  intervalMs: number;
+  maxRounds: number;
+  maxIntervalMs: number;
+}
+
 /** Round outcome reported by {@link DeadLetterAutoReplayer.triggerOnce}. */
 export interface AutoReplayRoundResult {
   /** Ids re-queued with a fresh attempt budget this round. */
@@ -76,6 +102,26 @@ export interface DeadLetterAutoReplayAuditEvent {
   totalReplayed: number;
   /** ISO-8601 timestamp of the round that triggered the stop. */
   lastRunAt: string;
+}
+
+/**
+ * The constructor's three validation gates, shared with `retune()` so a
+ * live revision is checked against exactly the same rules as the
+ * construction values: `intervalMs` finite > 0, `maxRounds` an integer
+ * >= 1, `maxIntervalMs` finite > 0 and >= `intervalMs`.
+ */
+function assertAutoReplaySchedule(intervalMs: number, maxRounds: number, maxIntervalMs: number): void {
+  if (!Number.isFinite(intervalMs) || intervalMs <= 0) {
+    throw new RangeError(`autoReplay.intervalMs must be a finite number > 0, got ${intervalMs}`);
+  }
+  if (!Number.isInteger(maxRounds) || maxRounds < 1) {
+    throw new RangeError(`autoReplay.maxRounds must be an integer >= 1, got ${maxRounds}`);
+  }
+  if (!Number.isFinite(maxIntervalMs) || maxIntervalMs <= 0 || maxIntervalMs < intervalMs) {
+    throw new RangeError(
+      `autoReplay.maxIntervalMs must be a finite number > 0 and >= intervalMs (${intervalMs}), got ${maxIntervalMs}`
+    );
+  }
 }
 
 /**
@@ -122,9 +168,10 @@ export interface DeadLetterAutoReplayAuditEvent {
  */
 export class DeadLetterAutoReplayer {
   private readonly enabled: boolean;
-  private readonly intervalMs: number;
-  private readonly maxRounds: number;
-  private readonly maxIntervalMs: number;
+  /** WR-344: live-revisable via `retune()` — `enabled` stays readonly. */
+  private intervalMs: number;
+  private maxRounds: number;
+  private maxIntervalMs: number;
   private readonly now: () => number;
   private readonly setTimer: (fn: () => void, ms: number) => ReplayTimerHandle;
   private readonly clearTimer: (handle: ReplayTimerHandle) => void;
@@ -154,21 +201,7 @@ export class DeadLetterAutoReplayer {
     this.maxRounds = opts.maxRounds ?? 10;
     this.maxIntervalMs = opts.maxIntervalMs ?? 3_600_000;
     this.now = opts.now ?? Date.now;
-    if (!Number.isFinite(this.intervalMs) || this.intervalMs <= 0) {
-      throw new RangeError(`autoReplay.intervalMs must be a finite number > 0, got ${opts.intervalMs}`);
-    }
-    if (!Number.isInteger(this.maxRounds) || this.maxRounds < 1) {
-      throw new RangeError(`autoReplay.maxRounds must be an integer >= 1, got ${opts.maxRounds}`);
-    }
-    if (
-      !Number.isFinite(this.maxIntervalMs) ||
-      this.maxIntervalMs <= 0 ||
-      this.maxIntervalMs < this.intervalMs
-    ) {
-      throw new RangeError(
-        `autoReplay.maxIntervalMs must be a finite number > 0 and >= intervalMs (${this.intervalMs}), got ${opts.maxIntervalMs}`
-      );
-    }
+    assertAutoReplaySchedule(this.intervalMs, this.maxRounds, this.maxIntervalMs);
     this.setTimer =
       opts.setTimer ??
       ((fn, ms) => {
@@ -191,6 +224,70 @@ export class DeadLetterAutoReplayer {
   /** Whether the schedule is currently ticking (started, not paused/stopped). */
   isRunning(): boolean {
     return this.running && !this.paused && !this.stopped;
+  }
+
+  /**
+   * WR-344: live revision of the schedule cadence (partial — omitted
+   * fields keep their live values). The merged values are re-validated
+   * with the constructor's same three gates, so an illegal patch
+   * throws `RangeError` and the live values — and the pending timer —
+   * are completely untouched; an empty patch is a `RangeError`, as is a
+   * non-object patch. Revising to the live values is a silent no-op
+   * (no re-arm, no audit). A real revision re-arms a running
+   * scheduler's pending timer on the new cadence — the wait recomputes
+   * from the new values and the current `consecutiveEmptyRounds`, and
+   * `nextRunAt` updates — while a round already in flight finishes
+   * against the `maxRounds` it started with. A paused scheduler only
+   * stores the values (`resume()` arms on them); a rounds-exhausted
+   * scheduler only stores them too (`resume()` resets the counters,
+   * then arms on the new values). `consecutiveEmptyRounds`,
+   * `totalReplayed`, `stopped`, and `lastRunAt` are never reset or
+   * recomputed here, and the `now` / `setTimer` / `clearTimer`
+   * injections are never revised. Returns the live config.
+   */
+  retune(patch: AutoReplayScheduleRevision): AutoReplayScheduleConfig {
+    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new RangeError(`autoReplay schedule revision must be an object, got ${JSON.stringify(patch)}`);
+    }
+    if (patch.intervalMs === undefined && patch.maxRounds === undefined && patch.maxIntervalMs === undefined) {
+      throw new RangeError(
+        "autoReplay schedule revision must set at least one of intervalMs, maxRounds, maxIntervalMs"
+      );
+    }
+    const intervalMs = patch.intervalMs ?? this.intervalMs;
+    const maxRounds = patch.maxRounds ?? this.maxRounds;
+    const maxIntervalMs = patch.maxIntervalMs ?? this.maxIntervalMs;
+    // Validate-then-apply: an illegal patch leaves the live values — and
+    // the pending timer — completely untouched.
+    assertAutoReplaySchedule(intervalMs, maxRounds, maxIntervalMs);
+    if (
+      intervalMs === this.intervalMs &&
+      maxRounds === this.maxRounds &&
+      maxIntervalMs === this.maxIntervalMs
+    ) {
+      return this.config();
+    }
+    this.intervalMs = intervalMs;
+    this.maxRounds = maxRounds;
+    this.maxIntervalMs = maxIntervalMs;
+    // Re-arm the pending timer on the new cadence when running;
+    // scheduleNext() is a no-op for a paused, stopped, or not-yet-started
+    // scheduler, which is exactly the values-only behavior those want.
+    this.scheduleNext();
+    return this.config();
+  }
+
+  /**
+   * WR-344: snapshot of the live schedule cadence — a fresh object,
+   * never a live reference, so mutating the return cannot move the
+   * scheduler.
+   */
+  config(): AutoReplayScheduleConfig {
+    return {
+      intervalMs: this.intervalMs,
+      maxRounds: this.maxRounds,
+      maxIntervalMs: this.maxIntervalMs,
+    };
   }
 
   /** Start the schedule. Idempotent; a no-op when disabled. */
@@ -316,6 +413,10 @@ export class DeadLetterAutoReplayer {
    * semantics as a manual `replayDeadLetters()` call, then account it.
    */
   private doRound(): AutoReplayRoundResult {
+    // WR-344: the exhaustion verdict belongs to the round as triggered —
+    // a retune landing mid-round must not re-judge it against the new
+    // budget; the next round reads the revised value.
+    const maxRounds = this.maxRounds;
     let replayed: string[] = [];
     let failed: DeadLetterBatchReplayResult["failed"] = [];
     let throttled: string[] = [];
@@ -340,7 +441,7 @@ export class DeadLetterAutoReplayer {
     } else {
       this.consecutiveEmptyRounds += 1;
     }
-    if (this.consecutiveEmptyRounds >= this.maxRounds) {
+    if (this.consecutiveEmptyRounds >= maxRounds) {
       this.stopped = true;
       this.clearPending();
       this.onAudit?.({
