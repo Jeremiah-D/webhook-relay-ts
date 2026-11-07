@@ -150,9 +150,11 @@ export interface ResolvedErrorBudgetOptions {
 
 /**
  * WR-346: a partial live revision of the five error-budget knobs —
- * omitted fields keep their live values. `onBurnRateAlert` / `now`
- * are never revisable: a retune carries the construction callback and
- * clock forward untouched.
+ * omitted fields keep their live values. `now` is never revisable: a
+ * retune carries the construction clock forward untouched. WR-353:
+ * `onBurnRateAlert` is revisable after all — via the dedicated
+ * `replaceAlertCallback()`, not through `retune()` — so the WR-346
+ * "never revisable" exclusion no longer holds for the callback.
  */
 export type ErrorBudgetRevision = Partial<
   Pick<
@@ -237,8 +239,10 @@ interface EndpointState {
  */
 export class ErrorBudgetMonitor {
   // WR-346: not readonly — `retune()` replaces the resolved config in
-  // place so the five knobs are live-revisable. `onBurnRateAlert` /
-  // `now` are carried over unchanged by every retune, never revised.
+  // place so the five knobs are live-revisable. `now` is carried over
+  // unchanged by every retune, never revised. WR-353: the callback is
+  // live-replaceable via `replaceAlertCallback()`; a retune carries
+  // the live callback forward untouched.
   private opts: ResolvedErrorBudgetOptions;
   private readonly states = new Map<string, EndpointState>();
 
@@ -282,6 +286,28 @@ export class ErrorBudgetMonitor {
     });
     this.opts = resolved;
     return this.config();
+  }
+
+  /**
+   * WR-353: replace the burn-rate alert callback at runtime — no
+   * restart. A non-function callback throws `RangeError` (the same
+   * gate as construction) and the live callback is left completely
+   * untouched; `undefined` clears the callback back to unset.
+   * Replacing with the same reference (or clearing when already
+   * unset) is a silent no-op. Only the callback moves: the five
+   * knobs, the clock, the accumulated outcomes, and the open-episode
+   * latches are untouched — the new callback takes effect from the
+   * next episode open, an open episode never re-fires, and a throwing
+   * callback is still swallowed by `recordOutcome`, so alerting can
+   * never break the delivery path. A later `retune()` carries the
+   * replaced callback forward unchanged.
+   */
+  replaceAlertCallback(cb?: (info: BurnRateAlertInfo) => void): void {
+    if (cb !== undefined && typeof cb !== "function") {
+      throw new RangeError("errorBudget: onBurnRateAlert must be a function");
+    }
+    if (cb === this.opts.onBurnRateAlert) return;
+    this.opts = { ...this.opts, onBurnRateAlert: cb };
   }
 
   /**

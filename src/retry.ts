@@ -6264,6 +6264,26 @@ export class RetryQueue {
   }
 
   /**
+   * WR-353: replace the live error-budget burn-rate alert callback —
+   * no restart. `undefined` clears the callback back to unset; a
+   * non-function callback throws `RangeError` and the live callback is
+   * untouched; replacing with the same reference (or clearing when
+   * already unset) is a no-op. Only the callback moves: the five
+   * knobs, the clock, the accumulated outcomes, and the open-episode
+   * latches are untouched, and the new callback takes effect from the
+   * next episode open. Throws `Error` when the error budget was never
+   * configured — enabling it needs a restart.
+   */
+  reviseErrorBudgetAlertCallback(cb?: (info: BurnRateAlertInfo) => void): void {
+    if (this.errorBudget === undefined) {
+      throw new Error(
+        "reviseErrorBudgetAlertCallback: error budget is not configured — enabling it requires a restart"
+      );
+    }
+    this.errorBudget.replaceAlertCallback(cb);
+  }
+
+  /**
    * WR-346: live error-budget burn-rate config — the five knobs.
    * `undefined` when the feature was never configured. Reads the live
    * values, so a runtime revision is visible immediately.

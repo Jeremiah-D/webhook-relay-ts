@@ -2917,6 +2917,18 @@ createRelayServer({
   the total time a delivery may take), this revises the burn-rate
   alert thresholds: it only changes when the relay pages, never
   whether a delivery proceeds.
+- **Live callback replacement (WR-353)** —
+  `server.reviseErrorBudgetAlertCallback(cb)` swaps the alert
+  recipient at runtime, no restart (`undefined` clears it back to
+  unset); the same callback also exists as
+  `queue.reviseErrorBudgetAlertCallback(cb)` for library users. The
+  new callback takes effect from the next episode open — an open
+  episode never re-fires — and every fired alert is still audited as
+  `error_budget_burn`, because the server only swaps its operator
+  cell, never the audit wrapper. A real replacement is audited as
+  `error_budget_alert_callback_replaced` with `previous` / `current`
+  recording only `'set'` / `'unset'` presence, never a function body;
+  a same-value replacement is a silent no-op.
 - Invalid configs (`slowWindowMs <= fastWindowMs`, `budgetErrorRate`
   outside (0, 1), non-positive thresholds) throw `RangeError` at
   startup. Library users drive `ErrorBudgetMonitor` directly with an

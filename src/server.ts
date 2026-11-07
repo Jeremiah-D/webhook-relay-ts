@@ -6030,6 +6030,25 @@ export interface RelayServer extends Server {
    */
   reviseErrorBudget?: (patch: ErrorBudgetRevision) => ErrorBudgetConfig;
   /**
+   * WR-353: replace the live error-budget burn-rate alert callback at
+   * runtime — no restart. `undefined` clears the callback back to
+   * unset; a non-function callback throws `RangeError` and the live
+   * callback is untouched; replacing with the same reference (or
+   * clearing when already unset) is a silent no-op with no audit
+   * event. Only the operator callback moves: the five knobs, the
+   * clock, the accumulated outcomes, and the open-episode latches are
+   * untouched, and the new callback takes effect from the next episode
+   * open. The monitor's own callback is never swapped — the
+   * `error_budget_burn` audit wrapper keeps reading the replaced
+   * callback through its cell, so every fired alert is still audited.
+   * A real replacement is audited as
+   * `error_budget_alert_callback_replaced` with `previous` /
+   * `current` recording only `'set'` / `'unset'` presence — never a
+   * function body. Always set; throws `Error` when `errorBudget` was
+   * never configured — enabling it needs a restart.
+   */
+  reviseErrorBudgetAlertCallback?: (cb?: (info: BurnRateAlertInfo) => void) => void;
+  /**
    * WR-346: live error-budget burn-rate config — the five knobs.
    * Only set when `errorBudget` was configured; `undefined`
    * otherwise.
@@ -7897,6 +7916,13 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
           ])
         )
       : opts.retry?.shadowTargets;
+  // WR-353: the operator's burn-rate alert callback, held in a mutable
+  // cell so `server.reviseErrorBudgetAlertCallback` can replace it at
+  // runtime. The audit wrapper below reads this cell — never the
+  // monitor's callback directly — so replacing the operator callback
+  // cannot bypass the `error_budget_burn` audit.
+  let operatorAlertCallback: ((info: BurnRateAlertInfo) => void) | undefined =
+    opts.retry?.errorBudget?.onBurnRateAlert;
   const queue = new RetryQueue({
     // WR-146: the queue talks to the hedged wrapper (a pure pass-through
     // when hedging is off) so the server's `defaultSender` handle keeps
@@ -7933,7 +7959,10 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // WR-147: wrap the caller's onBurnRateAlert so every burn-rate alert
     // is audited as `error_budget_burn`, not just observed. The monitor
     // itself swallows a throwing callback, so alerting can never break
-    // the delivery path.
+    // the delivery path. WR-353: the wrapper reads the mutable
+    // `operatorAlertCallback` cell — the monitor's callback is never
+    // swapped, so a runtime callback replacement cannot bypass this
+    // audit.
     ...(opts.retry?.errorBudget === undefined
       ? {}
       : {
@@ -7941,7 +7970,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
             ...opts.retry.errorBudget,
             onBurnRateAlert: (info: BurnRateAlertInfo) => {
               opts.auditLog.append(errorBudgetBurnAuditEvent(info));
-              opts.retry?.errorBudget?.onBurnRateAlert?.(info);
+              operatorAlertCallback?.(info);
             },
           },
         }),
@@ -15545,6 +15574,38 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   if (queue.getErrorBudgetConfig() !== undefined) {
     server.getErrorBudgetConfig = (): ErrorBudgetConfig => queue.getErrorBudgetConfig()!;
   }
+
+  // WR-353: live error-budget alert-callback replacement. The method
+  // is always set (like reviseErrorBudget above); with the monitor
+  // unconfigured the queue throws Error — enabling it needs a restart.
+  // Only the server-side operator-callback cell moves — the monitor's
+  // own callback (the `error_budget_burn` audit wrapper) is never
+  // touched, so a replacement cannot bypass the audit. A non-function
+  // callback throws `RangeError` and the live cell is untouched; a
+  // same-reference replacement (or clearing when already unset) is a
+  // silent no-op. A real replacement is audited as
+  // `error_budget_alert_callback_replaced` with `previous` / `current`
+  // recording only 'set' / 'unset' presence, never a function body.
+  server.reviseErrorBudgetAlertCallback = (
+    cb?: (info: BurnRateAlertInfo) => void
+  ): void => {
+    if (queue.getErrorBudgetConfig() === undefined) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseErrorBudgetAlertCallback(cb);
+    }
+    if (cb !== undefined && typeof cb !== "function") {
+      throw new RangeError("errorBudget: onBurnRateAlert must be a function");
+    }
+    if (cb === operatorAlertCallback) return;
+    const prev = operatorAlertCallback === undefined ? "unset" : "set";
+    const next = cb === undefined ? "unset" : "set";
+    operatorAlertCallback = cb;
+    opts.auditLog.append({
+      event: "error_budget_alert_callback_replaced",
+      previous: prev,
+      current: next,
+    });
+  };
 
   // WR-347: SLO-breach prediction knob runtime revision. The method
   // is always set (like reviseErrorBudget above); with the predictor
