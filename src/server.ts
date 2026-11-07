@@ -28,7 +28,7 @@ import {
   selectSignatureAlgorithmVerifier,
   type SignatureAlgorithmRule,
 } from "./signature-alg.ts";
-import { RetryQueue, errorBudgetBurnAuditEvent, type BurnRateAlertInfo, type DeliveryDeadlineConfig, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type ErrorBudgetConfig, type ErrorBudgetRevision, type FailoverEndpointConfig, type FailoverRevision, type QuorumRetention, type QuorumRetentionRevision, type RetryItem, type Sender, type SenderCallOptions, type MaintenanceWindowTransition, type SloRiskConfig, type SloRiskRevision, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
+import { RetryQueue, errorBudgetBurnAuditEvent, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutRevision, type DeliveryDeadlineConfig, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type ErrorBudgetConfig, type ErrorBudgetRevision, type FailoverEndpointConfig, type FailoverRevision, type QuorumRetention, type QuorumRetentionRevision, type RetryItem, type Sender, type SenderCallOptions, type MaintenanceWindowTransition, type SloRiskConfig, type SloRiskRevision, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
 import { parseDeliverAtHeader, DELIVER_AT_HEADER } from "./retry.ts";
 import type { ShadowDeliveredInfo, ShadowFailedInfo, ShadowTargetConfig, ShadowTargetsConfig } from "./retry.ts";
 import type {
@@ -6147,6 +6147,38 @@ export interface RelayServer extends Server {
    * quorum fan-out was never configured.
    */
   getQuorumRetention?: () => QuorumRetention | undefined;
+  /**
+   * WR-351: revise one endpoint's live canary ramp tuning at runtime
+   * (`steps` / `dwellMs` / `maxConsecutiveStepFailures` /
+   * `maxStepFailureRate` / `minStepSamples`, partial — omitted fields
+   * keep their live values). The new values govern the next dispatch
+   * (the new `steps[stepIndex]` coin flip) and the next step advance
+   * (the new `dwellMs` and gates). A real change is a new experiment:
+   * the step clock restarts, the step budget counters are cleared, and
+   * `stepIndex` is clamped to the new ramp's last step when the new
+   * `steps` is shorter. `candidateDispatched` is cumulative and
+   * untouched; the candidate/primary targets never change. An illegal
+   * patch throws `RangeError` and the live values are untouched; an
+   * empty patch is a `RangeError`; a same-value revision is a silent
+   * no-op with no audit event. A real revision is audited as
+   * `canary_rollout_revised` with `endpoint` and `previous` /
+   * `current` (the construction values — or the defaults
+   * [1, 5, 25, 50, 100] / 60_000 / 5 / 0.1 / 10 when unset — as first
+   * `previous`), and returns the live tuning. Always set; throws
+   * `Error` when the endpoint has no canary rollout config — enabling
+   * it needs a restart — or when the rollout is already terminal
+   * (`promoted` / `rolled_back`). This revises the ramp; WR-214 is the
+   * rollout mechanism itself.
+   */
+  reviseCanaryRollout?: (
+    endpoint: string,
+    patch: CanaryRolloutRevision
+  ) => CanaryRolloutEndpointTuning;
+  /**
+   * WR-351: live canary ramp tuning for one endpoint. Always set;
+   * `undefined` for endpoints without canary rollout config.
+   */
+  getCanaryRollout?: (endpoint: string) => CanaryRolloutEndpointTuning | undefined;
   /**
    * WR-344: revise the live dead-letter auto-replay schedule cadence
    * at runtime (`intervalMs` / `maxRounds` / `maxIntervalMs`, partial
@@ -15675,6 +15707,52 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // WR-350: live quorum retention tuning. Always set; `undefined` when
   // quorum fan-out was never configured.
   server.getQuorumRetention = (): QuorumRetention | undefined => queue.getQuorumRetention();
+
+  // WR-351: live per-endpoint canary ramp revision. The method is always
+  // set (like reviseFailover above); with the endpoint unconfigured the
+  // queue throws Error — enabling a canary rollout for it needs a
+  // restart. A real revision is audited as `canary_rollout_revised`
+  // with the endpoint and the previous and current five-field tuning
+  // (the construction values — or the defaults [1, 5, 25, 50, 100] /
+  // 60_000 / 5 / 0.1 / 10 when unset — as first `previous`); a
+  // same-value revision is a silent no-op.
+  server.reviseCanaryRollout = (
+    endpoint: string,
+    patch: CanaryRolloutRevision
+  ): CanaryRolloutEndpointTuning => {
+    const prev = queue.getCanaryRollout(endpoint);
+    if (prev === undefined) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseCanaryRollout(endpoint, patch);
+    }
+    // Validate-then-apply inside retune: an illegal patch throws
+    // RangeError and the live values are left completely intact.
+    const next = queue.reviseCanaryRollout(endpoint, patch);
+    const stepsSame =
+      next.steps.length === prev.steps.length &&
+      next.steps.every((p, i) => p === prev.steps[i]);
+    if (
+      stepsSame &&
+      next.dwellMs === prev.dwellMs &&
+      next.maxConsecutiveStepFailures === prev.maxConsecutiveStepFailures &&
+      next.maxStepFailureRate === prev.maxStepFailureRate &&
+      next.minStepSamples === prev.minStepSamples
+    ) {
+      return next;
+    }
+    opts.auditLog.append({
+      event: "canary_rollout_revised",
+      endpoint,
+      previous: prev,
+      current: next,
+    });
+    return next;
+  };
+
+  // WR-351: live per-endpoint canary ramp tuning. Always set;
+  // `undefined` for endpoints without canary rollout config.
+  server.getCanaryRollout = (endpoint: string): CanaryRolloutEndpointTuning | undefined =>
+    queue.getCanaryRollout(endpoint);
 
   // WR-344: dead-letter auto-replay schedule cadence runtime revision.
   // The method is always set (like reviseAdaptiveBackoff above); with

@@ -77,6 +77,31 @@ export interface CanaryRolloutEndpointConfig {
 /** Canary rollout configuration: primary `targetUrl` -> its rollout config. */
 export type CanaryRolloutConfig = Record<string, CanaryRolloutEndpointConfig>;
 
+/**
+ * WR-351: live snapshot of one endpoint's canary rollout tuning — the
+ * five ramp fields, all resolved (no defaults left). `steps` is a copy
+ * of the live array, never a live reference, so callers cannot mutate
+ * the rollout by editing the snapshot. The candidate/primary targets
+ * are routing identity and are deliberately NOT part of this snapshot:
+ * revising the ramp never changes where traffic can go.
+ */
+export interface CanaryRolloutEndpointTuning {
+  steps: number[];
+  dwellMs: number;
+  maxConsecutiveStepFailures: number;
+  maxStepFailureRate: number;
+  minStepSamples: number;
+}
+
+/** WR-351: partial patch for {@link CanaryRolloutManager.retune}. */
+export type CanaryRolloutRevision = {
+  steps?: number[];
+  dwellMs?: number;
+  maxConsecutiveStepFailures?: number;
+  maxStepFailureRate?: number;
+  minStepSamples?: number;
+};
+
 /** Why a rollout rolled back. */
 export type CanaryRollbackReason = "consecutive_failures" | "failure_rate";
 
@@ -338,6 +363,102 @@ export class CanaryRolloutManager {
       });
     }
     return rows;
+  }
+
+  /**
+   * WR-351: revise one endpoint's live ramp tuning. The merged values
+   * are checked against the same field gates as construction
+   * (`assertValidCanaryRolloutConfig`, with the candidate carried over
+   * from live state); an illegal patch throws `RangeError` and the live
+   * values are left completely intact. An empty patch is a `RangeError`,
+   * a non-object patch is a `RangeError`, and an unknown endpoint throws
+   * `Error`. Only a `rolling` rollout can be revised — `promoted` /
+   * `rolled_back` are terminal, and revising them throws `Error`
+   * (a finished ramp cannot be re-ramped; reconfigure and restart).
+   * A same-value patch is a silent no-op that returns the current
+   * snapshot WITHOUT resetting the step clock or counters. A real
+   * change is a new experiment: `stepStartedAtMs` resets to now and
+   * `stepSamples` / `stepFailures` / `consecutiveFailures` are cleared
+   * (the old step's budget does not carry into the new ramp), and
+   * `stepIndex` is clamped to the new ramp's last step when the new
+   * `steps` is shorter than the current step. `candidateDispatched`
+   * is cumulative and untouched; the candidate/primary targets never
+   * change. The new values govern the next `resolveTarget()` (the new
+   * `steps[stepIndex]` coin flip) and the next `maybeAdvance()` (the
+   * new `dwellMs` and gates); a ramp whose last step is below 100%
+   * still holds that split forever. Returns the live tuning snapshot.
+   */
+  retune(endpoint: string, patch: CanaryRolloutRevision): CanaryRolloutEndpointTuning {
+    const st = this.states.get(endpoint);
+    if (!st) {
+      throw new Error(
+        `CanaryRolloutManager: no canary rollout configured for endpoint ${JSON.stringify(endpoint)}`
+      );
+    }
+    if (st.state !== "rolling") {
+      throw new Error(
+        `CanaryRolloutManager: cannot retune endpoint ${JSON.stringify(endpoint)}: rollout is ${st.state} (terminal — a finished ramp cannot be revised)`
+      );
+    }
+    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new RangeError(`canary rollout revision must be an object, got ${JSON.stringify(patch)}`);
+    }
+    if (Object.keys(patch).length === 0) {
+      throw new RangeError("canary rollout revision must not be empty");
+    }
+    const merged: CanaryRolloutEndpointConfig = {
+      candidate: st.candidate,
+      steps: patch.steps ?? st.steps,
+      dwellMs: patch.dwellMs ?? st.dwellMs,
+      maxConsecutiveStepFailures:
+        patch.maxConsecutiveStepFailures ?? st.maxConsecutiveStepFailures,
+      maxStepFailureRate: patch.maxStepFailureRate ?? st.maxStepFailureRate,
+      minStepSamples: patch.minStepSamples ?? st.minStepSamples,
+    };
+    assertValidCanaryRolloutConfig({ [endpoint]: merged });
+    const stepsSame =
+      merged.steps!.length === st.steps.length &&
+      merged.steps!.every((p, i) => p === st.steps[i]);
+    if (
+      stepsSame &&
+      merged.dwellMs === st.dwellMs &&
+      merged.maxConsecutiveStepFailures === st.maxConsecutiveStepFailures &&
+      merged.maxStepFailureRate === st.maxStepFailureRate &&
+      merged.minStepSamples === st.minStepSamples
+    ) {
+      return this.config(endpoint)!;
+    }
+    // A real change is a new experiment: fresh step clock and budget,
+    // step index clamped to the new ramp.
+    st.steps = [...merged.steps!];
+    st.dwellMs = merged.dwellMs!;
+    st.maxConsecutiveStepFailures = merged.maxConsecutiveStepFailures!;
+    st.maxStepFailureRate = merged.maxStepFailureRate!;
+    st.minStepSamples = merged.minStepSamples!;
+    st.stepIndex = Math.min(st.stepIndex, st.steps.length - 1);
+    st.stepStartedAtMs = this.now();
+    st.stepSamples = 0;
+    st.stepFailures = 0;
+    st.consecutiveFailures = 0;
+    return this.config(endpoint)!;
+  }
+
+  /**
+   * WR-351: snapshot of one endpoint's live ramp tuning, or
+   * `undefined` when the endpoint has no canary rollout config. Reads
+   * the live values, so a runtime revision is visible immediately.
+   * `steps` is a copy, never the live array.
+   */
+  config(endpoint: string): CanaryRolloutEndpointTuning | undefined {
+    const st = this.states.get(endpoint);
+    if (!st) return undefined;
+    return {
+      steps: [...st.steps],
+      dwellMs: st.dwellMs,
+      maxConsecutiveStepFailures: st.maxConsecutiveStepFailures,
+      maxStepFailureRate: st.maxStepFailureRate,
+      minStepSamples: st.minStepSamples,
+    };
   }
 
   /**

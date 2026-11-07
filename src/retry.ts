@@ -369,7 +369,9 @@ import {
   CanaryRolloutManager,
   type CanaryRolloutConfig,
   type CanaryRolloutEndpointStats,
+  type CanaryRolloutEndpointTuning,
   type CanaryRolloutEvent,
+  type CanaryRolloutRevision,
 } from "./canary-rollout.ts";
 import {
   QuorumFanoutSet,
@@ -521,7 +523,9 @@ export type {
   CanaryRolloutConfig,
   CanaryRolloutEndpointConfig,
   CanaryRolloutEndpointStats,
+  CanaryRolloutEndpointTuning,
   CanaryRolloutEvent,
+  CanaryRolloutRevision,
   CanaryRollbackReason,
   CanaryRolloutState,
 } from "./canary-rollout.ts";
@@ -11864,6 +11868,41 @@ export class RetryQueue {
    */
   getCanaryStats(): CanaryRolloutEndpointStats[] {
     return this.canary?.stats() ?? [];
+  }
+
+  /**
+   * WR-351: revise one endpoint's live canary ramp tuning (partial —
+   * omitted fields keep their live values). The new values govern the
+   * next `resolveTarget()` (the new `steps[stepIndex]` coin flip) and
+   * the next step advance (the new `dwellMs` and gates). A real change
+   * is a new experiment: the step clock restarts and the step budget
+   * counters are cleared, and `stepIndex` is clamped to the new ramp's
+   * last step when the new `steps` is shorter. `candidateDispatched`
+   * is cumulative and untouched; the candidate/primary targets never
+   * change. An illegal patch throws `RangeError` and the live values
+   * are untouched; an empty patch is a `RangeError`; revising to the
+   * live values is a no-op that leaves the step clock and counters
+   * alone. Throws `Error` when the endpoint has no canary rollout
+   * config — enabling it needs a restart — or when the rollout is
+   * already terminal (`promoted` / `rolled_back`). Returns the live
+   * tuning snapshot.
+   */
+  reviseCanaryRollout(endpoint: string, patch: CanaryRolloutRevision): CanaryRolloutEndpointTuning {
+    if (this.canary === undefined || this.canary.config(endpoint) === undefined) {
+      throw new Error(
+        `reviseCanaryRollout: canary rollout is not configured for endpoint ${JSON.stringify(endpoint)} — enabling it requires a restart`
+      );
+    }
+    return this.canary.retune(endpoint, patch);
+  }
+
+  /**
+   * WR-351: one endpoint's live canary ramp tuning. `undefined` when
+   * the endpoint has no canary rollout config. Reads the live values,
+   * so a runtime revision is visible immediately.
+   */
+  getCanaryRollout(endpoint: string): CanaryRolloutEndpointTuning | undefined {
+    return this.canary?.config(endpoint);
   }
 
   /**

@@ -3915,6 +3915,27 @@ const server = createRelayServer({
   `relay_canary_rollout_events_total{endpoint,candidate,event}`.
   `queue.getCanaryStats()` shows each endpoint's state, step,
   percent, and step budget counters.
+- **Live ramp revision (WR-351)** — the ramp tuning is revisable at
+  runtime via `reviseCanaryRollout(endpoint, { steps?, dwellMs?,
+  maxConsecutiveStepFailures?, maxStepFailureRate?, minStepSamples? })`
+  / `getCanaryRollout(endpoint)` on the queue and the server. The new
+  values govern the next dispatch (the new `steps[stepIndex]` coin
+  flip) and the next step advance (the new `dwellMs` and gates). A real
+  change is a new experiment: the step clock restarts, the step budget
+  counters are cleared, and `stepIndex` is clamped to the new ramp's
+  last step when the new `steps` is shorter. `candidateDispatched` is
+  cumulative and untouched; the candidate/primary targets never change;
+  a ramp whose last step is below 100% still holds that split forever.
+  A real revision is audited as `canary_rollout_revised` with
+  `endpoint` and `previous` / `current` (the construction values — or
+  the defaults [1, 5, 25, 50, 100] / 60_000 / 5 / 0.1 / 10 when unset
+  — as first `previous`); an illegal patch throws `RangeError` and
+  leaves the live values untouched, an empty patch is a `RangeError`,
+  and a same-value revision is a silent no-op that leaves the step
+  clock and counters alone. Revising a `promoted` / `rolled_back`
+  rollout throws `Error` (a finished ramp cannot be re-ramped), as
+  does revising an endpoint with no canary rollout configured —
+  enabling one needs a restart.
 - **Orthogonality** — failover's probationary failback canary is a
   single-probe trust check, not a stepped ramp with a budget; weighted
   dispatch is static traffic sharing, never a promotion; error-budget
