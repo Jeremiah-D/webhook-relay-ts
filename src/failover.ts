@@ -66,6 +66,28 @@ export interface FailoverTargetConfig {
 /** Failover configuration: primary `targetUrl` -> its target config. */
 export type FailoverConfig = Record<string, FailoverTargetConfig>;
 
+/**
+ * WR-349: the live-revisable slice of one endpoint's failover config —
+ * the three switching thresholds. `FailoverConfig` is already taken by
+ * the `Record<string, FailoverTargetConfig>` above, hence the separate
+ * snapshot name.
+ */
+export interface FailoverEndpointConfig {
+  /** Consecutive retryable failures on the active target that trigger a switch. */
+  failureThreshold: number;
+  /** Whether the primary gets a probationary canary after the quiet period. */
+  autoFailback: boolean;
+  /** Quiet period in ms after a switch before the primary becomes eligible for a canary. */
+  failbackIntervalMs: number;
+}
+
+/** WR-349: partial patch for {@link FailoverManager.retune}. */
+export type FailoverRevision = {
+  failureThreshold?: number;
+  autoFailback?: boolean;
+  failbackIntervalMs?: number;
+};
+
 /** Why a failover switch happened. */
 export type FailoverSwitchReason =
   | "circuit_open"
@@ -313,6 +335,63 @@ export class FailoverManager {
       });
     }
     return true;
+  }
+
+  /**
+   * WR-349: revise one endpoint's live switching thresholds. The merged
+   * values are checked against the same field gates as construction
+   * (standbys come from live state, so they pass); an illegal patch
+   * throws `RangeError` and the live values are left completely intact.
+   * An empty patch is a `RangeError`, a non-object patch is a
+   * `RangeError`, and an unknown endpoint throws `Error`. A same-value
+   * patch is a silent no-op that returns the current snapshot. The new
+   * values govern the next `resolveTarget()` call: tightening
+   * `failureThreshold` at or below the current `consecutiveFailures`
+   * switches on the next dispatch, and changing `failbackIntervalMs`
+   * never re-arms the quiet period — the next canary is still judged
+   * by time since the last switch. `consecutiveFailures`, `switches`,
+   * `lastSwitchAtMs`, the targets list, and any unconfirmed canary are
+   * untouched. Returns the live config snapshot.
+   */
+  retune(endpoint: string, patch: FailoverRevision): FailoverEndpointConfig {
+    const st = this.states.get(endpoint);
+    if (!st) {
+      throw new Error(
+        `FailoverManager: no failover configured for endpoint ${JSON.stringify(endpoint)}`
+      );
+    }
+    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new RangeError(`failover revision must be an object, got ${JSON.stringify(patch)}`);
+    }
+    if (Object.keys(patch).length === 0) {
+      throw new RangeError("failover revision must not be empty");
+    }
+    const merged: FailoverTargetConfig = {
+      standbys: st.targets.slice(1),
+      failureThreshold: patch.failureThreshold ?? st.failureThreshold,
+      autoFailback: patch.autoFailback ?? st.autoFailback,
+      failbackIntervalMs: patch.failbackIntervalMs ?? st.failbackIntervalMs,
+    };
+    assertValidFailoverConfig({ [endpoint]: merged });
+    st.failureThreshold = merged.failureThreshold!;
+    st.autoFailback = merged.autoFailback!;
+    st.failbackIntervalMs = merged.failbackIntervalMs!;
+    return this.config(endpoint)!;
+  }
+
+  /**
+   * WR-349: snapshot of one endpoint's live switching thresholds, or
+   * `undefined` when the endpoint has no failover config. Reads the
+   * live values, so a runtime revision is visible immediately.
+   */
+  config(endpoint: string): FailoverEndpointConfig | undefined {
+    const st = this.states.get(endpoint);
+    if (!st) return undefined;
+    return {
+      failureThreshold: st.failureThreshold,
+      autoFailback: st.autoFailback,
+      failbackIntervalMs: st.failbackIntervalMs,
+    };
   }
 
   /** Snapshot of every endpoint with failover configured. */

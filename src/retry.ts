@@ -358,7 +358,9 @@ import {
 import {
   FailoverManager,
   type FailoverConfig,
+  type FailoverEndpointConfig,
   type FailoverEndpointStats,
+  type FailoverRevision,
   type FailoverSwitchEvent,
 } from "./failover.ts";
 import {
@@ -510,7 +512,7 @@ export type {
   ResponseAssertionVerdict,
 } from "./response-assertions.ts";
 export type { DownstreamResponseSummary };
-export type { FailoverConfig, FailoverEndpointStats, FailoverSwitchEvent };
+export type { FailoverConfig, FailoverEndpointConfig, FailoverEndpointStats, FailoverRevision, FailoverSwitchEvent };
 export type {
   CanaryRolloutConfig,
   CanaryRolloutEndpointConfig,
@@ -11836,6 +11838,36 @@ export class RetryQueue {
    */
   resetFailover(endpoint: string): boolean {
     return this.failover?.resetFailover(endpoint) ?? false;
+  }
+
+  /**
+   * WR-349: revise one endpoint's live failover thresholds (partial —
+   * omitted fields keep their live values). The new values govern the
+   * next `resolveTarget()` call; in-flight deliveries keep the target
+   * they were dispatched with. An illegal patch throws `RangeError`
+   * and the live values are untouched; an empty patch is a
+   * `RangeError`. Throws `Error` when the endpoint has no failover
+   * config — enabling it needs a restart. Returns the live config.
+   * Thresholds are per logical endpoint: three targets on one endpoint
+   * share the same three values, and revising one endpoint never
+   * touches another.
+   */
+  reviseFailover(endpoint: string, patch: FailoverRevision): FailoverEndpointConfig {
+    if (this.failover === undefined || this.failover.config(endpoint) === undefined) {
+      throw new Error(
+        `reviseFailover: failover is not configured for endpoint ${JSON.stringify(endpoint)} — enabling it requires a restart`
+      );
+    }
+    return this.failover.retune(endpoint, patch);
+  }
+
+  /**
+   * WR-349: one endpoint's live failover thresholds. `undefined` when
+   * the endpoint has no failover config. Reads the live values, so a
+   * runtime revision is visible immediately.
+   */
+  getFailoverConfig(endpoint: string): FailoverEndpointConfig | undefined {
+    return this.failover?.config(endpoint);
   }
 
   /**

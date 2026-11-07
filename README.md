@@ -3844,6 +3844,22 @@ const server = createRelayServer({
   latency histograms, and circuit gauges are keyed by the *physical*
   target that served the attempt; `queue.getFailoverStats()` shows the
   current active target per logical endpoint.
+- **Live revision (WR-349)** — `relay.reviseFailover(endpoint, patch)`
+  / `queue.reviseFailover(endpoint, patch)` retunes one endpoint's
+  switching thresholds at runtime (`failureThreshold` /
+  `autoFailback` / `failbackIntervalMs`, partial — omitted fields keep
+  their live values; `relay.getFailoverConfig(endpoint)` /
+  `queue.getFailoverConfig(endpoint)` read the live values). The new
+  values govern the next dispatch: tightening `failureThreshold` to or
+  below the current consecutive-failure count switches on the next
+  dispatch, and changing `failbackIntervalMs` never re-arms the quiet
+  period. A real revision is audited as `failover_revised` with
+  `endpoint` and `previous` / `current`; a same-value revision is a
+  silent no-op, an illegal patch throws `RangeError` and leaves the
+  live values intact. Revising an endpoint without failover config
+  throws — enabling it needs a restart. Thresholds are per logical
+  endpoint; the targets list itself is never revised. This is the
+  switching threshold; WR-39 is the switching mechanism itself.
 - **Dead letters** record the physical target they died on
   (`failoverEndpoint` remembers the logical endpoint), so a replay
   re-resolves against the *current* active target instead of pinning to

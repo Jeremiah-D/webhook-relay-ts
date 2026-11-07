@@ -28,7 +28,7 @@ import {
   selectSignatureAlgorithmVerifier,
   type SignatureAlgorithmRule,
 } from "./signature-alg.ts";
-import { RetryQueue, errorBudgetBurnAuditEvent, type BurnRateAlertInfo, type DeliveryDeadlineConfig, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type ErrorBudgetConfig, type ErrorBudgetRevision, type RetryItem, type Sender, type SenderCallOptions, type MaintenanceWindowTransition, type SloRiskConfig, type SloRiskRevision, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
+import { RetryQueue, errorBudgetBurnAuditEvent, type BurnRateAlertInfo, type DeliveryDeadlineConfig, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type ErrorBudgetConfig, type ErrorBudgetRevision, type FailoverEndpointConfig, type FailoverRevision, type RetryItem, type Sender, type SenderCallOptions, type MaintenanceWindowTransition, type SloRiskConfig, type SloRiskRevision, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
 import { parseDeliverAtHeader, DELIVER_AT_HEADER } from "./retry.ts";
 import type { ShadowDeliveredInfo, ShadowFailedInfo, ShadowTargetConfig, ShadowTargetsConfig } from "./retry.ts";
 import type {
@@ -6097,6 +6097,30 @@ export interface RelayServer extends Server {
    * `minTlsVersions` was configured; `undefined` otherwise.
    */
   getTlsMinVersion?: (endpoint: string) => MinTlsVersion | undefined;
+  /**
+   * WR-349: revise one endpoint's live failover thresholds at runtime
+   * (`failureThreshold` / `autoFailback` / `failbackIntervalMs`,
+   * partial — omitted fields keep their live values). The new values
+   * govern the next dispatch: tightening `failureThreshold` to or
+   * below the current consecutive-failure count switches on the next
+   * dispatch, and changing `failbackIntervalMs` never re-arms the
+   * quiet period. An illegal patch throws `RangeError` and the live
+   * values are untouched; an empty patch is a `RangeError`; a
+   * same-value revision is a silent no-op with no audit event. A real
+   * revision is audited as `failover_revised` with `endpoint` and
+   * `previous` / `current` (the construction values — or the defaults
+   * 5 / `true` / 30_000 when unset — as first `previous`), and returns
+   * the live config. Always set; throws `Error` when the endpoint has
+   * no failover config — enabling it needs a restart. This revises the
+   * switching thresholds; WR-39 is the switching mechanism itself, and
+   * WR-66 / WR-202 / WR-214 are the mutually exclusive routing modes.
+   */
+  reviseFailover?: (endpoint: string, patch: FailoverRevision) => FailoverEndpointConfig;
+  /**
+   * WR-349: live failover thresholds for one endpoint. Always set;
+   * `undefined` for endpoints without failover config.
+   */
+  getFailoverConfig?: (endpoint: string) => FailoverEndpointConfig | undefined;
   /**
    * WR-344: revise the live dead-letter auto-replay schedule cadence
    * at runtime (`intervalMs` / `maxRounds` / `maxIntervalMs`, partial
@@ -15556,6 +15580,44 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     server.getTlsMinVersion = (endpoint: string): MinTlsVersion | undefined =>
       opts.minTlsVersions![endpoint];
   }
+
+  // WR-349: live per-endpoint failover threshold revision. The method
+  // is always set (like reviseTlsMinVersion above); with the endpoint
+  // unconfigured the queue throws Error — enabling failover for it
+  // needs a restart. A real revision is audited as `failover_revised`
+  // with the endpoint and the previous and current three-field config
+  // (the construction values — or the defaults 5 / true / 30_000 when
+  // unset — as first `previous`); a same-value revision is a silent
+  // no-op.
+  server.reviseFailover = (endpoint: string, patch: FailoverRevision): FailoverEndpointConfig => {
+    const prev = queue.getFailoverConfig(endpoint);
+    if (prev === undefined) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseFailover(endpoint, patch);
+    }
+    // Validate-then-apply inside retune: an illegal patch throws
+    // RangeError and the live values are left completely intact.
+    const next = queue.reviseFailover(endpoint, patch);
+    if (
+      next.failureThreshold === prev.failureThreshold &&
+      next.autoFailback === prev.autoFailback &&
+      next.failbackIntervalMs === prev.failbackIntervalMs
+    ) {
+      return next;
+    }
+    opts.auditLog.append({
+      event: "failover_revised",
+      endpoint,
+      previous: prev,
+      current: next,
+    });
+    return next;
+  };
+
+  // WR-349: live per-endpoint failover thresholds. Always set;
+  // `undefined` for endpoints without failover config.
+  server.getFailoverConfig = (endpoint: string): FailoverEndpointConfig | undefined =>
+    queue.getFailoverConfig(endpoint);
 
   // WR-344: dead-letter auto-replay schedule cadence runtime revision.
   // The method is always set (like reviseAdaptiveBackoff above); with
