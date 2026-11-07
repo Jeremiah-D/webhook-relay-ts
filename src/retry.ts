@@ -10820,6 +10820,34 @@ export class RetryQueue {
   }
 
   /**
+   * WR-348: revise the live follower bound (see
+   * `OutboundCoalescer.retuneMaxFollowers`). The new bound governs the
+   * next join decision; deliveries already attached to an in-flight
+   * attempt stay on it. An illegal value throws `RangeError` and the
+   * live value is untouched. Throws `Error` when coalescing was never
+   * configured — enabling it needs a restart. Returns the live bound.
+   * The one bound is shared by the main path and the shadow mirrors —
+   * both go through the same coalescer.
+   */
+  reviseMaxFollowers(maxFollowers: number): number {
+    if (this.coalescer === undefined) {
+      throw new Error(
+        "reviseMaxFollowers: request coalescing is not configured — enabling it requires a restart"
+      );
+    }
+    return this.coalescer.retuneMaxFollowers(maxFollowers);
+  }
+
+  /**
+   * WR-348: the live follower bound. `undefined` when coalescing was
+   * never configured. Reads the live value, so a runtime revision is
+   * visible immediately.
+   */
+  getMaxFollowers(): number | undefined {
+    return this.coalescer?.currentMaxFollowers();
+  }
+
+  /**
    * WR-85: per-(tenant, endpoint, shadow target) mirror counters
    * (`delivered` / `failed`). Empty when the feature is off or no shadow
    * copy has landed yet. Also rendered as `relay_shadow_total` in

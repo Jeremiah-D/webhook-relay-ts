@@ -110,7 +110,7 @@ function assertMaxFollowers(value: number): void {
 }
 
 export class OutboundCoalescer {
-  private readonly maxFollowers: number;
+  private maxFollowers: number;
   private readonly inFlight = new Map<string, InFlightAttempt>();
   /**
    * Whether the wrapped sender's last call for this item led the
@@ -203,5 +203,26 @@ export class OutboundCoalescer {
       mergedDeliveries: this.mergedDeliveries,
       inFlightKeys: this.inFlight.size,
     };
+  }
+
+  /**
+   * WR-348: live revision of the follower bound. The new bound governs
+   * the next join decision in `wrap()` — it reads `this.maxFollowers`
+   * on every attach — while deliveries already attached to an in-flight
+   * attempt stay on it and settle with it; their `followers` count is
+   * never recomputed. Counters keep accumulating across a revision. An
+   * illegal value throws `RangeError` (validated with the same
+   * `assertMaxFollowers` gate as construction) and the live value is
+   * left completely intact. Returns the live bound.
+   */
+  retuneMaxFollowers(maxFollowers: number): number {
+    assertMaxFollowers(maxFollowers);
+    this.maxFollowers = maxFollowers;
+    return this.maxFollowers;
+  }
+
+  /** WR-348: the live follower bound. */
+  currentMaxFollowers(): number {
+    return this.maxFollowers;
   }
 }

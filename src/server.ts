@@ -5849,6 +5849,30 @@ export interface RelayServer extends Server {
    */
   getSlowStartConfig?: () => SlowStartConfig | undefined;
   /**
+   * WR-348: revise the live coalescing follower bound at runtime (the
+   * `maxFollowers` cap from `coalesce`, default `Infinity`). The new
+   * bound governs the next join decision; deliveries already attached
+   * to an in-flight attempt stay on it and settle with it, and the
+   * `physicalAttempts` / `mergedDeliveries` counters keep accumulating.
+   * An illegal value throws `RangeError` and the live value is
+   * untouched; a same-value revision is a no-op with no audit event. A
+   * real revision is audited as `max_followers_revised` with
+   * `previous` / `current` (the construction value — or `Infinity`
+   * when unset — as first `previous`), and returns the live bound.
+   * Always set; throws `Error` when coalescing was never configured —
+   * enabling it needs a restart. The one bound is shared by all
+   * endpoints and tenants, and by the main path and the shadow
+   * mirrors. This revises the merge fan-in cap; WR-91 is the merging
+   * mechanism itself, WR-336 the opposite-direction valve (hedging
+   * duplicates attempts, coalescing reuses them).
+   */
+  reviseMaxFollowers?: (maxFollowers: number) => number;
+  /**
+   * WR-348: live coalescing follower bound. Only set when `coalesce`
+   * was configured; `undefined` otherwise.
+   */
+  getMaxFollowers?: () => number | undefined;
+  /**
    * WR-340: revise the live adaptive weight-tuning parameters at
    * runtime (`ewmaAlpha` / `maxStepRatio` / `hysteresisPoints` /
    * `minWeightFloor` / `retuneEpsilon` / `retuneIntervalMs`, partial —
@@ -15167,6 +15191,39 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // `retry.slowStart` was configured.
   if (queue.getSlowStartConfig() !== undefined) {
     server.getSlowStartConfig = (): SlowStartConfig => queue.getSlowStartConfig()!;
+  }
+
+  // WR-348: coalescing follower-bound runtime revision. The method is
+  // always set (like reviseSlowStart above); with coalescing
+  // unconfigured the queue throws Error — enabling it needs a restart.
+  // A real revision is audited as `max_followers_revised` with the
+  // previous and current bound (the construction value — or `Infinity`
+  // when unset — as first `previous`); a same-value revision is a
+  // silent no-op.
+  server.reviseMaxFollowers = (maxFollowers: number): number => {
+    const prev = queue.getMaxFollowers();
+    if (prev === undefined) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseMaxFollowers(maxFollowers);
+    }
+    // Validate-then-apply inside retune: an illegal value throws
+    // RangeError and the live value is left completely intact.
+    const next = queue.reviseMaxFollowers(maxFollowers);
+    if (next === prev) {
+      return next;
+    }
+    opts.auditLog.append({
+      event: "max_followers_revised",
+      previous: prev,
+      current: next,
+    });
+    return next;
+  };
+
+  // WR-348: live coalescing follower bound. Only set when `coalesce`
+  // was configured.
+  if (queue.getMaxFollowers() !== undefined) {
+    server.getMaxFollowers = (): number => queue.getMaxFollowers()!;
   }
 
   // WR-340: adaptive weight-tuning config runtime revision. The method

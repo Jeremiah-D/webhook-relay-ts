@@ -11027,6 +11027,19 @@ const queue = new RetryQueue({
 - **Bounded** — `maxFollowers` (default `Infinity`) caps how many
   deliveries may ride one attempt; overflow starts its own physical
   attempt instead of joining. Never drops, never waits.
+- **Live revision (WR-348)** — `relay.reviseMaxFollowers(n)` /
+  `queue.reviseMaxFollowers(n)` retunes the bound at runtime
+  (`relay.getMaxFollowers()` / `queue.getMaxFollowers()` read the live
+  value). Tightening only affects the *next* join decision: deliveries
+  already attached to an in-flight attempt stay on it and settle with
+  it, and the `physicalAttempts` / `mergedDeliveries` counters keep
+  accumulating. A real revision is audited as `max_followers_revised`
+  with `previous` / `current`; a same-value revision is a silent
+  no-op, an illegal value throws `RangeError` and leaves the live
+  value intact. Revising when coalescing was never configured throws —
+  enabling it needs a restart. The one bound is shared by all
+  endpoints and tenants, and by the main path and the shadow mirrors.
+  This is the merge fan-in cap; WR-91 is the merging mechanism itself.
 - **Combinations** — coalescing wraps the fully composed sender, so the
   merged attempt is the one that checks out a WR-24 keep-alive pooled
   connection (N logical deliveries, one socket); the WR-21 pin check runs
