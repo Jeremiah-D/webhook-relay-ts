@@ -5951,6 +5951,41 @@ export interface RelayServer extends Server {
    */
   getDnsCacheConfig?: () => DnsCacheConfig | undefined;
   /**
+   * WR-343: revise one endpoint's live TLS minimum version at
+   * runtime — no restart. The floor is read live on every send, so
+   * the next handshake for the endpoint negotiates under the new
+   * floor; a connection already handshaked keeps the floor it was
+   * built with (the pool agent key binds the floor, so the revised
+   * floor selects a fresh agent). An illegal floor throws
+   * `RangeError` and the live value is untouched; a same-value
+   * revision is a silent no-op with no audit event. A real revision
+   * is audited as `tls_min_version_revised` with `endpoint`,
+   * `previous` (`undefined` on a first set — no floor) and
+   * `current`, and returns the live floor. Always set; throws
+   * `Error` when `minTlsVersions` was never configured — enabling
+   * floors needs a restart. This revises the floor; WR-74 is the
+   * floor mechanism itself, WR-73 the certificate-expiry monitor
+   * that rides the same handshake.
+   */
+  reviseTlsMinVersion: (endpoint: string, floor: MinTlsVersion) => MinTlsVersion;
+  /**
+   * WR-343: remove one endpoint's live TLS minimum-version override
+   * at runtime — the endpoint falls back to no floor (unlimited,
+   * the construction default for an unlisted endpoint). Returns
+   * `true` when a floor was removed (audited as
+   * `tls_min_version_removed` with the endpoint and the removed
+   * floor as `previous`), `false` when no floor was configured
+   * (silent, no audit) — including when the feature itself was
+   * never configured. Always set.
+   */
+  removeTlsMinVersion: (endpoint: string) => boolean;
+  /**
+   * WR-343: live TLS minimum version for one endpoint — `undefined`
+   * when the endpoint carries no floor (unlimited). Only set when
+   * `minTlsVersions` was configured; `undefined` otherwise.
+   */
+  getTlsMinVersion?: (endpoint: string) => MinTlsVersion | undefined;
+  /**
    * WR-336: revise the live hedge delay (`hedgeDelayMs`) at runtime.
    * The next dispatch arms its hedge timer on the new value; a timer
    * already armed keeps the old delay, and in-flight attempts (and
@@ -15173,6 +15208,60 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // was configured.
   if (sharedDnsCache !== undefined) {
     server.getDnsCacheConfig = (): DnsCacheConfig => sharedDnsCache.config();
+  }
+
+  // WR-343: live per-endpoint TLS minimum-version revision /
+  // removal. The sender reads the floor live on every send
+  // (`minTlsVersions?.[item.targetUrl]`), so mutating the record in
+  // place is the whole mechanism — no sender rebuild, no timer
+  // re-arm. A real revision is audited as `tls_min_version_revised`
+  // with the endpoint and the previous (undefined on a first set —
+  // no floor) / current floors; a same-value revision is a silent
+  // no-op; an illegal floor throws RangeError and the live value is
+  // untouched. Always set; throws Error when `minTlsVersions` was
+  // never configured — enabling floors needs a restart, because the
+  // sender captured an undefined record at construction. A revised
+  // floor constrains only new handshakes: the pool agent key binds
+  // the floor, so the next send handshakes under the new floor,
+  // while a connection handshaked under the old floor keeps it
+  // (WR-74 note) — it simply stops being selected for that endpoint
+  // once the key changes.
+  server.reviseTlsMinVersion = (endpoint: string, floor: MinTlsVersion): MinTlsVersion => {
+    if (opts.minTlsVersions === undefined) {
+      throw new Error(
+        "reviseTlsMinVersion: TLS minimum versions are not configured — enabling them requires a restart"
+      );
+    }
+    assertValidMinTlsVersion(floor);
+    const previous = opts.minTlsVersions[endpoint];
+    if (previous === floor) return floor;
+    opts.minTlsVersions[endpoint] = floor;
+    opts.auditLog.append({
+      event: "tls_min_version_revised",
+      endpoint,
+      previous,
+      current: floor,
+    });
+    return floor;
+  };
+
+  server.removeTlsMinVersion = (endpoint: string): boolean => {
+    const previous = opts.minTlsVersions?.[endpoint];
+    if (previous === undefined) return false;
+    delete opts.minTlsVersions![endpoint];
+    opts.auditLog.append({
+      event: "tls_min_version_removed",
+      endpoint,
+      previous,
+    });
+    return true;
+  };
+
+  // WR-343: live per-endpoint TLS minimum version. Only set when
+  // `minTlsVersions` was configured.
+  if (opts.minTlsVersions !== undefined) {
+    server.getTlsMinVersion = (endpoint: string): MinTlsVersion | undefined =>
+      opts.minTlsVersions![endpoint];
   }
 
   // WR-336: live hedge-delay revision. Both methods are always set

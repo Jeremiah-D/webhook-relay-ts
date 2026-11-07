@@ -1219,7 +1219,20 @@ reliability primitives that matter for any signed-payload pipeline.
   entry); an unparseable negotiated protocol fails closed. The keep-alive
   pool and the H2 session pool bind the floor into their keys
   (`|tlsmin:<version>`), so a connection handshaked under one floor can
-  never serve an endpoint configured with another. Orthogonal to
+  never serve an endpoint configured with another. Floors are revisable
+  live with `reviseTlsMinVersion(endpoint, floor)` (WR-343): the sender
+  reads the floor on every send, so the next handshake for the endpoint
+  negotiates under the new floor; a same-value revision is a silent
+  no-op, an illegal floor throws `RangeError` with the live value
+  untouched, and a real revision is audited as `tls_min_version_revised`
+  (`previous` / `current`, `previous` absent on a first set).
+  `removeTlsMinVersion(endpoint)` deletes the floor (back to unlimited;
+  audited as `tls_min_version_removed`), and `getTlsMinVersion(endpoint)`
+  reads the live floor (`undefined` when none — only set when
+  `minTlsVersions` was configured). Revising on a relay that never
+  configured floors throws `Error` — enabling floors needs a restart. A
+  revised floor constrains only new handshakes: a connection handshaked
+  under the old floor keeps it. Orthogonal to
   `tlsClientCerts` (WR-36, client identity) and the WR-73 expiry monitor
   (warns about expiry; this rejects weak negotiation). Applies to `https:`
   targets; `wss:` targets are not covered in this round (the WebSocket pool
