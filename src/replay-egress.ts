@@ -50,6 +50,20 @@ export interface ReplayEgressOptions {
 
 export const DEFAULT_REPLAY_EGRESS_RPS = 10;
 
+/** Partial live revision of the replay egress rate (WR-345). */
+export interface ReplayEgressRevision {
+  /**
+   * New per-second budget; omitted keeps the live value. A present value
+   * must be a finite number > 0 — the same gate as construction.
+   */
+  replaysPerSecond?: number;
+}
+
+/** Live snapshot of the replay egress rate (WR-345). */
+export interface ReplayEgressConfig {
+  replaysPerSecond: number;
+}
+
 function assertReplayEgressRps(replaysPerSecond: number): void {
   if (!Number.isFinite(replaysPerSecond) || replaysPerSecond <= 0) {
     throw new RangeError(
@@ -65,7 +79,7 @@ function assertReplayEgressRps(replaysPerSecond: number): void {
  * back (never drops it) and retries on the next replay call.
  */
 export class ReplayEgressGate {
-  private readonly perSecond: number;
+  private perSecond: number;
   private readonly buckets = new Map<string, { tokens: number; updatedMs: number }>();
   private readonly now: () => number;
 
@@ -79,6 +93,44 @@ export class ReplayEgressGate {
   /** Configured per-second budget (every endpoint shares the same budget). */
   limit(): number {
     return this.perSecond;
+  }
+
+  /**
+   * WR-345: revise the live per-second budget (partial — an omitted
+   * `replaysPerSecond` keeps the live value). Takes effect on the next
+   * `take()`: tightening needs no explicit bucket clamp — `refill()`
+   * caps every bucket at the new `perSecond` on the next read — and
+   * loosening adds no tokens, the balance only grows back through
+   * elapsed-time refill. A new endpoint's first bucket still starts
+   * full at the new rate, and `msUntilToken()` follows the live value.
+   * An illegal patch throws `RangeError` and the live value is
+   * untouched; an empty patch is a `RangeError`; revising to the live
+   * value is a silent no-op. Returns the live config.
+   */
+  retune(patch: ReplayEgressRevision): ReplayEgressConfig {
+    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new RangeError(`replayEgress revision must be an object, got ${JSON.stringify(patch)}`);
+    }
+    if (patch.replaysPerSecond === undefined) {
+      throw new RangeError("replayEgress revision must set replaysPerSecond");
+    }
+    const next = patch.replaysPerSecond;
+    // Validate-then-apply: the merged value must pass the construction
+    // gate before the live value moves.
+    assertReplayEgressRps(next);
+    if (next === this.perSecond) {
+      return this.config();
+    }
+    this.perSecond = next;
+    return this.config();
+  }
+
+  /**
+   * WR-345: live rate snapshot — a fresh object, never a live
+   * reference, so mutating it cannot move the gate.
+   */
+  config(): ReplayEgressConfig {
+    return { replaysPerSecond: this.perSecond };
   }
 
   private refill(endpoint: string): { tokens: number; updatedMs: number } {

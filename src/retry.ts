@@ -208,7 +208,7 @@ import {
   type OrderedModeOptions,
   type ResolvedOrderedConfig,
 } from "./ordered.ts";
-import { ReplayEgressGate, type ReplayEgressOptions, DEFAULT_REPLAY_EGRESS_RPS } from "./replay-egress.ts";
+import { ReplayEgressGate, type ReplayEgressConfig, type ReplayEgressOptions, type ReplayEgressRevision, DEFAULT_REPLAY_EGRESS_RPS } from "./replay-egress.ts";
 import {
   ReplayApprovalStore,
   ReplayApprovalError,
@@ -593,7 +593,7 @@ export type {
   TenantBudgetStatsRow,
   TenantBudgetStats,
 };
-export type { ReplayEgressOptions };
+export type { ReplayEgressOptions, ReplayEgressConfig, ReplayEgressRevision };
 export { ReplayEgressGate, DEFAULT_REPLAY_EGRESS_RPS };
 export type { EndpointRetryBudgetSnapshot, RetryBudgetOptions } from "./retry-budget.ts";
 export type { TenantConcurrencySnapshot } from "./tenant-concurrency.ts";
@@ -6842,6 +6842,38 @@ export class RetryQueue {
    */
   getReplayEgressGate(): ReplayEgressGate | undefined {
     return this.replayEgress;
+  }
+
+  /**
+   * WR-345: revise the live dead-letter replay egress rate (partial —
+   * omitted fields keep their live values). Takes effect on the next
+   * `take()` inside `replayDeadLetters`: tightening clamps every
+   * endpoint's bucket balance on the next read, loosening adds no
+   * tokens. Entries already replayed are unaffected, the cumulative
+   * `throttled` counter is never reset, and the single-id
+   * `replayDeadLetter(id)` escape hatch stays ungated. An illegal
+   * patch throws `RangeError` and the live value is untouched; an
+   * empty patch is a `RangeError`; revising to the live value is a
+   * no-op. Throws `Error` when replay egress was never configured —
+   * enabling it needs a restart. Returns the live config.
+   */
+  reviseReplayEgress(patch: ReplayEgressRevision): ReplayEgressConfig {
+    if (this.replayEgress === undefined) {
+      throw new Error(
+        "reviseReplayEgress: replay egress is not configured — enabling it requires a restart"
+      );
+    }
+    return this.replayEgress.retune(patch);
+  }
+
+  /**
+   * WR-345: live replay egress rate — the single shared per-second
+   * budget. `undefined` when the feature was never configured. Reads
+   * the live values, so a runtime revision is visible immediately.
+   */
+  getReplayEgressConfig(): ReplayEgressConfig | undefined {
+    if (this.replayEgress === undefined) return undefined;
+    return this.replayEgress.config();
   }
 
   /**

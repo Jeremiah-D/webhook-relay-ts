@@ -116,7 +116,7 @@ import {
   type OAuth2ClientCredentialsConfig,
   type ResolvedOAuth2ClientConfig,
 } from "./oauth-client.ts";
-import type { ReplayEgressOptions } from "./replay-egress.ts";
+import type { ReplayEgressConfig, ReplayEgressOptions, ReplayEgressRevision } from "./replay-egress.ts";
 import { ReplayApprovalError, type ReplayApprovalDenyReason, type ReplayApprovalOptions } from "./replay-approval.ts";
 import { HttpDeliveryError, parseRetryAfterMs } from "./failure.ts";
 import {
@@ -5955,6 +5955,32 @@ export interface RelayServer extends Server {
    */
   getDnsCacheConfig?: () => DnsCacheConfig | undefined;
   /**
+   * WR-345: revise the live dead-letter replay egress rate at runtime
+   * (`replaysPerSecond`, partial — omitted fields keep their live
+   * values). Takes effect on the next `take()` inside
+   * `replayDeadLetters`: tightening clamps every endpoint's bucket
+   * balance on the next read, loosening adds no tokens. Entries already
+   * replayed are unaffected, the cumulative `throttled` counter is
+   * never reset, and the single-id `replayDeadLetter(id)` escape hatch
+   * stays ungated. An illegal patch throws `RangeError` and the live
+   * value is untouched; an empty patch is a `RangeError`; a same-value
+   * revision is a silent no-op with no audit event. A real revision is
+   * audited as `replay_egress_revised` with `previous` / `current`
+   * (the construction values as first `previous` — the default 10 when
+   * unset), and returns the live config. Always set; throws `Error`
+   * when replay egress was never configured — enabling it needs a
+   * restart. This revises the re-queue admission rate; WR-344 revises
+   * the auto-replay round cadence, WR-68 is the gate mechanism itself,
+   * and WR-31 the auto-replayer that shares it.
+   */
+  reviseReplayEgress?: (patch: ReplayEgressRevision) => ReplayEgressConfig;
+  /**
+   * WR-345: live replay egress rate — the single shared per-second
+   * budget. Only set when `replayEgress` was configured; `undefined`
+   * otherwise.
+   */
+  getReplayEgressConfig?: () => ReplayEgressConfig | undefined;
+  /**
    * WR-343: revise one endpoint's live TLS minimum version at
    * runtime — no restart. The floor is read live on every send, so
    * the next handshake for the endpoint negotiates under the new
@@ -6007,7 +6033,7 @@ export interface RelayServer extends Server {
    * 60_000/10/3_600_000 when unset), and returns the live config.
    * Always set; throws `Error` when auto replay was never configured
    * — enabling it needs a restart. This revises the round cadence;
-   * WR-343 revises the replay-egress rate instead, and WR-31 is the
+   * WR-345 revises the replay-egress rate instead, and WR-31 is the
    * scheduler mechanism itself.
    */
   reviseAutoReplaySchedule: (patch: AutoReplayScheduleRevision) => AutoReplayScheduleConfig;
@@ -15240,6 +15266,39 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // was configured.
   if (sharedDnsCache !== undefined) {
     server.getDnsCacheConfig = (): DnsCacheConfig => sharedDnsCache.config();
+  }
+
+  // WR-345: replay egress rate runtime revision. The method is always
+  // set (like reviseAdaptiveBackoff above); with the gate unconfigured
+  // the queue throws Error — enabling it needs a restart. A real
+  // revision is audited as `replay_egress_revised` with the previous
+  // and current config (the construction values as first `previous` —
+  // the default 10 when unset); an empty or same-value patch is a
+  // silent no-op.
+  server.reviseReplayEgress = (patch: ReplayEgressRevision): ReplayEgressConfig => {
+    const prev = queue.getReplayEgressConfig();
+    if (prev === undefined) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseReplayEgress(patch);
+    }
+    // Validate-then-apply inside retune: an illegal patch throws
+    // RangeError and the live values are left completely intact.
+    const next = queue.reviseReplayEgress(patch);
+    if (next.replaysPerSecond === prev.replaysPerSecond) {
+      return next;
+    }
+    opts.auditLog.append({
+      event: "replay_egress_revised",
+      previous: prev,
+      current: next,
+    });
+    return next;
+  };
+
+  // WR-345: live replay egress rate. Only set when `replayEgress`
+  // was configured.
+  if (queue.getReplayEgressConfig() !== undefined) {
+    server.getReplayEgressConfig = (): ReplayEgressConfig => queue.getReplayEgressConfig()!;
   }
 
   // WR-343: live per-endpoint TLS minimum-version revision /

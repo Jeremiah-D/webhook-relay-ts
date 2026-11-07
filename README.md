@@ -12242,7 +12242,7 @@ silent no-op; a real revision audits `auto_replay_schedule_revised`
 with `previous` / `current`. Enabling auto-replay itself still needs a
 restart: on a relay where it was never configured, revising throws and
 the getter is not mounted. This revises the round cadence only — the
-replay-egress rate (WR-343) is a separate control on the same replay
+replay-egress rate (WR-345) is a separate control on the same replay
 path.
 
 The round timer is unref'd, so a configured scheduler never pins the
@@ -12420,6 +12420,24 @@ throttled-but-healthy backlog never trips the rounds-exhausted stop.
 Off by default; a present-but-empty object uses the default
 `replaysPerSecond` of 10; invalid values throw `RangeError` at
 construction.
+
+**Live rate revision (WR-345).** The rate is revisable at runtime
+without a restart — `relay.reviseReplayEgress({ replaysPerSecond: 2 })`
+(or `queue.reviseReplayEgress(patch)` on a raw queue) — and
+`relay.getReplayEgressConfig()` reads the live value. The revision
+takes effect on the next `take()`: tightening clamps every endpoint's
+bucket balance on the next read (no explicit clamp needed), loosening
+adds no tokens (the balance only grows back through elapsed-time
+refill), and a new endpoint's first bucket still starts full at the new
+rate. Entries already replayed are unaffected, the cumulative
+`throttled` counter is never reset, and the single-id
+`replayDeadLetter(id)` escape hatch stays ungated. Revising to the live
+value is a silent no-op; a real revision audits
+`replay_egress_revised` with `previous` / `current`. Enabling the gate
+itself still needs a restart: on a relay where it was never configured,
+revising throws and the getter is not mounted. This revises the
+re-queue admission rate only — the WR-31 auto-replay round cadence is
+WR-344, a separate control on the same replay path.
 
 ### Downstream interaction record/replay harness (WR-174)
 
