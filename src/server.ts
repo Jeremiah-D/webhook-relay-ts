@@ -28,7 +28,7 @@ import {
   selectSignatureAlgorithmVerifier,
   type SignatureAlgorithmRule,
 } from "./signature-alg.ts";
-import { RetryQueue, errorBudgetBurnAuditEvent, type BurnRateAlertInfo, type DeliveryDeadlineConfig, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type RetryItem, type Sender, type SenderCallOptions, type MaintenanceWindowTransition, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
+import { RetryQueue, errorBudgetBurnAuditEvent, type BurnRateAlertInfo, type DeliveryDeadlineConfig, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type ErrorBudgetConfig, type ErrorBudgetRevision, type RetryItem, type Sender, type SenderCallOptions, type MaintenanceWindowTransition, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
 import { parseDeliverAtHeader, DELIVER_AT_HEADER } from "./retry.ts";
 import type { ShadowDeliveredInfo, ShadowFailedInfo, ShadowTargetConfig, ShadowTargetsConfig } from "./retry.ts";
 import type {
@@ -212,7 +212,7 @@ export {
 };
 export type { HedgeAuditEvent, HedgedSender, HedgedSenderOptions } from "./hedged.ts";
 export { errorBudgetBurnAuditEvent };
-export type { BurnRateAlertInfo, ErrorBudgetBurnAuditEvent } from "./retry.ts";
+export type { BurnRateAlertInfo, ErrorBudgetBurnAuditEvent, ErrorBudgetConfig, ErrorBudgetRevision } from "./retry.ts";
 import type { ReplayGuard } from "./replay.ts";
 import { DeliveryDeduplicator, type DedupOptions, type DedupWindowRevision } from "./dedup.ts";
 import type { BatchConfigRevision } from "./batch.ts";
@@ -5980,6 +5980,34 @@ export interface RelayServer extends Server {
    * otherwise.
    */
   getReplayEgressConfig?: () => ReplayEgressConfig | undefined;
+  /**
+   * WR-346: revise the live downstream error-budget burn-rate knobs
+   * at runtime — no restart. The five knobs (`fastWindowMs`,
+   * `slowWindowMs`, `budgetErrorRate`, `alertThreshold`, `minEvents`)
+   * take effect on the next `recordOutcome`: tightening the slow
+   * window prunes older samples on the next record, widening it never
+   * resurrects samples already pruned, and an open alert episode is
+   * neither opened nor closed early — the next outcome re-evaluates
+   * the latch under the new threshold. An illegal patch throws
+   * `RangeError` and the live values are untouched; an empty patch is
+   * a `RangeError`; a same-value revision is a silent no-op with no
+   * audit event. A real revision is audited as
+   * `error_budget_revised` with `previous` / `current` (the
+   * construction values as first `previous` — the defaults 1h / 6h /
+   * 0.01 / 2 / 10 when unset), and returns the live config. Always
+   * set; throws `Error` when `errorBudget` was never configured —
+   * enabling it needs a restart. This revises the burn-rate alert
+   * thresholds; WR-341 revises the delivery deadline, WR-147 is the
+   * alert mechanism itself, and WR-10 the circuit breaker that
+   * *does* gate dispatches (this only alerts).
+   */
+  reviseErrorBudget?: (patch: ErrorBudgetRevision) => ErrorBudgetConfig;
+  /**
+   * WR-346: live error-budget burn-rate config — the five knobs.
+   * Only set when `errorBudget` was configured; `undefined`
+   * otherwise.
+   */
+  getErrorBudgetConfig?: () => ErrorBudgetConfig | undefined;
   /**
    * WR-343: revise one endpoint's live TLS minimum version at
    * runtime — no restart. The floor is read live on every send, so
@@ -15299,6 +15327,49 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // was configured.
   if (queue.getReplayEgressConfig() !== undefined) {
     server.getReplayEgressConfig = (): ReplayEgressConfig => queue.getReplayEgressConfig()!;
+  }
+
+  // WR-346: error-budget burn-rate knob runtime revision. The method is
+  // always set (like reviseReplayEgress above); with the monitor
+  // unconfigured the queue throws Error — enabling it needs a restart.
+  // A real revision is audited as `error_budget_revised` with the
+  // previous and current five-knob config (the construction values as
+  // first `previous` — the defaults 1h / 6h / 0.01 / 2 / 10 when
+  // unset); an empty or same-value patch is a silent no-op. The
+  // revision takes effect on the next `recordOutcome`: a tightened
+  // slow window prunes older samples on the next record, a widened
+  // window never resurrects pruned samples, and an open alert episode
+  // is untouched until the next outcome re-evaluates it.
+  server.reviseErrorBudget = (patch: ErrorBudgetRevision): ErrorBudgetConfig => {
+    const prev = queue.getErrorBudgetConfig();
+    if (prev === undefined) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseErrorBudget(patch);
+    }
+    // Validate-then-apply inside retune: an illegal patch throws
+    // RangeError and the live values are left completely intact.
+    const next = queue.reviseErrorBudget(patch);
+    if (
+      next.fastWindowMs === prev.fastWindowMs &&
+      next.slowWindowMs === prev.slowWindowMs &&
+      next.budgetErrorRate === prev.budgetErrorRate &&
+      next.alertThreshold === prev.alertThreshold &&
+      next.minEvents === prev.minEvents
+    ) {
+      return next;
+    }
+    opts.auditLog.append({
+      event: "error_budget_revised",
+      previous: prev,
+      current: next,
+    });
+    return next;
+  };
+
+  // WR-346: live error-budget burn-rate config. Only set when
+  // `errorBudget` was configured.
+  if (queue.getErrorBudgetConfig() !== undefined) {
+    server.getErrorBudgetConfig = (): ErrorBudgetConfig => queue.getErrorBudgetConfig()!;
   }
 
   // WR-343: live per-endpoint TLS minimum-version revision /

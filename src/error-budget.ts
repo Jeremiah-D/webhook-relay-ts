@@ -149,6 +149,28 @@ export interface ResolvedErrorBudgetOptions {
 }
 
 /**
+ * WR-346: a partial live revision of the five error-budget knobs —
+ * omitted fields keep their live values. `onBurnRateAlert` / `now`
+ * are never revisable: a retune carries the construction callback and
+ * clock forward untouched.
+ */
+export type ErrorBudgetRevision = Partial<
+  Pick<
+    ResolvedErrorBudgetOptions,
+    "fastWindowMs" | "slowWindowMs" | "budgetErrorRate" | "alertThreshold" | "minEvents"
+  >
+>;
+
+/** WR-346: the five live error-budget knobs, all required. */
+export interface ErrorBudgetConfig {
+  fastWindowMs: number;
+  slowWindowMs: number;
+  budgetErrorRate: number;
+  alertThreshold: number;
+  minEvents: number;
+}
+
+/**
  * Validate an {@link ErrorBudgetOptions} and fill in defaults. Throws
  * `RangeError` on any invalid value — fail fast at startup, never
  * mis-alert at runtime.
@@ -206,13 +228,74 @@ interface EndpointState {
  * per endpoint as `relay_error_budget_burn_ratio` (activity-gated).
  *
  * The monitor never touches the delivery path — it only observes.
+ *
+ * WR-346: the five knobs are live-revisable with `retune()` — no
+ * restart. A retune takes effect on the next `recordOutcome`;
+ * widening a window never resurrects samples already pruned, and an
+ * open alert episode is untouched until the next outcome
+ * re-evaluates it.
  */
 export class ErrorBudgetMonitor {
-  private readonly opts: ResolvedErrorBudgetOptions;
+  // WR-346: not readonly — `retune()` replaces the resolved config in
+  // place so the five knobs are live-revisable. `onBurnRateAlert` /
+  // `now` are carried over unchanged by every retune, never revised.
+  private opts: ResolvedErrorBudgetOptions;
   private readonly states = new Map<string, EndpointState>();
 
   constructor(options: ErrorBudgetOptions = {}) {
     this.opts = resolveErrorBudgetOptions(options);
+  }
+
+  /**
+   * WR-346: revise the five burn-rate knobs at runtime — no restart.
+   * The patch must be a non-empty object; the merged config is
+   * re-validated with the same five gates (and the same error text)
+   * as construction, including the `slowWindowMs > fastWindowMs`
+   * cross-gate, so an illegal patch throws `RangeError` and the live
+   * values are left completely intact. Revising to the live values is
+   * a silent no-op. Takes effect on the next `recordOutcome`: the
+   * prune cutoff and the fast/slow window evaluation read the live
+   * values, so tightening the slow window prunes older samples on the
+   * next record while widening it never resurrects samples already
+   * pruned — already-accumulated outcomes are never recomputed. An
+   * open alert episode is neither opened nor closed early by a
+   * retune; the next outcome re-evaluates the latch under the new
+   * threshold. Returns the live config.
+   */
+  retune(patch: ErrorBudgetRevision): ErrorBudgetConfig {
+    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new RangeError(`errorBudget revision must be an object, got ${JSON.stringify(patch)}`);
+    }
+    if (Object.keys(patch).length === 0) {
+      throw new RangeError("errorBudget revision must not be empty");
+    }
+    // Validate-then-apply: the merged config must pass the
+    // construction gates before the live values move.
+    const resolved = resolveErrorBudgetOptions({
+      fastWindowMs: patch.fastWindowMs ?? this.opts.fastWindowMs,
+      slowWindowMs: patch.slowWindowMs ?? this.opts.slowWindowMs,
+      budgetErrorRate: patch.budgetErrorRate ?? this.opts.budgetErrorRate,
+      alertThreshold: patch.alertThreshold ?? this.opts.alertThreshold,
+      minEvents: patch.minEvents ?? this.opts.minEvents,
+      onBurnRateAlert: this.opts.onBurnRateAlert,
+      now: this.opts.now,
+    });
+    this.opts = resolved;
+    return this.config();
+  }
+
+  /**
+   * WR-346: the live five-knob config. A snapshot — mutating the
+   * returned object never moves the monitor.
+   */
+  config(): ErrorBudgetConfig {
+    return {
+      fastWindowMs: this.opts.fastWindowMs,
+      slowWindowMs: this.opts.slowWindowMs,
+      budgetErrorRate: this.opts.budgetErrorRate,
+      alertThreshold: this.opts.alertThreshold,
+      minEvents: this.opts.minEvents,
+    };
   }
 
   /**

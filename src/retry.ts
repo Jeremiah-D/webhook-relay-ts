@@ -78,7 +78,9 @@ import {
   resolveErrorBudgetOptions,
   type BurnRateAlertInfo,
   type ErrorBudgetBurnAuditEvent,
+  type ErrorBudgetConfig,
   type ErrorBudgetOptions,
+  type ErrorBudgetRevision,
   type ResolvedErrorBudgetOptions,
 } from "./error-budget.ts";
 import type { EncryptedPayload, PayloadEncryptor } from "./encrypt.ts";
@@ -555,7 +557,9 @@ export type { ReplayIdempotencyOptions, ReplayIdempotencyStats };
 export type {
   BurnRateAlertInfo,
   ErrorBudgetBurnAuditEvent,
+  ErrorBudgetConfig,
   ErrorBudgetOptions,
+  ErrorBudgetRevision,
   ResolvedErrorBudgetOptions,
 };
 export { ErrorBudgetMonitor, errorBudgetBurnAuditEvent, resolveErrorBudgetOptions };
@@ -6220,6 +6224,40 @@ export class RetryQueue {
    */
   getErrorBudgetMonitor(): ErrorBudgetMonitor | undefined {
     return this.errorBudget;
+  }
+
+  /**
+   * WR-346: revise the live error-budget burn-rate knobs (partial —
+   * omitted fields keep their live values). Takes effect on the next
+   * `recordOutcome`: the prune cutoff and the fast/slow window
+   * evaluation read the live values, so tightening the slow window
+   * prunes older samples on the next record while widening it never
+   * resurrects samples already pruned. Already-accumulated outcomes
+   * are not recomputed, and an open alert episode is neither opened
+   * nor closed early by a retune — the next outcome re-evaluates the
+   * latch under the new threshold. An illegal patch throws `RangeError`
+   * and the live values are untouched; an empty patch is a `RangeError`;
+   * revising to the live values is a no-op. Throws `Error` when the
+   * error budget was never configured — enabling it needs a restart.
+   * Returns the live config.
+   */
+  reviseErrorBudget(patch: ErrorBudgetRevision): ErrorBudgetConfig {
+    if (this.errorBudget === undefined) {
+      throw new Error(
+        "reviseErrorBudget: error budget is not configured — enabling it requires a restart"
+      );
+    }
+    return this.errorBudget.retune(patch);
+  }
+
+  /**
+   * WR-346: live error-budget burn-rate config — the five knobs.
+   * `undefined` when the feature was never configured. Reads the live
+   * values, so a runtime revision is visible immediately.
+   */
+  getErrorBudgetConfig(): ErrorBudgetConfig | undefined {
+    if (this.errorBudget === undefined) return undefined;
+    return this.errorBudget.config();
   }
 
   /**

@@ -2874,6 +2874,26 @@ createRelayServer({
   (endpoint, burn rates, windows, budget); `relay_error_budget_burn_ratio{endpoint}`
   gauges the current fast-window burn rate (1.0 = exactly at budget;
   activity-gated, absent until the first outcome).
+- **Live revision (WR-346)** — `server.reviseErrorBudget(patch)`
+  revises the five knobs (`fastWindowMs`, `slowWindowMs`,
+  `budgetErrorRate`, `alertThreshold`, `minEvents`) at runtime, no
+  restart; `server.getErrorBudgetConfig()` returns the live values
+  (`undefined` when the monitor was never configured). A revision
+  takes effect on the next `recordOutcome`: tightening the slow
+  window prunes older samples on the next record, but widening a
+  window never resurrects samples already pruned, and an open alert
+  episode is neither opened nor closed early — the next outcome
+  re-evaluates the latch under the new threshold. The
+  `relay_error_budget_burn_ratio` gauge follows a revised
+  `budgetErrorRate` on the next render. A same-value revision is a
+  silent no-op; a real revision is audited as `error_budget_revised`
+  with `previous` / `current`. An illegal patch throws `RangeError`
+  and leaves the live values untouched. A monitor that was never
+  configured cannot be switched on at runtime — enabling it requires
+  a restart. Unlike WR-341 (which revises the delivery deadline —
+  the total time a delivery may take), this revises the burn-rate
+  alert thresholds: it only changes when the relay pages, never
+  whether a delivery proceeds.
 - Invalid configs (`slowWindowMs <= fastWindowMs`, `budgetErrorRate`
   outside (0, 1), non-positive thresholds) throw `RangeError` at
   startup. Library users drive `ErrorBudgetMonitor` directly with an
