@@ -179,6 +179,8 @@ export type {
   QuorumFanoutStats,
   QuorumFanoutStatus,
   QuorumMetricsInput,
+  QuorumRetention,
+  QuorumRetentionRevision,
   QuorumSatisfiedInfo,
   QuorumTargetDeadLetteredInfo,
 };
@@ -383,6 +385,8 @@ import {
   type QuorumFanoutStats,
   type QuorumFanoutStatus,
   type QuorumMetricsInput,
+  type QuorumRetention,
+  type QuorumRetentionRevision,
   type QuorumSatisfiedInfo,
   type QuorumTargetDeadLetteredInfo,
 } from "./quorum.ts";
@@ -10876,6 +10880,38 @@ export class RetryQueue {
    */
   getQuorumEvictedCount(): number {
     return this.quorum?.evictedCount() ?? 0;
+  }
+
+  /**
+   * WR-350: revise the live quorum retention tuning (partial — omitted
+   * fields keep their live values). The new values take effect at the
+   * next lazy retention sweep (the next dispatch / record / stats
+   * call): tightening `retentionMs` evicts verdicts older than the new
+   * window; lowering `maxFanouts` evicts the oldest verdicts first
+   * down to the new cap. The evicted cumulative count is never reset;
+   * already-evicted fan-outs are never resurrected; in-progress
+   * fan-outs are never evicted. An illegal patch throws `RangeError`
+   * and the live values are untouched; an empty patch is a
+   * `RangeError`; revising to the live values is a no-op. Throws
+   * `Error` when quorum fan-out was never configured — enabling it
+   * needs a restart. Returns the live retention snapshot.
+   */
+  reviseQuorumRetention(patch: QuorumRetentionRevision): QuorumRetention {
+    if (this.quorum === undefined) {
+      throw new Error(
+        "reviseQuorumRetention: quorum fan-out is not configured — enabling it requires a restart"
+      );
+    }
+    return this.quorum.retuneRetention(patch);
+  }
+
+  /**
+   * WR-350: live quorum retention tuning. `undefined` when quorum
+   * fan-out was never configured. Reads the live values, so a runtime
+   * revision is visible immediately.
+   */
+  getQuorumRetention(): QuorumRetention | undefined {
+    return this.quorum?.currentRetention();
   }
 
   /**

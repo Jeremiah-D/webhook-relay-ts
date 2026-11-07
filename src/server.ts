@@ -28,7 +28,7 @@ import {
   selectSignatureAlgorithmVerifier,
   type SignatureAlgorithmRule,
 } from "./signature-alg.ts";
-import { RetryQueue, errorBudgetBurnAuditEvent, type BurnRateAlertInfo, type DeliveryDeadlineConfig, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type ErrorBudgetConfig, type ErrorBudgetRevision, type FailoverEndpointConfig, type FailoverRevision, type RetryItem, type Sender, type SenderCallOptions, type MaintenanceWindowTransition, type SloRiskConfig, type SloRiskRevision, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
+import { RetryQueue, errorBudgetBurnAuditEvent, type BurnRateAlertInfo, type DeliveryDeadlineConfig, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type ErrorBudgetConfig, type ErrorBudgetRevision, type FailoverEndpointConfig, type FailoverRevision, type QuorumRetention, type QuorumRetentionRevision, type RetryItem, type Sender, type SenderCallOptions, type MaintenanceWindowTransition, type SloRiskConfig, type SloRiskRevision, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
 import { parseDeliverAtHeader, DELIVER_AT_HEADER } from "./retry.ts";
 import type { ShadowDeliveredInfo, ShadowFailedInfo, ShadowTargetConfig, ShadowTargetsConfig } from "./retry.ts";
 import type {
@@ -6121,6 +6121,32 @@ export interface RelayServer extends Server {
    * `undefined` for endpoints without failover config.
    */
   getFailoverConfig?: (endpoint: string) => FailoverEndpointConfig | undefined;
+  /**
+   * WR-350: revise the live quorum retention tuning at runtime
+   * (`retentionMs` / `maxFanouts`, partial — omitted fields keep their
+   * live values). The new values take effect at the next lazy retention
+   * sweep (the next dispatch / record / stats call): tightening
+   * `retentionMs` evicts verdicts older than the new window; lowering
+   * `maxFanouts` evicts the oldest verdicts first down to the new cap.
+   * The evicted cumulative count is never reset; already-evicted
+   * fan-outs are never resurrected; in-progress fan-outs are never
+   * evicted. An illegal patch throws `RangeError` and the live values
+   * are untouched; an empty patch is a `RangeError`; a same-value
+   * revision is a silent no-op with no audit event. A real revision is
+   * audited as `quorum_retention_revised` with `previous` / `current`
+   * (the construction values — or the defaults 3_600_000 / 10_000 when
+   * unset — as first `previous`), and returns the live retention.
+   * Always set; throws `Error` when quorum fan-out was never
+   * configured — enabling it needs a restart. This revises the
+   * retention window; WR-109 is the retention mechanism itself, and
+   * WR-106 is the fan-out mechanism.
+   */
+  reviseQuorumRetention?: (patch: QuorumRetentionRevision) => QuorumRetention;
+  /**
+   * WR-350: live quorum retention tuning. Always set; `undefined` when
+   * quorum fan-out was never configured.
+   */
+  getQuorumRetention?: () => QuorumRetention | undefined;
   /**
    * WR-344: revise the live dead-letter auto-replay schedule cadence
    * at runtime (`intervalMs` / `maxRounds` / `maxIntervalMs`, partial
@@ -15618,6 +15644,37 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // `undefined` for endpoints without failover config.
   server.getFailoverConfig = (endpoint: string): FailoverEndpointConfig | undefined =>
     queue.getFailoverConfig(endpoint);
+
+  // WR-350: live quorum retention tuning revision. The method is always
+  // set (like reviseFailover above); with quorum unconfigured the queue
+  // throws Error — enabling quorum fan-out needs a restart. A real
+  // revision is audited as `quorum_retention_revised` with the previous
+  // and current two-field retention (the construction values — or the
+  // defaults 3_600_000 / 10_000 when unset — as first `previous`); a
+  // same-value revision is a silent no-op.
+  server.reviseQuorumRetention = (patch: QuorumRetentionRevision): QuorumRetention => {
+    const prev = queue.getQuorumRetention();
+    if (prev === undefined) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseQuorumRetention(patch);
+    }
+    // Validate-then-apply inside retuneRetention: an illegal patch
+    // throws RangeError and the live values are left completely intact.
+    const next = queue.reviseQuorumRetention(patch);
+    if (next.retentionMs === prev.retentionMs && next.maxFanouts === prev.maxFanouts) {
+      return next;
+    }
+    opts.auditLog.append({
+      event: "quorum_retention_revised",
+      previous: prev,
+      current: next,
+    });
+    return next;
+  };
+
+  // WR-350: live quorum retention tuning. Always set; `undefined` when
+  // quorum fan-out was never configured.
+  server.getQuorumRetention = (): QuorumRetention | undefined => queue.getQuorumRetention();
 
   // WR-344: dead-letter auto-replay schedule cadence runtime revision.
   // The method is always set (like reviseAdaptiveBackoff above); with

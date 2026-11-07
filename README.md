@@ -4274,6 +4274,19 @@ const server = createRelayServer({
   kept for backward compatibility). In-progress fan-outs are never
   evicted; a delivery outcome that arrives after its fan-out was evicted
   is silently ignored (the verdict, once reached, is terminal).
+  The retention tuning is live-revisable (WR-350): `reviseQuorumRetention({ retentionMs?, maxFanouts? })`
+  / `getQuorumRetention()` on the queue and the server. The new values
+  take effect at the next lazy retention sweep (the next dispatch /
+  record / stats call) — tightening `retentionMs` evicts verdicts older
+  than the new window, lowering `maxFanouts` evicts the oldest verdicts
+  first down to the new cap. The evicted cumulative count is never
+  reset, already-evicted fan-outs are never resurrected, and in-progress
+  fan-outs are still never evicted. A real revision is audited as
+  `quorum_retention_revised` with `previous` / `current`; an illegal
+  patch throws `RangeError` and leaves the live values untouched, an
+  empty patch is a `RangeError`, and a same-value revision is a silent
+  no-op. Revising when quorum fan-out was never configured throws
+  `Error` — enabling it needs a restart.
 - **Invalid configs throw `RangeError` at startup** — empty/duplicate/
   non-`http(s)` targets, fanning out to the logical endpoint itself
   (double-delivery), or a quorum outside `[1, targets.length]`. Absent =

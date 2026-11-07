@@ -264,6 +264,26 @@ export const DEFAULT_QUORUM_RETENTION_MS = 3_600_000;
 export const DEFAULT_QUORUM_MAX_FANOUTS = 10_000;
 
 /**
+ * WR-350: live snapshot of the quorum retention tuning — the two
+ * construction-time values, both required. `retentionMs` is the
+ * post-verdict window a settled fan-out stays in memory; `maxFanouts`
+ * is the cap on retained settled fan-outs (LRU by verdict time).
+ * Both are positive integers; the defaults are
+ * `DEFAULT_QUORUM_RETENTION_MS` (1h) and `DEFAULT_QUORUM_MAX_FANOUTS`
+ * (10_000).
+ */
+export interface QuorumRetention {
+  retentionMs: number;
+  maxFanouts: number;
+}
+
+/** WR-350: partial patch for {@link QuorumFanoutSet.retuneRetention}. */
+export type QuorumRetentionRevision = {
+  retentionMs?: number;
+  maxFanouts?: number;
+};
+
+/**
  * Validate the WR-109 retention options the way a constructor would.
  * Throws `RangeError` on the first problem so a bad retention config
  * fails at startup, never mid-delivery — mirroring
@@ -399,10 +419,10 @@ export class QuorumFanoutSet {
     string,
     { endpoint: string; tenant?: string; satisfied: number; failed: number; acknowledged: number; targetDeadLetters: number }
   >();
-  /** WR-109: retention window after a verdict (`retentionMs` option). */
-  private readonly retentionMs: number;
-  /** WR-109: cap on retained settled fan-outs (`maxFanouts` option). */
-  private readonly maxFanouts: number;
+  /** WR-109: retention window after a verdict (`retentionMs` option). WR-350: live-revisable via `retuneRetention` — no longer `readonly`. */
+  private retentionMs: number;
+  /** WR-109: cap on retained settled fan-outs (`maxFanouts` option). WR-350: live-revisable via `retuneRetention` — no longer `readonly`. */
+  private maxFanouts: number;
   /** WR-109: epoch-ms clock for eviction decisions and derived ISO timestamps. */
   private readonly now: () => number;
   /**
@@ -680,6 +700,52 @@ export class QuorumFanoutSet {
    */
   evictedCount(): number {
     return this.evicted;
+  }
+
+  /**
+   * WR-350: revise the live retention tuning (partial — omitted fields
+   * keep their live values). The merged values are checked against the
+   * same field gates as construction
+   * (`assertValidQuorumRetentionOptions`): both must be positive
+   * integers. An illegal patch throws `RangeError` and the live values
+   * are left completely intact; an empty patch is a `RangeError`; a
+   * non-object patch is a `RangeError`. A same-value patch is a silent
+   * no-op that returns the current snapshot. The new values take effect
+   * at the next lazy `sweepRetention()` (the next dispatch / record /
+   * stats call): tightening `retentionMs` evicts verdicts older than
+   * the new window at that sweep; lowering `maxFanouts` evicts the
+   * oldest verdicts first down to the new cap; loosening either value
+   * simply retains more. The `evicted` cumulative count is never reset;
+   * already-evicted fan-outs are never resurrected; in-progress
+   * fan-outs are still never evicted. Returns the live retention
+   * snapshot.
+   */
+  retuneRetention(patch: QuorumRetentionRevision): QuorumRetention {
+    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new RangeError(
+        `quorum retention revision must be an object, got ${JSON.stringify(patch)}`
+      );
+    }
+    if (Object.keys(patch).length === 0) {
+      throw new RangeError("quorum retention revision must not be empty");
+    }
+    const merged: QuorumRetention = {
+      retentionMs: patch.retentionMs ?? this.retentionMs,
+      maxFanouts: patch.maxFanouts ?? this.maxFanouts,
+    };
+    assertValidQuorumRetentionOptions(merged);
+    this.retentionMs = merged.retentionMs;
+    this.maxFanouts = merged.maxFanouts;
+    return this.currentRetention();
+  }
+
+  /**
+   * WR-350: snapshot of the live retention tuning. Reads the live
+   * values, so a runtime revision is visible immediately. Returns a
+   * fresh object, never a live reference.
+   */
+  currentRetention(): QuorumRetention {
+    return { retentionMs: this.retentionMs, maxFanouts: this.maxFanouts };
   }
 
   /**
