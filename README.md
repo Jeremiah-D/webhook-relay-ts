@@ -544,6 +544,29 @@ reliability primitives that matter for any signed-payload pipeline.
   `relay_slo_risk_seconds{endpoint}` reports the predicted headroom in
   seconds while an endpoint is elevated. Event-driven (no timers), so the
   whole thing is deterministic under an injected clock.
+- **Live revision (WR-347)** — `server.reviseSloRisk(patch)`
+  revises the five knobs (`warnRatio`, `ewmaAlpha`, `minSamples`,
+  `clearRatio`, `trendHorizon`) at runtime, no restart;
+  `server.getSloRiskConfig()` returns the live values (`undefined`
+  when the predictor was never configured). A revision takes effect
+  on the next `observe`: a tightened `warnRatio` elevates on the
+  next observation, while a relaxed one leaves an elevated endpoint
+  elevated until the next observation re-evaluates it — the
+  accumulated EWMA state (`backlogEwma`/`trendEwma`), the `atRisk`
+  latch, the score, and the prediction are never reset or
+  recomputed, so changing `ewmaAlpha` only changes the smoothing
+  weight of subsequent observations. The
+  `relay_slo_risk_seconds` gauge follows a revised `warnRatio` on
+  the next `observe`. A same-value revision is a silent no-op; a
+  real revision is audited as `slo_risk_revised` with `previous` /
+  `current`. An illegal patch throws `RangeError` and leaves the
+  live values untouched. A predictor that was never configured
+  cannot be switched on at runtime — enabling it requires a
+  restart. Unlike WR-147 (which revises the error-budget burn-rate
+  alert — a post-hoc error-rate signal), this revises the SLO-breach
+  *prediction* thresholds: it only changes when the relay warns
+  early, never whether a delivery proceeds, and never the latency
+  SLO budget itself (`sloMs` comes from the `observe` caller).
 - `src/endpoint-health.ts` — outbound endpoint health scoring
   (`EndpointHealthTracker`), opt-in under `retry.endpointHealth`
   (disabled by default; an explicit server-level `endpointHealth` wins

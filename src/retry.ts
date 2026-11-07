@@ -109,9 +109,11 @@ import {
 } from "./latency.ts";
 import {
   SloRiskPredictor,
+  type SloRiskConfig,
   type SloRiskInfo,
   type SloRiskObservation,
   type SloRiskOptions,
+  type SloRiskRevision,
 } from "./slo-risk.ts";
 import {
   EndpointHealthTracker,
@@ -565,7 +567,7 @@ export type {
 export { ErrorBudgetMonitor, errorBudgetBurnAuditEvent, resolveErrorBudgetOptions };
 export type { EncryptedPayload, PayloadEncryptor };
 export type { EndpointLatencyStats, LatencyTrackerOptions };
-export type { SloRiskInfo, SloRiskObservation, SloRiskOptions };
+export type { SloRiskConfig, SloRiskInfo, SloRiskObservation, SloRiskOptions, SloRiskRevision };
 export type { FieldMask, FieldMaskRule, MaskStrategy };
 export { EndpointHealthTracker, assertValidEndpointHealthOptions };
 export type {
@@ -4203,7 +4205,8 @@ export class RetryQueue {
    * default) — mirrors `latencies` above.
    */
   private readonly sloRisks = new Map<string, SloRiskPredictor>();
-  private readonly sloRiskOpts?: SloRiskOptions;
+  /** WR-71: SLO-risk options; undefined when disabled. WR-347: live-revisable — `reviseSloRisk` replaces this with the merged options so tenants born later start from the revised values. */
+  private sloRiskOpts?: SloRiskOptions;
   private readonly endpointHealths = new Map<string, EndpointHealthTracker>();
   private readonly endpointHealthOpts?: EndpointHealthOptions;
   private readonly onEndpointDegraded?: (info: EndpointDegradedInfo) => void;
@@ -10979,6 +10982,55 @@ export class RetryQueue {
       }
     }
     return out;
+  }
+
+  /**
+   * WR-347: revise the live SLO-risk prediction knobs (partial —
+   * omitted fields keep their live values). Takes effect on the next
+   * `observe`: the EWMA update, the cold-start gate, the forward
+   * projection, and the elevated/cleared gates all read the live
+   * values. The accumulated EWMA state, the `atRisk` latch, the
+   * score, and the prediction are never reset or recomputed — a
+   * changed `ewmaAlpha` only affects the smoothing of subsequent
+   * observations, and an already-elevated endpoint stays elevated
+   * until the next observation re-evaluates it. An illegal patch
+   * throws `RangeError` and the live values are untouched; an empty
+   * patch is a `RangeError`; revising to the live values is a no-op.
+   * Throws `Error` when SLO-risk prediction was never configured —
+   * enabling it needs a restart. The one config is shared by all
+   * tenants: every live per-tenant predictor is retuned in place
+   * (they all share one live config, so a single validation covers
+   * them all), and tenants born later start from the revised values.
+   * Returns the live config.
+   */
+  reviseSloRisk(patch: SloRiskRevision): SloRiskConfig {
+    if (this.sloRiskOpts === undefined) {
+      throw new Error(
+        "reviseSloRisk: SLO risk prediction is not configured — enabling it requires a restart"
+      );
+    }
+    // Retune the default tenant's predictor first so the returned
+    // config is the live one (sloRiskFor creates it lazily when
+    // absent), then every other live tenant.
+    const primary = this.sloRiskFor(undefined)!;
+    const next = primary.retune(patch);
+    for (const predictor of this.sloRisks.values()) {
+      if (predictor !== primary) predictor.retune(patch);
+    }
+    // Tenants born later start from the revised values.
+    this.sloRiskOpts = { ...this.sloRiskOpts, ...patch };
+    return next;
+  }
+
+  /**
+   * WR-347: live SLO-risk prediction config — the five knobs shared
+   * by all tenants. `undefined` when the feature was never
+   * configured. Reads the live values, so a runtime revision is
+   * visible immediately.
+   */
+  getSloRiskConfig(): SloRiskConfig | undefined {
+    if (this.sloRiskOpts === undefined) return undefined;
+    return this.sloRiskFor(undefined)!.config();
   }
 
   /**

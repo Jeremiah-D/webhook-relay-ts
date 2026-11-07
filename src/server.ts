@@ -28,7 +28,7 @@ import {
   selectSignatureAlgorithmVerifier,
   type SignatureAlgorithmRule,
 } from "./signature-alg.ts";
-import { RetryQueue, errorBudgetBurnAuditEvent, type BurnRateAlertInfo, type DeliveryDeadlineConfig, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type ErrorBudgetConfig, type ErrorBudgetRevision, type RetryItem, type Sender, type SenderCallOptions, type MaintenanceWindowTransition, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
+import { RetryQueue, errorBudgetBurnAuditEvent, type BurnRateAlertInfo, type DeliveryDeadlineConfig, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type ErrorBudgetConfig, type ErrorBudgetRevision, type RetryItem, type Sender, type SenderCallOptions, type MaintenanceWindowTransition, type SloRiskConfig, type SloRiskRevision, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
 import { parseDeliverAtHeader, DELIVER_AT_HEADER } from "./retry.ts";
 import type { ShadowDeliveredInfo, ShadowFailedInfo, ShadowTargetConfig, ShadowTargetsConfig } from "./retry.ts";
 import type {
@@ -212,7 +212,7 @@ export {
 };
 export type { HedgeAuditEvent, HedgedSender, HedgedSenderOptions } from "./hedged.ts";
 export { errorBudgetBurnAuditEvent };
-export type { BurnRateAlertInfo, ErrorBudgetBurnAuditEvent, ErrorBudgetConfig, ErrorBudgetRevision } from "./retry.ts";
+export type { BurnRateAlertInfo, ErrorBudgetBurnAuditEvent, ErrorBudgetConfig, ErrorBudgetRevision, SloRiskConfig, SloRiskRevision } from "./retry.ts";
 import type { ReplayGuard } from "./replay.ts";
 import { DeliveryDeduplicator, type DedupOptions, type DedupWindowRevision } from "./dedup.ts";
 import type { BatchConfigRevision } from "./batch.ts";
@@ -6008,6 +6008,36 @@ export interface RelayServer extends Server {
    * otherwise.
    */
   getErrorBudgetConfig?: () => ErrorBudgetConfig | undefined;
+  /**
+   * WR-347: revise the live SLO-breach prediction knobs at runtime
+   * — no restart. The five knobs (`warnRatio`, `ewmaAlpha`,
+   * `minSamples`, `clearRatio`, `trendHorizon`) take effect on the
+   * next `observe`: the EWMA update, the cold-start gate, the
+   * forward projection, and the elevated/cleared gates all read the
+   * live values, so a tightened `warnRatio` elevates on the next
+   * observation while a relaxed one leaves an elevated endpoint
+   * elevated until the next observation re-evaluates it. The
+   * accumulated EWMA state, the `atRisk` latch, the score, and the
+   * prediction are never reset or recomputed by a revision. An
+   * illegal patch throws `RangeError` and the live values are
+   * untouched; an empty patch is a `RangeError`; a same-value
+   * revision is a silent no-op with no audit event. A real revision
+   * is audited as `slo_risk_revised` with `previous` / `current`
+   * (the construction values as first `previous` — the defaults 0.8
+   * / 0.2 / 3 / 0.7 / 3 when unset), and returns the live config.
+   * Always set; throws `Error` when `sloRisk` was never configured
+   * — enabling it needs a restart. This revises the SLO-breach
+   * prediction thresholds; WR-147 revises the error-budget burn-rate
+   * alert, WR-13 reports already-missed latency, and the latency SLO
+   * budget itself (`sloMs`) comes from the `observe` caller, not
+   * from this predictor's config.
+   */
+  reviseSloRisk?: (patch: SloRiskRevision) => SloRiskConfig;
+  /**
+   * WR-347: live SLO-breach prediction config — the five knobs.
+   * Only set when `sloRisk` was configured; `undefined` otherwise.
+   */
+  getSloRiskConfig?: () => SloRiskConfig | undefined;
   /**
    * WR-343: revise one endpoint's live TLS minimum version at
    * runtime — no restart. The floor is read live on every send, so
@@ -15370,6 +15400,50 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // `errorBudget` was configured.
   if (queue.getErrorBudgetConfig() !== undefined) {
     server.getErrorBudgetConfig = (): ErrorBudgetConfig => queue.getErrorBudgetConfig()!;
+  }
+
+  // WR-347: SLO-breach prediction knob runtime revision. The method
+  // is always set (like reviseErrorBudget above); with the predictor
+  // unconfigured the queue throws Error — enabling it needs a
+  // restart. A real revision is audited as `slo_risk_revised` with
+  // the previous and current five-knob config (the construction
+  // values as first `previous` — the defaults 0.8 / 0.2 / 3 / 0.7 /
+  // 3 when unset); an empty or same-value patch is a silent no-op.
+  // The revision takes effect on the next `observe`: the EWMA
+  // update, the cold-start gate, the forward projection, and the
+  // elevated/cleared gates all read the live values, while the
+  // accumulated EWMA state and the `atRisk` latch are untouched
+  // until the next observation re-evaluates them.
+  server.reviseSloRisk = (patch: SloRiskRevision): SloRiskConfig => {
+    const prev = queue.getSloRiskConfig();
+    if (prev === undefined) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseSloRisk(patch);
+    }
+    // Validate-then-apply inside retune: an illegal patch throws
+    // RangeError and the live values are left completely intact.
+    const next = queue.reviseSloRisk(patch);
+    if (
+      next.warnRatio === prev.warnRatio &&
+      next.ewmaAlpha === prev.ewmaAlpha &&
+      next.minSamples === prev.minSamples &&
+      next.clearRatio === prev.clearRatio &&
+      next.trendHorizon === prev.trendHorizon
+    ) {
+      return next;
+    }
+    opts.auditLog.append({
+      event: "slo_risk_revised",
+      previous: prev,
+      current: next,
+    });
+    return next;
+  };
+
+  // WR-347: live SLO-breach prediction config. Only set when
+  // `sloRisk` was configured.
+  if (queue.getSloRiskConfig() !== undefined) {
+    server.getSloRiskConfig = (): SloRiskConfig => queue.getSloRiskConfig()!;
   }
 
   // WR-343: live per-endpoint TLS minimum-version revision /

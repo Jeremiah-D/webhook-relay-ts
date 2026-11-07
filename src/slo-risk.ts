@@ -62,6 +62,30 @@ export interface SloRiskOptions {
   onSloRisk?: (info: SloRiskInfo) => void;
 }
 
+/**
+ * WR-347: a partial live revision of the five SLO-risk knobs —
+ * omitted fields keep their live values. `onSloRisk` is never
+ * revisable: a retune carries the construction callback forward
+ * untouched. (There is no clock to carry: the predictor reads time
+ * from the `observe` caller.)
+ */
+export type SloRiskRevision = {
+  warnRatio?: number;
+  ewmaAlpha?: number;
+  minSamples?: number;
+  clearRatio?: number;
+  trendHorizon?: number;
+};
+
+/** WR-347: the five live SLO-risk knobs, all required. */
+export interface SloRiskConfig {
+  warnRatio: number;
+  ewmaAlpha: number;
+  minSamples: number;
+  clearRatio: number;
+  trendHorizon: number;
+}
+
 /** One risk-state transition. All JSON-serializable. */
 export interface SloRiskInfo {
   endpoint: string;
@@ -125,34 +149,118 @@ function checkRatio(name: string, value: number | undefined, def: number, upperI
 }
 
 /**
+ * WR-347: validate SLO-risk options and fill in defaults — the single
+ * validation path shared by construction and `retune()`, so a live
+ * revision is checked by the same five gates (and the same error
+ * text) as startup. Throws `RangeError` on any invalid value.
+ */
+function resolveSloRiskOptions(opts: SloRiskOptions): {
+  warnRatio: number;
+  ewmaAlpha: number;
+  minSamples: number;
+  clearRatio: number;
+  trendHorizon: number;
+  onSloRisk?: (info: SloRiskInfo) => void;
+} {
+  const warnRatio = checkRatio("warnRatio", opts.warnRatio, 0.8, true);
+  const ewmaAlpha = checkRatio("ewmaAlpha", opts.ewmaAlpha, 0.2, true);
+  const minSamples = opts.minSamples ?? 3;
+  if (!Number.isInteger(minSamples) || minSamples < 1) {
+    throw new RangeError(`minSamples must be an integer >= 1, got ${opts.minSamples}`);
+  }
+  const clearRatio = checkRatio("clearRatio", opts.clearRatio, 0.7, false);
+  const trendHorizon = opts.trendHorizon ?? 3;
+  if (!Number.isFinite(trendHorizon) || trendHorizon < 0) {
+    throw new RangeError(`trendHorizon must be >= 0, got ${opts.trendHorizon}`);
+  }
+  return { warnRatio, ewmaAlpha, minSamples, clearRatio, trendHorizon, onSloRisk: opts.onSloRisk };
+}
+
+/**
  * Per-endpoint SLO-breach predictor. One instance serves every endpoint;
  * tenants get separate instances (see `RetryQueue`, mirroring the
  * per-tenant `LatencyTracker`).
+ *
+ * WR-347: the five knobs are live-revisable with `retune()` — no
+ * restart. A retune takes effect on the next `observe`; the
+ * accumulated EWMA state, the `atRisk` latch, the score, and the
+ * prediction are never reset or recomputed by a retune.
  */
 export class SloRiskPredictor {
-  private readonly warnRatio: number;
-  private readonly alpha: number;
-  private readonly minSamples: number;
-  private readonly clearRatio: number;
-  private readonly trendHorizon: number;
+  // WR-347: not readonly — `retune()` replaces the five knobs in
+  // place so they are live-revisable. `onSloRisk` is never revised.
+  private warnRatio: number;
+  private alpha: number;
+  private minSamples: number;
+  private clearRatio: number;
+  private trendHorizon: number;
   private readonly onSloRisk?: (info: SloRiskInfo) => void;
   private readonly endpoints = new Map<string, EndpointState>();
 
   constructor(opts: SloRiskOptions = {}) {
-    this.warnRatio = checkRatio("warnRatio", opts.warnRatio, 0.8, true);
-    this.alpha = checkRatio("ewmaAlpha", opts.ewmaAlpha, 0.2, true);
-    const minSamples = opts.minSamples ?? 3;
-    if (!Number.isInteger(minSamples) || minSamples < 1) {
-      throw new RangeError(`minSamples must be an integer >= 1, got ${opts.minSamples}`);
+    const resolved = resolveSloRiskOptions(opts);
+    this.warnRatio = resolved.warnRatio;
+    this.alpha = resolved.ewmaAlpha;
+    this.minSamples = resolved.minSamples;
+    this.clearRatio = resolved.clearRatio;
+    this.trendHorizon = resolved.trendHorizon;
+    this.onSloRisk = resolved.onSloRisk;
+  }
+
+  /**
+   * WR-347: revise the five SLO-risk knobs at runtime — no restart.
+   * The patch must be a non-empty object; the merged config is
+   * re-validated with the same five gates (and the same error text)
+   * as construction, so an illegal patch throws `RangeError` and the
+   * live values are left completely intact. Revising to the live
+   * values is a silent no-op. Takes effect on the next `observe`:
+   * the EWMA update, the cold-start gate, the forward projection,
+   * and the elevated/cleared gates all read the live values, so a
+   * tightened `warnRatio` elevates on the next observation while a
+   * relaxed one leaves an elevated endpoint elevated until the next
+   * observation re-evaluates it. The accumulated EWMA state
+   * (`backlogEwma`/`trendEwma`), the `atRisk` latch, the score, and
+   * the prediction are never reset or recomputed by a retune —
+   * changing `ewmaAlpha` only changes the smoothing weight of
+   * subsequent observations. Returns the live config.
+   */
+  retune(patch: SloRiskRevision): SloRiskConfig {
+    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new RangeError(`sloRisk revision must be an object, got ${JSON.stringify(patch)}`);
     }
-    this.minSamples = minSamples;
-    this.clearRatio = checkRatio("clearRatio", opts.clearRatio, 0.7, false);
-    const trendHorizon = opts.trendHorizon ?? 3;
-    if (!Number.isFinite(trendHorizon) || trendHorizon < 0) {
-      throw new RangeError(`trendHorizon must be >= 0, got ${opts.trendHorizon}`);
+    if (Object.keys(patch).length === 0) {
+      throw new RangeError("sloRisk revision must not be empty");
     }
-    this.trendHorizon = trendHorizon;
-    this.onSloRisk = opts.onSloRisk;
+    // Validate-then-apply: the merged config must pass the
+    // construction gates before the live values move.
+    const resolved = resolveSloRiskOptions({
+      warnRatio: patch.warnRatio ?? this.warnRatio,
+      ewmaAlpha: patch.ewmaAlpha ?? this.alpha,
+      minSamples: patch.minSamples ?? this.minSamples,
+      clearRatio: patch.clearRatio ?? this.clearRatio,
+      trendHorizon: patch.trendHorizon ?? this.trendHorizon,
+      onSloRisk: this.onSloRisk,
+    });
+    this.warnRatio = resolved.warnRatio;
+    this.alpha = resolved.ewmaAlpha;
+    this.minSamples = resolved.minSamples;
+    this.clearRatio = resolved.clearRatio;
+    this.trendHorizon = resolved.trendHorizon;
+    return this.config();
+  }
+
+  /**
+   * WR-347: the live five-knob config. A snapshot — mutating the
+   * returned object never moves the predictor.
+   */
+  config(): SloRiskConfig {
+    return {
+      warnRatio: this.warnRatio,
+      ewmaAlpha: this.alpha,
+      minSamples: this.minSamples,
+      clearRatio: this.clearRatio,
+      trendHorizon: this.trendHorizon,
+    };
   }
 
   /**
