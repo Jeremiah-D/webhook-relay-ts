@@ -75,6 +75,7 @@ describe("AdaptiveMaxDelay.retune (WR-335)", () => {
       floorMs: 1,
       ceilMs: 1e9,
       minSamples: 1,
+      maxSamplesPerEndpoint: 1024,
       tightenFactor: 0.8,
     });
     assert.equal(c.capFor(URL_A), 2000);
@@ -117,6 +118,7 @@ describe("AdaptiveMaxDelay.retune (WR-335)", () => {
       floorMs: 1,
       ceilMs: 1e9,
       minSamples: 5,
+      maxSamplesPerEndpoint: 1024,
       tightenFactor: 0.8,
     });
     assert.equal(c.capFor(URL_A), 60000); // cold again, resting cap
@@ -252,6 +254,7 @@ describe("AdaptiveMaxDelay.retune (WR-335)", () => {
       floorMs: 1000,
       ceilMs: 240000,
       minSamples: 1,
+      maxSamplesPerEndpoint: 1024,
       tightenFactor: 0.5,
     });
     // The tightened cap was NOT cleared by the failed revisions.
@@ -269,6 +272,7 @@ describe("AdaptiveMaxDelay.retune (WR-335)", () => {
       floorMs: 1000,
       ceilMs: 240000,
       minSamples: 1,
+      maxSamplesPerEndpoint: 1024,
       tightenFactor: 0.8,
     });
   });
@@ -286,6 +290,7 @@ describe("AdaptiveMaxDelay.retune (WR-335)", () => {
       floorMs: 1000,
       ceilMs: 240000,
       minSamples: 10,
+      maxSamplesPerEndpoint: 1024,
       tightenFactor: 0.8,
     };
     assert.deepEqual(c.retune({ marginRatio: 0.5 }), live);
@@ -330,6 +335,7 @@ describe("RetryQueue adaptive max-delay revision (WR-335)", () => {
       floorMs: 1000,
       ceilMs: 240000,
       minSamples: 10,
+      maxSamplesPerEndpoint: 1024,
       tightenFactor: 0.8,
     });
     assert.deepEqual(q.reviseAdaptiveMaxDelay({ marginRatio: 1, minSamples: 5 }), {
@@ -337,6 +343,7 @@ describe("RetryQueue adaptive max-delay revision (WR-335)", () => {
       floorMs: 1000,
       ceilMs: 240000,
       minSamples: 5,
+      maxSamplesPerEndpoint: 1024,
       tightenFactor: 0.8,
     });
     assert.deepEqual(q.getAdaptiveMaxDelayConfig(), {
@@ -344,6 +351,7 @@ describe("RetryQueue adaptive max-delay revision (WR-335)", () => {
       floorMs: 1000,
       ceilMs: 240000,
       minSamples: 5,
+      maxSamplesPerEndpoint: 1024,
       tightenFactor: 0.8,
     });
     q.stop();
@@ -469,6 +477,7 @@ describe("RelayServer adaptive max-delay revision (WR-335)", () => {
     floorMs: 1000,
     ceilMs: 240000,
     minSamples: 10,
+    maxSamplesPerEndpoint: 1024,
     tightenFactor: 0.8,
   };
 
@@ -517,6 +526,7 @@ describe("RelayServer adaptive max-delay revision (WR-335)", () => {
       floorMs: 1000,
       ceilMs: 240000,
       minSamples: 3,
+      maxSamplesPerEndpoint: 1024,
       tightenFactor: 0.8,
     });
     relay.reviseAdaptiveMaxDelay!({ minSamples: 5, tightenFactor: 0.6 });
@@ -525,6 +535,7 @@ describe("RelayServer adaptive max-delay revision (WR-335)", () => {
       floorMs: 1000,
       ceilMs: 240000,
       minSamples: 5,
+      maxSamplesPerEndpoint: 1024,
       tightenFactor: 0.6,
     });
   });

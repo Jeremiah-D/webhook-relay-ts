@@ -57,7 +57,10 @@ function percentile(sorted: number[], p: number): number {
 export class LatencyTracker {
   /** The SLO budget in ms samples are judged against. */
   readonly sloMs: number;
-  private readonly maxSamples: number;
+  // Mutable only via `resize` (WR-352): the window bound is part of
+  // the revision surface, while the per-endpoint sample arrays and the
+  // in-flight accepted clocks are never replaced.
+  private maxSamples: number;
   private readonly now: () => number;
   /** Delivery ids accepted but not yet delivered or discarded. */
   private readonly acceptedAt = new Map<string, number>();
@@ -87,6 +90,32 @@ export class LatencyTracker {
    */
   recordAccepted(id: string): void {
     this.acceptedAt.set(id, this.now());
+  }
+
+  /**
+   * Retune the rolling sample window in place (WR-352, following the
+   * EB-276 `DeliveryLatencyTracker.resize` precedent): shrinking evicts
+   * only the oldest samples past the new bound per endpoint — the same
+   * oldest-first eviction `recordDelivered` applies — and widening
+   * only raises the bound, keeps every sample, and never restores
+   * samples a shrink already evicted. The tracker object, its
+   * per-endpoint sample arrays, and the in-flight accepted clocks are
+   * never replaced, so in-flight deliveries keep the clocks they were
+   * stamped with. An illegal value (non-integer or < 1) throws
+   * `RangeError` and leaves the live window and samples untouched.
+   */
+  resize(newMax: number): void {
+    if (!Number.isInteger(newMax) || newMax < 1) {
+      throw new RangeError(
+        `maxSamplesPerEndpoint must be an integer >= 1, got ${newMax}`
+      );
+    }
+    if (newMax < this.maxSamples) {
+      for (const arr of this.samples.values()) {
+        if (arr.length > newMax) arr.splice(0, arr.length - newMax);
+      }
+    }
+    this.maxSamples = newMax;
   }
 
   /**

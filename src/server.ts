@@ -5771,28 +5771,31 @@ export interface RelayServer extends Server {
   /**
    * WR-335: revise the live adaptive max-delay config at runtime
    * (`marginRatio` / `floorMs` / `ceilMs` / `minSamples` /
-   * `tightenFactor`, partial — omitted fields keep their live
-   * values). The next retry wait is bounded by the recomputed caps;
-   * waits already scheduled keep the cap computed when they were
-   * armed. Raising `minSamples` can return a warm endpoint to cold
-   * (samples < new threshold → falls back to the resting
-   * `maxDelayMs`); lowering keeps warm endpoints warm. An illegal
-   * patch throws `RangeError` and the live values are untouched; an
-   * empty patch is a `RangeError`; a same-value revision is a no-op
-   * with no audit event. A real revision is audited as
-   * `adaptive_max_delay_revised` with `previous` / `current` (the
-   * construction values as first `previous`), and returns the live
-   * config. Always set; throws `Error` when the cap was never
-   * configured — enabling it needs a restart. The one config is
-   * shared by all endpoints: there is no per-endpoint override. This
-   * caps the wait *between* attempts; WR-334 revises the per-attempt
-   * timeout cap instead.
+   * `maxSamplesPerEndpoint` / `tightenFactor`, partial — omitted
+   * fields keep their live values). The next retry wait is bounded by
+   * the recomputed caps; waits already scheduled keep the cap computed
+   * when they were armed. Raising `minSamples` can return a warm
+   * endpoint to cold (samples < new threshold → falls back to the
+   * resting `maxDelayMs`); lowering keeps warm endpoints warm. A
+   * narrowed `maxSamplesPerEndpoint` evicts the oldest samples from
+   * the rolling window in place (WR-352) — the p99 is recomputed from
+   * the surviving samples on the next read; widening keeps every
+   * sample. An illegal patch throws `RangeError` and the live values
+   * are untouched; an empty patch is a `RangeError`; a same-value
+   * revision is a no-op with no audit event. A real revision is
+   * audited as `adaptive_max_delay_revised` with `previous` /
+   * `current` (the construction values as first `previous`), and
+   * returns the live config. Always set; throws `Error` when the cap
+   * was never configured — enabling it needs a restart. The one config
+   * is shared by all endpoints: there is no per-endpoint override.
+   * This caps the wait *between* attempts; WR-334 revises the
+   * per-attempt timeout cap instead.
    */
   reviseAdaptiveMaxDelay?: (patch: AdaptiveMaxDelayRevision) => AdaptiveMaxDelayConfig;
   /**
    * WR-335: live adaptive max-delay config — the five formula inputs
-   * shared by all endpoints. Only set when `adaptiveMaxDelay` was
-   * configured; `undefined` otherwise.
+   * plus the sample window, shared by all endpoints. Only set when
+   * `adaptiveMaxDelay` was configured; `undefined` otherwise.
    */
   getAdaptiveMaxDelayConfig?: () => AdaptiveMaxDelayConfig | undefined;
   /**
@@ -15159,7 +15162,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // restart. A real revision is audited as `adaptive_max_delay_revised`
   // with the previous and current config (the construction values as
   // first `previous`); an empty or same-value patch is a silent
-  // no-op.
+  // no-op. Since WR-352 the config carries six fields — a window-only
+  // revision resizes the tracker in place and is audited the same way.
   server.reviseAdaptiveMaxDelay = (
     patch: AdaptiveMaxDelayRevision
   ): AdaptiveMaxDelayConfig => {
@@ -15176,6 +15180,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       next.floorMs === prev.floorMs &&
       next.ceilMs === prev.ceilMs &&
       next.minSamples === prev.minSamples &&
+      next.maxSamplesPerEndpoint === prev.maxSamplesPerEndpoint &&
       next.tightenFactor === prev.tightenFactor
     ) {
       return next;

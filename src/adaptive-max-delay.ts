@@ -101,23 +101,32 @@ export interface AdaptiveMaxDelayOptions {
  * WR-335: a partial revision of the adaptive max-delay config
  * (`marginRatio` / `floorMs` / `ceilMs` / `minSamples` /
  * `tightenFactor`, at least one field set). Omitted fields keep their
- * live values; an empty patch is a `RangeError`. `maxSamplesPerEndpoint`
- * is deliberately not revisable — changing the sample window would
- * rebuild the LatencyTracker and drop the rolling samples.
+ * live values; an empty patch is a `RangeError`. WR-352 adds
+ * `maxSamplesPerEndpoint`: the sample window is revisable after all —
+ * retune resizes the LatencyTracker in place (oldest samples evicted
+ * on shrink, samples otherwise preserved), so the WR-335 "deliberately
+ * not revisable" exclusion is superseded.
  */
 export type AdaptiveMaxDelayRevision = Partial<
   Pick<
     AdaptiveMaxDelayOptions,
-    "marginRatio" | "floorMs" | "ceilMs" | "minSamples" | "tightenFactor"
+    | "marginRatio"
+    | "floorMs"
+    | "ceilMs"
+    | "minSamples"
+    | "maxSamplesPerEndpoint"
+    | "tightenFactor"
   >
 >;
 
-/** WR-335: live adaptive max-delay config — the five formula inputs, after any revision. */
+/** WR-335: live adaptive max-delay config — the five formula inputs plus the sample window, after any revision. */
 export interface AdaptiveMaxDelayConfig {
   marginRatio: number;
   floorMs: number;
   ceilMs: number;
   minSamples: number;
+  /** Rolling sample window per endpoint (WR-352, live-revisable via resize). */
+  maxSamplesPerEndpoint: number;
   tightenFactor: number;
 }
 
@@ -206,12 +215,15 @@ function assertAdaptiveMaxDelayOptions(
 export class AdaptiveMaxDelay {
   // WR-335: live-revisable via `retune()` (the constructor still
   // validates every value through the same gates), so these are
-  // deliberately not `readonly`. `tracker` stays frozen: retune never
-  // touches the rolling samples or the sample window.
+  // deliberately not `readonly`. WR-352: retune resizes the tracker
+  // in place — the rolling samples survive, oldest-first eviction
+  // only on shrink — so the sample window is revisable without
+  // rebuilding the tracker.
   private marginRatio: number;
   private floorMs: number;
   private ceilMs: number;
   private minSamples: number;
+  private maxSamplesPerEndpoint: number;
   /**
    * The resting cap, read live: endpoints with no samples use it, so a
    * queue-level hot-reload of `maxDelayMs` (WR-32) stays in sync without
@@ -231,6 +243,7 @@ export class AdaptiveMaxDelay {
     this.floorMs = floorMs;
     this.ceilMs = ceilMs;
     this.minSamples = minSamples;
+    this.maxSamplesPerEndpoint = maxSamplesPerEndpoint;
     this.baseMaxDelay =
       typeof baseMaxDelayMs === "function" ? baseMaxDelayMs : () => baseMaxDelayMs;
     this.tightenFactor = tightenFactor;
@@ -247,21 +260,24 @@ export class AdaptiveMaxDelay {
    * WR-335: revise the live config (partial — omitted fields keep
    * their live values). Merge-then-validate reusing the construction
    * gates (`assertAdaptiveMaxDelayOptions`, including the `ceilMs >=
-   * floorMs` cross-check): an illegal patch throws `RangeError` and
-   * the live values are left completely untouched (including the
-   * adapted caps), and an empty patch is a `RangeError`. A patch equal
-   * to the live values is a silent no-op. A real revision updates the
-   * five inputs in place and clears the adapted caps, so the next
-   * `capFor()` recomputes every endpoint from the new formula; the
-   * rolling samples are untouched — p99 is unchanged, only the formula
-   * inputs move. Raising `minSamples` can return a warm endpoint to
-   * cold (samples < new threshold → falls back to the resting
-   * `baseMaxDelay()`); lowering keeps warm endpoints warm. A changed
-   * `tightenFactor` only affects later `recordFailure` tighten steps —
-   * the revision itself clears the caps, so a previously tightened cap
-   * is recomputed from the p99 target on the next read, not
-   * re-tightened at the new factor. Returns the live config after the
-   * revision.
+   * floorMs` cross-check and, since WR-352, the sample-window gate):
+   * an illegal patch throws `RangeError` and the live values are left
+   * completely untouched (including the adapted caps and the rolling
+   * samples), and an empty patch is a `RangeError`. A patch equal to
+   * the live values is a silent no-op. A real revision updates the six
+   * inputs in place, resizes the tracker window in place (oldest
+   * samples evicted on shrink, the rest preserved — the tracker is
+   * never rebuilt), and clears the adapted caps, so the next
+   * `capFor()` recomputes every endpoint from the new formula and the
+   * new window; the rolling samples are otherwise untouched — p99 only
+   * moves when the window itself evicted samples. Raising `minSamples`
+   * can return a warm endpoint to cold (samples < new threshold →
+   * falls back to the resting `baseMaxDelay()`); lowering keeps warm
+   * endpoints warm. A changed `tightenFactor` only affects later
+   * `recordFailure` tighten steps — the revision itself clears the
+   * caps, so a previously tightened cap is recomputed from the p99
+   * target on the next read, not re-tightened at the new factor.
+   * Returns the live config after the revision.
    */
   retune(patch: AdaptiveMaxDelayRevision): AdaptiveMaxDelayConfig {
     if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
@@ -274,10 +290,11 @@ export class AdaptiveMaxDelay {
       patch.floorMs === undefined &&
       patch.ceilMs === undefined &&
       patch.minSamples === undefined &&
+      patch.maxSamplesPerEndpoint === undefined &&
       patch.tightenFactor === undefined
     ) {
       throw new RangeError(
-        "adaptiveMaxDelay revision must set at least one of marginRatio, floorMs, ceilMs, minSamples, tightenFactor"
+        "adaptiveMaxDelay revision must set at least one of marginRatio, floorMs, ceilMs, minSamples, maxSamplesPerEndpoint, tightenFactor"
       );
     }
     const next: AdaptiveMaxDelayConfig = {
@@ -285,6 +302,7 @@ export class AdaptiveMaxDelay {
       floorMs: patch.floorMs ?? this.floorMs,
       ceilMs: patch.ceilMs ?? this.ceilMs,
       minSamples: patch.minSamples ?? this.minSamples,
+      maxSamplesPerEndpoint: patch.maxSamplesPerEndpoint ?? this.maxSamplesPerEndpoint,
       tightenFactor: patch.tightenFactor ?? this.tightenFactor,
     };
     // Validate-then-apply: the merged values must pass the
@@ -296,6 +314,7 @@ export class AdaptiveMaxDelay {
       next.floorMs === this.floorMs &&
       next.ceilMs === this.ceilMs &&
       next.minSamples === this.minSamples &&
+      next.maxSamplesPerEndpoint === this.maxSamplesPerEndpoint &&
       next.tightenFactor === this.tightenFactor
     ) {
       return this.snapshot();
@@ -304,20 +323,28 @@ export class AdaptiveMaxDelay {
     this.floorMs = next.floorMs;
     this.ceilMs = next.ceilMs;
     this.minSamples = next.minSamples;
+    this.maxSamplesPerEndpoint = next.maxSamplesPerEndpoint;
     this.tightenFactor = next.tightenFactor;
+    // A narrowed window rewrites the p99: resize the tracker in
+    // place (oldest samples evicted, the rest preserved — the tracker
+    // object is never rebuilt) and drop the derived caps so the next
+    // capFor() recomputes from the new window. Widening keeps every
+    // sample; the resize is still the only window move.
+    this.tracker.resize(next.maxSamplesPerEndpoint);
     // Derived caps are stale under the new formula: drop them all so
     // the next capFor() recomputes from the surviving samples.
     this.caps.clear();
     return this.snapshot();
   }
 
-  /** WR-335: live config snapshot (the five formula inputs). */
+  /** WR-335: live config snapshot (the five formula inputs plus the sample window). */
   snapshot(): AdaptiveMaxDelayConfig {
     return {
       marginRatio: this.marginRatio,
       floorMs: this.floorMs,
       ceilMs: this.ceilMs,
       minSamples: this.minSamples,
+      maxSamplesPerEndpoint: this.maxSamplesPerEndpoint,
       tightenFactor: this.tightenFactor,
     };
   }

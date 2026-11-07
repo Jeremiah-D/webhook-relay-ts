@@ -10090,9 +10090,9 @@ export class RetryQueue {
 
   /**
    * WR-335: live adaptive max-delay config — the five formula inputs
-   * shared by all endpoints. `undefined` when the feature was never
-   * configured. Reads the live values, so a runtime revision is
-   * visible immediately.
+   * plus the sample window, shared by all endpoints. `undefined` when
+   * the feature was never configured. Reads the live values, so a
+   * runtime revision is visible immediately.
    */
   getAdaptiveMaxDelayConfig(): AdaptiveMaxDelayConfig | undefined {
     return this.adaptiveMaxDelay?.snapshot();

@@ -12795,6 +12795,7 @@ const queue = new RetryQueue({
     floorMs: 1_000, // storm-converged floor (default)
     ceilMs: 240_000, // ceiling, default 4x maxDelayMs
     minSamples: 10, // samples before p99 kicks in (default)
+    maxSamplesPerEndpoint: 1024, // rolling p99 window per endpoint (default)
     tightenFactor: 0.8, // per-failure tighten multiplier (default)
   },
 });
@@ -12815,12 +12816,17 @@ via `queue.getAdaptiveMaxDelayStats()` and `effectiveRetryConfig(url)`.
 
 Live revision (WR-335): `server.reviseAdaptiveMaxDelay(patch)` revises the
 config at runtime (`marginRatio` / `floorMs` / `ceilMs` / `minSamples` /
-`tightenFactor`, partial — omitted fields keep their live values);
+`maxSamplesPerEndpoint` / `tightenFactor`, partial — omitted fields keep their live values);
 `server.getAdaptiveMaxDelayConfig()` returns the live config (the getter
 is only mounted when the feature was configured). A revision clears the
 adapted caps, so the next retry wait is bounded by the cap recomputed from
 the new formula — waits already scheduled keep the cap computed when they
-were armed, and the rolling samples (hence p99) are untouched. An illegal
+were armed, and the rolling samples (hence p99) are untouched. Since
+WR-352 the sample window is revisable too: narrowing
+`maxSamplesPerEndpoint` evicts the oldest samples from the rolling window
+in place (the tracker is never rebuilt), so the p99 is recomputed from the
+surviving samples on the next read; widening keeps every sample and never
+restores samples a shrink already evicted. An illegal
 patch throws `RangeError` and leaves the live config untouched; an empty
 or same-value patch is a silent no-op. A real revision is audited as
 `adaptive_max_delay_revised` with `previous` / `current`. Enabling the
