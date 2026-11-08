@@ -40,6 +40,12 @@
  * under an injected clock. Opt-in: the caller only constructs the
  * tracker when the feature is enabled; unset = zero behavior change.
  *
+ * The eight knobs are live-revisable at runtime via `retune()`
+ * (WR-359): a revision takes effect from the next score evaluation,
+ * never retroactively, and a shrunken sample window truncates at once.
+ * The `RetryQueue` fans a revision out to every live per-tenant
+ * tracker and audits it once as `endpoint_health_revised`.
+ *
  * Zero dependencies. The clock is injectable for deterministic tests.
  */
 
@@ -187,6 +193,49 @@ export function assertValidEndpointHealthOptions(opts: EndpointHealthOptions | u
 }
 
 /**
+ * Live endpoint-health config — the eight revisable knobs (WR-359).
+ */
+export interface EndpointHealthConfig {
+  ewmaAlpha: number;
+  maxLatencySamples: number;
+  sloMs: number;
+  successWeight: number;
+  latencyWeight: number;
+  circuitOpenPenalty: number;
+  degradeThreshold: number;
+  recoverThreshold: number;
+}
+
+/** Partial patch for `EndpointHealthTracker.retune` (WR-359). */
+export type EndpointHealthRevision = Partial<EndpointHealthConfig>;
+
+export interface EndpointHealthRevisedAuditEvent {
+  event: "endpoint_health_revised";
+  /** The live config before the revision. */
+  previous: EndpointHealthConfig;
+  /** The live config after the revision. */
+  current: EndpointHealthConfig;
+}
+
+/**
+ * The live config behind an options object: explicit knobs win, the
+ * rest fall back to the construction defaults. Shared by the tracker
+ * constructor and `retune()` so both read the same defaults.
+ */
+export function endpointHealthConfigOf(opts: EndpointHealthOptions): EndpointHealthConfig {
+  return {
+    ewmaAlpha: opts.ewmaAlpha ?? 0.2,
+    maxLatencySamples: opts.maxLatencySamples ?? 256,
+    sloMs: opts.sloMs ?? 5000,
+    successWeight: opts.successWeight ?? 0.7,
+    latencyWeight: opts.latencyWeight ?? 0.3,
+    circuitOpenPenalty: opts.circuitOpenPenalty ?? 100,
+    degradeThreshold: opts.degradeThreshold ?? 40,
+    recoverThreshold: opts.recoverThreshold ?? 70,
+  };
+}
+
+/**
  * Fired once per degradation episode: the endpoint's score fell strictly
  * below `degradeThreshold`. All JSON-serializable.
  */
@@ -280,14 +329,20 @@ function percentile(sorted: number[], p: number): number {
  * opaque string).
  */
 export class EndpointHealthTracker {
-  private readonly ewmaAlpha: number;
-  private readonly maxLatencySamples: number;
-  private readonly sloMs: number;
-  private readonly successWeight: number;
-  private readonly latencyWeight: number;
-  private readonly circuitOpenPenalty: number;
-  private readonly degradeThreshold: number;
-  private readonly recoverThreshold: number;
+  // WR-359: live-revisable via `retune()` (the constructor still
+  // validates every value through the same gates), so these are
+  // deliberately not `readonly`. Every scorer reads them live:
+  // `latencyTerm` reads `sloMs`, `scoreOf` reads the weights and the
+  // open penalty, `evaluate` reads the thresholds, and `recordOutcome`
+  // caps the sample window at the live `maxLatencySamples`.
+  private ewmaAlpha: number;
+  private maxLatencySamples: number;
+  private sloMs: number;
+  private successWeight: number;
+  private latencyWeight: number;
+  private circuitOpenPenalty: number;
+  private degradeThreshold: number;
+  private recoverThreshold: number;
   private readonly onEndpointDegraded?: (info: EndpointDegradedInfo) => void;
   private readonly onEndpointRecovered?: (info: EndpointRecoveredInfo) => void;
   private readonly circuitState: (endpoint: string) => CircuitState;
@@ -296,18 +351,130 @@ export class EndpointHealthTracker {
 
   constructor(opts: EndpointHealthOptions = {}) {
     assertValidEndpointHealthOptions(opts);
-    this.ewmaAlpha = opts.ewmaAlpha ?? 0.2;
-    this.maxLatencySamples = opts.maxLatencySamples ?? 256;
-    this.sloMs = opts.sloMs ?? 5000;
-    this.successWeight = opts.successWeight ?? 0.7;
-    this.latencyWeight = opts.latencyWeight ?? 0.3;
-    this.circuitOpenPenalty = opts.circuitOpenPenalty ?? 100;
-    this.degradeThreshold = opts.degradeThreshold ?? 40;
-    this.recoverThreshold = opts.recoverThreshold ?? 70;
+    const cfg = endpointHealthConfigOf(opts);
+    this.ewmaAlpha = cfg.ewmaAlpha;
+    this.maxLatencySamples = cfg.maxLatencySamples;
+    this.sloMs = cfg.sloMs;
+    this.successWeight = cfg.successWeight;
+    this.latencyWeight = cfg.latencyWeight;
+    this.circuitOpenPenalty = cfg.circuitOpenPenalty;
+    this.degradeThreshold = cfg.degradeThreshold;
+    this.recoverThreshold = cfg.recoverThreshold;
     this.onEndpointDegraded = opts.onEndpointDegraded;
     this.onEndpointRecovered = opts.onEndpointRecovered;
     this.circuitState = opts.circuitState ?? (() => "closed");
     this.now = opts.now ?? Date.now;
+  }
+
+  /**
+   * WR-359: revise the live scoring knobs (partial — omitted fields
+   * keep their live values). Merge-then-validate reusing the
+   * construction gates (`assertValidEndpointHealthOptions`, including
+   * the strict degrade < recover gap on the merged values): an illegal
+   * patch throws `RangeError` and the live values are left completely
+   * untouched, and an empty patch is a `RangeError`. A patch equal to
+   * the live values is a silent no-op. A real revision updates the
+   * eight knobs in place and takes effect from the next score
+   * evaluation — already-recorded EWMA / samples / degraded state /
+   * `consecutiveLowScores` are untouched (lowering the degrade line
+   * never retroactively degrades, raising it never re-admits; an
+   * in-flight endpoint flips only when its next evaluation runs
+   * against the new thresholds). A shrunken `maxLatencySamples`
+   * truncates every rolling sample window to the newest N at once, so
+   * the p95 term of the next evaluation already reflects the new
+   * window. The callbacks, the clock, and the circuit-state provider
+   * are never rebound by a revision. Returns the live config after
+   * the revision.
+   */
+  retune(patch: EndpointHealthRevision): EndpointHealthConfig {
+    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new RangeError(
+        `endpoint health revision must be an object, got ${JSON.stringify(patch)}`
+      );
+    }
+    if (
+      patch.ewmaAlpha === undefined &&
+      patch.maxLatencySamples === undefined &&
+      patch.sloMs === undefined &&
+      patch.successWeight === undefined &&
+      patch.latencyWeight === undefined &&
+      patch.circuitOpenPenalty === undefined &&
+      patch.degradeThreshold === undefined &&
+      patch.recoverThreshold === undefined
+    ) {
+      throw new RangeError(
+        "endpoint health revision must set at least one of ewmaAlpha, maxLatencySamples, sloMs, successWeight, latencyWeight, circuitOpenPenalty, degradeThreshold, recoverThreshold"
+      );
+    }
+    const next: EndpointHealthConfig = {
+      ewmaAlpha: patch.ewmaAlpha ?? this.ewmaAlpha,
+      maxLatencySamples: patch.maxLatencySamples ?? this.maxLatencySamples,
+      sloMs: patch.sloMs ?? this.sloMs,
+      successWeight: patch.successWeight ?? this.successWeight,
+      latencyWeight: patch.latencyWeight ?? this.latencyWeight,
+      circuitOpenPenalty: patch.circuitOpenPenalty ?? this.circuitOpenPenalty,
+      degradeThreshold: patch.degradeThreshold ?? this.degradeThreshold,
+      recoverThreshold: patch.recoverThreshold ?? this.recoverThreshold,
+    };
+    // Validate-then-apply: the merged values must pass the
+    // construction gates before any live value moves. The callbacks,
+    // clock, and circuit-state provider carry over untouched.
+    assertValidEndpointHealthOptions({
+      ...next,
+      now: this.now,
+      circuitState: this.circuitState,
+      onEndpointDegraded: this.onEndpointDegraded,
+      onEndpointRecovered: this.onEndpointRecovered,
+    });
+    if (
+      next.ewmaAlpha === this.ewmaAlpha &&
+      next.maxLatencySamples === this.maxLatencySamples &&
+      next.sloMs === this.sloMs &&
+      next.successWeight === this.successWeight &&
+      next.latencyWeight === this.latencyWeight &&
+      next.circuitOpenPenalty === this.circuitOpenPenalty &&
+      next.degradeThreshold === this.degradeThreshold &&
+      next.recoverThreshold === this.recoverThreshold
+    ) {
+      return this.snapshotConfig();
+    }
+    const samplesShrank = next.maxLatencySamples < this.maxLatencySamples;
+    this.ewmaAlpha = next.ewmaAlpha;
+    this.maxLatencySamples = next.maxLatencySamples;
+    this.sloMs = next.sloMs;
+    this.successWeight = next.successWeight;
+    this.latencyWeight = next.latencyWeight;
+    this.circuitOpenPenalty = next.circuitOpenPenalty;
+    this.degradeThreshold = next.degradeThreshold;
+    this.recoverThreshold = next.recoverThreshold;
+    // A shrunken sample window truncates at once: the p95 term of the
+    // next evaluation already reflects the new window.
+    if (samplesShrank) {
+      for (const s of this.endpoints.values()) {
+        if (s.samples.length > this.maxLatencySamples) {
+          s.samples.splice(0, s.samples.length - this.maxLatencySamples);
+        }
+      }
+    }
+    return this.snapshotConfig();
+  }
+
+  /**
+   * WR-359: live endpoint-health config snapshot (the eight knobs).
+   * Named `snapshotConfig` — plain `snapshot()` is the per-endpoint
+   * rows view below.
+   */
+  snapshotConfig(): EndpointHealthConfig {
+    return {
+      ewmaAlpha: this.ewmaAlpha,
+      maxLatencySamples: this.maxLatencySamples,
+      sloMs: this.sloMs,
+      successWeight: this.successWeight,
+      latencyWeight: this.latencyWeight,
+      circuitOpenPenalty: this.circuitOpenPenalty,
+      degradeThreshold: this.degradeThreshold,
+      recoverThreshold: this.recoverThreshold,
+    };
   }
 
   private stateFor(endpoint: string): EndpointState {

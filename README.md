@@ -590,7 +590,27 @@ reliability primitives that matter for any signed-payload pipeline.
   low-score count per endpoint, and
   `relay_endpoint_health_score{endpoint}` reports the live score.
   Event-driven (no timers), so the whole thing is deterministic under an
-  injected clock.
+  injected clock. Live revision (WR-359):
+  `server.reviseEndpointHealth(patch)` revises the eight scoring knobs
+  (`ewmaAlpha` / `maxLatencySamples` / `sloMs` / `successWeight` /
+  `latencyWeight` / `circuitOpenPenalty` / `degradeThreshold` /
+  `recoverThreshold`, partial — omitted fields keep their live values);
+  `server.getEndpointHealthConfig()` returns the live config (the
+  getter is only mounted when `endpointHealth` was configured). The
+  revision fans out to every live per-tenant tracker and to the
+  queue-level options (tenants born later start from the revised
+  values); the new knobs govern the next score evaluation —
+  already-recorded EWMA / samples / degraded state /
+  `consecutiveLowScores` are untouched, and a shrunken
+  `maxLatencySamples` truncates every rolling sample window at once. An
+  illegal patch throws `RangeError` and leaves the live values
+  untouched; an empty or same-value patch is a silent no-op. A real
+  revision is audited exactly once as `endpoint_health_revised` with
+  `previous` / `current`. Enabling scoring when it was never configured
+  still requires a restart. Covered by `test/endpoint-health.test.ts`
+  and `test/endpoint-health-revision.test.ts` (14 tests: threshold and
+  weight flips, SLO and sample-window effects, multi-tenant fan-out,
+  late-born tenants, no-op and must-restart cases, server audit).
 - `src/audit.ts` — append-only JSONL audit log (`append` / `readAll`) plus an
   indexed query (`query({ event, endpoint, since, until, limit })`): a lazily
   maintained line-offset index maps each complete line to its `ts`/`event`/

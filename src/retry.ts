@@ -121,9 +121,13 @@ import {
 import {
   EndpointHealthTracker,
   assertValidEndpointHealthOptions,
+  endpointHealthConfigOf,
   type EndpointDegradedInfo,
+  type EndpointHealthConfig,
   type EndpointHealthMetricsInput,
   type EndpointHealthOptions,
+  type EndpointHealthRevisedAuditEvent,
+  type EndpointHealthRevision,
   type EndpointHealthStatsRow,
   type EndpointRecoveredInfo,
 } from "./endpoint-health.ts";
@@ -584,11 +588,14 @@ export type { EncryptedPayload, PayloadEncryptor };
 export type { EndpointLatencyStats, LatencyTrackerOptions };
 export type { SloRiskConfig, SloRiskInfo, SloRiskObservation, SloRiskOptions, SloRiskRevision };
 export type { FieldMask, FieldMaskRule, MaskStrategy };
-export { EndpointHealthTracker, assertValidEndpointHealthOptions };
+export { EndpointHealthTracker, assertValidEndpointHealthOptions, endpointHealthConfigOf };
 export type {
   EndpointDegradedInfo,
+  EndpointHealthConfig,
   EndpointHealthMetricsInput,
   EndpointHealthOptions,
+  EndpointHealthRevisedAuditEvent,
+  EndpointHealthRevision,
   EndpointHealthStatsRow,
   EndpointRecoveredInfo,
 };
@@ -2141,6 +2148,15 @@ export interface RetryQueueOptions {
    * routes these into the audit log; library users get the hook directly.
    */
   onProbeAudit?: (event: ProbeAuditEvent) => void;
+  /**
+   * WR-359: called exactly once per real `reviseEndpointHealth`
+   * revision with the `endpoint_health_revised` event (previous /
+   * current config, all eight knobs). The server routes it into the
+   * audit log; library users get the hook directly. Not called for a
+   * same-value or empty patch (those never reach this hook — the
+   * former is a silent no-op, the latter throws `RangeError`).
+   */
+  onEndpointHealthAudit?: (event: EndpointHealthRevisedAuditEvent) => void;
   /**
    * Called after `updateEndpointConfig` applies a hot-reload patch, with
    * the endpoint and the before/after diff of every patched field. The
@@ -4226,9 +4242,12 @@ export class RetryQueue {
   /** WR-71: SLO-risk options; undefined when disabled. WR-347: live-revisable — `reviseSloRisk` replaces this with the merged options so tenants born later start from the revised values. */
   private sloRiskOpts?: SloRiskOptions;
   private readonly endpointHealths = new Map<string, EndpointHealthTracker>();
-  private readonly endpointHealthOpts?: EndpointHealthOptions;
+  /** WR-179: endpoint-health options; undefined when disabled. WR-359: live-revisable — `reviseEndpointHealth` replaces this with the merged options so tenants born later start from the revised values. */
+  private endpointHealthOpts?: EndpointHealthOptions;
   private readonly onEndpointDegraded?: (info: EndpointDegradedInfo) => void;
   private readonly onEndpointRecovered?: (info: EndpointRecoveredInfo) => void;
+  /** WR-359: receives the single `endpoint_health_revised` audit event per real revision. */
+  private readonly onEndpointHealthAudit?: (event: EndpointHealthRevisedAuditEvent) => void;
   private readonly onSloRisk?: (info: SloRiskInfo) => void;
   /**
    * WR-71: per-(tenant, endpoint) pending deliveries (queued + in-flight
@@ -5183,6 +5202,7 @@ export class RetryQueue {
     this.endpointHealthOpts = opts.endpointHealth;
     this.onEndpointDegraded = opts.endpointHealth?.onEndpointDegraded;
     this.onEndpointRecovered = opts.endpointHealth?.onEndpointRecovered;
+    this.onEndpointHealthAudit = opts.onEndpointHealthAudit;
     if (this.endpointHealthOpts !== undefined) {
       new EndpointHealthTracker(this.endpointHealthOpts);
     }
@@ -6620,6 +6640,106 @@ export class RetryQueue {
    */
   getProbeConfig(): ProbeConfig | undefined {
     return this.prober?.snapshot();
+  }
+
+  /**
+   * WR-359: revise the live endpoint-health scoring knobs (partial —
+   * omitted fields keep their live values). Validate-then-apply at the
+   * queue level first: the merged config must pass the construction
+   * gates (`assertValidEndpointHealthOptions`, including the strict
+   * degrade < recover gap) before any live tracker moves, so an
+   * illegal patch throws `RangeError` and every tracker — and the
+   * queue-level options — stay completely untouched; an empty patch is
+   * a `RangeError`; revising to the live values is a silent no-op with
+   * no audit event. A real revision updates the queue-level options
+   * (tenants born later start from the revised values) and retunes
+   * every live per-tenant tracker in place: the new knobs govern the
+   * next score evaluation — already-recorded EWMA / samples / degraded
+   * state / `consecutiveLowScores` are untouched, and a shrunken
+   * `maxLatencySamples` truncates every rolling sample window at once.
+   * The revision is audited exactly once as
+   * `endpoint_health_revised` with `previous` / `current` (all eight
+   * knobs), via the `onEndpointHealthAudit` channel. Throws `Error`
+   * when health scoring was never configured — enabling it needs a
+   * restart. The degrade / recover callbacks are revised separately
+   * (not part of this patch); the circuit-state provider is never
+   * rebound. Returns the live config.
+   */
+  reviseEndpointHealth(patch: EndpointHealthRevision): EndpointHealthConfig {
+    if (this.endpointHealthOpts === undefined) {
+      throw new Error(
+        "reviseEndpointHealth: endpoint health scoring is not configured — enabling it requires a restart: " +
+          "the trackers are created at startup and a running relay cannot start scoring endpoints without one"
+      );
+    }
+    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new RangeError(
+        `endpoint health revision must be an object, got ${JSON.stringify(patch)}`
+      );
+    }
+    const previous = endpointHealthConfigOf(this.endpointHealthOpts);
+    const next: EndpointHealthConfig = {
+      ewmaAlpha: patch.ewmaAlpha ?? previous.ewmaAlpha,
+      maxLatencySamples: patch.maxLatencySamples ?? previous.maxLatencySamples,
+      sloMs: patch.sloMs ?? previous.sloMs,
+      successWeight: patch.successWeight ?? previous.successWeight,
+      latencyWeight: patch.latencyWeight ?? previous.latencyWeight,
+      circuitOpenPenalty: patch.circuitOpenPenalty ?? previous.circuitOpenPenalty,
+      degradeThreshold: patch.degradeThreshold ?? previous.degradeThreshold,
+      recoverThreshold: patch.recoverThreshold ?? previous.recoverThreshold,
+    };
+    // Validate-then-apply: the merged values must pass the
+    // construction gates before any live tracker moves. The merge above
+    // is pure (no side effects, cannot throw); the empty-patch check
+    // follows it, then the gates.
+    if (
+      patch.ewmaAlpha === undefined &&
+      patch.maxLatencySamples === undefined &&
+      patch.sloMs === undefined &&
+      patch.successWeight === undefined &&
+      patch.latencyWeight === undefined &&
+      patch.circuitOpenPenalty === undefined &&
+      patch.degradeThreshold === undefined &&
+      patch.recoverThreshold === undefined
+    ) {
+      throw new RangeError(
+        "endpoint health revision must set at least one of ewmaAlpha, maxLatencySamples, sloMs, successWeight, latencyWeight, circuitOpenPenalty, degradeThreshold, recoverThreshold"
+      );
+    }
+    assertValidEndpointHealthOptions({ ...this.endpointHealthOpts, ...next });
+    if (
+      next.ewmaAlpha === previous.ewmaAlpha &&
+      next.maxLatencySamples === previous.maxLatencySamples &&
+      next.sloMs === previous.sloMs &&
+      next.successWeight === previous.successWeight &&
+      next.latencyWeight === previous.latencyWeight &&
+      next.circuitOpenPenalty === previous.circuitOpenPenalty &&
+      next.degradeThreshold === previous.degradeThreshold &&
+      next.recoverThreshold === previous.recoverThreshold
+    ) {
+      return { ...previous };
+    }
+    this.endpointHealthOpts = { ...this.endpointHealthOpts, ...next };
+    for (const tracker of this.endpointHealths.values()) {
+      tracker.retune(patch);
+    }
+    this.onEndpointHealthAudit?.({
+      event: "endpoint_health_revised",
+      previous,
+      current: { ...next },
+    });
+    return { ...next };
+  }
+
+  /**
+   * WR-359: live endpoint-health config — the eight scoring knobs.
+   * `undefined` when health scoring was never configured. Reads the
+   * live values, so a runtime revision is visible immediately.
+   */
+  getEndpointHealthConfig(): EndpointHealthConfig | undefined {
+    return this.endpointHealthOpts === undefined
+      ? undefined
+      : endpointHealthConfigOf(this.endpointHealthOpts);
   }
 
   /**

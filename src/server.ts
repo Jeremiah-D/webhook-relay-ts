@@ -48,7 +48,9 @@ import type {
 import type { PhaseDurationsMs } from "./retry.ts";
 import type {
   EndpointDegradedInfo,
+  EndpointHealthConfig,
   EndpointHealthOptions,
+  EndpointHealthRevision,
   EndpointRecoveredInfo,
 } from "./retry.ts";
 import type { StalePauseOptions } from "./retry.ts";
@@ -5896,6 +5898,37 @@ export interface RelayServer extends Server {
    */
   getProxyHealthConfig?: () => ProxyHealthConfig | undefined;
   /**
+   * WR-359: revise the live outbound endpoint health scoring knobs at
+   * runtime (`ewmaAlpha` / `maxLatencySamples` / `sloMs` /
+   * `successWeight` / `latencyWeight` / `circuitOpenPenalty` /
+   * `degradeThreshold` / `recoverThreshold`, partial — omitted fields
+   * keep their live values). The revision fans out to every live
+   * per-tenant tracker and to the queue-level options (tenants born
+   * later start from the revised values); the new knobs govern the
+   * next score evaluation — already-recorded EWMA / samples / degraded
+   * state / `consecutiveLowScores` are untouched, and a shrunken
+   * `maxLatencySamples` truncates every rolling sample window at once.
+   * An illegal patch throws `RangeError` and the live values are
+   * untouched; an empty patch is a `RangeError`; a same-value revision
+   * is a no-op with no audit event. A real revision is audited as
+   * `endpoint_health_revised` with `previous` / `current` (all eight
+   * knobs), via the queue's `onEndpointHealthAudit` → audit-log
+   * channel, and returns the live config. Always set; throws `Error`
+   * when `endpointHealth` was never configured — enabling it needs a
+   * restart. The degrade / recover callbacks are not part of this
+   * patch, and the circuit-state provider is never rebound. Orthogonal
+   * to WR-179 (which owns the scoring mechanism itself), WR-201 (which
+   * reads scores to tune weights — this tunes the scores themselves),
+   * and WR-10 (the circuit-breaker trip decision, untouched here).
+   */
+  reviseEndpointHealth?: (patch: EndpointHealthRevision) => EndpointHealthConfig;
+  /**
+   * WR-359: live outbound endpoint health config — the eight scoring
+   * knobs. Only set when `endpointHealth` was configured; `undefined`
+   * otherwise.
+   */
+  getEndpointHealthConfig?: () => EndpointHealthConfig | undefined;
+  /**
    * WR-357: revise the live fail2ban thresholds at runtime
    * (`maxConsecutiveFailures` / `banDurationMs` / `maxEntries`,
    * partial — omitted fields keep their live values). The new values
@@ -8461,6 +8494,13 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     onProbeAudit: (event) => {
       opts.auditLog.append(event);
       opts.retry?.onProbeAudit?.(event);
+    },
+    // WR-359: route the single `endpoint_health_revised` audit event
+    // per real revision into the audit log (and on to the caller's
+    // hook, like onProbeAudit above).
+    onEndpointHealthAudit: (event) => {
+      opts.auditLog.append(event);
+      opts.retry?.onEndpointHealthAudit?.(event);
     },
     // Wrap the caller's hook so every starvation-guard activation is
     // audited, not just observed.
@@ -15430,6 +15470,25 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // `proxyHealth` was configured.
   if (proxyHealthMonitor !== undefined) {
     server.getProxyHealthConfig = (): ProxyHealthConfig => proxyHealthMonitor.snapshot();
+  }
+
+  // WR-359: outbound endpoint health scoring knob runtime revision.
+  // The method is always set (like reviseProxyHealth above); with
+  // endpointHealth unconfigured the queue throws the canonical
+  // must-restart Error — enabling it needs a restart. The audit event
+  // `endpoint_health_revised` (with the previous and current config,
+  // all eight knobs) is emitted by the queue via the
+  // `onEndpointHealthAudit` → audit-log channel, so a real revision
+  // is audited exactly once; an empty or same-value patch is a silent
+  // no-op.
+  server.reviseEndpointHealth = (patch: EndpointHealthRevision): EndpointHealthConfig =>
+    queue.reviseEndpointHealth(patch);
+
+  // WR-359: live outbound endpoint health config. Only set when
+  // `endpointHealth` was configured.
+  if (queue.getEndpointHealthConfig() !== undefined) {
+    server.getEndpointHealthConfig = (): EndpointHealthConfig =>
+      queue.getEndpointHealthConfig()!;
   }
 
   // WR-357: fail2ban threshold runtime revision. The method is always
