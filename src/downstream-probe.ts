@@ -83,6 +83,22 @@ export interface ProbeOptions {
   lookup?: LookupFunction;
 }
 
+/**
+ * WR-355: a partial revision of the downstream probe cadence
+ * (`intervalMs` / `timeoutMs` / `method`, at least one field set).
+ * Omitted fields keep their live values; an empty patch is a
+ * `RangeError`. The probed endpoint list stays fixed at construction
+ * — only the rhythm moves.
+ */
+export type ProbeRevision = Partial<Pick<ProbeOptions, "intervalMs" | "timeoutMs" | "method">>;
+
+/** WR-355: live downstream probe config — the three cadence knobs, after any revision. */
+export interface ProbeConfig {
+  intervalMs: number;
+  timeoutMs: number;
+  method: "HEAD" | "GET";
+}
+
 /** Payload of the `probe_failed` audit event. */
 export interface ProbeFailedAuditEvent {
   event: "probe_failed";
@@ -174,6 +190,28 @@ function defaultProbeRequest(
   });
 }
 
+/**
+ * Shared gates for the three probe cadence knobs, used by the
+ * constructor and by `retune()` (WR-355): merge-then-validate means a
+ * revision is judged against the same rules as construction, so an
+ * illegal patch throws `RangeError` before any live value moves.
+ */
+function assertValidProbeCadence(
+  intervalMs: number,
+  timeoutMs: number,
+  method: "HEAD" | "GET"
+): void {
+  if (!Number.isFinite(intervalMs) || intervalMs <= 0) {
+    throw new RangeError(`probe.intervalMs must be a finite number > 0, got ${intervalMs}`);
+  }
+  if (method !== "HEAD" && method !== "GET") {
+    throw new RangeError(`probe.method must be "HEAD" or "GET", got ${JSON.stringify(method)}`);
+  }
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new RangeError(`probe.timeoutMs must be a finite number > 0, got ${timeoutMs}`);
+  }
+}
+
 interface ProbeRecord {
   success: number;
   failure: number;
@@ -191,9 +229,12 @@ interface ProbeRecord {
  */
 export class DownstreamProber {
   private readonly endpoints: string[];
-  private readonly intervalMs: number;
-  private readonly method: "HEAD" | "GET";
-  private readonly timeoutMs: number;
+  // WR-355: live-revisable via `retune()` (the constructor still
+  // validates every value through the same gates), so these are
+  // deliberately not `readonly`. The probed endpoint list stays fixed.
+  private intervalMs: number;
+  private method: "HEAD" | "GET";
+  private timeoutMs: number;
   private readonly setTimer: (fn: () => void, ms: number) => ProbeTimerHandle;
   private readonly clearTimer: (handle: ProbeTimerHandle) => void;
   private readonly probeRequest: (endpoint: string, method: "HEAD" | "GET") => Promise<boolean>;
@@ -224,26 +265,22 @@ export class DownstreamProber {
     }
     this.endpoints = [...endpoints];
     this.intervalMs = rest.intervalMs ?? 30_000;
-    if (!Number.isFinite(this.intervalMs) || this.intervalMs <= 0) {
-      throw new RangeError(`probe.intervalMs must be a finite number > 0, got ${rest.intervalMs}`);
-    }
     this.method = rest.method ?? "HEAD";
-    if (this.method !== "HEAD" && this.method !== "GET") {
-      throw new RangeError(`probe.method must be "HEAD" or "GET", got ${JSON.stringify(rest.method)}`);
-    }
     this.timeoutMs = rest.timeoutMs ?? 5_000;
-    if (!Number.isFinite(this.timeoutMs) || this.timeoutMs <= 0) {
-      throw new RangeError(`probe.timeoutMs must be a finite number > 0, got ${rest.timeoutMs}`);
-    }
+    assertValidProbeCadence(this.intervalMs, this.timeoutMs, this.method);
     this.setTimer = rest.setTimer ?? defaultSetTimer;
     this.clearTimer = rest.clearTimer ?? ((h) => h.clear());
-    const timeoutMs = this.timeoutMs;
     if (rest.lookup !== undefined && typeof rest.lookup !== "function") {
       throw new RangeError("probe.lookup must be a function");
     }
+    // WR-355: the default probe reads `this.timeoutMs` live at call
+    // time instead of capturing the construction value, so a
+    // `timeoutMs` revision takes effect on the next round without
+    // rebinding — and an injected custom `probeRequest` is untouched
+    // by `timeoutMs` revisions, exactly as before.
     this.probeRequest =
       rest.probeRequest ??
-      ((endpoint, method) => defaultProbeRequest(endpoint, method, timeoutMs, rest.lookup));
+      ((endpoint, method) => defaultProbeRequest(endpoint, method, this.timeoutMs, rest.lookup));
     this.recordOutcome = recordOutcome;
     this.onAudit = onAudit;
     for (const ep of this.endpoints) {
@@ -269,6 +306,77 @@ export class DownstreamProber {
         rec.timer = undefined;
       }
     }
+  }
+
+  /**
+   * WR-355: revise the live probe cadence (partial — omitted fields
+   * keep their live values). Merge-then-validate reusing the
+   * construction gates (`assertValidProbeCadence`): an illegal patch
+   * throws `RangeError` and the live values are left completely
+   * untouched, and an empty patch is a `RangeError`. A patch equal to
+   * the live values is a silent no-op. A real revision updates the
+   * three knobs in place: when the prober is running and `intervalMs`
+   * changed, every pending timer is re-armed at the new interval
+   * (clear + reschedule — no extra round, and the `running` /
+   * `success` / `failure` / `consecutiveFailures` counts are
+   * untouched); an unstarted prober picks the new values up on the
+   * next `start()`. `method` / `timeoutMs` changes take effect from
+   * the next round — the default probe request reads the live
+   * `timeoutMs` at call time, while an injected custom `probeRequest`
+   * is unaffected by `timeoutMs`. In-flight rounds settle on their
+   * original flow (not cancelled, not re-sent). The probed endpoint
+   * list never moves. Returns the live config after the revision.
+   */
+  retune(patch: ProbeRevision): ProbeConfig {
+    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new RangeError(`probe revision must be an object, got ${JSON.stringify(patch)}`);
+    }
+    if (
+      patch.intervalMs === undefined &&
+      patch.timeoutMs === undefined &&
+      patch.method === undefined
+    ) {
+      throw new RangeError(
+        "probe revision must set at least one of intervalMs, timeoutMs, method"
+      );
+    }
+    const next: ProbeConfig = {
+      intervalMs: patch.intervalMs ?? this.intervalMs,
+      timeoutMs: patch.timeoutMs ?? this.timeoutMs,
+      method: patch.method ?? this.method,
+    };
+    // Validate-then-apply: the merged values must pass the
+    // construction gates before any live value moves.
+    assertValidProbeCadence(next.intervalMs, next.timeoutMs, next.method);
+    if (
+      next.intervalMs === this.intervalMs &&
+      next.timeoutMs === this.timeoutMs &&
+      next.method === this.method
+    ) {
+      return this.snapshot();
+    }
+    const intervalChanged = next.intervalMs !== this.intervalMs;
+    this.intervalMs = next.intervalMs;
+    this.timeoutMs = next.timeoutMs;
+    this.method = next.method;
+    // A running prober re-arms every pending timer at the new
+    // interval. `schedule()` clears the old timer first, so no round
+    // is duplicated; an in-flight round keeps settling on its own and
+    // its `tick()` re-arms afterwards as usual. Unchanged intervals
+    // leave the pending countdowns alone.
+    if (this.running && intervalChanged) {
+      for (const ep of this.endpoints) this.schedule(ep);
+    }
+    return this.snapshot();
+  }
+
+  /** WR-355: live probe config snapshot (the three cadence knobs). */
+  snapshot(): ProbeConfig {
+    return {
+      intervalMs: this.intervalMs,
+      timeoutMs: this.timeoutMs,
+      method: this.method,
+    };
   }
 
   /**

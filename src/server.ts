@@ -509,7 +509,7 @@ import {
   OutboundSchemaViolationError,
   type OutboundSchemaMetrics,
 } from "./outbound-schema.ts";
-import type { ProbeOptions } from "./downstream-probe.ts";
+import type { ProbeConfig, ProbeOptions, ProbeRevision } from "./downstream-probe.ts";
 import {
   ProxyHealthMonitor,
   type ProxyHealthOptions,
@@ -5804,6 +5804,34 @@ export interface RelayServer extends Server {
    * `adaptiveMaxDelay` was configured; `undefined` otherwise.
    */
   getAdaptiveMaxDelayConfig?: () => AdaptiveMaxDelayConfig | undefined;
+  /**
+   * WR-355: revise the live downstream probe cadence at runtime
+   * (`intervalMs` / `timeoutMs` / `method`, partial — omitted fields
+   * keep their live values). A running prober re-arms its pending
+   * timers at the new interval (no extra round, probe counts
+   * untouched); an unstarted prober picks the new values up on the
+   * next start. `method` / `timeoutMs` changes take effect from the
+   * next round — the default probe request reads the live `timeoutMs`
+   * at call time, while an injected custom `probeRequest` is
+   * unaffected by `timeoutMs`. An in-flight round settles on its
+   * original flow. An illegal patch throws `RangeError` and the live
+   * values are untouched; an empty patch is a `RangeError`; a
+   * same-value revision is a no-op with no audit event. A real
+   * revision is audited as `probe_revised` with `previous` / `current`
+   * (the construction values as first `previous`), and returns the
+   * live config. Always set; throws `Error` when probing was never
+   * configured — enabling it needs a restart. The probed endpoint
+   * list is fixed at construction and never moves; this revises only
+   * the rhythm. Orthogonal to WR-331 (which revises the circuit
+   * breaker's half-open probe knobs) and to WR-10 (which owns the
+   * trip / cooldown decision, untouched here).
+   */
+  reviseProbe?: (patch: ProbeRevision) => ProbeConfig;
+  /**
+   * WR-355: live downstream probe config — the three cadence knobs.
+   * Only set when `probe` was configured; `undefined` otherwise.
+   */
+  getProbeConfig?: () => ProbeConfig | undefined;
   /**
    * WR-337: revise the live adaptive concurrency config at runtime
    * (`minLimit` / `maxLimit` / `initialLimit` / `increaseStep` /
@@ -15235,6 +15263,42 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   if (queue.getAdaptiveMaxDelayConfig() !== undefined) {
     server.getAdaptiveMaxDelayConfig = (): AdaptiveMaxDelayConfig =>
       queue.getAdaptiveMaxDelayConfig()!;
+  }
+
+  // WR-355: downstream probe cadence runtime revision. The method is
+  // always set (like reviseAdaptiveMaxDelay above); with probing
+  // unconfigured the queue throws Error — enabling it needs a
+  // restart. A real revision is audited as `probe_revised` with the
+  // previous and current config (the construction values as first
+  // `previous`); an empty or same-value patch is a silent no-op.
+  server.reviseProbe = (patch: ProbeRevision): ProbeConfig => {
+    const prev = queue.getProbeConfig();
+    if (prev === undefined) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseProbe(patch);
+    }
+    // Validate-then-apply inside retune: an illegal patch throws
+    // RangeError and the live values are left completely intact.
+    const next = queue.reviseProbe(patch);
+    if (
+      next.intervalMs === prev.intervalMs &&
+      next.timeoutMs === prev.timeoutMs &&
+      next.method === prev.method
+    ) {
+      return next;
+    }
+    opts.auditLog.append({
+      event: "probe_revised",
+      previous: prev,
+      current: next,
+    });
+    return next;
+  };
+
+  // WR-355: live downstream probe config. Only set when `probe` was
+  // configured.
+  if (queue.getProbeConfig() !== undefined) {
+    server.getProbeConfig = (): ProbeConfig => queue.getProbeConfig()!;
   }
 
   // WR-337: adaptive concurrency config runtime revision. The method is

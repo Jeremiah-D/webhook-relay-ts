@@ -1097,6 +1097,18 @@ reliability primitives that matter for any signed-payload pipeline.
   `relay_probe_consecutive_failures{endpoint}`; `getProbeStats()` reports
   per-endpoint counters. A throwing probe implementation counts as a
   failure, never a crash. Invalid configs throw `RangeError` at startup.
+  Live revision (WR-355): `server.reviseProbe(patch)` revises the cadence
+  (`intervalMs` / `timeoutMs` / `method`, partial — omitted fields keep
+  their live values); `server.getProbeConfig()` returns the live config
+  (the getter is only mounted when probing was configured). A running
+  prober re-arms its pending timers at the new interval (no extra round,
+  probe counts untouched); `method` / `timeoutMs` changes take effect
+  from the next round, and an in-flight round settles on its original
+  flow. An illegal patch throws `RangeError` and leaves the live config
+  untouched; an empty or same-value patch is a silent no-op. A real
+  revision is audited as `probe_revised` with `previous` / `current`.
+  Enabling probing when it was never configured still requires a
+  restart, and the probed endpoint list stays fixed at construction.
   (Not to be confused with the keep-alive pool's *connection* health
   probing, `OutboundConnectionPool({ healthProbe })`, which culls dead
   idle sockets before reuse.)
