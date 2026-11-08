@@ -6913,6 +6913,36 @@ export interface RelayServer extends Server {
     tenant?: string
   ) => Array<{ endpoint: string } & { thresholds: ResolvedCircuitThresholds; overridden: boolean }>;
   /**
+   * WR-363: revise the fleet-wide circuit-breaker defaults at runtime
+   * (`failureThreshold` / `cooldownMs` / `tripMode` /
+   * `errorRateWindowSize` / `errorRateThreshold` /
+   * `errorRateMinSamples`) — the fallback every endpoint without its
+   * own override trips on. The patch merges over the live defaults
+   * and the merged result is validated as a unit; an illegal patch
+   * throws `RangeError` and the live defaults are untouched, a
+   * same-value revision is a no-op with no audit event. A real
+   * revision is audited as `circuit_breaker_defaults_revised` with
+   * the `previous` / `current` six-field sets, and returns the live
+   * defaults. Always set; throws `Error` when the circuit breaker was
+   * never configured — enabling it needs a restart. Per-endpoint
+   * overrides (WR-319) keep winning and are fully unaffected; the
+   * half-open probe knobs are not in this revision's scope (WR-331
+   * owns those). An already-open endpoint keeps its state /
+   * `openedAtMs` / trips and wakes on its already-scheduled recheck;
+   * the new cooldown applies from the next trip; a window shrink
+   * trims the stored outcomes at once.
+   */
+  reviseCircuitBreakerDefaults: (
+    patch: CircuitThresholdPatch
+  ) => ResolvedCircuitThresholds;
+  /**
+   * WR-363: the live fleet-wide circuit-breaker defaults — the
+   * constructor options resolved against the built-in defaults, with
+   * any runtime revision applied. Only set when the circuit breaker
+   * was configured; `undefined` otherwise.
+   */
+  getCircuitBreakerDefaults?: () => ResolvedCircuitThresholds | undefined;
+  /**
    * WR-331: revise one endpoint's live half-open probe knobs at
    * runtime — no restart. The patch merges over the endpoint's live
    * effective probe values; an illegal patch (or an empty patch)
@@ -17061,6 +17091,44 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       tenant?: string
     ): Array<{ endpoint: string } & { thresholds: ResolvedCircuitThresholds; overridden: boolean }> =>
       queue.getCircuitBreakers(tenant);
+  }
+
+  // WR-363: live fleet-wide circuit-breaker defaults revision. The
+  // queue does the validate-then-apply work (RangeError on an illegal
+  // merged patch, live defaults untouched); this layer only owns the
+  // "must restart" Error (the queue throws it when the feature was
+  // never configured) and the audit: a real revision appends
+  // `circuit_breaker_defaults_revised` with the previous / current
+  // six-field sets, a same-value revision is a silent no-op. The
+  // breaker re-reads the live defaults on every trip decision and
+  // cooldown check, so no timer is re-armed here — an already-open
+  // endpoint keeps its `openedAtMs` and wakes on its
+  // already-scheduled recheck.
+  server.reviseCircuitBreakerDefaults = (
+    patch: CircuitThresholdPatch
+  ): ResolvedCircuitThresholds => {
+    const previous = queue.getCircuitBreakerDefaults();
+    if (previous === undefined) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseCircuitBreakerDefaults(patch);
+    }
+    const next = queue.reviseCircuitBreakerDefaults(patch);
+    if (sameCircuitThresholds(previous, next)) {
+      return next;
+    }
+    opts.auditLog.append({
+      event: "circuit_breaker_defaults_revised",
+      previous,
+      current: next,
+    });
+    return next;
+  };
+
+  // WR-363: live fleet-wide circuit-breaker defaults reads. Only set
+  // when `retry.circuitBreaker` was configured.
+  if (queue.circuitBreakerConfigured()) {
+    server.getCircuitBreakerDefaults = (): ResolvedCircuitThresholds | undefined =>
+      queue.getCircuitBreakerDefaults();
   }
 
   // WR-331: live half-open probe revision / removal for one

@@ -175,9 +175,11 @@ interface CircuitRecord {
  * (possibly partial) inputs and `where` names the call site in error
  * messages; `base` supplies the already-resolved defaults the partial
  * values merge over. Throws `RangeError` on any illegal value and
- * returns the fully resolved thresholds.
+ * returns the fully resolved thresholds. Exported for the queue's
+ * global-default revision (WR-363), which merges a patch over the
+ * live defaults with exactly this validation.
  */
-function resolveCircuitThresholds(
+export function resolveCircuitThresholds(
   values: CircuitThresholdPatch,
   where: string,
   base: ResolvedCircuitThresholds
@@ -241,13 +243,28 @@ const CIRCUIT_DEFAULTS: ResolvedCircuitThresholds = {
   errorRateMinSamples: 10,
 };
 
+/**
+ * Resolve raw constructor options into the effective global defaults
+ * (WR-363): the same merge the constructor performs, so the queue can
+ * read the live defaults without building a breaker first.
+ */
+export function resolveCircuitBreakerOptions(
+  opts: CircuitBreakerOptions
+): ResolvedCircuitThresholds {
+  return resolveCircuitThresholds(opts, "constructor", CIRCUIT_DEFAULTS);
+}
+
 export class EndpointCircuitBreaker {
-  private readonly failureThreshold: number;
-  private readonly tripMode: CircuitTripMode;
-  private readonly errorRateWindowSize: number;
-  private readonly errorRateThreshold: number;
-  private readonly errorRateMinSamples: number;
-  private readonly cooldownMs: number;
+  // WR-363: the six trip/cooldown fields are deliberately *not*
+  // readonly — `retuneDefaults` replaces the fleet-wide defaults at
+  // runtime. The half-open probe knobs below stay readonly: their
+  // live revision is per-endpoint only (WR-331).
+  private failureThreshold: number;
+  private tripMode: CircuitTripMode;
+  private errorRateWindowSize: number;
+  private errorRateThreshold: number;
+  private errorRateMinSamples: number;
+  private cooldownMs: number;
   private readonly halfOpenMaxInFlight: number;
   private readonly halfOpenRetryMs: number;
   private readonly nowMs: () => number;
@@ -321,6 +338,30 @@ export class EndpointCircuitBreaker {
     const rec = this.records.get(endpoint);
     if (rec !== undefined) {
       while (rec.window.length > effective.errorRateWindowSize) rec.window.shift();
+    }
+  }
+
+  /**
+   * WR-363: replace the constructor-default thresholds live — the
+   * fleet-wide defaults behind `thresholdsFor` for every endpoint
+   * without its own override. `resolved` must already be validated
+   * (the queue resolves the patch with `resolveCircuitThresholds`
+   * before calling here), so this never throws. Already-built
+   * breakers keep their state, records and trips; only a shrunk
+   * window trims the stored outcomes at once (same trim as
+   * `setEndpointThresholds`). Per-endpoint overrides are untouched
+   * and keep winning over the new defaults; the half-open probe
+   * knobs are untouched (WR-331 owns those).
+   */
+  retuneDefaults(resolved: ResolvedCircuitThresholds): void {
+    this.failureThreshold = resolved.failureThreshold;
+    this.tripMode = resolved.tripMode;
+    this.errorRateWindowSize = resolved.errorRateWindowSize;
+    this.errorRateThreshold = resolved.errorRateThreshold;
+    this.errorRateMinSamples = resolved.errorRateMinSamples;
+    this.cooldownMs = resolved.cooldownMs;
+    for (const rec of this.records.values()) {
+      while (rec.window.length > resolved.errorRateWindowSize) rec.window.shift();
     }
   }
 

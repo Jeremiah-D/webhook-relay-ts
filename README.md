@@ -1066,7 +1066,19 @@ reliability primitives that matter for any signed-payload pipeline.
   already-scheduled recheck; a tightened cooldown applies from the
   next trip. All four methods are `tenant`-scoped (omitted means the
   default tenant); revising with the breaker unconfigured throws
-  `Error` — enabling it needs a restart. WR-331 adds the server-side
+  `Error` — enabling it needs a restart. WR-363 adds the server-side
+  live revision of the fleet-wide defaults themselves:
+  `reviseCircuitBreakerDefaults(patch)` merges a
+  `CircuitThresholdPatch` over the live defaults (illegal merged
+  values throw `RangeError` and leave the live defaults untouched; a
+  same-value revision is a silent no-op) and audits
+  `circuit_breaker_defaults_revised` with the `previous` / `current`
+  six-field sets; `getCircuitBreakerDefaults()` reports the live
+  defaults (only set when the breaker was configured). A revision
+  retunes every already-built tenant breaker in place and tenants
+  born later start from the new defaults; per-endpoint overrides
+  (WR-319) keep winning and are fully unaffected, and the half-open
+  probe knobs are untouched (WR-331 owns those). WR-331 adds the server-side
   live revision of the half-open probe knobs, orthogonal to WR-319
   (thresholds vs. probe pacing, no shared fields):
   `reviseEndpointCircuitProbe(endpoint, patch, tenant?)` merges a

@@ -22,7 +22,7 @@ import {
   type StalePauseOptions,
   type StalePauseSweepResult,
 } from "./stale-pause.ts";
-import { EndpointCircuitBreaker, type CircuitBreakerOptions, type CircuitProbeRevision, type CircuitState, type CircuitStats, type CircuitThresholdPatch, type ResolvedCircuitProbe, type ResolvedCircuitThresholds } from "./circuit.ts";
+import { EndpointCircuitBreaker, resolveCircuitBreakerOptions, resolveCircuitThresholds, type CircuitBreakerOptions, type CircuitProbeRevision, type CircuitState, type CircuitStats, type CircuitThresholdPatch, type ResolvedCircuitProbe, type ResolvedCircuitThresholds } from "./circuit.ts";
 import {
   EndpointBulkheads,
   BulkheadRejectedError,
@@ -4097,7 +4097,12 @@ export class RetryQueue {
    * costs nothing.
    */
   private readonly breakers = new Map<string, EndpointCircuitBreaker>();
-  private readonly circuitBreakerOpts?: CircuitBreakerOptions;
+  // WR-363: deliberately *not* readonly — `reviseCircuitBreakerDefaults`
+  // replaces the stored options (resolved thresholds over the raw
+  // constructor options) so tenants born later start from the revised
+  // defaults. The raw knobs (`nowMs`, `onStateChange`, half-open
+  // pacing) are preserved across revisions.
+  private circuitBreakerOpts?: CircuitBreakerOptions;
   /**
    * WR-148: per-tenant slow-start ramp controllers, keyed by tenant
    * instance key; `undefined` options mean the feature is off.
@@ -12014,6 +12019,69 @@ export class RetryQueue {
       thresholds: breaker.thresholdsFor(endpoint),
       overridden: breaker.hasEndpointOverride(endpoint),
     };
+  }
+
+  /**
+   * WR-363: revise the fleet-wide circuit-breaker defaults at runtime
+   * — the queue-side setter behind
+   * `RelayServer.reviseCircuitBreakerDefaults`. The patch merges over
+   * the live defaults and the merged result is validated as a unit by
+   * `resolveCircuitThresholds` — an illegal patch throws `RangeError`
+   * and the live defaults are left completely intact. The stored
+   * options are updated first (so a tenant's breaker built later
+   * starts from the new defaults), then every already-built breaker
+   * is retuned in place via `EndpointCircuitBreaker.retuneDefaults`
+   * (state, `openedAtMs` and trips kept; a shrunk window trims the
+   * stored outcomes at once). Per-endpoint overrides keep winning:
+   * `thresholdsFor` reads the override first, and an override stores
+   * the resolved effective full set, so a covered endpoint is fully
+   * unaffected by a defaults revision. A patch that lands on the
+   * current defaults is a silent no-op. The next trip decision for
+   * an uncovered endpoint judges by the new defaults; an already-open
+   * endpoint keeps its state and wakes on its already-scheduled
+   * recheck (the new cooldown applies from the next trip); in-flight
+   * probes settle under the old half-open slot (probe knobs are not
+   * in this revision's scope — WR-331 owns those). Throws `Error`
+   * when the circuit breaker was never configured — enabling it
+   * needs a restart. Returns the live resolved defaults.
+   */
+  reviseCircuitBreakerDefaults(patch: CircuitThresholdPatch): ResolvedCircuitThresholds {
+    if (this.circuitBreakerOpts === undefined) {
+      throw new Error(
+        "reviseCircuitBreakerDefaults: circuit breaker is not configured — enabling it requires a restart: " +
+          "the breaker is created at startup and a running relay cannot start breaking without one"
+      );
+    }
+    const current = resolveCircuitBreakerOptions(this.circuitBreakerOpts);
+    const next = resolveCircuitThresholds(patch, "reviseCircuitBreakerDefaults", current);
+    if (
+      next.failureThreshold === current.failureThreshold &&
+      next.cooldownMs === current.cooldownMs &&
+      next.tripMode === current.tripMode &&
+      next.errorRateWindowSize === current.errorRateWindowSize &&
+      next.errorRateThreshold === current.errorRateThreshold &&
+      next.errorRateMinSamples === current.errorRateMinSamples
+    ) {
+      return current;
+    }
+    this.circuitBreakerOpts = { ...this.circuitBreakerOpts, ...next };
+    for (const breaker of this.breakers.values()) {
+      breaker.retuneDefaults(next);
+    }
+    return next;
+  }
+
+  /**
+   * WR-363: the live fleet-wide circuit-breaker defaults — the
+   * constructor options resolved against the built-in defaults, with
+   * any runtime revision applied. `undefined` when the circuit
+   * breaker was never configured. Read-only: unlike the setter it
+   * never creates a breaker, so a read cannot conjure state. Reads
+   * the live values, so a runtime revision is visible immediately.
+   */
+  getCircuitBreakerDefaults(): ResolvedCircuitThresholds | undefined {
+    if (this.circuitBreakerOpts === undefined) return undefined;
+    return resolveCircuitBreakerOptions(this.circuitBreakerOpts);
   }
 
   /**
