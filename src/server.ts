@@ -68,7 +68,7 @@ import {
   type ResolvedHttpHardening,
 } from "./http-hardening.ts";
 import type { LatencyPhaseOptions, OrderedAuditEvent, OrderedModeOptions } from "./retry.ts";
-import type { BulkheadRevision, BulkheadRevisionSnapshot, CircuitProbeRevision, CircuitThresholdPatch, DeliveryWindowListEntry, DeliveryWindowSnapshot, EndpointConcurrencySnapshot, EndpointQuotaSnapshot, EndpointRetryBudgetSnapshot, EndpointRetryPolicyRevision, GlobalConcurrencyStats, GlobalRateLimitRevision, GlobalRateLimitStats, HolidayCalendarConfig, HolidayCalendarSnapshot, MinNormalShareSnapshot, ResolvedCircuitProbe, ResolvedCircuitThresholds, ResolvedEndpointRetryPolicy, StatusRetryPolicyConfig, TenantConcurrencySnapshot, TenantRetryBudgetRevision } from "./retry.ts";
+import type { BulkheadRevision, BulkheadRevisionSnapshot, CircuitProbeRevision, CircuitThresholdPatch, DeliveryWindowListEntry, DeliveryWindowSnapshot, EndpointConcurrencySnapshot, EndpointQuotaSnapshot, EndpointRetryBudgetSnapshot, EndpointRetryPolicyRevision, GlobalConcurrencyStats, GlobalRateLimitRevision, GlobalRateLimitStats, HolidayCalendarConfig, HolidayCalendarSnapshot, MinNormalShareSnapshot, ResolvedCircuitProbe, ResolvedCircuitThresholds, ResolvedEndpointRetryPolicy, StatusRetryPolicyConfig, TenantBudgetSnapshot, TenantConcurrencySnapshot, TenantRetryBudgetRevision } from "./retry.ts";
 import {
   DEFAULT_STATUS_RETRY_MULTIPLIER,
   assertValidStatusRetryPolicy,
@@ -6643,6 +6643,49 @@ export interface RelayServer extends Server {
    * Always set.
    */
   removeTenantRetryBudget: (tenant: string) => boolean;
+  /**
+   * WR-362: revise one tenant's monthly delivery budget at runtime
+   * (deliveries per UTC month). With `tenant` omitted the default
+   * tenant moves — the allowance every tenant without a budget would
+   * otherwise not have (unlimited tenants stay unlimited until
+   * revised); with a tenant given, that tenant's allowance moves (or
+   * is set). The next dispatch judges by the new allowance; a
+   * dispatch already parked keeps its month-boundary re-arm (never
+   * released early), in-flight attempts are unaffected, and the
+   * counted usage is never recomputed. Check order: tenant id, then
+   * budget, then apply — an illegal tenant id (`TypeError` /
+   * `RangeError`) or budget (`RangeError`) leaves the live budget
+   * untouched; a same-value revision is a no-op with no audit
+   * event. A real revision is audited as `tenant_budget_revised`
+   * with `tenant` / `previous` (undefined on a first revision) /
+   * `current` allowances, and returns the live snapshot. Always set
+   * — the enforcer is always constructed, so there is no "not
+   * configured" branch (unlike `reviseTenantRetryBudget`): revising
+   * a tenant from unlimited works like any other. Other tenants, the
+   * global budget (WR-38/WR-314) and the per-tenant / endpoint retry
+   * budgets (WR-326/WR-327) are untouched. This budgets delivery
+   * *volume* per month — the WR-326 per-tenant retry budget gates
+   * retries per minute, a different billing dimension.
+   */
+  reviseTenantBudget: (
+    tenant: string | undefined,
+    deliveriesPerMonth: number
+  ) => TenantBudgetSnapshot;
+  /**
+   * WR-362: live per-tenant monthly delivery-budget read — the
+   * configured allowance for `tenant` (or the default tenant when
+   * omitted), or `undefined` when the tenant is unlimited. Always
+   * set — the enforcer is always constructed.
+   */
+  getTenantBudget?: (tenant?: string) => TenantBudgetSnapshot | undefined;
+  /**
+   * WR-362: remove one tenant's monthly delivery budget at runtime —
+   * the tenant falls back to unlimited. Returns `true` when a
+   * budget was removed (audited as `tenant_budget_removed` with
+   * `tenant` and the removed allowance as `previous`), `false` when
+   * the tenant had no budget. Always set.
+   */
+  removeTenantBudget: (tenant: string) => boolean;
   /**
    * WR-324: revise the urgent fast-lane rate at runtime (the
    * per-second token budget shared by every endpoint's bucket). The
@@ -16651,6 +16694,57 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       tenant?: string
     ): TenantRetryBudgetRevision | undefined => queue.getTenantRetryBudget(tenant);
   }
+
+  // WR-362: per-tenant monthly delivery-budget runtime revision.
+  // The method is always set (like reviseTenantConcurrency above);
+  // the enforcer is always constructed, so there is no "not
+  // configured" branch — a revision from unlimited works like any
+  // other. A real revision is audited as `tenant_budget_revised`
+  // with the tenant and the previous (undefined on a first revision)
+  // and current allowances; a same-value revision is a silent
+  // no-op.
+  server.reviseTenantBudget = (
+    tenant: string | undefined,
+    deliveriesPerMonth: number
+  ): TenantBudgetSnapshot => {
+    const previous = queue.getTenantBudget(tenant);
+    // Validate-then-apply inside the queue revision: an illegal
+    // tenant id or budget throws RangeError and the live budget is
+    // left completely intact.
+    const next = queue.reviseTenantBudget(tenant, deliveriesPerMonth);
+    if (next.deliveriesPerMonth === previous?.deliveriesPerMonth) {
+      return next;
+    }
+    opts.auditLog.append({
+      event: "tenant_budget_revised",
+      tenant: next.tenant,
+      previous: previous?.deliveriesPerMonth,
+      current: next.deliveriesPerMonth,
+    });
+    return next;
+  };
+
+  // WR-362: per-tenant monthly delivery-budget removal. Always set;
+  // a tenant without a budget returns false silently. A real
+  // removal audits `tenant_budget_removed` with the tenant and the
+  // removed allowance as `previous`.
+  server.removeTenantBudget = (tenant: string): boolean => {
+    const previous = queue.getTenantBudget(tenant);
+    if (previous === undefined) return false;
+    queue.removeTenantBudget(tenant);
+    opts.auditLog.append({
+      event: "tenant_budget_removed",
+      tenant,
+      previous: previous.deliveriesPerMonth,
+    });
+    return true;
+  };
+
+  // WR-362: live per-tenant monthly delivery-budget reads. Always
+  // set; the enforcer is always constructed.
+  server.getTenantBudget = (
+    tenant?: string
+  ): TenantBudgetSnapshot | undefined => queue.getTenantBudget(tenant);
 
   // WR-324: relay-level urgent fast-lane rate runtime revision. The
   // method is always set (like setGlobalConcurrency above); the

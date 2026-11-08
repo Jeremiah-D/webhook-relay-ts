@@ -211,6 +211,7 @@ import {
   type TenantBudgetOptions,
   type TenantBudgetStatsRow,
 } from "./budget.ts";
+import { DEFAULT_TENANT } from "./usage.ts";
 import {
   OrderedTracker,
   assertValidOrderedConfig,
@@ -620,6 +621,7 @@ export type {
   TenantBudgetOptions,
   TenantBudgetStatsRow,
   TenantBudgetStats,
+  TenantBudgetSnapshot,
 };
 export type { ReplayEgressOptions, ReplayEgressConfig, ReplayEgressRevision };
 export { ReplayEgressGate, DEFAULT_REPLAY_EGRESS_RPS };
@@ -3985,6 +3987,27 @@ export class LaneScheduler {
 export interface TenantBudgetStats extends TenantBudgetStatsRow {
   /** Dispatches rescheduled because the tenant was over budget (cumulative). */
   delayed: number;
+}
+
+/**
+ * WR-362: the live monthly delivery budget for one tenant — the
+ * snapshot `RelayServer.reviseTenantBudget` / `getTenantBudget`
+ * return. `previous` is the allowance before the revision
+ * (`undefined` on a first revision); a tenant without a configured
+ * budget has no snapshot at all (`getTenantBudget` returns
+ * `undefined`), so `overridden` is always `true` here — the flag
+ * exists so the shape stays uniform with the other revision
+ * snapshots (WR-326/WR-327/WR-328).
+ */
+export interface TenantBudgetSnapshot {
+  /** Tenant id, or `"default"` for the default tenant. */
+  tenant: string;
+  /** Configured monthly delivery allowance. */
+  deliveriesPerMonth: number;
+  /** Allowance before the revision; `undefined` on a first revision. */
+  previous?: number;
+  /** Always `true`: a snapshot only exists for a configured budget. */
+  overridden: boolean;
 }
 
 /**
@@ -12854,6 +12877,73 @@ export class RetryQueue {
       ...row,
       delayed: this.budgetDelayed.get(row.tenant) ?? 0,
     }));
+  }
+
+  /**
+   * WR-362: revise one tenant's live monthly delivery budget — the
+   * queue-side setter behind `RelayServer.reviseTenantBudget`. The
+   * enforcer is always constructed, so there is no "not configured"
+   * branch (unlike `reviseTenantRetryBudget`): revising a tenant
+   * from unlimited works like any other. Check order: tenant id,
+   * then budget, then apply — an illegal tenant id
+   * (`TypeError`/`RangeError`) or budget (`RangeError`) leaves the
+   * live budget completely untouched. Revising to the tenant's
+   * current allowance is a silent no-op. The next dispatch judges
+   * by the new allowance — a tenant already past the tightened
+   * allowance parks its next dispatch, a loosened tenant's next
+   * dispatch goes out at once; a dispatch already parked keeps its
+   * month-boundary re-arm (never released early), in-flight
+   * attempts are unaffected, and the counted `used` is never
+   * recomputed (the month rollover alone zeroes it, re-arming the
+   * `budget_exceeded` audit under the new allowance). Other tenants
+   * and the global / endpoint / tenant retry budgets (WR-38 /
+   * WR-314 / WR-326 / WR-327) are untouched. `tenant` omitted
+   * revises the default tenant (`"default"`). Returns the live
+   * snapshot (`previous` = the allowance before the revision —
+   * `undefined` on a first revision).
+   */
+  reviseTenantBudget(
+    tenant: string | undefined,
+    deliveriesPerMonth: number
+  ): TenantBudgetSnapshot {
+    const key = tenant ?? DEFAULT_TENANT;
+    const previous = this.budget.budgetFor(key);
+    if (previous === deliveriesPerMonth) {
+      // Same-value revision: a no-op that does not even touch the
+      // row's last-active stamp.
+      return { tenant: key, deliveriesPerMonth: previous, previous, overridden: true };
+    }
+    // Validate-then-apply inside the enforcer: an illegal tenant id
+    // or budget throws and the live budget is left completely intact.
+    this.budget.setTenantBudget(key, { deliveriesPerMonth });
+    return { tenant: key, deliveriesPerMonth, previous, overridden: true };
+  }
+
+  /**
+   * WR-362: the live monthly delivery budget for one tenant — the
+   * configured allowance, or `undefined` when the tenant is
+   * unlimited. Read-only: unlike the setter it never creates a row,
+   * so a read cannot conjure state. Reads the live value, so a
+   * runtime revision is visible immediately. `tenant` omitted reads
+   * the default tenant (`"default"`).
+   */
+  getTenantBudget(tenant?: string): TenantBudgetSnapshot | undefined {
+    const key = tenant ?? DEFAULT_TENANT;
+    const budget = this.budget.budgetFor(key);
+    if (budget === undefined) return undefined;
+    return { tenant: key, deliveriesPerMonth: budget, previous: budget, overridden: true };
+  }
+
+  /**
+   * WR-362: drop one tenant's monthly delivery budget so it falls
+   * back to unlimited. Returns `false` when the tenant carried no
+   * budget (including a malformed tenant id, which never throws
+   * here); `true` when a budget was removed.
+   */
+  removeTenantBudget(tenant: string): boolean {
+    if (this.budget.budgetFor(tenant) === undefined) return false;
+    this.budget.clearTenantBudget(tenant);
+    return true;
   }
 
   /**

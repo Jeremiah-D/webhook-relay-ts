@@ -3879,6 +3879,21 @@ queue.setTenantBudget("globex", { deliveriesPerMonth: 500 }); // runtime change,
   until the first budget is configured). Invalid budgets throw
   `RangeError` at configuration; the clock is injectable for
   deterministic tests.
+- **Live revision (WR-362)** — `relay.reviseTenantBudget(tenant,
+  deliveriesPerMonth)` revises one tenant's allowance at runtime (omit
+  `tenant` for the default tenant); `relay.getTenantBudget(tenant?)`
+  reads the live allowance (`undefined` when unlimited) and
+  `relay.removeTenantBudget(tenant)` drops the tenant back to
+  unlimited. A real revision is audited as `tenant_budget_revised`
+  (tenant, previous — `undefined` on a first revision — current); a
+  removal as `tenant_budget_removed`. A same-value revision is a silent
+  no-op; an illegal tenant id or budget throws `RangeError` and leaves
+  the live budget untouched. The next dispatch judges by the new
+  allowance; a dispatch already parked keeps its month-boundary re-arm
+  (never released early), in-flight attempts are unaffected, and the
+  counted usage is never recomputed. This budgets delivery *volume* per
+  month — distinct from the WR-326 per-tenant retry budget, which gates
+  retries per minute (a scheduling gate, not a billing allowance).
 
 ## Endpoint failover (active/standby)
 
