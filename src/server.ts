@@ -67,7 +67,7 @@ import {
   type HttpHardeningOptions,
   type ResolvedHttpHardening,
 } from "./http-hardening.ts";
-import type { OrderedAuditEvent, OrderedModeOptions } from "./retry.ts";
+import type { LatencyPhaseOptions, OrderedAuditEvent, OrderedModeOptions } from "./retry.ts";
 import type { BulkheadRevision, BulkheadRevisionSnapshot, CircuitProbeRevision, CircuitThresholdPatch, DeliveryWindowListEntry, DeliveryWindowSnapshot, EndpointConcurrencySnapshot, EndpointQuotaSnapshot, EndpointRetryBudgetSnapshot, EndpointRetryPolicyRevision, GlobalConcurrencyStats, GlobalRateLimitRevision, GlobalRateLimitStats, HolidayCalendarConfig, HolidayCalendarSnapshot, MinNormalShareSnapshot, ResolvedCircuitProbe, ResolvedCircuitThresholds, ResolvedEndpointRetryPolicy, StatusRetryPolicyConfig, TenantConcurrencySnapshot, TenantRetryBudgetRevision } from "./retry.ts";
 import {
   DEFAULT_STATUS_RETRY_MULTIPLIER,
@@ -5813,6 +5813,30 @@ export interface RelayServer extends Server {
    * `adaptiveMaxDelay` was configured; `undefined` otherwise.
    */
   getAdaptiveMaxDelayConfig?: () => AdaptiveMaxDelayConfig | undefined;
+  /**
+   * WR-360: revise the live latency-phase sample window at runtime
+   * (`maxSamplesPerEndpoint`, the per-(endpoint, phase) rolling window
+   * bound). A narrowed window evicts the oldest samples from every
+   * already-built per-tenant tracker in place (WR-352 precedent) — the
+   * p50/p95 are recomputed from the surviving samples on the next
+   * read; widening keeps every sample. Tenants born later start at the
+   * new window at once; `recordPhases` keeps rolling at the new bound
+   * from the next sample. An illegal value throws `RangeError` and the
+   * live values are untouched; a same-value revision is a no-op with no
+   * audit event. A real revision is audited as
+   * `latency_phases_revised` with `previous` / `current` (the
+   * construction value as first `previous`), and returns the live
+   * options. Always set; throws `Error` when phase tracking was never
+   * configured — enabling it needs a restart. The one window is shared
+   * by all endpoints and tenants: there is no per-endpoint override.
+   */
+  reviseLatencyPhases?: (maxSamplesPerEndpoint: number) => LatencyPhaseOptions;
+  /**
+   * WR-360: live latency-phase options — the sample window bound.
+   * Only set when `latencyPhases` was configured; `undefined`
+   * otherwise.
+   */
+  getLatencyPhaseOptions?: () => LatencyPhaseOptions | undefined;
   /**
    * WR-355: revise the live downstream probe cadence at runtime
    * (`intervalMs` / `timeoutMs` / `method`, partial — omitted fields
@@ -15393,6 +15417,39 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   if (queue.getAdaptiveMaxDelayConfig() !== undefined) {
     server.getAdaptiveMaxDelayConfig = (): AdaptiveMaxDelayConfig =>
       queue.getAdaptiveMaxDelayConfig()!;
+  }
+
+  // WR-360: latency-phase sample-window runtime revision. The method
+  // is always set (like reviseAdaptiveMaxDelay above); with phase
+  // tracking unconfigured the queue throws Error — enabling it needs a
+  // restart. A real revision is audited as `latency_phases_revised`
+  // with the previous and current options (the construction value as
+  // first `previous`); a same-value revision is a silent no-op.
+  server.reviseLatencyPhases = (maxSamplesPerEndpoint: number): LatencyPhaseOptions => {
+    const prev = queue.getLatencyPhaseOptions();
+    if (prev === undefined) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseLatencyPhases(maxSamplesPerEndpoint);
+    }
+    // Validate-then-apply inside revise: an illegal value throws
+    // RangeError and the live values are left completely intact.
+    const next = queue.reviseLatencyPhases(maxSamplesPerEndpoint);
+    if (next.maxSamplesPerEndpoint === prev.maxSamplesPerEndpoint) {
+      return next;
+    }
+    opts.auditLog.append({
+      event: "latency_phases_revised",
+      previous: prev,
+      current: next,
+    });
+    return next;
+  };
+
+  // WR-360: live latency-phase options. Only set when
+  // `retry.latencyPhases` was configured.
+  if (queue.getLatencyPhaseOptions() !== undefined) {
+    server.getLatencyPhaseOptions = (): LatencyPhaseOptions =>
+      queue.getLatencyPhaseOptions()!;
   }
 
   // WR-355: downstream probe cadence runtime revision. The method is

@@ -4378,8 +4378,8 @@ export class RetryQueue {
   private readonly deliveryReceiptOpts?: DeliveryReceiptOptions;
   /** WR-94: per-tenant adaptive concurrency controllers (WR-48 scoping). */
   private readonly adaptiveConcurrencies = new Map<string, AdaptiveConcurrencyController>();
-  /** WR-95: latency phase options; undefined when disabled. */
-  private readonly latencyPhasesOpts?: LatencyPhaseOptions;
+  /** WR-95: latency phase options; undefined when disabled. Mutable only via `reviseLatencyPhases` (WR-360) — the stored options are what lazily-built per-tenant trackers are constructed from, so a revision must reach tenants born later. */
+  private latencyPhasesOpts?: LatencyPhaseOptions;
   /** WR-95: per-tenant latency phase trackers (WR-48 scoping). */
   private readonly latencyPhaseTrackers = new Map<string, LatencyPhasesTracker>();
   private readonly onRetryBudgetDepleted?: (info: RetryBudgetDepletedInfo) => void;
@@ -10315,6 +10315,55 @@ export class RetryQueue {
    */
   getAdaptiveMaxDelayConfig(): AdaptiveMaxDelayConfig | undefined {
     return this.adaptiveMaxDelay?.snapshot();
+  }
+
+  /**
+   * WR-360: revise the live latency-phase sample window
+   * (`maxSamplesPerEndpoint`, the per-(endpoint, phase) rolling window
+   * bound). A narrowed window evicts the oldest samples from every
+   * already-built per-tenant tracker in place (WR-352 precedent) — the
+   * p50/p95 are recomputed from the surviving samples on the next read;
+   * widening keeps every sample. Tenants born later are constructed
+   * from the revised options, so they start at the new window at once.
+   * `recordPhases` keeps rolling at the new bound from the next
+   * sample. An illegal value throws `RangeError` and the live values
+   * are untouched; revising to the live value is a no-op. Throws
+   * `Error` when phase tracking was never configured — enabling it
+   * needs a restart. Returns the live options.
+   */
+  reviseLatencyPhases(maxSamplesPerEndpoint: number): LatencyPhaseOptions {
+    if (this.latencyPhasesOpts === undefined) {
+      throw new Error(
+        "reviseLatencyPhases: latency phase tracking is not configured — enabling it requires a restart: " +
+          "the tracker is created at startup and a running relay cannot start sampling phases without one"
+      );
+    }
+    if (!Number.isInteger(maxSamplesPerEndpoint) || maxSamplesPerEndpoint < 1) {
+      throw new RangeError(
+        `maxSamplesPerEndpoint must be an integer >= 1, got ${maxSamplesPerEndpoint}`
+      );
+    }
+    const current = this.latencyPhasesOpts.maxSamplesPerEndpoint ?? 1024;
+    if (maxSamplesPerEndpoint === current) {
+      return { maxSamplesPerEndpoint: current };
+    }
+    // Validate-then-apply: the value is already validated above, so the
+    // fan-out cannot fail partway — every built tracker is retuned.
+    for (const tracker of this.latencyPhaseTrackers.values()) {
+      tracker.resize(maxSamplesPerEndpoint);
+    }
+    this.latencyPhasesOpts = { ...this.latencyPhasesOpts, maxSamplesPerEndpoint };
+    return { maxSamplesPerEndpoint };
+  }
+
+  /**
+   * WR-360: live latency-phase options — the sample window bound.
+   * `undefined` when phase tracking was never configured. Reads the
+   * live values, so a runtime revision is visible immediately.
+   */
+  getLatencyPhaseOptions(): LatencyPhaseOptions | undefined {
+    if (this.latencyPhasesOpts === undefined) return undefined;
+    return { maxSamplesPerEndpoint: this.latencyPhasesOpts.maxSamplesPerEndpoint ?? 1024 };
   }
 
   /**

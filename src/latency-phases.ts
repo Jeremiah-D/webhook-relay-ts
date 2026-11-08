@@ -117,7 +117,10 @@ function percentile(sorted: number[], p: number): number {
 }
 
 export class LatencyPhasesTracker {
-  private readonly maxSamples: number;
+  // Mutable only via `resize` (WR-360): the window bound is part of
+  // the revision surface, while the per-endpoint phase windows are
+  // never replaced.
+  private maxSamples: number;
   private readonly now: () => number;
   /** Per endpoint → per phase → rolling sample window, newest last. */
   private readonly windows = new Map<string, Map<LatencyPhaseName, number[]>>();
@@ -132,6 +135,42 @@ export class LatencyPhasesTracker {
     }
     this.maxSamples = maxSamples;
     this.now = opts.now ?? Date.now;
+  }
+
+  /**
+   * Live rolling window bound (WR-360) — the value `resize` last set
+   * (or the construction value when never resized).
+   */
+  get maxSamplesPerEndpoint(): number {
+    return this.maxSamples;
+  }
+
+  /**
+   * Retune the rolling sample window in place (WR-360, following the
+   * WR-352 `LatencyTracker.resize` precedent): shrinking evicts only
+   * the oldest samples past the new bound per (endpoint, phase) — the
+   * same oldest-first eviction `recordPhases` applies — and widening
+   * only raises the bound, keeps every sample, and never restores
+   * samples a shrink already evicted. `lastSampleAt` is untouched (a
+   * resize is not a sample), and the stats shape is unchanged — the
+   * percentiles are recomputed from the surviving samples on the next
+   * read. An illegal value (non-integer or < 1) throws `RangeError`
+   * and leaves the live window and samples untouched.
+   */
+  resize(newMax: number): void {
+    if (!Number.isInteger(newMax) || newMax < 1) {
+      throw new RangeError(
+        `maxSamplesPerEndpoint must be an integer >= 1, got ${newMax}`
+      );
+    }
+    if (newMax < this.maxSamples) {
+      for (const per of this.windows.values()) {
+        for (const arr of per.values()) {
+          if (arr.length > newMax) arr.splice(0, arr.length - newMax);
+        }
+      }
+    }
+    this.maxSamples = newMax;
   }
 
   /**

@@ -526,7 +526,12 @@ reliability primitives that matter for any signed-payload pipeline.
   dominant phase (largest measured duration) is attributed into the
   `slo_missed` audit event (`dominantPhase` + `phaseBreakdown`) and the
   OTLP `slo_missed` record. `getLatencyPhaseStats()` exposes the
-  per-endpoint phase distributions.
+  per-endpoint phase distributions. The sample window is live-revisable
+  (WR-360): `reviseLatencyPhases(maxSamplesPerEndpoint)` narrows the
+  window in place (oldest samples evicted from every built per-tenant
+  tracker, p50/p95 recomputed from the survivors) or widens it (samples
+  kept); tenants born later start at the new window. A real revision is
+  audited as `latency_phases_revised` with `previous` / `current`.
 - `src/slo-risk.ts` — SLO-breach prediction and early warning
   (`SloRiskPredictor`), opt-in under `retry.latency.sloRisk` (disabled by
   default). Every `enqueue` and every delivered sample feeds a per-endpoint
