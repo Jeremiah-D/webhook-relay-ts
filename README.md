@@ -4880,6 +4880,24 @@ createRelayServer({
   evicted to make room). The clock is injectable (`now`), and illegal
   values (`maxConsecutiveFailures < 1`, non-positive `banDurationMs`,
   `maxEntries < 1`) throw `RangeError` at startup.
+- **Live revision (WR-357)** — `server.reviseFail2Ban(patch)` revises
+  the three thresholds at runtime (`maxConsecutiveFailures` /
+  `banDurationMs` / `maxEntries`, partial — omitted fields keep their
+  live values); `server.getFail2BanConfig()` returns the live config
+  (the getter is only mounted when fail2ban was configured). A revision
+  takes effect from the next failure assessment: already-counted
+  failures and already-armed bans are untouched (lowering the threshold
+  never retroactively bans, raising it never unbans, and an in-flight
+  ban keeps the expiry it was armed with), and `GET /bans` reports the
+  stored `bannedAt`, so a duration revision never drifts it. Shrinking
+  `maxEntries` trims the table at once (expired bans swept first, then
+  least-recently-active non-banned entries; a live ban is never evicted
+  to make room, so when the table holds more live bans than the new
+  bound it temporarily exceeds the bound until bans expire). An illegal
+  patch throws `RangeError` and leaves the live values untouched; an
+  empty or same-value patch is a silent no-op. A real revision is
+  audited as `fail2ban_revised` with `previous` / `current`. Enabling
+  fail2ban when it was never configured still requires a restart.
 - **Off by default** — with no `fail2ban`, intake behavior is
   byte-identical to the legacy one, and `GET /metrics` renders no new
   series.

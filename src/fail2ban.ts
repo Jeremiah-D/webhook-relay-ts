@@ -84,6 +84,25 @@ export interface Fail2BanOptions {
 /** The default bound on tracked sender IPs when `maxEntries` is unset. */
 export const DEFAULT_FAIL2BAN_MAX_ENTRIES = 10000;
 
+/**
+ * WR-357: a partial revision of the fail2ban thresholds
+ * (`maxConsecutiveFailures` / `banDurationMs` / `maxEntries`, at
+ * least one field set). Omitted fields keep their live values; an
+ * empty patch is a `RangeError`. The merged values are judged against
+ * the same gates as construction, so an illegal patch throws
+ * `RangeError` and the live values are left completely untouched.
+ */
+export type Fail2BanRevision = Partial<
+  Pick<Fail2BanOptions, "maxConsecutiveFailures" | "banDurationMs" | "maxEntries">
+>;
+
+/** WR-357: live fail2ban config — the three thresholds, after any revision. */
+export interface Fail2BanConfig {
+  maxConsecutiveFailures: number;
+  banDurationMs: number;
+  maxEntries: number;
+}
+
 /** One active ban, as exposed to operators (`GET /bans`). */
 export interface BanInfo {
   /** The banned sender IP. */
@@ -151,6 +170,14 @@ interface TrackedIp {
   failures: number;
   /** Epoch ms the ban lifts; 0 means not banned. */
   bannedUntil: number;
+  /**
+   * WR-357: epoch ms the current ban started, stored at activation.
+   * `bans()` used to derive this as `bannedUntil - banDurationMs`,
+   * which drifted when `banDurationMs` was revised mid-ban — the
+   * stored value keeps `GET /bans` stable across revisions. 0 means
+   * never banned; kept across ban extensions, refreshed on re-ban.
+   */
+  bannedAt: number;
   /** Epoch ms of the last failure or success (eviction order). */
   lastSeen: number;
 }
@@ -159,12 +186,21 @@ interface TrackedIp {
  * Per-sender-IP consecutive auth-failure tracking with automatic
  * time-boxed bans. Construct once at server startup (invalid config
  * throws RangeError there); the per-request methods never throw on
- * hostile input — an unparseable IP is just another map key.
+ * hostile input — an unparseable IP is just another map key. The
+ * three thresholds are live-revisable at runtime via `retune()`
+ * (WR-357): `recordFailure` reads them live, so a revision takes
+ * effect from the next failure assessment — already-counted failures
+ * and already-armed bans are untouched (lowering the threshold never
+ * retroactively bans, raising it never unbans, and an in-flight ban
+ * keeps the expiry it was armed with).
  */
 export class Fail2Ban {
-  private readonly maxConsecutiveFailures: number;
-  private readonly banDurationMs: number;
-  private readonly maxEntries: number;
+  // WR-357: live-revisable via `retune()` (the constructor still
+  // validates every value through the same gates), so these are
+  // deliberately not `readonly`.
+  private maxConsecutiveFailures: number;
+  private banDurationMs: number;
+  private maxEntries: number;
   private readonly now: () => number;
   private readonly isExempt: ((pathname: string, ip: string) => boolean) | undefined;
   private readonly entries = new Map<string, TrackedIp>();
@@ -176,6 +212,73 @@ export class Fail2Ban {
     this.maxEntries = opts.maxEntries ?? DEFAULT_FAIL2BAN_MAX_ENTRIES;
     this.now = opts.now ?? Date.now;
     this.isExempt = opts.isExempt;
+  }
+
+  /**
+   * WR-357: revise the live fail2ban thresholds (partial — omitted
+   * fields keep their live values). Merge-then-validate reusing the
+   * construction gates (`assertValidFail2BanOptions`): an illegal
+   * patch throws `RangeError` and the live values are left completely
+   * untouched, and an empty patch is a `RangeError`. A patch equal to
+   * the live values is a silent no-op. A real revision updates the
+   * three knobs in place: `recordFailure` reads them live, so the new
+   * values govern the next failure assessment — already-counted
+   * failures and already-armed bans are untouched (lowering the
+   * threshold never retroactively bans, raising it never unbans, and
+   * an in-flight ban keeps the expiry it was armed with). Shrinking
+   * `maxEntries` trims the table at once, sweeping expired bans
+   * first and then evicting the least-recently-active non-banned
+   * entries — a live ban is never evicted to make room, so when the
+   * table holds more live bans than the new bound the trim stops at
+   * the live bans and the table temporarily exceeds the bound until
+   * bans expire (the next admission re-applies the bound through
+   * `evictIfNeeded`). Returns the live config after the revision.
+   */
+  retune(patch: Fail2BanRevision): Fail2BanConfig {
+    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new RangeError(`fail2ban revision must be an object, got ${JSON.stringify(patch)}`);
+    }
+    if (
+      patch.maxConsecutiveFailures === undefined &&
+      patch.banDurationMs === undefined &&
+      patch.maxEntries === undefined
+    ) {
+      throw new RangeError(
+        "fail2ban revision must set at least one of maxConsecutiveFailures, banDurationMs, maxEntries"
+      );
+    }
+    const next: Fail2BanConfig = {
+      maxConsecutiveFailures: patch.maxConsecutiveFailures ?? this.maxConsecutiveFailures,
+      banDurationMs: patch.banDurationMs ?? this.banDurationMs,
+      maxEntries: patch.maxEntries ?? this.maxEntries,
+    };
+    // Validate-then-apply: the merged values must pass the
+    // construction gates before any live value moves. `now` /
+    // `isExempt` are carried over untouched — a revision never
+    // rebinds the clock or the exemption hook.
+    assertValidFail2BanOptions({ ...next, now: this.now, isExempt: this.isExempt });
+    if (
+      next.maxConsecutiveFailures === this.maxConsecutiveFailures &&
+      next.banDurationMs === this.banDurationMs &&
+      next.maxEntries === this.maxEntries
+    ) {
+      return this.snapshot();
+    }
+    const maxEntriesShrank = next.maxEntries < this.maxEntries;
+    this.maxConsecutiveFailures = next.maxConsecutiveFailures;
+    this.banDurationMs = next.banDurationMs;
+    this.maxEntries = next.maxEntries;
+    if (maxEntriesShrank) this.trimToMaxEntries(this.now());
+    return this.snapshot();
+  }
+
+  /** WR-357: live fail2ban config snapshot (the three thresholds). */
+  snapshot(): Fail2BanConfig {
+    return {
+      maxConsecutiveFailures: this.maxConsecutiveFailures,
+      banDurationMs: this.banDurationMs,
+      maxEntries: this.maxEntries,
+    };
   }
 
   /** Number of IPs currently tracked (counters and bans alike). */
@@ -209,7 +312,7 @@ export class Fail2Ban {
     let e = this.entries.get(ip);
     if (e === undefined) {
       this.evictIfNeeded(now);
-      e = { failures: 0, bannedUntil: 0, lastSeen: now };
+      e = { failures: 0, bannedUntil: 0, bannedAt: 0, lastSeen: now };
       this.entries.set(ip, e);
     }
     e.failures += 1;
@@ -220,6 +323,10 @@ export class Fail2Ban {
       this.isExempt?.(pathname, ip) !== true
     ) {
       justBanned = e.bannedUntil <= now;
+      // WR-357: only a fresh activation (re-)stamps the start — an
+      // extension keeps the original bannedAt, so `bans()` never
+      // drifts when `banDurationMs` is revised mid-ban.
+      if (justBanned) e.bannedAt = now;
       e.bannedUntil = now + this.banDurationMs;
     }
     return { banned: e.bannedUntil > now, justBanned, consecutiveFailures: e.failures };
@@ -273,7 +380,10 @@ export class Fail2Ban {
       if (e.bannedUntil > now) {
         out.push({
           ip,
-          bannedAt: e.bannedUntil - this.banDurationMs,
+          // WR-357: stored at activation, never derived from the live
+          // `banDurationMs` — a duration revision mid-ban leaves both
+          // timestamps exactly as armed.
+          bannedAt: e.bannedAt,
           expiresAt: e.bannedUntil,
           consecutiveFailures: e.failures,
         });
@@ -281,6 +391,34 @@ export class Fail2Ban {
     }
     out.sort((a, b) => a.bannedAt - b.bannedAt);
     return out;
+  }
+
+  /**
+   * WR-357: trim the table down to the live `maxEntries` bound after
+   * a shrink — the `evictIfNeeded` victim order (expired bans swept
+   * first, then least-recently-active non-banned entries), except a
+   * live ban is never evicted to make room: when every remaining
+   * entry is a live ban the trim stops and the table temporarily
+   * exceeds the bound (there is no new entry to admit here, unlike
+   * `evictIfNeeded`'s soonest-expiring fallback).
+   */
+  private trimToMaxEntries(now: number): void {
+    for (const [ip, e] of this.entries) {
+      if (e.bannedUntil !== 0 && e.bannedUntil <= now) this.entries.delete(ip);
+    }
+    while (this.entries.size > this.maxEntries) {
+      let victim: string | undefined;
+      let victimScore = Infinity;
+      for (const [ip, e] of this.entries) {
+        if (e.bannedUntil > now) continue; // live ban: protected
+        if (e.lastSeen < victimScore) {
+          victim = ip;
+          victimScore = e.lastSeen;
+        }
+      }
+      if (victim === undefined) return; // only live bans remain
+      this.entries.delete(victim);
+    }
   }
 
   /**

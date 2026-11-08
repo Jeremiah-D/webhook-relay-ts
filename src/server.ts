@@ -275,7 +275,9 @@ import { InboundIpAcl, IpAclMetrics, type IpAclOptions } from "./ip-acl.ts";
 import {
   Fail2Ban,
   Fail2BanMetrics,
+  type Fail2BanConfig,
   type Fail2BanOptions,
+  type Fail2BanRevision,
 } from "./fail2ban.ts";
 import { GeoIpInboundPolicy, type GeoIpOptions } from "./geoip.ts";
 import { InboundApiKeyAuth, type ApiKeyOptions, type EndpointApiKeyRule } from "./api-key.ts";
@@ -2131,7 +2133,10 @@ export interface RelayServerOptions {
    * the WR-53/GeoIP policy 403s, and the WR-97 outbound-pacing 429 —
    * different trust layers the ban cannot enforce. Off by default:
    * unset means zero behavior change. Invalid config throws
-   * `RangeError` at startup.
+   * `RangeError` at startup. The three thresholds are live-revisable
+   * at runtime via `server.reviseFail2Ban` (WR-357) — a revision takes
+   * effect from the next failure assessment, and an in-flight ban
+   * keeps the expiry it was armed with.
    */
   fail2ban?: Fail2BanOptions;
   /**
@@ -5858,6 +5863,33 @@ export interface RelayServer extends Server {
    * configured; `undefined` otherwise.
    */
   getProbeEndpoints?: () => string[] | undefined;
+  /**
+   * WR-357: revise the live fail2ban thresholds at runtime
+   * (`maxConsecutiveFailures` / `banDurationMs` / `maxEntries`,
+   * partial — omitted fields keep their live values). The new values
+   * govern the next failure assessment: already-counted failures and
+   * already-armed bans are untouched (lowering the threshold never
+   * retroactively bans, raising it never unbans, and an in-flight ban
+   * keeps the expiry it was armed with — `GET /bans` reports the
+   * stored `bannedAt`, so a duration revision never drifts it).
+   * Shrinking `maxEntries` trims the table at once (expired bans
+   * swept first, then least-recently-active non-banned entries; a
+   * live ban is never evicted to make room). An illegal patch throws
+   * `RangeError` and the live values are untouched; an empty patch is
+   * a `RangeError`; a same-value revision is a no-op with no audit
+   * event. A real revision is audited as `fail2ban_revised` with
+   * `previous` / `current` (all three thresholds), and returns the
+   * live config. Always set; throws `Error` when fail2ban was never
+   * configured — enabling it needs a restart. Orthogonal to WR-182
+   * (which owns the banning mechanism itself) and to WR-53 (which
+   * owns the static-allow exemption, untouched here).
+   */
+  reviseFail2Ban?: (patch: Fail2BanRevision) => Fail2BanConfig;
+  /**
+   * WR-357: live fail2ban config — the three thresholds. Only set
+   * when `fail2ban` was configured; `undefined` otherwise.
+   */
+  getFail2BanConfig?: () => Fail2BanConfig | undefined;
   /**
    * WR-337: revise the live adaptive concurrency config at runtime
    * (`minLimit` / `maxLimit` / `initialLimit` / `increaseStep` /
@@ -15342,6 +15374,44 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // configured.
   if (queue.getProbeEndpoints() !== undefined) {
     server.getProbeEndpoints = (): string[] => queue.getProbeEndpoints()!;
+  }
+
+  // WR-357: fail2ban threshold runtime revision. The method is always
+  // set; with fail2ban unconfigured the canonical must-restart Error
+  // is thrown — enabling it needs a restart. A real revision is
+  // audited as `fail2ban_revised` with the previous and current
+  // config (the construction values as first `previous`); an empty or
+  // same-value patch is a silent no-op.
+  server.reviseFail2Ban = (patch: Fail2BanRevision): Fail2BanConfig => {
+    if (fail2ban === undefined) {
+      throw new Error(
+        "reviseFail2Ban: fail2ban is not configured — enabling it requires a restart: " +
+          "the tracker is built at startup and a running relay cannot start banning IPs without one"
+      );
+    }
+    const prev = fail2ban.snapshot();
+    // Validate-then-apply inside retune: an illegal patch throws
+    // RangeError and the live values are left completely intact.
+    const next = fail2ban.retune(patch);
+    if (
+      next.maxConsecutiveFailures === prev.maxConsecutiveFailures &&
+      next.banDurationMs === prev.banDurationMs &&
+      next.maxEntries === prev.maxEntries
+    ) {
+      return next;
+    }
+    opts.auditLog.append({
+      event: "fail2ban_revised",
+      previous: prev,
+      current: next,
+    });
+    return next;
+  };
+
+  // WR-357: live fail2ban config. Only set when `fail2ban` was
+  // configured.
+  if (fail2ban !== undefined) {
+    server.getFail2BanConfig = (): Fail2BanConfig => fail2ban.snapshot();
   }
 
   // WR-337: adaptive concurrency config runtime revision. The method is
