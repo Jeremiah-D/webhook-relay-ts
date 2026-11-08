@@ -1107,8 +1107,20 @@ reliability primitives that matter for any signed-payload pipeline.
   flow. An illegal patch throws `RangeError` and leaves the live config
   untouched; an empty or same-value patch is a silent no-op. A real
   revision is audited as `probe_revised` with `previous` / `current`.
+  Live revision (WR-356): `server.reviseProbeEndpoints({ add, remove })`
+  revises the probed endpoint list itself — a new endpoint gets a fresh
+  probe record and, when the prober is running, is armed at once at the
+  live interval; a removed endpoint loses its record and its pending
+  timer, and an in-flight round for it settles but its result is
+  discarded. `server.getProbeEndpoints()` returns the live list. The
+  circuit breaker keeps its own per-endpoint state, so a re-added
+  endpoint starts with fresh probe stats while its breaker state follows
+  the old value. An illegal patch throws `RangeError` and leaves the
+  live list untouched; an empty patch is a `RangeError`; a patch with no
+  net change is a silent no-op. A real revision is audited as
+  `probe_endpoints_revised` with `previous` / `current` endpoint lists.
   Enabling probing when it was never configured still requires a
-  restart, and the probed endpoint list stays fixed at construction.
+  restart.
   (Not to be confused with the keep-alive pool's *connection* health
   probing, `OutboundConnectionPool({ healthProbe })`, which culls dead
   idle sockets before reuse.)

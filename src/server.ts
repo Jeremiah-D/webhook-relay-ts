@@ -509,7 +509,7 @@ import {
   OutboundSchemaViolationError,
   type OutboundSchemaMetrics,
 } from "./outbound-schema.ts";
-import type { ProbeConfig, ProbeOptions, ProbeRevision } from "./downstream-probe.ts";
+import type { ProbeConfig, ProbeEndpointsRevision, ProbeOptions, ProbeRevision } from "./downstream-probe.ts";
 import {
   ProxyHealthMonitor,
   type ProxyHealthOptions,
@@ -5820,9 +5820,9 @@ export interface RelayServer extends Server {
    * revision is audited as `probe_revised` with `previous` / `current`
    * (the construction values as first `previous`), and returns the
    * live config. Always set; throws `Error` when probing was never
-   * configured — enabling it needs a restart. The probed endpoint
-   * list is fixed at construction and never moves; this revises only
-   * the rhythm. Orthogonal to WR-331 (which revises the circuit
+   * configured — enabling it needs a restart. The endpoint list is
+   * revised separately, via `reviseProbeEndpoints` (WR-356); this
+   * revises only the rhythm. Orthogonal to WR-331 (which revises the circuit
    * breaker's half-open probe knobs) and to WR-10 (which owns the
    * trip / cooldown decision, untouched here).
    */
@@ -5832,6 +5832,32 @@ export interface RelayServer extends Server {
    * Only set when `probe` was configured; `undefined` otherwise.
    */
   getProbeConfig?: () => ProbeConfig | undefined;
+  /**
+   * WR-356: revise the live probed endpoint list at runtime (`add`
+   * endpoints to start probing, `remove` endpoints to stop probing;
+   * partial — omitted fields keep their live values). A newly added
+   * endpoint gets a fresh probe record and, when the prober is
+   * running, is armed at once at the live interval; a removed endpoint
+   * loses its record and its pending timer, and an in-flight round for
+   * it settles but its result is discarded. The circuit breaker keeps
+   * its own per-endpoint state untouched, so a re-added endpoint starts
+   * with fresh probe stats while its breaker state follows the old
+   * value. An illegal patch throws `RangeError` and the live list is
+   * untouched; an empty patch is a `RangeError`; a patch with no net
+   * change is a silent no-op with no audit event. A real revision is
+   * audited as `probe_endpoints_revised` with `previous` / `current`
+   * endpoint lists, via the `onProbeAudit` → audit-log channel, and
+   * returns the live endpoint list. Always set; throws `Error` when
+   * probing was never configured — enabling it needs a restart. The
+   * cadence knobs are revised separately, via `reviseProbe` (WR-355).
+   */
+  reviseProbeEndpoints?: (patch: ProbeEndpointsRevision) => string[];
+  /**
+   * WR-356: live probed endpoint list — the target URLs currently
+   * being probed, in live order. Only set when `probe` was
+   * configured; `undefined` otherwise.
+   */
+  getProbeEndpoints?: () => string[] | undefined;
   /**
    * WR-337: revise the live adaptive concurrency config at runtime
    * (`minLimit` / `maxLimit` / `initialLimit` / `increaseStep` /
@@ -15299,6 +15325,23 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // configured.
   if (queue.getProbeConfig() !== undefined) {
     server.getProbeConfig = (): ProbeConfig => queue.getProbeConfig()!;
+  }
+
+  // WR-356: downstream probe endpoint list runtime revision. The
+  // method is always set (like reviseProbe above); with probing
+  // unconfigured the queue throws Error — enabling it needs a
+  // restart. The audit event `probe_endpoints_revised` (with the
+  // previous and current endpoint lists) is emitted by the prober via
+  // the `onProbeAudit` → audit-log channel, so a real revision is
+  // audited exactly once; a net-zero or same-value patch is a silent
+  // no-op.
+  server.reviseProbeEndpoints = (patch: ProbeEndpointsRevision): string[] =>
+    queue.reviseProbeEndpoints(patch);
+
+  // WR-356: live probed endpoint list. Only set when `probe` was
+  // configured.
+  if (queue.getProbeEndpoints() !== undefined) {
+    server.getProbeEndpoints = (): string[] => queue.getProbeEndpoints()!;
   }
 
   // WR-337: adaptive concurrency config runtime revision. The method is

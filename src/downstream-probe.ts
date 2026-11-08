@@ -87,10 +87,25 @@ export interface ProbeOptions {
  * WR-355: a partial revision of the downstream probe cadence
  * (`intervalMs` / `timeoutMs` / `method`, at least one field set).
  * Omitted fields keep their live values; an empty patch is a
- * `RangeError`. The probed endpoint list stays fixed at construction
- * — only the rhythm moves.
+ * `RangeError`. The probed endpoint list is revised separately, via
+ * `retuneEndpoints()` (WR-356) — only the rhythm moves here.
  */
 export type ProbeRevision = Partial<Pick<ProbeOptions, "intervalMs" | "timeoutMs" | "method">>;
+
+/**
+ * WR-356: a partial revision of the probed endpoint list — endpoints
+ * to start probing (`add`) and endpoints to stop probing (`remove`).
+ * At least one field must be a non-empty array; an empty patch is a
+ * `RangeError`. Entries are exact target URLs; `add` must not name an
+ * endpoint already probed (unless the same patch also removes it) and
+ * `remove` must name a live endpoint, and the merged list must stay
+ * non-empty — an illegal patch throws `RangeError` and the live list
+ * is left completely untouched.
+ */
+export type ProbeEndpointsRevision = {
+  add?: string[];
+  remove?: string[];
+};
 
 /** WR-355: live downstream probe config — the three cadence knobs, after any revision. */
 export interface ProbeConfig {
@@ -113,8 +128,22 @@ export interface ProbeRecoveredAuditEvent {
   endpoint: string;
 }
 
+/**
+ * WR-356: payload of the `probe_endpoints_revised` audit event —
+ * the endpoint list before and after a real revision. Emitted via
+ * the same `onAudit` channel as `probe_failed` / `probe_recovered`.
+ */
+export interface ProbeEndpointsRevisedAuditEvent {
+  event: "probe_endpoints_revised";
+  previous: string[];
+  current: string[];
+}
+
 /** Every probe outcome the prober audits. */
-export type ProbeAuditEvent = ProbeFailedAuditEvent | ProbeRecoveredAuditEvent;
+export type ProbeAuditEvent =
+  | ProbeFailedAuditEvent
+  | ProbeRecoveredAuditEvent
+  | ProbeEndpointsRevisedAuditEvent;
 
 /** Observable snapshot of one endpoint's probe history. */
 export interface ProbeEndpointStats {
@@ -228,10 +257,16 @@ interface ProbeRecord {
  * `probe_failed` / `probe_recovered` to the audit log.
  */
 export class DownstreamProber {
-  private readonly endpoints: string[];
+  // WR-356: live-revisable via `retuneEndpoints()` (the constructor
+  // still validates every value through the same gates), so this is
+  // deliberately not `readonly` — new endpoints get a fresh record and
+  // a running prober arms their timer at once; removed endpoints lose
+  // their record and their pending timer.
+  private endpoints: string[];
   // WR-355: live-revisable via `retune()` (the constructor still
   // validates every value through the same gates), so these are
-  // deliberately not `readonly`. The probed endpoint list stays fixed.
+  // deliberately not `readonly`. The probed endpoint list is revised
+  // separately, via `retuneEndpoints()` (WR-356).
   private intervalMs: number;
   private method: "HEAD" | "GET";
   private timeoutMs: number;
@@ -324,8 +359,9 @@ export class DownstreamProber {
    * the next round — the default probe request reads the live
    * `timeoutMs` at call time, while an injected custom `probeRequest`
    * is unaffected by `timeoutMs`. In-flight rounds settle on their
-   * original flow (not cancelled, not re-sent). The probed endpoint
-   * list never moves. Returns the live config after the revision.
+   * original flow (not cancelled, not re-sent). The endpoint list
+   * itself is revised via `retuneEndpoints()` (WR-356). Returns the
+   * live config after the revision.
    */
   retune(patch: ProbeRevision): ProbeConfig {
     if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
@@ -370,6 +406,122 @@ export class DownstreamProber {
     return this.snapshot();
   }
 
+  /**
+   * WR-356: revise the live probed endpoint list (partial — `add`
+   * endpoints to start probing, `remove` endpoints to stop probing).
+   * Merge-then-validate reusing the construction gates: every entry
+   * must be a non-empty string, `add` / `remove` must be duplicate-free,
+   * `remove` must name live endpoints, `add` must not hit the live
+   * list (unless the same patch also removes it — the net-zero case
+   * below), and the merged list must stay non-empty. An illegal patch
+   * throws `RangeError` and the live list is left completely untouched;
+   * an empty patch (neither field a non-empty array, or a non-object)
+   * is a `RangeError`. A patch whose merged list equals the live list
+   * (e.g. `add` and `remove` naming the same live endpoint) is a
+   * silent no-op — no timer churn, no audit event. A real revision
+   * applies atomically: each added endpoint gets a fresh record
+   * (`success` / `failure` / `consecutiveFailures` all 0) and, when
+   * the prober is running, is armed at once at the live `intervalMs`
+   * (an unstarted prober picks it up on the next `start()`); each
+   * removed endpoint has its pending timer cleared and its record
+   * deleted, and an in-flight round for it settles on its original
+   * flow but its result is discarded — no `recordOutcome`, no
+   * `probe_failed` / `probe_recovered`, no re-arm. The circuit
+   * breaker keeps its own per-endpoint state untouched: only probing
+   * stops, so a re-added endpoint starts with fresh probe stats while
+   * its breaker state follows the old value. A real revision is
+   * audited as `probe_endpoints_revised` with `previous` / `current`
+   * endpoint lists, via the same `onAudit` channel as `probe_failed` /
+   * `probe_recovered`. Returns the live endpoint list after the
+   * revision.
+   */
+  retuneEndpoints(patch: ProbeEndpointsRevision): string[] {
+    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new RangeError(
+        `probe endpoints revision must be an object, got ${JSON.stringify(patch)}`
+      );
+    }
+    const add = patch.add ?? [];
+    const remove = patch.remove ?? [];
+    if (!Array.isArray(add) || !Array.isArray(remove)) {
+      throw new RangeError("probe endpoints revision add/remove must be arrays of target URLs");
+    }
+    if (add.length === 0 && remove.length === 0) {
+      throw new RangeError(
+        "probe endpoints revision must set at least one of add, remove to a non-empty list"
+      );
+    }
+    // Validate-then-apply: every gate runs before any live value moves.
+    for (const ep of add) {
+      if (typeof ep !== "string" || ep === "") {
+        throw new RangeError("`probe.endpoints` entries must be non-empty strings");
+      }
+    }
+    for (const ep of remove) {
+      if (typeof ep !== "string" || ep === "") {
+        throw new RangeError("`probe.endpoints` entries must be non-empty strings");
+      }
+    }
+    if (new Set(add).size !== add.length) {
+      throw new RangeError("probe endpoints revision add must not contain duplicates");
+    }
+    if (new Set(remove).size !== remove.length) {
+      throw new RangeError("probe endpoints revision remove must not contain duplicates");
+    }
+    const live = new Set(this.endpoints);
+    for (const ep of remove) {
+      if (!live.has(ep)) {
+        throw new RangeError(`unknown probe endpoint ${JSON.stringify(ep)}`);
+      }
+    }
+    const removeSet = new Set(remove);
+    const addSet = new Set(add);
+    for (const ep of add) {
+      // An add that names a live endpoint the same patch also removes
+      // is the net-zero case, not a conflict — it survives in place.
+      if (live.has(ep) && !removeSet.has(ep)) {
+        throw new RangeError(
+          `probe endpoint ${JSON.stringify(ep)} is already probed`
+        );
+      }
+    }
+    // Surviving endpoints keep their live order (a removed-then-added
+    // endpoint stays in place); genuinely new endpoints append.
+    const next: string[] = [
+      ...this.endpoints.filter((ep) => !removeSet.has(ep) || addSet.has(ep)),
+      ...add.filter((ep) => !live.has(ep)),
+    ];
+    if (next.length === 0) {
+      throw new RangeError("`probe.endpoints` must be a non-empty array of target URLs");
+    }
+    if (next.length === this.endpoints.length && next.every((ep, i) => ep === this.endpoints[i])) {
+      return this.snapshotEndpoints();
+    }
+    const previous = [...this.endpoints];
+    const nextSet = new Set(next);
+    for (const ep of previous) {
+      if (!nextSet.has(ep)) {
+        const rec = this.records.get(ep);
+        if (rec?.timer !== undefined) this.clearTimer(rec.timer);
+        this.records.delete(ep);
+      }
+    }
+    for (const ep of next) {
+      if (!live.has(ep)) {
+        this.records.set(ep, { success: 0, failure: 0, consecutiveFailures: 0, inFlight: false });
+        if (this.running) this.schedule(ep);
+      }
+    }
+    this.endpoints = next;
+    this.onAudit?.({ event: "probe_endpoints_revised", previous, current: [...next] });
+    return this.snapshotEndpoints();
+  }
+
+  /** WR-356: live probed endpoint list snapshot (a copy). */
+  snapshotEndpoints(): string[] {
+    return [...this.endpoints];
+  }
+
   /** WR-355: live probe config snapshot (the three cadence knobs). */
   snapshot(): ProbeConfig {
     return {
@@ -409,7 +561,11 @@ export class DownstreamProber {
   }
 
   private schedule(endpoint: string): void {
-    const rec = this.records.get(endpoint)!;
+    // WR-356: a record deleted by `retuneEndpoints()` while its round
+    // was in flight must not be re-armed — the tick tail re-arms after
+    // the round settles, and the endpoint is gone by then.
+    const rec = this.records.get(endpoint);
+    if (!rec) return;
     if (rec.timer !== undefined) this.clearTimer(rec.timer);
     rec.timer = this.setTimer(() => this.tick(endpoint), this.intervalMs);
   }
@@ -438,6 +594,11 @@ export class DownstreamProber {
     } finally {
       rec.inFlight = false;
     }
+    // WR-356: the endpoint may have been removed by `retuneEndpoints()`
+    // while this round was in flight — its record is gone, so the
+    // result is discarded whole: no counters, no `recordOutcome`, no
+    // audit event, and the tick tail must not re-arm it.
+    if (this.records.get(endpoint) !== rec) return ok;
     rec.lastProbeAtMs = Date.now();
     if (ok) {
       rec.success += 1;

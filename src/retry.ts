@@ -65,6 +65,7 @@ import {
   DownstreamProber,
   type ProbeAuditEvent,
   type ProbeConfig,
+  type ProbeEndpointsRevision,
   type ProbeEndpointStats,
   type ProbeOptions,
   type ProbeRevision,
@@ -564,7 +565,7 @@ export type {
 };
 
 export type { CircuitBreakerOptions, CircuitProbeRevision, CircuitState, CircuitStats, CircuitThresholdPatch, ResolvedCircuitProbe, ResolvedCircuitThresholds };
-export type { ProbeAuditEvent, ProbeConfig, ProbeEndpointStats, ProbeOptions, ProbeRevision } from "./downstream-probe.ts";
+export type { ProbeAuditEvent, ProbeConfig, ProbeEndpointsRevision, ProbeEndpointStats, ProbeOptions, ProbeRevision } from "./downstream-probe.ts";
 export { DownstreamProber } from "./downstream-probe.ts";
 export type { EndpointDependencyOptions } from "./endpoint-dependencies.ts";
 export { EndpointDependencyGraph } from "./endpoint-dependencies.ts";
@@ -2129,8 +2130,8 @@ export interface RetryQueueOptions {
    * (`relay_probe_total`, `relay_probe_consecutive_failures`) and audited
    * via `onProbeAudit`. Disabled by default. The cadence knobs
    * (`intervalMs` / `timeoutMs` / `method`) are live-revisable at
-   * runtime via `reviseProbe()` (WR-355) — the endpoint list itself
-   * stays fixed at construction.
+   * runtime via `reviseProbe()` (WR-355), and the probed endpoint list
+   * itself is live-revisable via `reviseProbeEndpoints()` (WR-356).
    */
   probe?: ProbeOptions;
   /**
@@ -6598,8 +6599,8 @@ export class RetryQueue {
    * untouched; an empty patch is a `RangeError`; revising to the live
    * values is a no-op. Throws `Error` when probing was never
    * configured — enabling it needs a restart. The probed endpoint
-   * list is fixed at construction and never moves. Returns the live
-   * config.
+   * list is revised separately, via `reviseProbeEndpoints()` (WR-356).
+   * Returns the live config.
    */
   reviseProbe(patch: ProbeRevision): ProbeConfig {
     const prober = this.prober;
@@ -6619,6 +6620,44 @@ export class RetryQueue {
    */
   getProbeConfig(): ProbeConfig | undefined {
     return this.prober?.snapshot();
+  }
+
+  /**
+   * WR-356: revise the live probed endpoint list (partial — `add`
+   * endpoints to start probing, `remove` endpoints to stop probing).
+   * A newly added endpoint gets a fresh probe record and, when the
+   * prober is running, is armed at once at the live interval; a
+   * removed endpoint loses its record and its pending timer, and an
+   * in-flight round for it settles but its result is discarded. The
+   * circuit breaker keeps its own per-endpoint state untouched, so a
+   * re-added endpoint starts with fresh probe stats while its breaker
+   * state follows the old value. An illegal patch throws `RangeError`
+   * and the live list is untouched; an empty patch is a `RangeError`;
+   * a patch with no net change is a silent no-op. A real revision is
+   * audited as `probe_endpoints_revised` with `previous` / `current`
+   * endpoint lists, via the `onProbeAudit` channel. Throws `Error`
+   * when probing was never configured — enabling it needs a restart.
+   * Returns the live endpoint list.
+   */
+  reviseProbeEndpoints(patch: ProbeEndpointsRevision): string[] {
+    const prober = this.prober;
+    if (prober === undefined) {
+      throw new Error(
+        "reviseProbeEndpoints: downstream probing is not configured — enabling it requires a restart: " +
+          "the prober is created at startup and a running relay cannot start probing new endpoints without one"
+      );
+    }
+    return prober.retuneEndpoints(patch);
+  }
+
+  /**
+   * WR-356: live probed endpoint list — the target URLs currently
+   * being probed, in live order. `undefined` when probing was never
+   * configured. Reads the live values, so a runtime revision is
+   * visible immediately.
+   */
+  getProbeEndpoints(): string[] | undefined {
+    return this.prober?.snapshotEndpoints();
   }
 
   /**
