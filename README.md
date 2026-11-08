@@ -4718,6 +4718,17 @@ const server = createRelayServer({
   (how big one webhook may be).
 - Invalid maps (non-record, invalid tenant-id keys, non-positive-integer
   budgets) throw `RangeError` at startup.
+- **Live-revisable (WR-361)** — `reviseTenantBodyLimits(patch)` retunes
+  the record at runtime: `tenant → bytes` adds or tightens a budget,
+  `tenant → null` deletes the override (the tenant falls back to the
+  endpoint/global budget on the next request). The intake resolves the
+  live record on every request, so the next request is sized by the new
+  budgets while in-flight intakes keep the budget they were parsed
+  under. An illegal patch throws `RangeError` with the live record
+  untouched; an empty or same-value patch is a silent no-op. A real
+  revision is audited as `tenant_body_limits_revised` with `previous` /
+  `current` (full-record snapshots); `getTenantBodyLimits()` returns a
+  copy of the live record.
 
 ## Inbound JSON depth limit
 

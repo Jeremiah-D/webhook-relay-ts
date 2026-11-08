@@ -6461,6 +6461,28 @@ export interface RelayServer extends Server {
    */
   getInboundTenantRateLimit?: () => number | undefined;
   /**
+   * WR-361: revise the live per-tenant inbound body budgets at
+   * runtime (tenant id → max body bytes, or `null` to delete that
+   * tenant's override). The next request's intake is sized by the new
+   * budgets; requests already admitted keep the budget they were
+   * parsed under. An illegal patch throws `RangeError` and the live
+   * record is untouched; an empty patch is a `RangeError`; a
+   * same-value revision is a no-op with no audit event. A real
+   * revision is audited as `tenant_body_limits_revised` with
+   * `previous` / `current` (the full records, deep-copied; the
+   * construction record as first `previous`), and returns the live
+   * snapshot. Always set; throws `Error` when the budgets were never
+   * configured — enabling them needs a restart.
+   */
+  reviseTenantBodyLimits?: (patch: Record<string, number | null>) => TenantBodyLimits;
+  /**
+   * WR-361: live per-tenant inbound body budgets snapshot — a copy of
+   * the record, so callers can inspect (or mutate) it without
+   * touching the budgets the intake resolves per request. Only set
+   * when `tenantBodyLimits` was configured; `undefined` otherwise.
+   */
+  getTenantBodyLimits?: () => TenantBodyLimits | undefined;
+  /**
    * WR-329: revise the live tenant-level outbound rate-limit defaults
    * at runtime (`burst` / `refillPerSecond` / `mode`, partial —
    * omitted fields keep their live values). The next `take()` /
@@ -16288,6 +16310,81 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   if (inboundTenantRateLimiter !== undefined) {
     server.getInboundTenantRateLimit = (): number | undefined =>
       inboundTenantRateLimiter.perTenantLimit();
+  }
+
+  // WR-361: per-tenant inbound body-budget runtime revision. The
+  // method is always set (like reviseInboundTenantRateLimit above);
+  // with the record unconfigured it throws Error — enabling the
+  // budgets needs a restart. A real revision is audited as
+  // `tenant_body_limits_revised` with the previous and current full
+  // records (deep copies; the construction record as first
+  // `previous`); an empty or same-value patch is a silent no-op.
+  server.reviseTenantBodyLimits = (patch: Record<string, number | null>): TenantBodyLimits => {
+    if (opts.tenantBodyLimits === undefined) {
+      throw new Error(
+        "reviseTenantBodyLimits: per-tenant body limits are not configured — enabling them requires a restart"
+      );
+    }
+    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new RangeError(
+        `tenantBodyLimits revision must be a record of tenant id -> max body bytes | null, got ${JSON.stringify(patch)}`
+      );
+    }
+    const keys = Object.keys(patch);
+    if (keys.length === 0) {
+      throw new RangeError("tenantBodyLimits revision must not be empty");
+    }
+    // Validate-then-apply: every patch key must be a valid tenant id
+    // (WR-48, even for a deletion), then the merged record must pass
+    // the construction-time validator — an illegal patch throws
+    // RangeError and the live record is left completely intact.
+    for (const tenant of keys) {
+      try {
+        assertValidTenantId(tenant);
+      } catch (err) {
+        throw new RangeError(
+          `tenantBodyLimits: invalid tenant id ${JSON.stringify(tenant)}: ${(err as Error).message}`
+        );
+      }
+    }
+    const previous: TenantBodyLimits = { ...opts.tenantBodyLimits };
+    const merged: TenantBodyLimits = { ...previous };
+    for (const [tenant, bytes] of Object.entries(patch)) {
+      if (bytes === null) {
+        delete merged[tenant];
+      } else {
+        merged[tenant] = bytes;
+      }
+    }
+    assertValidTenantBodyLimits(merged);
+    const sameRecord =
+      Object.keys(previous).length === Object.keys(merged).length &&
+      Object.keys(previous).every((k) => previous[k] === merged[k]);
+    if (sameRecord) {
+      return { ...previous };
+    }
+    // Rewrite the live record in place (WR-311 precedent): the intake
+    // resolves `opts.tenantBodyLimits` on every request — no startup
+    // copy — so the next request is sized by the new budgets while
+    // in-flight intakes keep the budget they were parsed under.
+    for (const key of Object.keys(opts.tenantBodyLimits)) {
+      delete opts.tenantBodyLimits[key];
+    }
+    Object.assign(opts.tenantBodyLimits, merged);
+    opts.auditLog.append({
+      event: "tenant_body_limits_revised",
+      previous,
+      current: { ...merged },
+    });
+    return { ...merged };
+  };
+
+  // WR-361: live per-tenant inbound body budgets snapshot — a copy of
+  // the record, so callers can inspect (or mutate) it without touching
+  // the budgets the intake resolves per request. Only set when
+  // `tenantBodyLimits` was configured.
+  if (opts.tenantBodyLimits !== undefined) {
+    server.getTenantBodyLimits = (): TenantBodyLimits => ({ ...opts.tenantBodyLimits! });
   }
 
   // WR-310: relay-level global rate-limit snapshot. Only set when
