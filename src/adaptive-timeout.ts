@@ -91,22 +91,33 @@ export interface AdaptiveTimeoutOptions {
  * WR-334: a partial revision of the adaptive timeout config
  * (`baseTimeoutMs` / `marginRatio` / `minTimeoutMs` / `maxTimeoutMs` /
  * `minSamples`, at least one field set). Omitted fields keep their live
- * values; an empty patch is a `RangeError`.
+ * values; an empty patch is a `RangeError`. WR-354 adds
+ * `maxSamplesPerEndpoint`: the sample window is revisable after all —
+ * retune resizes the LatencyTracker in place (oldest samples evicted
+ * on shrink, samples otherwise preserved), so the WR-334 "deliberately
+ * not revisable" exclusion is superseded.
  */
 export type AdaptiveTimeoutRevision = Partial<
   Pick<
     AdaptiveTimeoutOptions,
-    "baseTimeoutMs" | "marginRatio" | "minTimeoutMs" | "maxTimeoutMs" | "minSamples"
+    | "baseTimeoutMs"
+    | "marginRatio"
+    | "minTimeoutMs"
+    | "maxTimeoutMs"
+    | "minSamples"
+    | "maxSamplesPerEndpoint"
   >
 >;
 
-/** WR-334: live adaptive timeout config — the five formula inputs, after any revision. */
+/** WR-334: live adaptive timeout config — the five formula inputs plus the sample window, after any revision. */
 export interface AdaptiveTimeoutConfig {
   baseTimeoutMs: number;
   marginRatio: number;
   minTimeoutMs: number;
   maxTimeoutMs: number;
   minSamples: number;
+  /** Rolling sample window per endpoint (WR-354, live-revisable via resize). */
+  maxSamplesPerEndpoint: number;
 }
 
 /** Per-endpoint adaptive timeout view. All JSON-serializable. */
@@ -197,13 +208,16 @@ export function assertValidAdaptiveTimeoutOptions(opts: unknown): void {
 export class AdaptiveTimeout {
   // WR-334: live-revisable via `retune()` (the constructor still
   // validates every value through the same gates), so these are
-  // deliberately not `readonly`. `tracker` stays frozen: retune never
-  // touches the rolling samples or the sample window.
+  // deliberately not `readonly`. WR-354: retune resizes the tracker
+  // in place — the rolling samples survive, oldest-first eviction
+  // only on shrink — so the sample window is revisable without
+  // rebuilding the tracker.
   private baseTimeoutMs: number;
   private marginRatio: number;
   private minTimeoutMs: number;
   private maxTimeoutMs: number;
   private minSamples: number;
+  private maxSamplesPerEndpoint: number;
   private readonly tracker: LatencyTracker;
 
   constructor(opts: AdaptiveTimeoutOptions) {
@@ -213,11 +227,12 @@ export class AdaptiveTimeout {
     this.minTimeoutMs = opts.minTimeoutMs ?? 100;
     this.maxTimeoutMs = opts.maxTimeoutMs ?? 4 * opts.baseTimeoutMs;
     this.minSamples = opts.minSamples ?? 10;
+    this.maxSamplesPerEndpoint = opts.maxSamplesPerEndpoint ?? 1024;
     // The tracker's own SLO bookkeeping is irrelevant here — only the
     // rolling p99 window is used — so sloMs just needs to be valid.
     this.tracker = new LatencyTracker({
       sloMs: this.baseTimeoutMs,
-      maxSamplesPerEndpoint: opts.maxSamplesPerEndpoint ?? 1024,
+      maxSamplesPerEndpoint: this.maxSamplesPerEndpoint,
       now: opts.now,
     });
   }
@@ -226,20 +241,28 @@ export class AdaptiveTimeout {
    * WR-334: revise the live config (partial — omitted fields keep
    * their live values). Merge-then-validate reusing the construction
    * gates (`assertValidAdaptiveTimeoutOptions`, including the
-   * `maxTimeoutMs >= minTimeoutMs` cross-check): an illegal patch
-   * throws `RangeError` and the live values are left completely
-   * untouched, and an empty patch is a `RangeError`. A patch equal to
-   * the live values is a silent no-op. The rolling samples are
-   * untouched — p99 is unchanged, only the formula inputs move — so
-   * the next `timeoutFor()` judges by the new values; deliveries
+   * `maxTimeoutMs >= minTimeoutMs` cross-check and, since WR-354, the
+   * sample-window gate): an illegal patch throws `RangeError` and the
+   * live values are left completely untouched, and an empty patch is a
+   * `RangeError`. A patch equal to the live values is a silent no-op.
+   * A real revision updates the six inputs in place, resizes the
+   * tracker window in place (oldest samples evicted on shrink, the
+   * rest preserved — the tracker is never rebuilt), and the next
+   * `timeoutFor()` recomputes every endpoint from the new window; the
+   * rolling samples are otherwise untouched — p99 only moves when the
+   * window itself evicted samples. There are no derived caps to clear
+   * (unlike WR-352: the timeout is computed live from p99 on every
+   * read). Shrinking the window below `minSamples` returns an endpoint
+   * to cold (samples < threshold → falls back to the new
+   * `baseTimeoutMs`); widening keeps warm endpoints warm. Deliveries
    * already stamped keep their original cap, and in-flight attempts
    * are unaffected. Raising `minSamples` can return a warm endpoint
    * to cold (samples < new threshold → falls back to the new
-   * `baseTimeoutMs`); lowering keeps warm endpoints warm. Raising
-   * `baseTimeoutMs` does not affect warm endpoints' derived cap
-   * (only the cold fallback). Tightening `maxTimeoutMs` takes effect
-   * on the next dispatch immediately. Returns the live config after
-   * the revision.
+   * `baseTimeoutMs`); lowering keeps warm endpoints warm.
+   * Raising `baseTimeoutMs` does not affect warm endpoints' derived
+   * cap (only the cold fallback). Tightening `maxTimeoutMs` takes
+   * effect on the next dispatch immediately. Returns the live config
+   * after the revision.
    */
   retune(patch: AdaptiveTimeoutRevision): AdaptiveTimeoutConfig {
     if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
@@ -252,10 +275,11 @@ export class AdaptiveTimeout {
       patch.marginRatio === undefined &&
       patch.minTimeoutMs === undefined &&
       patch.maxTimeoutMs === undefined &&
-      patch.minSamples === undefined
+      patch.minSamples === undefined &&
+      patch.maxSamplesPerEndpoint === undefined
     ) {
       throw new RangeError(
-        "adaptiveTimeout revision must set at least one of baseTimeoutMs, marginRatio, minTimeoutMs, maxTimeoutMs, minSamples"
+        "adaptiveTimeout revision must set at least one of baseTimeoutMs, marginRatio, minTimeoutMs, maxTimeoutMs, minSamples, maxSamplesPerEndpoint"
       );
     }
     const next: AdaptiveTimeoutConfig = {
@@ -264,6 +288,7 @@ export class AdaptiveTimeout {
       minTimeoutMs: patch.minTimeoutMs ?? this.minTimeoutMs,
       maxTimeoutMs: patch.maxTimeoutMs ?? this.maxTimeoutMs,
       minSamples: patch.minSamples ?? this.minSamples,
+      maxSamplesPerEndpoint: patch.maxSamplesPerEndpoint ?? this.maxSamplesPerEndpoint,
     };
     // Validate-then-apply: the merged values must pass the
     // construction gates (including the max >= min cross-check)
@@ -274,7 +299,8 @@ export class AdaptiveTimeout {
       next.marginRatio === this.marginRatio &&
       next.minTimeoutMs === this.minTimeoutMs &&
       next.maxTimeoutMs === this.maxTimeoutMs &&
-      next.minSamples === this.minSamples
+      next.minSamples === this.minSamples &&
+      next.maxSamplesPerEndpoint === this.maxSamplesPerEndpoint
     ) {
       return this.snapshot();
     }
@@ -283,10 +309,17 @@ export class AdaptiveTimeout {
     this.minTimeoutMs = next.minTimeoutMs;
     this.maxTimeoutMs = next.maxTimeoutMs;
     this.minSamples = next.minSamples;
+    this.maxSamplesPerEndpoint = next.maxSamplesPerEndpoint;
+    // A narrowed window rewrites the p99: resize the tracker in
+    // place (oldest samples evicted, the rest preserved — the tracker
+    // object is never rebuilt). Widening keeps every sample; the
+    // resize is still the only window move. No derived caps exist to
+    // clear — the next timeoutFor() computes live from the new window.
+    this.tracker.resize(next.maxSamplesPerEndpoint);
     return this.snapshot();
   }
 
-  /** WR-334: live config snapshot (the five formula inputs). */
+  /** WR-334: live config snapshot (the five formula inputs plus the sample window). */
   snapshot(): AdaptiveTimeoutConfig {
     return {
       baseTimeoutMs: this.baseTimeoutMs,
@@ -294,6 +327,7 @@ export class AdaptiveTimeout {
       minTimeoutMs: this.minTimeoutMs,
       maxTimeoutMs: this.maxTimeoutMs,
       minSamples: this.minSamples,
+      maxSamplesPerEndpoint: this.maxSamplesPerEndpoint,
     };
   }
 

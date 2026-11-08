@@ -12763,22 +12763,29 @@ const queue = new RetryQueue({
     minTimeoutMs: 100, // floor (default)
     maxTimeoutMs: 20_000, // ceiling, default 4x base
     minSamples: 10, // samples before p99 kicks in (default)
+    maxSamplesPerEndpoint: 1024, // rolling p99 window per endpoint (default)
   },
 });
 ```
 
 Live revision (WR-334): `server.reviseAdaptiveTimeout(patch)` revises the
 config at runtime (`baseTimeoutMs` / `marginRatio` / `minTimeoutMs` /
-`maxTimeoutMs` / `minSamples`, partial — omitted fields keep their live
-values); `server.getAdaptiveTimeoutConfig()` returns the live config
-(the getter is only mounted when the feature was configured). A revision
-affects only the next dispatch — the cap is recomputed per dispatch —
-while an in-flight attempt keeps the cap stamped on it at dispatch. An
-illegal patch throws `RangeError` and leaves the live config untouched;
-an empty or same-value patch is a silent no-op. A real revision is
-audited as `adaptive_timeout_revised` with `previous` / `current`.
-Enabling the feature when it was never configured still requires a
-restart.
+`maxTimeoutMs` / `minSamples` / `maxSamplesPerEndpoint`, partial — omitted
+fields keep their live values); `server.getAdaptiveTimeoutConfig()`
+returns the live config (the getter is only mounted when the feature was
+configured). A revision affects only the next dispatch — the cap is
+recomputed per dispatch — while an in-flight attempt keeps the cap
+stamped on it at dispatch. Since WR-354 the sample window is revisable
+too: narrowing `maxSamplesPerEndpoint` evicts the oldest samples from the
+rolling window in place (the tracker is never rebuilt), so the p99 is
+recomputed from the surviving samples on the next read — and shrinking
+the window below `minSamples` returns an endpoint to cold; widening
+keeps every sample and never restores samples a shrink already evicted.
+An illegal patch throws `RangeError` and leaves the live config
+untouched; an empty or same-value patch is a silent no-op. A real
+revision is audited as `adaptive_timeout_revised` with `previous` /
+`current`. Enabling the feature when it was never configured still
+requires a restart.
 
 The timeout for an endpoint is `clamp(p99 * (1 + marginRatio), minTimeoutMs, maxTimeoutMs)` —
 slow endpoints get headroom against false kills, stable fast endpoints get

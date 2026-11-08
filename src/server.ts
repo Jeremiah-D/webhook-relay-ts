@@ -5746,26 +5746,32 @@ export interface RelayServer extends Server {
   /**
    * WR-334: revise the live adaptive timeout config at runtime
    * (`baseTimeoutMs` / `marginRatio` / `minTimeoutMs` /
-   * `maxTimeoutMs` / `minSamples`, partial — omitted fields keep
-   * their live values). The next dispatch stamps its cap from the new
-   * values; deliveries already stamped keep their original cap, and
-   * in-flight attempts are unaffected. Raising `minSamples` can
-   * return a warm endpoint to cold (samples < new threshold → falls
-   * back to the new `baseTimeoutMs`); lowering keeps warm endpoints
-   * warm. An illegal patch throws `RangeError` and the live values
-   * are untouched; an empty patch is a `RangeError`; a same-value
-   * revision is a no-op with no audit event. A real revision is
-   * audited as `adaptive_timeout_revised` with `previous` / `current`
-   * (the construction values as first `previous`), and returns the
-   * live config. Always set; throws `Error` when the timeout was
-   * never configured — enabling it needs a restart. The one config is
-   * shared by all endpoints: there is no per-endpoint override.
+   * `maxTimeoutMs` / `minSamples` / `maxSamplesPerEndpoint`,
+   * partial — omitted fields keep their live values). The next
+   * dispatch stamps its cap from the new values; deliveries already
+   * stamped keep their original cap, and in-flight attempts are
+   * unaffected. Raising `minSamples` can return a warm endpoint to
+   * cold (samples < new threshold → falls back to the new
+   * `baseTimeoutMs`); lowering keeps warm endpoints warm. A narrowed
+   * `maxSamplesPerEndpoint` evicts the oldest samples from the
+   * rolling window in place (WR-354) — the p99 is recomputed from the
+   * surviving samples on the next read, and shrinking the window
+   * below `minSamples` returns an endpoint to cold; widening keeps
+   * every sample. An illegal patch throws `RangeError` and the live
+   * values are untouched; an empty patch is a `RangeError`; a
+   * same-value revision is a no-op with no audit event. A real
+   * revision is audited as `adaptive_timeout_revised` with `previous`
+   * / `current` (the construction values as first `previous`), and
+   * returns the live config. Always set; throws `Error` when the
+   * timeout was never configured — enabling it needs a restart. The
+   * one config is shared by all endpoints: there is no per-endpoint
+   * override.
    */
   reviseAdaptiveTimeout?: (patch: AdaptiveTimeoutRevision) => AdaptiveTimeoutConfig;
   /**
    * WR-334: live adaptive timeout config — the five formula inputs
-   * shared by all endpoints. Only set when `adaptiveTimeout` was
-   * configured; `undefined` otherwise.
+   * plus the sample window, shared by all endpoints. Only set when
+   * `adaptiveTimeout` was configured; `undefined` otherwise.
    */
   getAdaptiveTimeoutConfig?: () => AdaptiveTimeoutConfig | undefined;
   /**
@@ -15149,7 +15155,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // restart. A real revision is audited as `adaptive_timeout_revised`
   // with the previous and current config (the construction values as
   // first `previous`); an empty or same-value patch is a silent
-  // no-op.
+  // no-op. Since WR-354 the config carries six fields — a window-only
+  // revision resizes the tracker in place and is audited the same way.
   server.reviseAdaptiveTimeout = (
     patch: AdaptiveTimeoutRevision
   ): AdaptiveTimeoutConfig => {
@@ -15166,7 +15173,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       next.marginRatio === prev.marginRatio &&
       next.minTimeoutMs === prev.minTimeoutMs &&
       next.maxTimeoutMs === prev.maxTimeoutMs &&
-      next.minSamples === prev.minSamples
+      next.minSamples === prev.minSamples &&
+      next.maxSamplesPerEndpoint === prev.maxSamplesPerEndpoint
     ) {
       return next;
     }

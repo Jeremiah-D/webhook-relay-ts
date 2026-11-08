@@ -77,6 +77,7 @@ describe("AdaptiveTimeout.retune (WR-334)", () => {
       minTimeoutMs: 100,
       maxTimeoutMs: 4000,
       minSamples: 1,
+      maxSamplesPerEndpoint: 1024,
     });
     assert.equal(at.timeoutFor(URL_A), 2000);
   });
@@ -145,6 +146,7 @@ describe("AdaptiveTimeout.retune (WR-334)", () => {
       minTimeoutMs: 100,
       maxTimeoutMs: 4000,
       minSamples: 5,
+      maxSamplesPerEndpoint: 1024,
     });
     assert.equal(at.timeoutFor(URL_A), 2000); // cold again, new base
     at.retune({ minSamples: 2 });
@@ -186,6 +188,8 @@ describe("AdaptiveTimeout.retune (WR-334)", () => {
       { maxTimeoutMs: 0 },
       { minSamples: 0 },
       { minSamples: 1.5 },
+      { maxSamplesPerEndpoint: 0 },
+      { maxSamplesPerEndpoint: 1.5 },
       // Merged max < min (max 50 < live min 100).
       { maxTimeoutMs: 50 },
       // Merged min > max (min 5000 > live max 4000).
@@ -200,6 +204,7 @@ describe("AdaptiveTimeout.retune (WR-334)", () => {
       minTimeoutMs: 100,
       maxTimeoutMs: 4000,
       minSamples: 10,
+      maxSamplesPerEndpoint: 1024,
     });
     assert.equal(at.timeoutFor(URL_A), 1000);
   });
@@ -216,6 +221,7 @@ describe("AdaptiveTimeout.retune (WR-334)", () => {
       minTimeoutMs: 100,
       maxTimeoutMs: 4000,
       minSamples: 10,
+      maxSamplesPerEndpoint: 1024,
     });
   });
 
@@ -233,6 +239,7 @@ describe("AdaptiveTimeout.retune (WR-334)", () => {
       minTimeoutMs: 100,
       maxTimeoutMs: 4000,
       minSamples: 10,
+      maxSamplesPerEndpoint: 1024,
     };
     assert.deepEqual(at.retune({ marginRatio: 0.5 }), live);
     assert.deepEqual(at.retune({ baseTimeoutMs: 1000, minSamples: 10 }), live);
@@ -306,6 +313,7 @@ describe("RetryQueue adaptive timeout revision (WR-334)", () => {
       minTimeoutMs: 100,
       maxTimeoutMs: 4000,
       minSamples: 10,
+      maxSamplesPerEndpoint: 1024,
     });
     assert.deepEqual(q.reviseAdaptiveTimeout({ marginRatio: 1, minSamples: 5 }), {
       baseTimeoutMs: 1000,
@@ -313,6 +321,7 @@ describe("RetryQueue adaptive timeout revision (WR-334)", () => {
       minTimeoutMs: 100,
       maxTimeoutMs: 4000,
       minSamples: 5,
+      maxSamplesPerEndpoint: 1024,
     });
     assert.deepEqual(q.getAdaptiveTimeoutConfig(), {
       baseTimeoutMs: 1000,
@@ -320,6 +329,7 @@ describe("RetryQueue adaptive timeout revision (WR-334)", () => {
       minTimeoutMs: 100,
       maxTimeoutMs: 4000,
       minSamples: 5,
+      maxSamplesPerEndpoint: 1024,
     });
     q.stop();
   });
@@ -354,6 +364,7 @@ describe("RetryQueue adaptive timeout revision (WR-334)", () => {
       minTimeoutMs: 100,
       maxTimeoutMs: 4000,
       minSamples: 100,
+      maxSamplesPerEndpoint: 1024,
     });
     release?.();
     await waitFor(() => q.pendingCount() === 0, "first delivery to settle");
@@ -433,6 +444,7 @@ describe("RelayServer adaptive timeout revision (WR-334)", () => {
     minTimeoutMs: 100,
     maxTimeoutMs: 4000,
     minSamples: 10,
+    maxSamplesPerEndpoint: 1024,
   };
 
   it("revision audits previous/current with the construction values first; same-value is a silent no-op", async () => {
@@ -481,6 +493,7 @@ describe("RelayServer adaptive timeout revision (WR-334)", () => {
       minTimeoutMs: 100,
       maxTimeoutMs: 8000,
       minSamples: 3,
+      maxSamplesPerEndpoint: 1024,
     });
     relay.reviseAdaptiveTimeout!({ baseTimeoutMs: 3000 });
     assert.deepEqual(relay.getAdaptiveTimeoutConfig!(), {
@@ -489,6 +502,7 @@ describe("RelayServer adaptive timeout revision (WR-334)", () => {
       minTimeoutMs: 100,
       maxTimeoutMs: 8000,
       minSamples: 3,
+      maxSamplesPerEndpoint: 1024,
     });
   });
 
@@ -528,6 +542,7 @@ describe("RelayServer adaptive timeout revision (WR-334)", () => {
       minTimeoutMs: 100,
       maxTimeoutMs: 4000,
       minSamples: 100,
+      maxSamplesPerEndpoint: 1024,
     });
     assert.equal(eventsOf(audit, "adaptive_timeout_revised").length, 1);
     release?.();

@@ -10069,9 +10069,9 @@ export class RetryQueue {
 
   /**
    * WR-334: live adaptive timeout config — the five formula inputs
-   * shared by all endpoints. `undefined` when the feature was never
-   * configured. Reads the live values, so a runtime revision is
-   * visible immediately.
+   * plus the sample window, shared by all endpoints. `undefined` when
+   * the feature was never configured. Reads the live values, so a
+   * runtime revision is visible immediately.
    */
   getAdaptiveTimeoutConfig(): AdaptiveTimeoutConfig | undefined {
     return this.adaptiveTimeout?.snapshot();
