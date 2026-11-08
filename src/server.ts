@@ -514,7 +514,9 @@ import {
 import type { ProbeConfig, ProbeEndpointsRevision, ProbeOptions, ProbeRevision } from "./downstream-probe.ts";
 import {
   ProxyHealthMonitor,
+  type ProxyHealthConfig,
   type ProxyHealthOptions,
+  type ProxyHealthRevision,
   type ProxyHealthStats,
 } from "./proxy-health.ts";
 import type { OtlpExporterOptions } from "./otlp.ts";
@@ -5863,6 +5865,36 @@ export interface RelayServer extends Server {
    * configured; `undefined` otherwise.
    */
   getProbeEndpoints?: () => string[] | undefined;
+  /**
+   * WR-358: revise the live outbound proxy health probe rhythm at
+   * runtime (`intervalMs` / `probeTimeoutMs` / `failureThreshold`,
+   * partial — omitted fields keep their live values). A running
+   * monitor re-arms its pending timers at the new interval (no extra
+   * round, probe counts and health state untouched); an unstarted
+   * monitor picks the new values up on the next start. `probeTimeoutMs`
+   * takes effect from the next probe and `failureThreshold` from the
+   * next failed probe — lowering the threshold never retroactively
+   * marks a proxy unhealthy, raising it never re-admits one. An
+   * illegal patch throws `RangeError` and the live values are
+   * untouched; an empty patch is a `RangeError`; a same-value revision
+   * is a no-op with no audit event. A real revision is audited as
+   * `proxy_health_revised` with `previous` / `current` (the three
+   * knobs), via the monitor's `onAudit` → audit-log channel, and
+   * returns the live config. Always set; throws `Error` when
+   * `proxyHealth` was never configured — enabling it needs a restart.
+   * The probe target and the tracked proxy list are revised separately
+   * (target stays construction-time; the list grows via
+   * `ensureTracked` at dispatch). Orthogonal to WR-181 (which owns
+   * the probing mechanism itself), WR-355 (downstream probes, not
+   * outbound proxies), and WR-10 (the circuit-breaker trip decision,
+   * untouched here).
+   */
+  reviseProxyHealth?: (patch: ProxyHealthRevision) => ProxyHealthConfig;
+  /**
+   * WR-358: live outbound proxy health config — the three probe knobs.
+   * Only set when `proxyHealth` was configured; `undefined` otherwise.
+   */
+  getProxyHealthConfig?: () => ProxyHealthConfig | undefined;
   /**
    * WR-357: revise the live fail2ban thresholds at runtime
    * (`maxConsecutiveFailures` / `banDurationMs` / `maxEntries`,
@@ -15374,6 +15406,30 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // configured.
   if (queue.getProbeEndpoints() !== undefined) {
     server.getProbeEndpoints = (): string[] => queue.getProbeEndpoints()!;
+  }
+
+  // WR-358: outbound proxy health probe rhythm runtime revision. The
+  // method is always set (like reviseProbe above); with proxyHealth
+  // unconfigured the canonical must-restart Error is thrown —
+  // enabling it needs a restart. A real revision is audited as
+  // `proxy_health_revised` with the previous and current config by
+  // the monitor itself via the `onAudit` → audit-log channel, so a
+  // real revision is audited exactly once; an empty or same-value
+  // patch is a silent no-op.
+  server.reviseProxyHealth = (patch: ProxyHealthRevision): ProxyHealthConfig => {
+    if (proxyHealthMonitor === undefined) {
+      throw new Error(
+        "reviseProxyHealth: proxy health probing is not configured — enabling it requires a restart: " +
+          "the monitor is created at startup and a running relay cannot start probing proxies without one"
+      );
+    }
+    return proxyHealthMonitor.retune(patch);
+  };
+
+  // WR-358: live outbound proxy health config. Only set when
+  // `proxyHealth` was configured.
+  if (proxyHealthMonitor !== undefined) {
+    server.getProxyHealthConfig = (): ProxyHealthConfig => proxyHealthMonitor.snapshot();
   }
 
   // WR-357: fail2ban threshold runtime revision. The method is always

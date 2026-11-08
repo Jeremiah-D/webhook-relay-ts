@@ -1683,10 +1683,26 @@ reliability primitives that matter for any signed-payload pipeline.
   userinfo-stripped URL. Wired into the server via `proxyHealth: {...}` (off
   by default); invalid values throw `RangeError` at startup; health is
   exported as `relay_proxy_unhealthy{proxy_url}` (1/0 gauge) and via
-  `server.getProxyHealthStats()`. Covered by `test/proxy-health.test.ts`
+  `server.getProxyHealthStats()`. Live revision (WR-358):
+  `server.reviseProxyHealth(patch)` revises the probe rhythm
+  (`intervalMs` / `probeTimeoutMs` / `failureThreshold`, partial —
+  omitted fields keep their live values); `server.getProxyHealthConfig()`
+  returns the live config (the getter is only mounted when `proxyHealth`
+  was configured). A running monitor re-arms its pending timers at the
+  new interval (no extra round, probe counts and health state untouched);
+  `probeTimeoutMs` takes effect from the next probe and
+  `failureThreshold` from the next failed probe — lowering the threshold
+  never retroactively marks a proxy unhealthy, raising it never
+  re-admits one. An illegal patch throws `RangeError` and leaves the
+  live values untouched; an empty or same-value patch is a silent
+  no-op. A real revision is audited as `proxy_health_revised` with
+  `previous` / `current`. Enabling probing when it was never configured
+  still requires a restart. Covered by `test/proxy-health.test.ts`
   (19 tests: threshold/recovery matrix, backup/direct/stay failover, audit
   shapes, credential redaction, end-to-end relay delivery through a fake
-  backup CONNECT proxy). Zero dependencies (`node:net` + `src/proxy.ts`).
+  backup CONNECT proxy) and `test/proxy-health-revision.test.ts` (13
+  tests: interval re-arm, live timeout/threshold reads, no-op and
+  must-restart cases, server audit). Zero dependencies (`node:net` + `src/proxy.ts`).
 - `bench/keepalive-bench.ts` (`npm run bench:keepalive`) — sequential
   deliveries to a localhost stub, before/after numbers (50 warmup deliveries
   per scenario; connection counts include warmup). Measured 2026-10-08,

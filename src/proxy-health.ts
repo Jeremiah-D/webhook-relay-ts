@@ -34,6 +34,12 @@ import { isSocks5ProxyUrl } from "./socks5.ts";
  * convention). Only plain-HTTP CONNECT proxies (`http:` scheme) are
  * tracked — `socks5://` entries are skipped, not failed.
  *
+ * The three knobs (`intervalMs` / `probeTimeoutMs` / `failureThreshold`)
+ * are live-revisable at runtime via `retune()` (WR-358): a running
+ * monitor re-arms its pending timers at the new interval — no restart,
+ * no lost probe state — and a real revision is audited as
+ * `proxy_health_revised` with the previous / current config.
+ *
  * Proxy credentials never leave this module's redaction boundary:
  * metrics labels, audit fields, and stats all use the userinfo-stripped
  * form (`http://user:pass@proxy:8080` → `http://proxy:8080`).
@@ -81,11 +87,30 @@ export interface ProxyRecoveredAuditEvent {
   proxyUrl: string;
 }
 
+/** Live proxy-health config — the three revisable knobs (WR-358). */
+export interface ProxyHealthConfig {
+  intervalMs: number;
+  probeTimeoutMs: number;
+  failureThreshold: number;
+}
+
+/** Partial patch for `ProxyHealthMonitor.retune` (WR-358). */
+export type ProxyHealthRevision = Partial<ProxyHealthConfig>;
+
+export interface ProxyHealthRevisedAuditEvent {
+  event: "proxy_health_revised";
+  /** The live config before the revision. */
+  previous: ProxyHealthConfig;
+  /** The live config after the revision. */
+  current: ProxyHealthConfig;
+}
+
 /** Every audit event this module emits. */
 export type ProxyHealthAuditEvent =
   | ProxyDegradedAuditEvent
   | ProxyUnhealthyAuditEvent
-  | ProxyRecoveredAuditEvent;
+  | ProxyRecoveredAuditEvent
+  | ProxyHealthRevisedAuditEvent;
 
 export interface ProxyHealthOptions {
   /**
@@ -195,15 +220,50 @@ function escapeLabelValue(value: string): string {
 }
 
 /**
+ * Shared construction gates for the three revisable knobs (WR-358):
+ * the constructor and `retune()` validate through the same function,
+ * so a live revision can never admit a value the constructor would
+ * reject. The messages name the offending merged value.
+ */
+function assertValidProxyHealthKnobs(
+  intervalMs: number,
+  probeTimeoutMs: number,
+  failureThreshold: number
+): void {
+  if (!Number.isFinite(intervalMs) || intervalMs <= 0) {
+    throw new RangeError(`proxyHealth.intervalMs must be a finite number > 0, got ${intervalMs}`);
+  }
+  if (!Number.isFinite(probeTimeoutMs) || probeTimeoutMs <= 0) {
+    throw new RangeError(
+      `proxyHealth.probeTimeoutMs must be a finite number > 0, got ${probeTimeoutMs}`
+    );
+  }
+  if (!Number.isInteger(failureThreshold) || failureThreshold < 1) {
+    throw new RangeError(
+      `proxyHealth.failureThreshold must be an integer >= 1, got ${failureThreshold}`
+    );
+  }
+}
+
+/**
  * Timed CONNECT health prober + dispatch-time failover for outbound
  * proxies. Constructed by `createRelayServer` when the `proxyHealth`
  * server option is set; `resolveProxy` is consulted by the default
  * sender on every proxied delivery attempt.
+ *
+ * The three knobs are live-revisable at runtime via `retune()`
+ * (WR-358): `schedule()` arms the next round at the live `intervalMs`,
+ * `probeOnce` handshakes with the live `probeTimeoutMs`, and the
+ * unhealthy verdict reads the live `failureThreshold` — so a revision
+ * takes effect from the next round without a restart.
  */
 export class ProxyHealthMonitor {
-  private readonly intervalMs: number;
-  private readonly probeTimeoutMs: number;
-  private readonly failureThreshold: number;
+  // WR-358: live-revisable via `retune()` (the constructor still
+  // validates every value through the same gates), so these are
+  // deliberately not `readonly`.
+  private intervalMs: number;
+  private probeTimeoutMs: number;
+  private failureThreshold: number;
   private readonly probeTarget: { host: string; port: number };
   private readonly connect: (
     proxyUrl: string,
@@ -219,24 +279,13 @@ export class ProxyHealthMonitor {
   private running = false;
 
   constructor(opts: ProxyHealthOptions = {}) {
-    this.intervalMs = opts.intervalMs ?? 30_000;
-    if (!Number.isFinite(this.intervalMs) || this.intervalMs <= 0) {
-      throw new RangeError(
-        `proxyHealth.intervalMs must be a finite number > 0, got ${opts.intervalMs}`
-      );
-    }
-    this.probeTimeoutMs = opts.probeTimeoutMs ?? 10_000;
-    if (!Number.isFinite(this.probeTimeoutMs) || this.probeTimeoutMs <= 0) {
-      throw new RangeError(
-        `proxyHealth.probeTimeoutMs must be a finite number > 0, got ${opts.probeTimeoutMs}`
-      );
-    }
-    this.failureThreshold = opts.failureThreshold ?? 3;
-    if (!Number.isInteger(this.failureThreshold) || this.failureThreshold < 1) {
-      throw new RangeError(
-        `proxyHealth.failureThreshold must be an integer >= 1, got ${opts.failureThreshold}`
-      );
-    }
+    const intervalMs = opts.intervalMs ?? 30_000;
+    const probeTimeoutMs = opts.probeTimeoutMs ?? 10_000;
+    const failureThreshold = opts.failureThreshold ?? 3;
+    assertValidProxyHealthKnobs(intervalMs, probeTimeoutMs, failureThreshold);
+    this.intervalMs = intervalMs;
+    this.probeTimeoutMs = probeTimeoutMs;
+    this.failureThreshold = failureThreshold;
     const target = opts.probeTarget ?? { host: "1.1.1.1", port: 443 };
     if (
       typeof target.host !== "string" ||
@@ -301,6 +350,86 @@ export class ProxyHealthMonitor {
         rec.timer = undefined;
       }
     }
+  }
+
+  /**
+   * WR-358: revise the live probe rhythm (partial — omitted fields
+   * keep their live values). Merge-then-validate reusing the
+   * construction gates (`assertValidProxyHealthKnobs`): an illegal
+   * patch throws `RangeError` and the live values are left completely
+   * untouched, and an empty patch is a `RangeError`. A patch equal to
+   * the live values is a silent no-op. A real revision updates the
+   * three knobs in place: when the monitor is running and `intervalMs`
+   * changed, every pending timer is re-armed at the new interval
+   * (clear + reschedule — no extra round, and the `success` /
+   * `failure` / `consecutiveFailures` / `healthy` state is untouched);
+   * a probe already in flight keeps settling on its original flow and
+   * its `tick()` re-arms afterwards as usual; an unstarted monitor
+   * picks the new values up on the next `start()`. `probeTimeoutMs`
+   * takes effect from the next probe (the handshake reads the live
+   * value at call time) and `failureThreshold` from the next failed
+   * probe (lowering it never retroactively marks a proxy unhealthy,
+   * raising it never re-admits one). A real revision is audited as
+   * `proxy_health_revised` with `previous` / `current` (the three
+   * knobs), via the same `onAudit` channel as `proxy_unhealthy` /
+   * `proxy_recovered`. Returns the live config after the revision.
+   */
+  retune(patch: ProxyHealthRevision): ProxyHealthConfig {
+    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new RangeError(
+        `proxy health revision must be an object, got ${JSON.stringify(patch)}`
+      );
+    }
+    if (
+      patch.intervalMs === undefined &&
+      patch.probeTimeoutMs === undefined &&
+      patch.failureThreshold === undefined
+    ) {
+      throw new RangeError(
+        "proxy health revision must set at least one of intervalMs, probeTimeoutMs, failureThreshold"
+      );
+    }
+    const next: ProxyHealthConfig = {
+      intervalMs: patch.intervalMs ?? this.intervalMs,
+      probeTimeoutMs: patch.probeTimeoutMs ?? this.probeTimeoutMs,
+      failureThreshold: patch.failureThreshold ?? this.failureThreshold,
+    };
+    // Validate-then-apply: the merged values must pass the
+    // construction gates before any live value moves.
+    assertValidProxyHealthKnobs(next.intervalMs, next.probeTimeoutMs, next.failureThreshold);
+    if (
+      next.intervalMs === this.intervalMs &&
+      next.probeTimeoutMs === this.probeTimeoutMs &&
+      next.failureThreshold === this.failureThreshold
+    ) {
+      return this.snapshot();
+    }
+    const previous = this.snapshot();
+    const intervalChanged = next.intervalMs !== this.intervalMs;
+    this.intervalMs = next.intervalMs;
+    this.probeTimeoutMs = next.probeTimeoutMs;
+    this.failureThreshold = next.failureThreshold;
+    // A running monitor re-arms every *pending* timer at the new
+    // interval. `schedule()` clears the old timer first, so no round
+    // is duplicated; an in-flight round has no pending timer (its
+    // `tick()` re-arms afterwards as usual).
+    if (this.running && intervalChanged) {
+      for (const [proxyUrl, rec] of this.records) {
+        if (rec.timer !== undefined) this.schedule(proxyUrl);
+      }
+    }
+    const current = this.snapshot();
+    this.onAudit?.({ event: "proxy_health_revised", previous, current });
+    return current;
+  }
+
+  /** WR-358: live proxy-health config snapshot (the three knobs). */
+  snapshot(): ProxyHealthConfig {
+    return {
+      intervalMs: this.intervalMs,
+      probeTimeoutMs: this.probeTimeoutMs,
+      failureThreshold: this.failureThreshold,
+    };
   }
 
   /**
