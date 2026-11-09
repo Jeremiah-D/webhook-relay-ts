@@ -69,6 +69,7 @@ import {
 } from "./http-hardening.ts";
 import type { LatencyPhaseOptions, OrderedAuditEvent, OrderedModeOptions } from "./retry.ts";
 import type { BulkheadRevision, BulkheadRevisionSnapshot, CircuitProbeRevision, CircuitThresholdPatch, DeliveryWindowListEntry, DeliveryWindowSnapshot, EndpointConcurrencySnapshot, EndpointDependencyCallbacksRevision, EndpointDependencyTransitionInfo, EndpointQuotaSnapshot, EndpointRetryBudgetSnapshot, EndpointRetryPolicyRevision, GlobalConcurrencyStats, GlobalRateLimitRevision, GlobalRateLimitStats, HolidayCalendarConfig, HolidayCalendarSnapshot, MinNormalShareSnapshot, ResolvedCircuitProbe, ResolvedCircuitThresholds, ResolvedEndpointRetryPolicy, StatusRetryPolicyConfig, TenantBudgetSnapshot, TenantConcurrencySnapshot, TenantRetryBudgetRevision } from "./retry.ts";
+import type { QueueDepthBreachInfo } from "./queue-depth.ts";
 import {
   DEFAULT_STATUS_RETRY_MULTIPLIER,
   assertValidStatusRetryPolicy,
@@ -7107,6 +7108,23 @@ export interface RelayServer extends Server {
     cb: CircuitStateChangeCallback | null
   ) => void;
   /**
+   * WR-371: live-redirect the queue-depth breach observer — the
+   * operator callback that fires once per breach episode. `null`
+   * clears back to audit-only (the tracker keeps evaluating and
+   * `relay_queue_depth_breach_total` keeps counting; the breach is
+   * still audited, just no longer forwarded to an operator). A
+   * non-function value throws `RangeError` and the live callback is
+   * untouched; replacing with the same reference (or clearing when
+   * already unset) is a silent no-op. A real replacement is audited
+   * as `queue_depth_breach_callback_revised` with `previous` /
+   * `current` recording only 'set' / 'cleared' presence, never a
+   * function body. Always set; throws `Error` when queue-depth
+   * alerting was never configured — enabling it needs a restart.
+   * The new callback takes effect from the next breach episode; the
+   * edge-triggered gate, thresholds, and breach counts are untouched.
+   */
+  reviseQueueDepthBreachCallback?: (cb: ((info: QueueDepthBreachInfo) => void) | null) => void;
+  /**
    * WR-331: revise one endpoint's live half-open probe knobs at
    * runtime — no restart. The patch merges over the endpoint's live
    * effective probe values; an illegal patch (or an empty patch)
@@ -8421,6 +8439,13 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   let operatorEndpointDependencyUnblockedCallback:
     | ((info: EndpointDependencyTransitionInfo) => void)
     | undefined = opts.retry?.onEndpointDependencyUnblocked;
+  // WR-371: the operator's queue-depth breach callback, held in a
+  // mutable cell so `server.reviseQueueDepthBreachCallback` can
+  // replace it at runtime. The audit wrapper below reads this cell —
+  // never the operator callback directly — so replacing the operator
+  // callback cannot bypass the `queue_depth_breached` audit.
+  let operatorQueueDepthBreachCallback: ((info: QueueDepthBreachInfo) => void) | undefined =
+    opts.retry?.onQueueDepthBreach;
   const queue = new RetryQueue({
     // WR-146: the queue talks to the hedged wrapper (a pure pass-through
     // when hedging is off) so the server's `defaultSender` handle keeps
@@ -9317,7 +9342,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         threshold,
         ...(activeOperatorKeyId !== undefined ? { keyId: activeOperatorKeyId } : {}),
       });
-      opts.retry?.onQueueDepthBreach?.({ endpoint, depth, threshold });
+      operatorQueueDepthBreachCallback?.({ endpoint, depth, threshold });
     },
     // Wrap the caller's onBatch so every flushed batch is audited, not just observed.
     onBatch: (info) => {
@@ -17774,6 +17799,44 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     operatorCircuitStateChangeCallback = next;
     opts.auditLog.append({
       event: "circuit_state_change_callback_revised",
+      previous: prev,
+      current: nextPresence,
+    });
+  };
+
+  // WR-371: live queue-depth breach observer revision. The method is
+  // always set (like reviseCircuitStateChangeCallback above); with
+  // queue-depth alerting unconfigured the queue throws the canonical
+  // "must restart" Error. The audit wrapper reads the operator cell,
+  // never the operator callback directly, so a replacement cannot
+  // bypass the `queue_depth_breached` audit. A non-function callback
+  // throws `RangeError` and the live cell is untouched; a
+  // same-reference replacement (or clearing when already unset) is a
+  // silent no-op. A real replacement is audited as
+  // `queue_depth_breach_callback_revised` with `previous` /
+  // `current` recording only 'set' / 'cleared' presence, never a
+  // function body. The new callback takes effect from the next breach
+  // episode; the edge-triggered gate, thresholds, and breach counts
+  // are untouched.
+  server.reviseQueueDepthBreachCallback = (
+    cb: ((info: QueueDepthBreachInfo) => void) | null
+  ): void => {
+    if (!queue.queueDepthAlertConfigured()) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseQueueDepthBreachCallback(cb);
+    }
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseQueueDepthBreachCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === operatorQueueDepthBreachCallback) return;
+    const prev = operatorQueueDepthBreachCallback === undefined ? "cleared" : "set";
+    const nextPresence = next === undefined ? "cleared" : "set";
+    operatorQueueDepthBreachCallback = next;
+    opts.auditLog.append({
+      event: "queue_depth_breach_callback_revised",
       previous: prev,
       current: nextPresence,
     });

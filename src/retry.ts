@@ -2754,7 +2754,9 @@ export interface RetryQueueOptions {
    * exception is swallowed and the backlog keeps moving. The server
    * audits these as `queue_depth_breached` (endpoint, depth,
    * threshold) — the operator alert channel for this feature;
-   * library users get the hook directly.
+   * library users get the hook directly. Live-revisable via
+   * `RetryQueue.reviseQueueDepthBreachCallback` (WR-371) — `null`
+   * clears back to no observer.
    */
   onQueueDepthBreach?: (info: QueueDepthBreachInfo) => void;
   /**
@@ -4251,7 +4253,12 @@ export class RetryQueue {
    * `onQueueDepthBreach`, so the feature is pure observation.
    */
   private readonly queueDepthAlert?: QueueDepthAlert;
-  private readonly onQueueDepthBreach?: (info: QueueDepthBreachInfo) => void;
+  // WR-371: deliberately *not* readonly — `reviseQueueDepthBreachCallback`
+  // replaces the live breach observer at runtime. The server's audit
+  // closure (which forwards to the operator callback) is held here when
+  // the queue runs under `RelayServer`; direct queue users hold their own
+  // callback in the same field.
+  private onQueueDepthBreach?: (info: QueueDepthBreachInfo) => void;
   /** `relay_queue_depth_breach_total`, cumulative breach episodes per endpoint. */
   private readonly queueDepthBreachCounts = new Map<string, number>();
   /**
@@ -8242,6 +8249,11 @@ export class RetryQueue {
   /** WR-370: whether the endpoint-dependency subsystem is enabled (queue-level). */
   endpointDependenciesConfigured(): boolean {
     return this.endpointDependencies !== undefined;
+  }
+
+  /** WR-371: whether the queue-depth alert subsystem is enabled (queue-level). */
+  queueDepthAlertConfigured(): boolean {
+    return this.queueDepthAlert !== undefined;
   }
 
   /** Whether the per-endpoint quota subsystem is enabled (queue-level). */
@@ -12313,6 +12325,43 @@ export class RetryQueue {
     const next = cb ?? undefined;
     if (next === this.circuitBreakerOnStateChange) return;
     this.circuitBreakerOnStateChange = next;
+  }
+
+  /**
+   * WR-371: live-redirect the queue-depth breach observer — the
+   * queue-side setter behind
+   * `RelayServer.reviseQueueDepthBreachCallback`. The new callback
+   * takes effect from the next breach episode; episodes that already
+   * fired are never re-delivered, and the edge-triggered gate is
+   * untouched — swapping the observer mid-episode does not re-fire
+   * the current episode. `null` clears back to no observer (the
+   * tracker keeps evaluating and `relay_queue_depth_breach_total`
+   * keeps counting — only the observation stops). A non-function
+   * value throws `RangeError` and the live callback is untouched;
+   * replacing with the same reference (or clearing when already
+   * unset) is a no-op. Only the observer moves: thresholds, edge
+   * state, breach counts, and the dispatch path are untouched.
+   * Throws `Error` when queue-depth alerting was never configured
+   * — enabling it needs a restart. Under `RelayServer` the field
+   * holds the server's audit closure, so direct calls here would
+   * replace the audit wrapper; server users must go through
+   * `RelayServer.reviseQueueDepthBreachCallback`, which swaps only
+   * the operator cell behind the audit closure.
+   */
+  reviseQueueDepthBreachCallback(cb: ((info: QueueDepthBreachInfo) => void) | null): void {
+    if (this.queueDepthAlert === undefined) {
+      throw new Error(
+        "reviseQueueDepthBreachCallback: queue-depth alerting is not configured — enabling it requires a restart"
+      );
+    }
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseQueueDepthBreachCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === this.onQueueDepthBreach) return;
+    this.onQueueDepthBreach = next;
   }
 
   /**

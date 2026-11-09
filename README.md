@@ -2883,6 +2883,19 @@ curl http://127.0.0.1:PORT/health/summary -H "Authorization: Bearer $OPERATOR_TO
   `relay_queue_depth_breach_total{endpoint}` (activity-gated — absent when
   the feature is off or no breach has happened); `GET /health/summary`
   shows the live depth per endpoint even without a configured threshold.
+- **Live-revisable observer (WR-371)** — the breach callback can be
+  swapped without a restart: `queue.reviseQueueDepthBreachCallback(cb)`
+  (library) or `server.reviseQueueDepthBreachCallback(cb)` (relay).
+  `null` clears back to audit-and-counter-only — the tracker keeps
+  evaluating and `relay_queue_depth_breach_total` keeps counting, only
+  the operator forwarding stops. The new callback takes effect from the
+  next breach episode; swapping mid-episode never re-fires the current
+  episode, and a throwing replacement can never break the delivery path.
+  A real revision is audited as `queue_depth_breach_callback_revised`
+  (`previous` / `current`: 'set' / 'cleared'); a same-reference revision
+  is a silent no-op, and a non-function value throws `RangeError` with
+  the live callback untouched. With alerting unconfigured the revision
+  throws `Error` — enabling it needs a restart.
 - **Off by default** — without the option the tracker is never
   constructed: zero behavior change, zero hot-path cost beyond one
   undefined check per backlog mutation.
