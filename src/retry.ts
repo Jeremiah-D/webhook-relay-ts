@@ -22,7 +22,7 @@ import {
   type StalePauseOptions,
   type StalePauseSweepResult,
 } from "./stale-pause.ts";
-import { EndpointCircuitBreaker, resolveCircuitBreakerOptions, resolveCircuitThresholds, type CircuitBreakerOptions, type CircuitProbeRevision, type CircuitState, type CircuitStats, type CircuitThresholdPatch, type ResolvedCircuitProbe, type ResolvedCircuitThresholds } from "./circuit.ts";
+import { EndpointCircuitBreaker, resolveCircuitBreakerOptions, resolveCircuitProbe, resolveCircuitProbeOptions, resolveCircuitThresholds, type CircuitBreakerOptions, type CircuitProbeRevision, type CircuitState, type CircuitStats, type CircuitThresholdPatch, type ResolvedCircuitProbe, type ResolvedCircuitThresholds } from "./circuit.ts";
 import {
   EndpointBulkheads,
   BulkheadRejectedError,
@@ -12082,6 +12082,71 @@ export class RetryQueue {
   getCircuitBreakerDefaults(): ResolvedCircuitThresholds | undefined {
     if (this.circuitBreakerOpts === undefined) return undefined;
     return resolveCircuitBreakerOptions(this.circuitBreakerOpts);
+  }
+
+  /**
+   * WR-364: revise the fleet-wide half-open probe defaults at runtime
+   * — the queue-side setter behind
+   * `RelayServer.reviseCircuitProbeDefaults`. The patch merges over
+   * the live probe defaults and the merged result is validated as a
+   * unit by `resolveCircuitProbe` — an illegal patch (or an empty
+   * patch, along `setEndpointProbe`) throws `RangeError` and the live
+   * defaults are left completely intact. The stored options are
+   * updated first (so a tenant's breaker built later starts from
+   * the new defaults), then every already-built breaker is retuned
+   * in place via `EndpointCircuitBreaker.retuneProbeDefaults`
+   * (state, `openedAtMs` and trips kept; in-flight probes settle
+   * under the old slot). Per-endpoint probe overrides keep winning:
+   * `probeFor` reads the override first, and an override stores the
+   * resolved effective full set, so a covered endpoint is fully
+   * unaffected by a defaults revision. A patch that lands on the
+   * current defaults is a silent no-op. The next parked attempt for
+   * an uncovered endpoint waits the new `halfOpenRetryMs` and the
+   * next half-open window grants up to the new
+   * `halfOpenMaxInFlight` probes; the trip/cooldown thresholds are
+   * untouched (WR-363 owns those). Throws `Error` when the circuit
+   * breaker was never configured — enabling it needs a restart.
+   * Returns the live resolved probe defaults.
+   */
+  reviseCircuitProbeDefaults(patch: CircuitProbeRevision): ResolvedCircuitProbe {
+    if (this.circuitBreakerOpts === undefined) {
+      throw new Error(
+        "reviseCircuitProbeDefaults: circuit breaker is not configured — enabling it requires a restart: " +
+          "the breaker is created at startup and a running relay cannot start breaking without one"
+      );
+    }
+    if (patch.halfOpenMaxInFlight === undefined && patch.halfOpenRetryMs === undefined) {
+      throw new RangeError(
+        "reviseCircuitProbeDefaults: at least one of halfOpenMaxInFlight / halfOpenRetryMs must be provided"
+      );
+    }
+    const current = resolveCircuitProbeOptions(this.circuitBreakerOpts);
+    const next = resolveCircuitProbe(patch, "reviseCircuitProbeDefaults", current);
+    if (
+      next.halfOpenMaxInFlight === current.halfOpenMaxInFlight &&
+      next.halfOpenRetryMs === current.halfOpenRetryMs
+    ) {
+      return current;
+    }
+    this.circuitBreakerOpts = { ...this.circuitBreakerOpts, ...next };
+    for (const breaker of this.breakers.values()) {
+      breaker.retuneProbeDefaults(next);
+    }
+    return next;
+  }
+
+  /**
+   * WR-364: the live fleet-wide half-open probe defaults — the
+   * constructor options resolved against the built-in defaults
+   * (1 probe in flight, 1000ms retry), with any runtime revision
+   * applied. `undefined` when the circuit breaker was never
+   * configured. Read-only: unlike the setter it never creates a
+   * breaker, so a read cannot conjure state. Reads the live values,
+   * so a runtime revision is visible immediately.
+   */
+  getCircuitBreakerProbeDefaults(): ResolvedCircuitProbe | undefined {
+    if (this.circuitBreakerOpts === undefined) return undefined;
+    return resolveCircuitProbeOptions(this.circuitBreakerOpts);
   }
 
   /**

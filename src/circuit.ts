@@ -254,19 +254,68 @@ export function resolveCircuitBreakerOptions(
   return resolveCircuitThresholds(opts, "constructor", CIRCUIT_DEFAULTS);
 }
 
+const CIRCUIT_PROBE_DEFAULTS: ResolvedCircuitProbe = {
+  halfOpenMaxInFlight: 1,
+  halfOpenRetryMs: 1000,
+};
+
+/**
+ * Validate and resolve the half-open probe knobs shared by the
+ * constructor and the runtime revisions. `values` carries the raw
+ * (possibly partial) inputs and `where` names the call site in error
+ * messages; `base` supplies the already-resolved defaults the partial
+ * values merge over. Throws `RangeError` on any illegal value and
+ * returns the fully resolved probe knobs. The constructor keeps its
+ * own inline checks (same rules, unprefixed messages); this resolver
+ * is the queue's global-default revision path (WR-364), which merges
+ * a patch over the live defaults with exactly these rules.
+ */
+export function resolveCircuitProbe(
+  values: CircuitProbeRevision,
+  where: string,
+  base: ResolvedCircuitProbe
+): ResolvedCircuitProbe {
+  const halfOpenMaxInFlight = values.halfOpenMaxInFlight ?? base.halfOpenMaxInFlight;
+  const halfOpenRetryMs = values.halfOpenRetryMs ?? base.halfOpenRetryMs;
+  if (!Number.isInteger(halfOpenMaxInFlight) || halfOpenMaxInFlight < 1) {
+    throw new RangeError(
+      `${where}: halfOpenMaxInFlight must be an integer >= 1, got ${values.halfOpenMaxInFlight}`
+    );
+  }
+  if (!Number.isFinite(halfOpenRetryMs) || halfOpenRetryMs <= 0) {
+    throw new RangeError(
+      `${where}: halfOpenRetryMs must be > 0, got ${values.halfOpenRetryMs}`
+    );
+  }
+  return { halfOpenMaxInFlight, halfOpenRetryMs };
+}
+
+/**
+ * Resolve raw constructor options into the effective global probe
+ * defaults (WR-364): the same merge the constructor performs, so the
+ * queue can read the live defaults without building a breaker first.
+ */
+export function resolveCircuitProbeOptions(
+  opts: CircuitBreakerOptions
+): ResolvedCircuitProbe {
+  return resolveCircuitProbe(opts, "constructor", CIRCUIT_PROBE_DEFAULTS);
+}
+
 export class EndpointCircuitBreaker {
   // WR-363: the six trip/cooldown fields are deliberately *not*
   // readonly — `retuneDefaults` replaces the fleet-wide defaults at
-  // runtime. The half-open probe knobs below stay readonly: their
-  // live revision is per-endpoint only (WR-331).
+  // runtime. WR-364: the half-open probe knobs below are likewise
+  // mutable — `retuneProbeDefaults` replaces the fleet-wide probe
+  // defaults at runtime (per-endpoint probe overrides, WR-331, still
+  // win over them).
   private failureThreshold: number;
   private tripMode: CircuitTripMode;
   private errorRateWindowSize: number;
   private errorRateThreshold: number;
   private errorRateMinSamples: number;
   private cooldownMs: number;
-  private readonly halfOpenMaxInFlight: number;
-  private readonly halfOpenRetryMs: number;
+  private halfOpenMaxInFlight: number;
+  private halfOpenRetryMs: number;
   private readonly nowMs: () => number;
   private readonly onStateChange?: (endpoint: string, from: CircuitState, to: CircuitState) => void;
   private readonly records = new Map<string, CircuitRecord>();
@@ -287,8 +336,9 @@ export class EndpointCircuitBreaker {
    * (WR-331). Orthogonal to `endpointOverrides`: probe knobs never
    * touch trip/cooldown thresholds, and threshold revisions never
    * touch probe knobs. An endpoint without a probe override uses the
-   * constructor defaults; the constructor fields stay the default
-   * source and are never mutated by a revision.
+   * constructor defaults as revised by `retuneProbeDefaults`
+   * (WR-364); a probe revision never writes into this map, so an
+   * override keeps winning over the revised defaults.
    */
   private readonly endpointProbeOverrides = new Map<string, ResolvedCircuitProbe>();
 
@@ -363,6 +413,25 @@ export class EndpointCircuitBreaker {
     for (const rec of this.records.values()) {
       while (rec.window.length > resolved.errorRateWindowSize) rec.window.shift();
     }
+  }
+
+  /**
+   * WR-364: replace the constructor-default half-open probe knobs
+   * live — the fleet-wide defaults behind `probeFor` for every
+   * endpoint without its own probe override. `resolved` must already
+   * be validated (the queue resolves the patch with
+   * `resolveCircuitProbe` before calling here), so this never
+   * throws. Already-built breakers keep their state, records and
+   * trips; in-flight probes settle under the old slot (tightening
+   * below the in-flight count simply grants no new permit until
+   * the count falls back, same as `setEndpointProbe`). Per-endpoint
+   * probe overrides are untouched and keep winning over the new
+   * defaults; the trip/cooldown thresholds are untouched (WR-363
+   * owns those).
+   */
+  retuneProbeDefaults(resolved: ResolvedCircuitProbe): void {
+    this.halfOpenMaxInFlight = resolved.halfOpenMaxInFlight;
+    this.halfOpenRetryMs = resolved.halfOpenRetryMs;
   }
 
   /**

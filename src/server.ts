@@ -6943,6 +6943,35 @@ export interface RelayServer extends Server {
    */
   getCircuitBreakerDefaults?: () => ResolvedCircuitThresholds | undefined;
   /**
+   * WR-364: revise the fleet-wide half-open probe defaults at runtime
+   * (`halfOpenMaxInFlight` / `halfOpenRetryMs`) — the fallback every
+   * endpoint without its own probe override recovers on. The patch
+   * merges over the live defaults and the merged result is validated
+   * as a unit; an illegal patch (or an empty patch) throws `RangeError`
+   * and the live defaults are untouched, a same-value revision is a
+   * no-op with no audit event. A real revision is audited as
+   * `circuit_breaker_probe_defaults_revised` with the `previous` /
+   * `current` two-field sets, and returns the live defaults. Always
+   * set; throws `Error` when the circuit breaker was never configured
+   * — enabling it needs a restart. Per-endpoint probe overrides
+   * (WR-331) keep winning and are fully unaffected; the trip/cooldown
+   * thresholds are not in this revision's scope (WR-363 owns those).
+   * An already-open endpoint keeps its state / `openedAtMs` / trips
+   * and wakes on its already-scheduled recheck; in-flight probes
+   * settle under the old slot, and a changed retry interval only
+   * affects the next parked attempt's wait.
+   */
+  reviseCircuitProbeDefaults: (
+    patch: CircuitProbeRevision
+  ) => ResolvedCircuitProbe;
+  /**
+   * WR-364: the live fleet-wide half-open probe defaults — the
+   * constructor options resolved against the built-in defaults, with
+   * any runtime revision applied. Only set when the circuit breaker
+   * was configured; `undefined` otherwise.
+   */
+  getCircuitBreakerProbeDefaults?: () => ResolvedCircuitProbe | undefined;
+  /**
    * WR-331: revise one endpoint's live half-open probe knobs at
    * runtime — no restart. The patch merges over the endpoint's live
    * effective probe values; an illegal patch (or an empty patch)
@@ -17129,6 +17158,45 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   if (queue.circuitBreakerConfigured()) {
     server.getCircuitBreakerDefaults = (): ResolvedCircuitThresholds | undefined =>
       queue.getCircuitBreakerDefaults();
+  }
+
+  // WR-364: live fleet-wide half-open probe defaults revision. The
+  // queue does the validate-then-apply work (RangeError on an illegal
+  // or empty merged patch, live defaults untouched); this layer only
+  // owns the "must restart" Error (the queue throws it when the
+  // feature was never configured) and the audit: a real revision
+  // appends `circuit_breaker_probe_defaults_revised` with the
+  // previous / current two-field sets, a same-value revision is a
+  // silent no-op. The breaker re-reads the live probe defaults on
+  // every `shouldAllow` / `retryInMs` call, so no timer is re-armed
+  // here — an already-open endpoint keeps its `openedAtMs` and wakes
+  // on its already-scheduled recheck, and in-flight probes settle
+  // under the old slot.
+  server.reviseCircuitProbeDefaults = (
+    patch: CircuitProbeRevision
+  ): ResolvedCircuitProbe => {
+    const previous = queue.getCircuitBreakerProbeDefaults();
+    if (previous === undefined) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseCircuitProbeDefaults(patch);
+    }
+    const next = queue.reviseCircuitProbeDefaults(patch);
+    if (sameCircuitProbe(previous, next)) {
+      return next;
+    }
+    opts.auditLog.append({
+      event: "circuit_breaker_probe_defaults_revised",
+      previous,
+      current: next,
+    });
+    return next;
+  };
+
+  // WR-364: live fleet-wide half-open probe defaults reads. Only set
+  // when `retry.circuitBreaker` was configured.
+  if (queue.circuitBreakerConfigured()) {
+    server.getCircuitBreakerProbeDefaults = (): ResolvedCircuitProbe | undefined =>
+      queue.getCircuitBreakerProbeDefaults();
   }
 
   // WR-331: live half-open probe revision / removal for one
