@@ -2699,6 +2699,27 @@ curl -X POST http://127.0.0.1:PORT/endpoints/enable \
   `relay_endpoint_auto_disables_total{endpoint}` and the
   `relay_endpoint_disabled{endpoint}` gauge (both activity-gated —
   absent when the feature is off).
+- **Live callback redirection (WR-369)** — `relay.reviseEndpointAutoDisableCallbacks({ onEndpointAutoDisabled, onEndpointEnabled })`
+  / `queue.reviseEndpointAutoDisableCallbacks(patch)` swaps the operator
+  callbacks that observe each transition at runtime, no restart: the
+  next disable/enable enters the new callback and the old one goes
+  silent. The patch is partial — an omitted field keeps its live
+  value — and `null` clears that hook back to audit-only (the gate
+  keeps disabling and re-enabling and the transitions are still
+  audited, just no longer forwarded). An empty or non-object patch
+  throws `RangeError`, as does a non-function value for a provided
+  field, and the live hooks are untouched; a patch identical to the
+  live values is a silent no-op. A real revision is audited as
+  `endpoint_auto_disable_callbacks_revised` with per-hook
+  `onEndpointAutoDisabled` / `onEndpointEnabled` ('set' / 'cleared' /
+  'unchanged') and `oldOnEndpointAutoDisabled` /
+  `oldOnEndpointEnabled` ('set' / 'absent') presence, never a
+  function body — and the audit can never be bypassed by a
+  replacement. Throws `Error` when auto-disable was never configured
+  — enabling it needs a restart. Only the observers move: the disable
+  gate, the failure streaks, and the disabled set are untouched.
+  WR-367 is the same family for the pause/resume hooks; WR-368 for
+  the replay skip/force hooks.
 - **Off by default** — without the option the tracker is never
   constructed: zero behavior change, zero hot-path cost.
 

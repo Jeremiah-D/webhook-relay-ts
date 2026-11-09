@@ -3168,6 +3168,8 @@ export type EndpointPauseCause = "manual" | "auto";
  * Fired on an endpoint auto-disable transition (WR-150). The endpoint is
  * the physical `targetUrl` that earned the consecutive-failure verdicts
  * (the same key the WR-10 breaker records on).
+ * Live-revisable via `RetryQueue.reviseEndpointAutoDisableCallbacks`
+ * (WR-369) — `null` clears the hook back to no observer.
  */
 export interface EndpointAutoDisabledInfo {
   /** The auto-disabled endpoint (physical `targetUrl`). */
@@ -3180,6 +3182,8 @@ export interface EndpointAutoDisabledInfo {
 
 /**
  * Fired on an operator re-enable of an auto-disabled endpoint (WR-150).
+ * Live-revisable via `RetryQueue.reviseEndpointAutoDisableCallbacks`
+ * (WR-369) — `null` clears the hook back to no observer.
  */
 export interface EndpointEnabledInfo {
   /** The re-enabled endpoint. */
@@ -3249,6 +3253,21 @@ export interface EndpointPauseCallbacksRevision {
 export interface ReplayCallbacksRevision {
   onReplaySkipped?: ((info: ReplaySkippedInfo) => void) | null;
   onReplayForced?: ((info: ReplayForcedInfo) => void) | null;
+}
+
+/**
+ * WR-369: patch for `RetryQueue.reviseEndpointAutoDisableCallbacks` /
+ * `RelayServer.reviseEndpointAutoDisableCallbacks`. Each field is
+ * optional — an omitted field keeps its live value; `null` clears that
+ * hook back to no observer (the gate keeps disabling and re-enabling
+ * exactly as before — only the observation stops). At least one field
+ * must be present, else the patch throws `RangeError` and the live
+ * hooks are untouched. Throws `Error` when auto-disable was never
+ * configured — enabling it needs a restart.
+ */
+export interface EndpointAutoDisableCallbacksRevision {
+  onEndpointAutoDisabled?: ((info: EndpointAutoDisabledInfo) => void) | null;
+  onEndpointEnabled?: ((info: EndpointEnabledInfo) => void) | null;
 }
 
 /**
@@ -4193,8 +4212,13 @@ export class RetryQueue {
   private onEndpointPaused?: (info: EndpointPauseInfo) => void;
   private onEndpointResumed?: (info: EndpointPauseInfo) => void;
   /** WR-150: auto-disable transition hooks (audited by the server). */
-  private readonly onEndpointAutoDisabled?: (info: EndpointAutoDisabledInfo) => void;
-  private readonly onEndpointEnabled?: (info: EndpointEnabledInfo) => void;
+  // WR-369: deliberately *not* readonly — `reviseEndpointAutoDisableCallbacks`
+  // replaces the live auto-disable/enable observers at runtime. The
+  // server's audit closures (which forward to the operator callbacks)
+  // are held here when the queue runs under `RelayServer`; direct queue
+  // users hold their own callbacks in the same fields.
+  private onEndpointAutoDisabled?: (info: EndpointAutoDisabledInfo) => void;
+  private onEndpointEnabled?: (info: EndpointEnabledInfo) => void;
   /**
    * WR-150: per-endpoint consecutive-failure tracker with the disable
    * gate. `undefined` when the `endpointAutoDisable` option is absent —
@@ -8186,6 +8210,11 @@ export class RetryQueue {
   /** WR-368: whether the replay-idempotency subsystem is enabled (queue-level). */
   replayIdempotencyConfigured(): boolean {
     return this.replayIdempotencyOpts !== undefined;
+  }
+
+  /** WR-369: whether the auto-disable subsystem is enabled (queue-level). */
+  autoDisableConfigured(): boolean {
+    return this.autoDisable !== undefined;
   }
 
   /** Whether the per-endpoint quota subsystem is enabled (queue-level). */
@@ -12418,6 +12447,76 @@ export class RetryQueue {
     if (nextSkipped === this.onReplaySkipped && nextForced === this.onReplayForced) return;
     this.onReplaySkipped = nextSkipped;
     this.onReplayForced = nextForced;
+  }
+
+  /**
+   * WR-369: live-redirect the endpoint auto-disable/enable observers —
+   * the queue-side setter behind
+   * `RelayServer.reviseEndpointAutoDisableCallbacks`. The new hooks take
+   * effect from the next transition; transitions that already fired are
+   * never re-delivered. `null` clears a hook back to no observer (the
+   * gate keeps disabling and re-enabling exactly as before — only the
+   * observation stops). An omitted field keeps its live value, so one
+   * hook can move without touching the other. An empty or non-object
+   * patch throws `RangeError`; a non-function value for a provided
+   * field throws `RangeError` and the live hooks are left completely
+   * intact. A patch identical to the live values is a no-op. Only the
+   * observers move: the disable gate, the failure streaks, and the
+   * disabled set are untouched. Throws `Error` when auto-disable was
+   * never configured — the disable/enable events only ever fire when
+   * the gate is set, so enabling it needs a restart. Under
+   * `RelayServer` the fields hold the server's audit closures, so
+   * direct calls here would replace the audit wrappers; server users
+   * must go through `RelayServer.reviseEndpointAutoDisableCallbacks`,
+   * which swaps only the operator cells behind the audit closures.
+   * The queue itself holds no audit log — the server audits a real
+   * revision as `endpoint_auto_disable_callbacks_revised`.
+   */
+  reviseEndpointAutoDisableCallbacks(patch: EndpointAutoDisableCallbacksRevision): void {
+    if (this.autoDisable === undefined) {
+      throw new Error(
+        "reviseEndpointAutoDisableCallbacks: endpoint auto-disable is not configured — enabling it requires a restart"
+      );
+    }
+    if (patch === null || typeof patch !== "object") {
+      throw new RangeError(
+        "reviseEndpointAutoDisableCallbacks: patch must be an object with at least one of onEndpointAutoDisabled / onEndpointEnabled"
+      );
+    }
+    const hasDisabled = patch.onEndpointAutoDisabled !== undefined;
+    const hasEnabled = patch.onEndpointEnabled !== undefined;
+    if (!hasDisabled && !hasEnabled) {
+      throw new RangeError(
+        "reviseEndpointAutoDisableCallbacks: patch must set at least one of onEndpointAutoDisabled / onEndpointEnabled"
+      );
+    }
+    if (
+      hasDisabled &&
+      patch.onEndpointAutoDisabled !== null &&
+      typeof patch.onEndpointAutoDisabled !== "function"
+    ) {
+      throw new RangeError(
+        "reviseEndpointAutoDisableCallbacks: onEndpointAutoDisabled must be a function or null"
+      );
+    }
+    if (
+      hasEnabled &&
+      patch.onEndpointEnabled !== null &&
+      typeof patch.onEndpointEnabled !== "function"
+    ) {
+      throw new RangeError(
+        "reviseEndpointAutoDisableCallbacks: onEndpointEnabled must be a function or null"
+      );
+    }
+    const nextDisabled = hasDisabled
+      ? patch.onEndpointAutoDisabled ?? undefined
+      : this.onEndpointAutoDisabled;
+    const nextEnabled = hasEnabled
+      ? patch.onEndpointEnabled ?? undefined
+      : this.onEndpointEnabled;
+    if (nextDisabled === this.onEndpointAutoDisabled && nextEnabled === this.onEndpointEnabled) return;
+    this.onEndpointAutoDisabled = nextDisabled;
+    this.onEndpointEnabled = nextEnabled;
   }
 
   /**

@@ -6391,6 +6391,29 @@ export interface RelayServer extends Server {
    */
   reviseReplayCallbacks?: (patch: ReplayCallbacksRevision) => void;
   /**
+   * WR-369: live-redirect the endpoint auto-disable/enable observers at
+   * runtime — no restart. Replaces the operator callbacks the server
+   * forwards each transition to, after the transition itself is
+   * audited as `endpoint_auto_disabled` / `endpoint_enabled`; the audit
+   * can never be bypassed by a replacement. The patch is partial — an
+   * omitted field keeps its live value — and `null` clears that hook
+   * back to audit-only (the gate keeps disabling and re-enabling and
+   * the transitions are still audited, just no longer forwarded to an
+   * operator). An empty or non-object patch throws `RangeError`, as
+   * does a non-function value for a provided field, and the live
+   * callbacks are untouched; a patch identical to the live values is
+   * a silent no-op. A real revision is audited as
+   * `endpoint_auto_disable_callbacks_revised` with per-hook
+   * `onEndpointAutoDisabled` / `onEndpointEnabled` ('set' / 'cleared' /
+   * 'unchanged') and `oldOnEndpointAutoDisabled` /
+   * `oldOnEndpointEnabled` ('set' / 'absent') presence, never a
+   * function body. Always set; throws `Error` when auto-disable was
+   * never configured — enabling it needs a restart. The new callbacks
+   * take effect from the next transition; the disable gate, the
+   * failure streaks, and the disabled set are untouched.
+   */
+  reviseEndpointAutoDisableCallbacks?: (patch: EndpointAutoDisableCallbacksRevision) => void;
+  /**
    * WR-350: revise the live quorum retention tuning at runtime
    * (`retentionMs` / `maxFanouts`, partial — omitted fields keep their
    * live values). The new values take effect at the next lazy retention
@@ -8350,6 +8373,17 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     opts.retry?.onReplaySkipped;
   let operatorReplayForcedCallback: ((info: ReplayForcedInfo) => void) | undefined =
     opts.retry?.onReplayForced;
+  // WR-369: the operator's auto-disable/enable callbacks, held in
+  // mutable cells so `server.reviseEndpointAutoDisableCallbacks` can
+  // replace them at runtime. The audit wrappers below read these
+  // cells — never the operator callbacks directly — so replacing an
+  // operator callback cannot bypass the `endpoint_auto_disabled` /
+  // `endpoint_enabled` audit.
+  let operatorEndpointAutoDisabledCallback:
+    | ((info: EndpointAutoDisabledInfo) => void)
+    | undefined = opts.retry?.onEndpointAutoDisabled;
+  let operatorEndpointEnabledCallback: ((info: EndpointEnabledInfo) => void) | undefined =
+    opts.retry?.onEndpointEnabled;
   const queue = new RetryQueue({
     // WR-146: the queue talks to the hedged wrapper (a pure pass-through
     // when hedging is off) so the server's `defaultSender` handle keeps
@@ -9210,6 +9244,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // Edge-triggered in the queue — each transition audits exactly one
     // event. The disable carries the streak that tripped it so the
     // operator sees *why* the gate fired.
+    // WR-369: the wrappers read the mutable operator cells — the
+    // operator callbacks are never swapped, so a runtime callback
+    // replacement cannot bypass this audit.
     onEndpointAutoDisabled: ({ endpoint, consecutiveFailures, failureThreshold }) => {
       opts.auditLog.append({
         event: "endpoint_auto_disabled",
@@ -9218,7 +9255,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         failureThreshold,
         ...(activeOperatorKeyId !== undefined ? { keyId: activeOperatorKeyId } : {}),
       });
-      opts.retry?.onEndpointAutoDisabled?.({ endpoint, consecutiveFailures, failureThreshold });
+      operatorEndpointAutoDisabledCallback?.({ endpoint, consecutiveFailures, failureThreshold });
     },
     onEndpointEnabled: ({ endpoint }) => {
       opts.auditLog.append({
@@ -9226,7 +9263,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         endpoint,
         ...(activeOperatorKeyId !== undefined ? { keyId: activeOperatorKeyId } : {}),
       });
-      opts.retry?.onEndpointEnabled?.({ endpoint });
+      operatorEndpointEnabledCallback?.({ endpoint });
     },
     // WR-153: audit each queue-depth breach episode. Edge-triggered in
     // the queue — one event per episode (endpoint, depth, threshold).
@@ -16534,6 +16571,81 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     operatorReplaySkippedCallback = nextSkipped;
     operatorReplayForcedCallback = nextForced;
     opts.auditLog.append({ event: "replay_callbacks_revised", ...payload });
+  };
+
+  // WR-369: live endpoint auto-disable/enable callback replacement.
+  // Only the server-side operator-callback cells move — the queue's own
+  // callbacks (the `endpoint_auto_disabled` / `endpoint_enabled` audit
+  // wrappers) are never touched, so a replacement cannot bypass the
+  // audit. The patch is partial: an omitted field keeps its live
+  // value; `null` clears that hook back to audit-only. An empty or
+  // non-object patch throws `RangeError`, as does a non-function
+  // value for a provided field, and the live cells are untouched; a
+  // patch identical to the live values is a silent no-op. A real
+  // revision is audited as `endpoint_auto_disable_callbacks_revised`
+  // with per-hook presence (`onEndpointAutoDisabled` /
+  // `onEndpointEnabled`: 'set' / 'cleared' / 'unchanged';
+  // `oldOnEndpointAutoDisabled` / `oldOnEndpointEnabled`:
+  // 'set' / 'absent'), never a function body. With auto-disable
+  // unconfigured the queue throws the canonical "must restart" Error.
+  server.reviseEndpointAutoDisableCallbacks = (patch: EndpointAutoDisableCallbacksRevision): void => {
+    if (!queue.autoDisableConfigured()) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseEndpointAutoDisableCallbacks(patch);
+    }
+    if (patch === null || typeof patch !== "object") {
+      throw new RangeError(
+        "reviseEndpointAutoDisableCallbacks: patch must be an object with at least one of onEndpointAutoDisabled / onEndpointEnabled"
+      );
+    }
+    const hasDisabled = patch.onEndpointAutoDisabled !== undefined;
+    const hasEnabled = patch.onEndpointEnabled !== undefined;
+    if (!hasDisabled && !hasEnabled) {
+      throw new RangeError(
+        "reviseEndpointAutoDisableCallbacks: patch must set at least one of onEndpointAutoDisabled / onEndpointEnabled"
+      );
+    }
+    if (
+      hasDisabled &&
+      patch.onEndpointAutoDisabled !== null &&
+      typeof patch.onEndpointAutoDisabled !== "function"
+    ) {
+      throw new RangeError(
+        "reviseEndpointAutoDisableCallbacks: onEndpointAutoDisabled must be a function or null"
+      );
+    }
+    if (
+      hasEnabled &&
+      patch.onEndpointEnabled !== null &&
+      typeof patch.onEndpointEnabled !== "function"
+    ) {
+      throw new RangeError(
+        "reviseEndpointAutoDisableCallbacks: onEndpointEnabled must be a function or null"
+      );
+    }
+    const nextDisabled = hasDisabled
+      ? patch.onEndpointAutoDisabled ?? undefined
+      : operatorEndpointAutoDisabledCallback;
+    const nextEnabled = hasEnabled
+      ? patch.onEndpointEnabled ?? undefined
+      : operatorEndpointEnabledCallback;
+    if (
+      nextDisabled === operatorEndpointAutoDisabledCallback &&
+      nextEnabled === operatorEndpointEnabledCallback
+    ) {
+      return;
+    }
+    const payload = {
+      onEndpointAutoDisabled: hasDisabled
+        ? (nextDisabled === undefined ? "cleared" : "set")
+        : "unchanged",
+      oldOnEndpointAutoDisabled: operatorEndpointAutoDisabledCallback === undefined ? "absent" : "set",
+      onEndpointEnabled: hasEnabled ? (nextEnabled === undefined ? "cleared" : "set") : "unchanged",
+      oldOnEndpointEnabled: operatorEndpointEnabledCallback === undefined ? "absent" : "set",
+    };
+    operatorEndpointAutoDisabledCallback = nextDisabled;
+    operatorEndpointEnabledCallback = nextEnabled;
+    opts.auditLog.append({ event: "endpoint_auto_disable_callbacks_revised", ...payload });
   };
 
   // WR-350: live quorum retention tuning revision. The method is always
