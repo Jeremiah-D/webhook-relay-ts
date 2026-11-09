@@ -28,7 +28,7 @@ import {
   selectSignatureAlgorithmVerifier,
   type SignatureAlgorithmRule,
 } from "./signature-alg.ts";
-import { RetryQueue, errorBudgetBurnAuditEvent, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeliveryDeadlineConfig, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type ErrorBudgetConfig, type ErrorBudgetRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type QuorumRetention, type QuorumRetentionRevision, type RetryItem, type Sender, type SenderCallOptions, type MaintenanceWindowTransition, type SloRiskConfig, type SloRiskRevision, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
+import { RetryQueue, errorBudgetBurnAuditEvent, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeliveryDeadlineConfig, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type EndpointPauseCallbacksRevision, type EndpointPauseInfo, type ErrorBudgetConfig, type ErrorBudgetRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type QuorumRetention, type QuorumRetentionRevision, type RetryItem, type Sender, type SenderCallOptions, type MaintenanceWindowTransition, type SloRiskConfig, type SloRiskRevision, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
 import { parseDeliverAtHeader, DELIVER_AT_HEADER } from "./retry.ts";
 import type { ShadowDeliveredInfo, ShadowFailedInfo, ShadowTargetConfig, ShadowTargetsConfig } from "./retry.ts";
 import type {
@@ -6346,6 +6346,28 @@ export interface RelayServer extends Server {
     cb: ((event: FailoverSwitchEvent) => void) | null
   ) => void;
   /**
+   * WR-367: live-redirect the endpoint pause/resume observers at
+   * runtime — no restart. Replaces the operator callbacks the server
+   * forwards each transition to, after the transition itself is
+   * audited as `endpoint_paused` / `endpoint_resumed`; the audit can
+   * never be bypassed by a replacement. The patch is partial — an
+   * omitted field keeps its live value — and `null` clears that hook
+   * back to audit-only (pauses and resumes keep working and are
+   * still audited, just no longer forwarded to an operator). An empty
+   * or non-object patch throws `RangeError`, as does a non-function
+   * value for a provided field, and the live callbacks are untouched;
+   * a patch identical to the live values is a silent no-op. A real
+   * revision is audited as `endpoint_pause_callbacks_revised` with
+   * per-hook `onEndpointPaused` / `onEndpointResumed` ('set' /
+   * 'cleared' / 'unchanged') and `oldOnEndpointPaused` /
+   * `oldOnEndpointResumed` ('set' / 'absent') presence, never a
+   * function body. Always set; there is no must-restart gate — the
+   * pause mechanism is always on and the hooks default to absent.
+   * The new callbacks take effect from the next transition; the pause
+   * set, parked items, and their remaining delays are untouched.
+   */
+  reviseEndpointPauseCallbacks?: (patch: EndpointPauseCallbacksRevision) => void;
+  /**
    * WR-350: revise the live quorum retention tuning at runtime
    * (`retentionMs` / `maxFanouts`, partial — omitted fields keep their
    * live values). The new values take effect at the next lazy retention
@@ -8285,6 +8307,16 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // cannot bypass the `failover_switched` audit.
   let operatorFailoverSwitchCallback: ((event: FailoverSwitchEvent) => void) | undefined =
     opts.retry?.onFailoverSwitch;
+  // WR-367: the operator's endpoint pause/resume callbacks, held in
+  // mutable cells so `server.reviseEndpointPauseCallbacks` can replace
+  // them at runtime. The audit wrappers below read these cells —
+  // never the operator callbacks directly — so replacing an operator
+  // callback cannot bypass the `endpoint_paused` / `endpoint_resumed`
+  // audit.
+  let operatorEndpointPausedCallback: ((info: EndpointPauseInfo) => void) | undefined =
+    opts.retry?.onEndpointPaused;
+  let operatorEndpointResumedCallback: ((info: EndpointPauseInfo) => void) | undefined =
+    opts.retry?.onEndpointResumed;
   const queue = new RetryQueue({
     // WR-146: the queue talks to the hedged wrapper (a pure pass-through
     // when hedging is off) so the server's `defaultSender` handle keeps
@@ -9117,6 +9149,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // as `endpoint_paused` — the richer `endpoint_auto_paused` event
     // from `onStalePauseAudit` already covers the transition, so each
     // pause audits exactly one event with the cause in its name.
+    // WR-367: the wrappers read the mutable operator cells — the
+    // operator callbacks are never swapped, so a runtime callback
+    // replacement cannot bypass this audit.
     onEndpointPaused: ({ endpoint, cause }) => {
       if (cause !== "auto") {
         opts.auditLog.append({
@@ -9125,7 +9160,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
           ...(activeOperatorKeyId !== undefined ? { keyId: activeOperatorKeyId } : {}),
         });
       }
-      opts.retry?.onEndpointPaused?.({ endpoint, cause });
+      operatorEndpointPausedCallback?.({ endpoint, cause });
     },
     onEndpointResumed: ({ endpoint }) => {
       opts.auditLog.append({
@@ -9133,7 +9168,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         endpoint,
         ...(activeOperatorKeyId !== undefined ? { keyId: activeOperatorKeyId } : {}),
       });
-      opts.retry?.onEndpointResumed?.({ endpoint });
+      operatorEndpointResumedCallback?.({ endpoint });
     },
     // WR-150: audit the auto-disable transition and operator re-enables.
     // Edge-triggered in the queue — each transition audits exactly one
@@ -16320,6 +16355,76 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       previous: prev,
       current: nextPresence,
     });
+  };
+
+  // WR-367: live endpoint pause/resume callback replacement. Only the
+  // server-side operator-callback cells move — the queue's own
+  // callbacks (the `endpoint_paused` / `endpoint_resumed` audit
+  // wrappers) are never touched, so a replacement cannot bypass the
+  // audit. The patch is partial: an omitted field keeps its live
+  // value; `null` clears that hook back to audit-only. An empty or
+  // non-object patch throws `RangeError`, as does a non-function
+  // value for a provided field, and the live cells are untouched; a
+  // patch identical to the live values is a silent no-op. A real
+  // revision is audited as `endpoint_pause_callbacks_revised` with
+  // per-hook presence (`onEndpointPaused` / `onEndpointResumed`:
+  // 'set' / 'cleared' / 'unchanged'; `oldOnEndpointPaused` /
+  // `oldOnEndpointResumed`: 'set' / 'absent'), never a function body.
+  // No must-restart gate: the pause mechanism is always on.
+  server.reviseEndpointPauseCallbacks = (patch: EndpointPauseCallbacksRevision): void => {
+    if (patch === null || typeof patch !== "object") {
+      throw new RangeError(
+        "reviseEndpointPauseCallbacks: patch must be an object with at least one of onEndpointPaused / onEndpointResumed"
+      );
+    }
+    const hasPaused = patch.onEndpointPaused !== undefined;
+    const hasResumed = patch.onEndpointResumed !== undefined;
+    if (!hasPaused && !hasResumed) {
+      throw new RangeError(
+        "reviseEndpointPauseCallbacks: patch must set at least one of onEndpointPaused / onEndpointResumed"
+      );
+    }
+    if (
+      hasPaused &&
+      patch.onEndpointPaused !== null &&
+      typeof patch.onEndpointPaused !== "function"
+    ) {
+      throw new RangeError(
+        "reviseEndpointPauseCallbacks: onEndpointPaused must be a function or null"
+      );
+    }
+    if (
+      hasResumed &&
+      patch.onEndpointResumed !== null &&
+      typeof patch.onEndpointResumed !== "function"
+    ) {
+      throw new RangeError(
+        "reviseEndpointPauseCallbacks: onEndpointResumed must be a function or null"
+      );
+    }
+    const nextPaused = hasPaused
+      ? patch.onEndpointPaused ?? undefined
+      : operatorEndpointPausedCallback;
+    const nextResumed = hasResumed
+      ? patch.onEndpointResumed ?? undefined
+      : operatorEndpointResumedCallback;
+    if (
+      nextPaused === operatorEndpointPausedCallback &&
+      nextResumed === operatorEndpointResumedCallback
+    ) {
+      return;
+    }
+    const payload = {
+      onEndpointPaused: hasPaused ? (nextPaused === undefined ? "cleared" : "set") : "unchanged",
+      oldOnEndpointPaused: operatorEndpointPausedCallback === undefined ? "absent" : "set",
+      onEndpointResumed: hasResumed
+        ? (nextResumed === undefined ? "cleared" : "set")
+        : "unchanged",
+      oldOnEndpointResumed: operatorEndpointResumedCallback === undefined ? "absent" : "set",
+    };
+    operatorEndpointPausedCallback = nextPaused;
+    operatorEndpointResumedCallback = nextResumed;
+    opts.auditLog.append({ event: "endpoint_pause_callbacks_revised", ...payload });
   };
 
   // WR-350: live quorum retention tuning revision. The method is always

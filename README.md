@@ -2618,6 +2618,27 @@ curl -X POST http://127.0.0.1:PORT/endpoints/pause \
   fire `onEndpointPaused` / `onEndpointResumed` and are written to the
   audit log as `endpoint_paused` / `endpoint_resumed` (queryable via
   `GET /audit?event=endpoint_paused`).
+- **Live callback redirection (WR-367)** — `relay.reviseEndpointPauseCallbacks({ onEndpointPaused, onEndpointResumed })`
+  / `queue.reviseEndpointPauseCallbacks(patch)` swaps the operator
+  callbacks that observe each transition at runtime, no restart: the
+  next pause/resume enters the new callback and the old one goes
+  silent. The patch is partial — an omitted field keeps its live
+  value — and `null` clears that hook back to audit-only (pauses and
+  resumes keep working and are still audited, just no longer
+  forwarded). An empty or non-object patch throws `RangeError`, as
+  does a non-function value for a provided field, and the live hooks
+  are untouched; a patch identical to the live values is a silent
+  no-op. A real revision is audited as
+  `endpoint_pause_callbacks_revised` with per-hook
+  `onEndpointPaused` / `onEndpointResumed` ('set' / 'cleared' /
+  'unchanged') and `oldOnEndpointPaused` / `oldOnEndpointResumed`
+  ('set' / 'absent') presence, never a function body — and the audit
+  can never be bypassed by a replacement. There is no must-restart
+  gate: the pause mechanism is always on and the hooks default to
+  absent. Only the observers move: the pause set, parked items, and
+  their remaining delays are untouched. WR-365 is the same family for
+  the circuit-breaker state-change hook; WR-366 for the
+  failover-switch hook.
 - **Parked timing is in-memory** — a restart resumes parked items promptly
   (attempt counts survive through the durable queue; the remaining
   backoff does not).

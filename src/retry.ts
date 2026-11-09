@@ -3205,6 +3205,8 @@ export interface StalePauseStatsRow {
  * Fired on an endpoint pause/resume transition (WR-50). Pause is keyed by
  * the logical endpoint (`targetUrl` as enqueued) and applies across
  * tenants — pausing a downstream holds every tenant's deliveries to it.
+ * Live-revisable via `RetryQueue.reviseEndpointPauseCallbacks` (WR-367)
+ * — `null` clears a hook back to no observer.
  */
 export interface EndpointPauseInfo {
   /** The paused/resumed endpoint (logical `targetUrl`). */
@@ -3215,6 +3217,19 @@ export interface EndpointPauseInfo {
    * the WR-100 sweeper passes `"auto"`.
    */
   cause?: EndpointPauseCause;
+}
+
+/**
+ * WR-367: patch for `RetryQueue.reviseEndpointPauseCallbacks` /
+ * `RelayServer.reviseEndpointPauseCallbacks`. Each field is optional —
+ * an omitted field keeps its live value; `null` clears that hook back
+ * to no observer (the pause mechanism itself is always on, so there is
+ * no must-restart gate). At least one field must be present, else the
+ * patch throws `RangeError` and the live hooks are untouched.
+ */
+export interface EndpointPauseCallbacksRevision {
+  onEndpointPaused?: ((info: EndpointPauseInfo) => void) | null;
+  onEndpointResumed?: ((info: EndpointPauseInfo) => void) | null;
 }
 
 /**
@@ -4145,8 +4160,13 @@ export class RetryQueue {
   private circuitBreakerOnStateChange?: CircuitStateChangeCallback;
   private readonly onConfigChange?: (endpoint: string, changes: ConfigChange[]) => void;
   /** WR-50: operator pause/resume transition hooks (audited by the server). */
-  private readonly onEndpointPaused?: (info: EndpointPauseInfo) => void;
-  private readonly onEndpointResumed?: (info: EndpointPauseInfo) => void;
+  // WR-367: deliberately *not* readonly — `reviseEndpointPauseCallbacks`
+  // replaces the live pause/resume observers at runtime. The server's
+  // audit closures (which forward to the operator callbacks) are held
+  // here when the queue runs under `RelayServer`; direct queue users
+  // hold their own callbacks in the same fields.
+  private onEndpointPaused?: (info: EndpointPauseInfo) => void;
+  private onEndpointResumed?: (info: EndpointPauseInfo) => void;
   /** WR-150: auto-disable transition hooks (audited by the server). */
   private readonly onEndpointAutoDisabled?: (info: EndpointAutoDisabledInfo) => void;
   private readonly onEndpointEnabled?: (info: EndpointEnabledInfo) => void;
@@ -12242,6 +12262,66 @@ export class RetryQueue {
     const next = cb ?? undefined;
     if (next === this.onFailoverSwitch) return;
     this.onFailoverSwitch = next;
+  }
+
+  /**
+   * WR-367: live-redirect the endpoint pause/resume observers — the
+   * queue-side setter behind
+   * `RelayServer.reviseEndpointPauseCallbacks`. The new hooks take
+   * effect from the next transition; transitions that already fired
+   * are never re-delivered. `null` clears a hook back to no observer
+   * (pausing and resuming keep working exactly as before — only the
+   * observation stops). An omitted field keeps its live value, so one
+   * hook can move without touching the other. An empty or non-object
+   * patch throws `RangeError`; a non-function value for a provided
+   * field throws `RangeError` and the live hooks are left completely
+   * intact. A patch identical to the live values is a no-op. Only the
+   * observers move: the pause set, parked items, and their remaining
+   * delays are untouched. There is no must-restart gate — the pause
+   * mechanism is always on and the hooks default to absent. Under
+   * `RelayServer` the fields hold the server's audit closures, so
+   * direct calls here would replace the audit wrappers; server users
+   * must go through `RelayServer.reviseEndpointPauseCallbacks`,
+   * which swaps only the operator cells behind the audit closures.
+   * The queue itself holds no audit log — the server audits a real
+   * revision as `endpoint_pause_callbacks_revised`.
+   */
+  reviseEndpointPauseCallbacks(patch: EndpointPauseCallbacksRevision): void {
+    if (patch === null || typeof patch !== "object") {
+      throw new RangeError(
+        "reviseEndpointPauseCallbacks: patch must be an object with at least one of onEndpointPaused / onEndpointResumed"
+      );
+    }
+    const hasPaused = patch.onEndpointPaused !== undefined;
+    const hasResumed = patch.onEndpointResumed !== undefined;
+    if (!hasPaused && !hasResumed) {
+      throw new RangeError(
+        "reviseEndpointPauseCallbacks: patch must set at least one of onEndpointPaused / onEndpointResumed"
+      );
+    }
+    if (
+      hasPaused &&
+      patch.onEndpointPaused !== null &&
+      typeof patch.onEndpointPaused !== "function"
+    ) {
+      throw new RangeError(
+        "reviseEndpointPauseCallbacks: onEndpointPaused must be a function or null"
+      );
+    }
+    if (
+      hasResumed &&
+      patch.onEndpointResumed !== null &&
+      typeof patch.onEndpointResumed !== "function"
+    ) {
+      throw new RangeError(
+        "reviseEndpointPauseCallbacks: onEndpointResumed must be a function or null"
+      );
+    }
+    const nextPaused = hasPaused ? patch.onEndpointPaused ?? undefined : this.onEndpointPaused;
+    const nextResumed = hasResumed ? patch.onEndpointResumed ?? undefined : this.onEndpointResumed;
+    if (nextPaused === this.onEndpointPaused && nextResumed === this.onEndpointResumed) return;
+    this.onEndpointPaused = nextPaused;
+    this.onEndpointResumed = nextResumed;
   }
 
   /**
