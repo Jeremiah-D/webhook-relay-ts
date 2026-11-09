@@ -28,7 +28,7 @@ import {
   selectSignatureAlgorithmVerifier,
   type SignatureAlgorithmRule,
 } from "./signature-alg.ts";
-import { RetryQueue, errorBudgetBurnAuditEvent, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeliveryDeadlineConfig, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type EndpointPauseCallbacksRevision, type EndpointPauseInfo, type ErrorBudgetConfig, type ErrorBudgetRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type QuorumRetention, type QuorumRetentionRevision, type RetryItem, type Sender, type SenderCallOptions, type MaintenanceWindowTransition, type SloRiskConfig, type SloRiskRevision, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
+import { RetryQueue, errorBudgetBurnAuditEvent, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeliveryDeadlineConfig, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type EndpointPauseCallbacksRevision, type EndpointPauseInfo, type ErrorBudgetConfig, type ErrorBudgetRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type QuorumRetention, type QuorumRetentionRevision, type ReplayCallbacksRevision, type ReplayForcedInfo, type ReplaySkippedInfo, type RetryItem, type Sender, type SenderCallOptions, type MaintenanceWindowTransition, type SloRiskConfig, type SloRiskRevision, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
 import { parseDeliverAtHeader, DELIVER_AT_HEADER } from "./retry.ts";
 import type { ShadowDeliveredInfo, ShadowFailedInfo, ShadowTargetConfig, ShadowTargetsConfig } from "./retry.ts";
 import type {
@@ -6368,6 +6368,29 @@ export interface RelayServer extends Server {
    */
   reviseEndpointPauseCallbacks?: (patch: EndpointPauseCallbacksRevision) => void;
   /**
+   * WR-368: live-redirect the replay skip/force observers at runtime
+   * — no restart. Replaces the operator callbacks the server
+   * forwards each guard decision to, after the decision itself is
+   * audited as `replay_skipped_delivered` / `replay_forced`; the audit
+   * can never be bypassed by a replacement. The patch is partial — an
+   * omitted field keeps its live value — and `null` clears that hook
+   * back to audit-only (the guard keeps skipping and forcing and the
+   * decisions are still audited, just no longer forwarded to an
+   * operator). An empty or non-object patch throws `RangeError`, as
+   * does a non-function value for a provided field, and the live
+   * callbacks are untouched; a patch identical to the live values is
+   * a silent no-op. A real revision is audited as
+   * `replay_callbacks_revised` with per-hook `onReplaySkipped` /
+   * `onReplayForced` ('set' / 'cleared' / 'unchanged') and
+   * `oldOnReplaySkipped` / `oldOnReplayForced` ('set' / 'absent')
+   * presence, never a function body. Always set; throws `Error`
+   * when replay idempotency was never configured — enabling it needs
+   * a restart. The new callbacks take effect from the next guard
+   * decision; the guard index, the dead-letter list, and the
+   * delivered records are untouched.
+   */
+  reviseReplayCallbacks?: (patch: ReplayCallbacksRevision) => void;
+  /**
    * WR-350: revise the live quorum retention tuning at runtime
    * (`retentionMs` / `maxFanouts`, partial — omitted fields keep their
    * live values). The new values take effect at the next lazy retention
@@ -8317,6 +8340,16 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     opts.retry?.onEndpointPaused;
   let operatorEndpointResumedCallback: ((info: EndpointPauseInfo) => void) | undefined =
     opts.retry?.onEndpointResumed;
+  // WR-368: the operator's replay skip/force callbacks, held in
+  // mutable cells so `server.reviseReplayCallbacks` can replace them
+  // at runtime. The audit wrappers below read these cells — never
+  // the operator callbacks directly — so replacing an operator
+  // callback cannot bypass the `replay_skipped_delivered` /
+  // `replay_forced` audit.
+  let operatorReplaySkippedCallback: ((info: ReplaySkippedInfo) => void) | undefined =
+    opts.retry?.onReplaySkipped;
+  let operatorReplayForcedCallback: ((info: ReplayForcedInfo) => void) | undefined =
+    opts.retry?.onReplayForced;
   const queue = new RetryQueue({
     // WR-146: the queue talks to the hedged wrapper (a pure pass-through
     // when hedging is off) so the server's `defaultSender` handle keeps
@@ -9122,14 +9155,17 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       opts.retry?.onEndpointDependencyUnblocked?.(info);
     },
     // WR-149: audit replay-idempotency guard decisions; the caller's own
-    // hooks still fire afterwards.
+    // hooks still fire afterwards. WR-368: the wrappers read the
+    // mutable operator cells — the operator callbacks are never
+    // swapped, so a runtime callback replacement cannot bypass this
+    // audit.
     onReplaySkipped: (info) => {
       opts.auditLog.append({ event: "replay_skipped_delivered", ...info });
-      opts.retry?.onReplaySkipped?.(info);
+      operatorReplaySkippedCallback?.(info);
     },
     onReplayForced: (info) => {
       opts.auditLog.append({ event: "replay_forced", ...info });
-      opts.retry?.onReplayForced?.(info);
+      operatorReplayForcedCallback?.(info);
     },
     // Wrap the caller's onConfigChange so every runtime config change is
     // audited, not just observed.
@@ -16425,6 +16461,79 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     operatorEndpointPausedCallback = nextPaused;
     operatorEndpointResumedCallback = nextResumed;
     opts.auditLog.append({ event: "endpoint_pause_callbacks_revised", ...payload });
+  };
+
+  // WR-368: live replay skip/force callback replacement. Only the
+  // server-side operator-callback cells move — the queue's own
+  // callbacks (the `replay_skipped_delivered` / `replay_forced`
+  // audit wrappers) are never touched, so a replacement cannot bypass
+  // the audit. The patch is partial: an omitted field keeps its live
+  // value; `null` clears that hook back to audit-only. An empty or
+  // non-object patch throws `RangeError`, as does a non-function
+  // value for a provided field, and the live cells are untouched; a
+  // patch identical to the live values is a silent no-op. A real
+  // revision is audited as `replay_callbacks_revised` with per-hook
+  // presence (`onReplaySkipped` / `onReplayForced`: 'set' / 'cleared'
+  // / 'unchanged'; `oldOnReplaySkipped` / `oldOnReplayForced`:
+  // 'set' / 'absent'), never a function body. With replay
+  // idempotency unconfigured the queue throws the canonical "must
+  // restart" Error.
+  server.reviseReplayCallbacks = (patch: ReplayCallbacksRevision): void => {
+    if (!queue.replayIdempotencyConfigured()) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseReplayCallbacks(patch);
+    }
+    if (patch === null || typeof patch !== "object") {
+      throw new RangeError(
+        "reviseReplayCallbacks: patch must be an object with at least one of onReplaySkipped / onReplayForced"
+      );
+    }
+    const hasSkipped = patch.onReplaySkipped !== undefined;
+    const hasForced = patch.onReplayForced !== undefined;
+    if (!hasSkipped && !hasForced) {
+      throw new RangeError(
+        "reviseReplayCallbacks: patch must set at least one of onReplaySkipped / onReplayForced"
+      );
+    }
+    if (
+      hasSkipped &&
+      patch.onReplaySkipped !== null &&
+      typeof patch.onReplaySkipped !== "function"
+    ) {
+      throw new RangeError(
+        "reviseReplayCallbacks: onReplaySkipped must be a function or null"
+      );
+    }
+    if (
+      hasForced &&
+      patch.onReplayForced !== null &&
+      typeof patch.onReplayForced !== "function"
+    ) {
+      throw new RangeError(
+        "reviseReplayCallbacks: onReplayForced must be a function or null"
+      );
+    }
+    const nextSkipped = hasSkipped
+      ? patch.onReplaySkipped ?? undefined
+      : operatorReplaySkippedCallback;
+    const nextForced = hasForced
+      ? patch.onReplayForced ?? undefined
+      : operatorReplayForcedCallback;
+    if (
+      nextSkipped === operatorReplaySkippedCallback &&
+      nextForced === operatorReplayForcedCallback
+    ) {
+      return;
+    }
+    const payload = {
+      onReplaySkipped: hasSkipped ? (nextSkipped === undefined ? "cleared" : "set") : "unchanged",
+      oldOnReplaySkipped: operatorReplaySkippedCallback === undefined ? "absent" : "set",
+      onReplayForced: hasForced ? (nextForced === undefined ? "cleared" : "set") : "unchanged",
+      oldOnReplayForced: operatorReplayForcedCallback === undefined ? "absent" : "set",
+    };
+    operatorReplaySkippedCallback = nextSkipped;
+    operatorReplayForcedCallback = nextForced;
+    opts.auditLog.append({ event: "replay_callbacks_revised", ...payload });
   };
 
   // WR-350: live quorum retention tuning revision. The method is always

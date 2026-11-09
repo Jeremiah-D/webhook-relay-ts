@@ -12596,6 +12596,29 @@ const queue = new RetryQueue({
   `replay_skipped_delivered`); forced overrides fire `onReplayForced`
   (audited as `replay_forced`, only when a newer delivered copy
   actually existed).
+- **Live callback redirection (WR-368)** — `relay.reviseReplayCallbacks({ onReplaySkipped, onReplayForced })`
+  / `queue.reviseReplayCallbacks(patch)` swaps the operator
+  callbacks that observe each guard decision at runtime, no restart:
+  the next skip/force enters the new callback and the old one goes
+  silent. The patch is partial — an omitted field keeps its live
+  value — and `null` clears that hook back to audit-only (the guard
+  keeps skipping and forcing and the decisions are still audited,
+  just no longer forwarded). An empty or non-object patch throws
+  `RangeError`, as does a non-function value for a provided field,
+  and the live hooks are untouched; a patch identical to the live
+  values is a silent no-op. A real revision is audited as
+  `replay_callbacks_revised` with per-hook
+  `onReplaySkipped` / `onReplayForced` ('set' / 'cleared' /
+  'unchanged') and `oldOnReplaySkipped` / `oldOnReplayForced`
+  ('set' / 'absent') presence, never a function body — and the audit
+  can never be bypassed by a replacement. Revising when replay
+  idempotency was never configured throws `Error` (enabling it needs
+  a restart): the skip/force events only ever fire when the guard is
+  set. Only the observers move: the guard index, the dead-letter
+  list, and the delivered records are untouched. WR-367 is the same
+  family for the endpoint pause/resume hooks; WR-365 for the
+  circuit-breaker state-change hook; WR-366 for the failover-switch
+  hook.
 - **Observability** — `getReplayIdempotencyStats()` exposes each
   tenant's indexed pair count and oldest record (activity-gated; absent
   rows never delivered anything).

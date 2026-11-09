@@ -1561,6 +1561,8 @@ export interface ReplayDeadLetterOpts {
  * Info for {@link RetryQueueOptions.onReplaySkipped}: the WR-149 guard
  * suppressed replaying a dead letter because the downstream already
  * holds a newer delivered copy of the same (endpoint, payload).
+ * Live-revisable via `RetryQueue.reviseReplayCallbacks` (WR-368) —
+ * `null` clears the hook back to no observer.
  */
 export interface ReplaySkippedInfo {
   /** The dead-letter entry id that was not replayed. */
@@ -1578,7 +1580,9 @@ export interface ReplaySkippedInfo {
 /**
  * Info for {@link RetryQueueOptions.onReplayForced}: the operator
  * overrode the WR-149 guard and replayed a dead letter despite a newer
- * delivered copy existing.
+ * delivered copy existing. Live-revisable via
+ * `RetryQueue.reviseReplayCallbacks` (WR-368) — `null` clears the hook
+ * back to no observer.
  */
 export interface ReplayForcedInfo {
   /** The dead-letter entry id that was replayed. */
@@ -3233,6 +3237,21 @@ export interface EndpointPauseCallbacksRevision {
 }
 
 /**
+ * WR-368: patch for `RetryQueue.reviseReplayCallbacks` /
+ * `RelayServer.reviseReplayCallbacks`. Each field is optional —
+ * an omitted field keeps its live value; `null` clears that hook back
+ * to no observer (the guard keeps skipping and forcing exactly as
+ * before — only the observation stops). At least one field must be
+ * present, else the patch throws `RangeError` and the live hooks are
+ * untouched. Throws `Error` when replay idempotency was never
+ * configured — enabling it needs a restart.
+ */
+export interface ReplayCallbacksRevision {
+  onReplaySkipped?: ((info: ReplaySkippedInfo) => void) | null;
+  onReplayForced?: ((info: ReplayForcedInfo) => void) | null;
+}
+
+/**
  * Effective hot-reloadable config for one (tenant, endpoint) — the
  * WR-88 config-snapshot read shape. Returned by
  * `RetryQueue.endpointConfig`: `maxConcurrentPerEndpoint` is always the
@@ -4144,8 +4163,14 @@ export class RetryQueue {
    */
   private readonly replayIdempotencyOpts?: ReplayIdempotencyOptions;
   private readonly replayIdempotencyGuards = new Map<string, ReplayIdempotencyGuard>();
-  private readonly onReplaySkipped?: (info: ReplaySkippedInfo) => void;
-  private readonly onReplayForced?: (info: ReplayForcedInfo) => void;
+  /** WR-149: replay-idempotency guard decision hooks (audited by the server). */
+  // WR-368: deliberately *not* readonly — `reviseReplayCallbacks`
+  // replaces the live skip/force observers at runtime. The server's
+  // audit closures (which forward to the operator callbacks) are held
+  // here when the queue runs under `RelayServer`; direct queue users
+  // hold their own callbacks in the same fields.
+  private onReplaySkipped?: (info: ReplaySkippedInfo) => void;
+  private onReplayForced?: (info: ReplayForcedInfo) => void;
   /**
    * WR-147: the per-endpoint error-budget burn-rate monitor. `undefined`
    * when the feature is off — the hot path then has one extra branch,
@@ -8156,6 +8181,11 @@ export class RetryQueue {
   /** WR-366: whether the failover subsystem is enabled (queue-level). */
   failoverConfigured(): boolean {
     return this.failover !== undefined;
+  }
+
+  /** WR-368: whether the replay-idempotency subsystem is enabled (queue-level). */
+  replayIdempotencyConfigured(): boolean {
+    return this.replayIdempotencyOpts !== undefined;
   }
 
   /** Whether the per-endpoint quota subsystem is enabled (queue-level). */
@@ -12322,6 +12352,72 @@ export class RetryQueue {
     if (nextPaused === this.onEndpointPaused && nextResumed === this.onEndpointResumed) return;
     this.onEndpointPaused = nextPaused;
     this.onEndpointResumed = nextResumed;
+  }
+
+  /**
+   * WR-368: live-redirect the replay skip/force observers — the
+   * queue-side setter behind `RelayServer.reviseReplayCallbacks`.
+   * The new hooks take effect from the next guard decision; decisions
+   * that already fired are never re-delivered. `null` clears a hook
+   * back to no observer (the guard keeps skipping and forcing exactly
+   * as before — only the observation stops). An omitted field keeps
+   * its live value, so one hook can move without touching the other.
+   * An empty or non-object patch throws `RangeError`; a non-function
+   * value for a provided field throws `RangeError` and the live hooks
+   * are left completely intact. A patch identical to the live values
+   * is a no-op. Only the observers move: the guard index, the
+   * dead-letter list, and the delivered records are untouched. Throws
+   * `Error` when replay idempotency was never configured — the
+   * skip/force events only ever fire when the guard is set, so
+   * enabling it needs a restart. Under `RelayServer` the fields hold
+   * the server's audit closures, so direct calls here would replace
+   * the audit wrappers; server users must go through
+   * `RelayServer.reviseReplayCallbacks`, which swaps only the
+   * operator cells behind the audit closures. The queue itself holds
+   * no audit log — the server audits a real revision as
+   * `replay_callbacks_revised`.
+   */
+  reviseReplayCallbacks(patch: ReplayCallbacksRevision): void {
+    if (this.replayIdempotencyOpts === undefined) {
+      throw new Error(
+        "reviseReplayCallbacks: replay idempotency is not configured — enabling it requires a restart"
+      );
+    }
+    if (patch === null || typeof patch !== "object") {
+      throw new RangeError(
+        "reviseReplayCallbacks: patch must be an object with at least one of onReplaySkipped / onReplayForced"
+      );
+    }
+    const hasSkipped = patch.onReplaySkipped !== undefined;
+    const hasForced = patch.onReplayForced !== undefined;
+    if (!hasSkipped && !hasForced) {
+      throw new RangeError(
+        "reviseReplayCallbacks: patch must set at least one of onReplaySkipped / onReplayForced"
+      );
+    }
+    if (
+      hasSkipped &&
+      patch.onReplaySkipped !== null &&
+      typeof patch.onReplaySkipped !== "function"
+    ) {
+      throw new RangeError(
+        "reviseReplayCallbacks: onReplaySkipped must be a function or null"
+      );
+    }
+    if (
+      hasForced &&
+      patch.onReplayForced !== null &&
+      typeof patch.onReplayForced !== "function"
+    ) {
+      throw new RangeError(
+        "reviseReplayCallbacks: onReplayForced must be a function or null"
+      );
+    }
+    const nextSkipped = hasSkipped ? patch.onReplaySkipped ?? undefined : this.onReplaySkipped;
+    const nextForced = hasForced ? patch.onReplayForced ?? undefined : this.onReplayForced;
+    if (nextSkipped === this.onReplaySkipped && nextForced === this.onReplayForced) return;
+    this.onReplaySkipped = nextSkipped;
+    this.onReplayForced = nextForced;
   }
 
   /**
