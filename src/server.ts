@@ -419,6 +419,14 @@ import {
   type DnsCacheRevision,
 } from "./dns-cache.ts";
 import { DnsPin, type DnsPinMismatchInfo, type DnsPinOptions } from "./dns-pin.ts";
+import {
+  OutboundSsrfGuard,
+  type OutboundSsrfAllowlistedInfo,
+  type OutboundSsrfBlockedInfo,
+  type OutboundSsrfGuardOptions,
+  type OutboundSsrfProxySkippedInfo,
+  type SsrfGuardAgentBinding,
+} from "./outbound-ssrf-guard.ts";
 import { warmupOutboundPool, resolveWarmupOptions } from "./warmup.ts";
 import { AuditSink, type AuditSinkOptions } from "./audit-sink.ts";
 import { SyslogAuditSink, type SyslogAuditSinkOptions } from "./syslog-sink.ts";
@@ -1477,6 +1485,29 @@ export interface RelayServerOptions {
    * `RangeError` at startup.
    */
   dnsPin?: DnsPin | DnsPinOptions;
+  /**
+   * WR-373: outbound SSRF guard (see `src/outbound-ssrf-guard.ts`) —
+   * a compiled `OutboundSsrfGuard` or options to build one. When set,
+   * the default sender's pooled agents (WR-24) and one-off requests
+   * resolve through the guard, which wraps the `dnsPin` / `dnsCache`
+   * lookup when one is configured (the system resolver otherwise):
+   * every resolved address is classified before connect, and a
+   * loopback / RFC 1918 / link-local / unique-local / unspecified /
+   * multicast hit refuses the lookup fail-closed — the item
+   * dead-letters without burning retry budget or touching the circuit
+   * breaker. `allowPrivateTargets` (exact `targetUrl` → `true`, inside
+   * the guard options) opts an endpoint into intentional private
+   * targets; deliveries through an HTTP CONNECT / SOCKS5 proxy skip
+   * the guard (the relay never dials the target directly) and audit
+   * the skip once per endpoint. Blocks audit as
+   * `outbound_ssrf_blocked` (hostname, category, offending addresses),
+   * allowlisted serves as `outbound_ssrf_allowlisted`, proxy skips as
+   * `outbound_ssrf_proxy_skipped`. Counters render into `GET /metrics`
+   * as `relay_outbound_ssrf_*` (categories only — resolved private IPs
+   * never appear in metrics labels). `undefined` keeps the exact
+   * pre-WR-373 behavior. Invalid values throw `RangeError` at startup.
+   */
+  outboundSsrfGuard?: OutboundSsrfGuard | OutboundSsrfGuardOptions;
   /**
    * Outbound connection warm-up (WR-70, see `src/warmup.ts`): at startup,
    * pre-establish keep-alive connections for the listed endpoint URLs on
@@ -2710,6 +2741,14 @@ export interface PooledSender extends Sender {
    */
   dnsPin: DnsPin | undefined;
   /**
+   * WR-373: the outbound SSRF guard, when configured — shared by the
+   * pooled and one-off request paths. `undefined` when the feature is
+   * off. Counters render into `GET /metrics` as
+   * `relay_outbound_ssrf_*` via `render()`; operators read them via
+   * `sender.outboundSsrfGuard.getStats()`.
+   */
+  outboundSsrfGuard: OutboundSsrfGuard | undefined;
+  /**
    * WR-170: per-DoH-URL DNS caches for endpoints with a `doh` entry,
    * keyed by DoH URL. Operators read counters via
    * `sender.dohCaches.get(dohUrl)?.getStats()`; the underlying
@@ -3072,7 +3111,40 @@ export function createDefaultSender(
    * covers the envelope bytes. `undefined` keeps the exact current
    * behavior.
    */
-  cloudEvents?: Record<string, CloudEventsEndpointConfig>
+  cloudEvents?: Record<string, CloudEventsEndpointConfig>,
+  /**
+   * WR-373: outbound SSRF guard (see `src/outbound-ssrf-guard.ts`) —
+   * a compiled `OutboundSsrfGuard` or options to build one. When set,
+   * the pooled agents (WR-24) and one-off requests resolve through
+   * the guard, which wraps the WR-194 pin-checked WR-92 lookup (the
+   * system resolver when neither is configured) — a compiled instance
+   * keeps its own inner lookup. `undefined` keeps the exact pre-WR-373
+   * behavior. Validated at startup.
+   */
+  outboundSsrfGuard?: OutboundSsrfGuard | OutboundSsrfGuardOptions,
+  /**
+   * WR-373: called once per SSRF-guarded lookup refused before connect
+   * (a resolved address was private). `createRelayServer` audits these
+   * as `outbound_ssrf_blocked`; library users get the hook directly. A
+   * compiled `OutboundSsrfGuard` instance keeps its own `onBlocked`.
+   */
+  onOutboundSsrfBlocked?: (info: OutboundSsrfBlockedInfo) => void,
+  /**
+   * WR-373: called once per allowlisted serve (every time a private
+   * address is served to an `allowPrivateTargets` endpoint).
+   * `createRelayServer` audits these as `outbound_ssrf_allowlisted`;
+   * library users get the hook directly. A compiled
+   * `OutboundSsrfGuard` instance keeps its own `onAllowlisted`.
+   */
+  onOutboundSsrfAllowlisted?: (info: OutboundSsrfAllowlistedInfo) => void,
+  /**
+   * WR-373: called once per proxied endpoint (the first binding, not
+   * per lookup). `createRelayServer` audits these as
+   * `outbound_ssrf_proxy_skipped`; library users get the hook
+   * directly. A compiled `OutboundSsrfGuard` instance keeps its own
+   * `onProxiedSkip`.
+   */
+  onOutboundSsrfProxySkipped?: (info: OutboundSsrfProxySkippedInfo) => void
 ): PooledSender {
   if (tlsPins !== undefined) {
     for (const [endpoint, pins] of Object.entries(tlsPins)) {
@@ -3574,6 +3646,33 @@ export function createDefaultSender(
   // The pin-checked lookup feeds the pool and the one-off request path;
   // without the pin this is exactly the pre-WR-194 lookup.
   const pinCheckedLookup = resolvedDnsPin?.lookup ?? dnsLookup;
+  // WR-373: compile the SSRF guard once — it wraps the pin-checked
+  // lookup above (the WR-92 cache when configured, the system resolver
+  // otherwise), so the guard judges exactly the addresses the
+  // connection will use. A caller-supplied compiled instance keeps its
+  // own inner lookup and hooks.
+  let resolvedSsrfGuard: OutboundSsrfGuard | undefined;
+  if (outboundSsrfGuard !== undefined) {
+    try {
+      resolvedSsrfGuard =
+        outboundSsrfGuard instanceof OutboundSsrfGuard
+          ? outboundSsrfGuard
+          : new OutboundSsrfGuard({
+              ...outboundSsrfGuard,
+              // An explicit inner lookup wins; otherwise the guard wraps
+              // the effective lookup (WR-92 cache / WR-194 pin, or the
+              // system resolver when neither is configured).
+              inner: outboundSsrfGuard.inner ?? pinCheckedLookup,
+              onBlocked: onOutboundSsrfBlocked ?? outboundSsrfGuard.onBlocked,
+              onAllowlisted: onOutboundSsrfAllowlisted ?? outboundSsrfGuard.onAllowlisted,
+              onProxiedSkip: onOutboundSsrfProxySkipped ?? outboundSsrfGuard.onProxiedSkip,
+            });
+    } catch (err) {
+      throw new RangeError(
+        `createDefaultSender: invalid outboundSsrfGuard: ${(err as Error).message}`
+      );
+    }
+  }
   // WR-170: fail fast on a misconfigured DoH URL — a typo must not
   // silently leave an endpoint on the system resolver.
   if (doh !== undefined) {
@@ -4147,6 +4246,14 @@ export function createDefaultSender(
         // DoH URL so a DoH-resolved connection never serves a
         // system-DNS endpoint.
         const dohBinding = dohLookupFor(item.targetUrl);
+        // WR-373: per-endpoint SSRF-guard binding — wraps the lookup the
+        // agent actually dials (the DoH lookup when one is bound, the
+        // pin-checked shared lookup otherwise), so the guard judges
+        // exactly the addresses the connection will use. A proxied
+        // endpoint audits its skip once here (the tunnel agent never
+        // dials the target, so the lookup itself would never fire).
+        const ssrfBinding: SsrfGuardAgentBinding | undefined =
+          resolvedSsrfGuard?.bindingFor(item.targetUrl, proxyUrl, dohBinding?.lookup);
         const agent =
           pool?.agentFor(
             url,
@@ -4170,7 +4277,12 @@ export function createDefaultSender(
             caBundle,
             // WR-170: per-endpoint DoH binding (undefined = system DNS /
             // shared cache).
-            dohBinding
+            dohBinding,
+            // WR-373: per-endpoint SSRF-guard binding (undefined = the
+            // guard is off). The pool key binds the guard mode, so an
+            // allowlisted endpoint can never ride a guarded endpoint's
+            // agent, or vice versa.
+            ssrfBinding
           ) ??
           (proxyUrl !== undefined
             ? (oneOffAgent = isSocks5ProxyUrl(proxyUrl)
@@ -4190,11 +4302,14 @@ export function createDefaultSender(
             : dohBinding !== undefined
               ? // WR-170: one-off DoH-bound agent (pooling disabled) —
                 // resolves through the endpoint's DoH cache.
+                // WR-373: the guard-wrapped DoH lookup when the guard is
+                // on — the guard judges the DoH-resolved addresses like
+                // any other.
                 (oneOffAgent = new (url.protocol === "https:" ? HttpsAgent : HttpAgent)({
                   keepAlive: false,
                   maxSockets: 1,
                   maxFreeSockets: 0,
-                  lookup: dohBinding.lookup,
+                  lookup: ssrfBinding?.lookup ?? dohBinding.lookup,
                 }))
               : undefined);
         // WR-143: phase-timeout response hook — assigned below when the
@@ -4365,7 +4480,14 @@ export function createDefaultSender(
                   // DNS cache too — same stale-while-revalidate as pooled.
                   // WR-194: pin-checked — a drifted answer refuses the
                   // connection before a single payload byte is written.
-                  ...(pinCheckedLookup !== undefined ? { lookup: pinCheckedLookup } : {}),
+                  // WR-373: the guard-wrapped lookup when the guard is on
+                  // — the guard judges the resolved addresses before
+                  // connect; without it this is the pin-checked lookup.
+                  ...(ssrfBinding !== undefined
+                    ? { lookup: ssrfBinding.lookup }
+                    : pinCheckedLookup !== undefined
+                      ? { lookup: pinCheckedLookup }
+                      : {}),
                   // WR-163: per-endpoint private CA bundle — Node verifies
                   // the chain against it (`rejectUnauthorized` stays on),
                   // so with pins also configured this is chain-first: a
@@ -4424,11 +4546,14 @@ export function createDefaultSender(
                 {
                   method: "POST",
                   agent: agent ?? false,
-                  // WR-92: one-off (unpooled) requests resolve through the
-                  // DNS cache too — same stale-while-revalidate as pooled.
-                  // WR-194: pin-checked — a drifted answer refuses the
-                  // connection before a single payload byte is written.
-                  ...(pinCheckedLookup !== undefined ? { lookup: pinCheckedLookup } : {}),
+                  // WR-373: the guard-wrapped lookup when the guard is on
+                  // — the guard judges the resolved addresses before
+                  // connect; without it this is the pin-checked lookup.
+                  ...(ssrfBinding !== undefined
+                    ? { lookup: ssrfBinding.lookup }
+                    : pinCheckedLookup !== undefined
+                      ? { lookup: pinCheckedLookup }
+                      : {}),
                 },
                 onResponse
               );
@@ -5455,6 +5580,10 @@ export function createDefaultSender(
   // baselines via `sender.dnsPin.getPinned(hostname)`, and re-baseline
   // after a verified change via `sender.dnsPin.reset(hostname)`.
   sender.dnsPin = resolvedDnsPin;
+  // WR-373: the shared SSRF guard instance (undefined when the feature
+  // is off) — operators read counters via
+  // `sender.outboundSsrfGuard.getStats()`.
+  sender.outboundSsrfGuard = resolvedSsrfGuard;
   // WR-170: per-DoH-URL DNS caches (empty when the feature is off) —
   // operators read counters via `sender.dohCaches.get(dohUrl)?.getStats()`.
   sender.dohCaches = dohCaches;
@@ -8020,6 +8149,46 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       at: info.at,
     });
   };
+  // WR-373: an outbound SSRF guard refusal — one audit line per blocked
+  // lookup naming the hostname, the category, and the offending
+  // resolved addresses (audit-only: the addresses never appear in
+  // metrics labels or the error message). The delivery attempt failed
+  // before connect and follows the non_retryable dead-letter path.
+  // Wired into the main sender below; WR-85 shadow sender copies keep
+  // the pre-existing unguarded behavior.
+  const onOutboundSsrfBlockedAudit = (info: OutboundSsrfBlockedInfo) => {
+    opts.auditLog.append({
+      event: "outbound_ssrf_blocked",
+      hostname: info.hostname,
+      category: info.category,
+      addresses: info.addresses,
+      at: info.at,
+    });
+  };
+  // WR-373: an allowlisted serve — one audit line per serve naming the
+  // hostname, the category, and the private addresses served (the
+  // operator wants a trail of every intentional private dial).
+  const onOutboundSsrfAllowlistedAudit = (info: OutboundSsrfAllowlistedInfo) => {
+    opts.auditLog.append({
+      event: "outbound_ssrf_allowlisted",
+      hostname: info.hostname,
+      category: info.category,
+      addresses: info.addresses,
+      at: info.at,
+    });
+  };
+  // WR-373: a proxied skip — one audit line per endpoint (the skip is a
+  // static configuration fact: the endpoint tunnels, so the relay never
+  // dials the target directly). Export-side validation is the proxy's
+  // responsibility.
+  const onOutboundSsrfProxySkippedAudit = (info: OutboundSsrfProxySkippedInfo) => {
+    opts.auditLog.append({
+      event: "outbound_ssrf_proxy_skipped",
+      hostname: info.hostname,
+      proxyUrl: info.proxyUrl,
+      at: info.at,
+    });
+  };
   // WR-165: a chaos-drill fault was injected — one audit line per fault
   // naming the endpoint, the fault kind, and the detail (latency or
   // synthetic status). Injected faults are always distinguishable from
@@ -8186,7 +8355,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   }
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, opts.awsSigV4, opts.awsSecretResolver, opts.outboundSchemas, opts.oauth2, undefined, opts.compressBrotli, opts.phaseTimeouts, opts.tlsCa, opts.chaos, onChaosInjectedAudit, opts.responseGuard, opts.doh, onDohFallbackAudit, proxyHealthMonitor, opts.outboundCredentials, opts.dnsPin, onDnsPinMismatchAudit, opts.cloudEvents)
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, opts.awsSigV4, opts.awsSecretResolver, opts.outboundSchemas, opts.oauth2, undefined, opts.compressBrotli, opts.phaseTimeouts, opts.tlsCa, opts.chaos, onChaosInjectedAudit, opts.responseGuard, opts.doh, onDohFallbackAudit, proxyHealthMonitor, opts.outboundCredentials, opts.dnsPin, onDnsPinMismatchAudit, opts.cloudEvents, opts.outboundSsrfGuard, onOutboundSsrfBlockedAudit, onOutboundSsrfAllowlistedAudit, onOutboundSsrfProxySkippedAudit)
       : undefined;
   // WR-146: tail-latency hedging for outbound attempts (opt-in). The
   // wrapper sits around whichever sender the queue uses — the default
@@ -8380,8 +8549,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
                   opts.doh,
                   onDohFallbackAudit,
                   // proxyHealthMonitor / outboundCredentials / dnsPin /
-                  // onDnsPinMismatch stay off for shadow copies
-                  // (pre-existing); the trailing slots lead to cloudEvents.
+                  // onDnsPinMismatch / outboundSsrfGuard stay off for
+                  // shadow copies (pre-existing); the trailing slots
+                  // lead to cloudEvents.
                   undefined,
                   undefined,
                   undefined,
@@ -10584,7 +10754,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       // new series. Absent entirely with a custom sender (no pool).
       res
         .writeHead(200, { "content-type": "text/plain; version=0.0.4" })
-        .end(queue.renderMetrics() + versionMetrics.render() + schemaMetrics.render() + (schemaRegistry?.renderMetrics() ?? "") + ipAclMetrics.render() + fail2banMetrics.render() + inboundTenantRateLimitMetrics.render() + operatorRateLimitMetrics.render() + (proxyHealthMonitor?.renderMetrics() ?? "") + certExpiryMonitor.render() + tlsVersionMonitor.render() + (ocspMonitor?.render() ?? "") + (usageMeter?.render() ?? "") + (defaultSender?.compressionStats.render() ?? "") + (defaultSender?.dnsCache?.render() ?? "") + (defaultSender?.dnsPin?.render() ?? "") + (defaultSender?.wsPool.renderMetrics() ?? "") + meshMetrics.render() + (defaultSender?.outboundSchemaMetrics?.render() ?? "") + (defaultSender?.chaosMetrics?.render() ?? "") + (reputation?.renderMetrics() ?? "") + hedgeMetrics.render() + (queue.getErrorBudgetMonitor()?.render() ?? ""));
+        .end(queue.renderMetrics() + versionMetrics.render() + schemaMetrics.render() + (schemaRegistry?.renderMetrics() ?? "") + ipAclMetrics.render() + fail2banMetrics.render() + inboundTenantRateLimitMetrics.render() + operatorRateLimitMetrics.render() + (proxyHealthMonitor?.renderMetrics() ?? "") + certExpiryMonitor.render() + tlsVersionMonitor.render() + (ocspMonitor?.render() ?? "") + (usageMeter?.render() ?? "") + (defaultSender?.compressionStats.render() ?? "") + (defaultSender?.dnsCache?.render() ?? "") + (defaultSender?.dnsPin?.render() ?? "") + (defaultSender?.outboundSsrfGuard?.render() ?? "") + (defaultSender?.wsPool.renderMetrics() ?? "") + meshMetrics.render() + (defaultSender?.outboundSchemaMetrics?.render() ?? "") + (defaultSender?.chaosMetrics?.render() ?? "") + (reputation?.renderMetrics() ?? "") + hedgeMetrics.render() + (queue.getErrorBudgetMonitor()?.render() ?? ""));
       return;
     }
     if (isEvents) {

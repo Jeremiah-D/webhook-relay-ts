@@ -11504,8 +11504,9 @@ const server = createRelayServer({
   no cache configured, revising throws — enabling the cache needs a
   restart. This revises the cache *configuration*; WR-92 is the cache
   mechanism itself, WR-170 the DoH resolver it fronts, WR-194 the
-  resolution pinning above it, and WR-211 the SRV discovery that reads
-  through it.
+  resolution pinning above it, WR-373 the SSRF guard that classifies
+  the resolved addresses above it, and WR-211 the SRV discovery that
+  reads through it.
 
 ## DNS resolution pinning (opt-in)
 
@@ -11552,6 +11553,76 @@ const server = createRelayServer({
   `mismatches_total`, `hosts` gauge); `sender.dnsPin.getStats()` exposes
   the counters. Bounded by `maxHosts` (default 1024, longest-pinned
   evicted); invalid `mode` / `maxHosts` throw `RangeError` at startup.
+
+## Outbound SSRF guard (opt-in)
+
+DNS pinning (WR-194) catches a *changed* address; it cannot catch an
+address that was private all along. The SSRF guard
+(`src/outbound-ssrf-guard.ts`, `node:dns` only) classifies the
+*resolved addresses themselves* before connect: loopback
+(`127.0.0.0/8`, `::1`), RFC 1918 (`10/8`, `172.16/12`, `192.168/16`),
+link-local (`169.254.0.0/16` — the cloud-metadata range — plus
+`fe80::/10`), unique-local (`fc00::/7`), unspecified (`0.0.0.0/8`,
+`::`), and multicast (`224.0.0.0/4`, `ff00::/8`). IPv4-mapped IPv6
+addresses (`::ffff:10.0.0.1`) are judged by their embedded IPv4
+address.
+
+```ts
+const server = createRelayServer({
+  outboundSsrfGuard: {},   // or a compiled `new OutboundSsrfGuard({...})`
+  // Per-endpoint opt-in for intentional private targets:
+  // outboundSsrfGuard: { allowPrivateTargets: { "http://internal:8080/hook": true } },
+});
+```
+
+- **Fail-closed by default** — any private hit refuses the whole
+  lookup with `OutboundSsrfBlockedError` before a single payload byte
+  is written, even when a public address is also present (the dialer
+  may pick any of them). The item dead-letters on the first attempt as
+  `"non_retryable"` — no retry budget burned, no circuit-breaker touch
+  (the endpoint was never contacted, so the control plane learns
+  nothing, mirroring the WR-115 transform-failure rule) — and a later
+  re-bind to a private address is refused the same way, on the next
+  new connection's resolution.
+- **Audit** — every block is audited as `outbound_ssrf_blocked`
+  (hostname, category, offending addresses); every allowlisted serve
+  as `outbound_ssrf_allowlisted` (same shape — the operator gets a
+  trail of every intentional private dial); a proxied skip as
+  `outbound_ssrf_proxy_skipped` (hostname, proxy URL, once per
+  endpoint). Resolved private IPs go into those audit events only —
+  never into metrics labels, and never into the error message (which
+  also lands in the `dead_letter` audit's `error` field).
+- **Layering** — the guard wraps the effective lookup (the WR-92 cache
+  when configured, pin-checked by WR-194 when configured, the system
+  resolver otherwise) via per-endpoint `dns.lookup`-compatible
+  bindings, so it judges exactly the addresses the connection will
+  use — no second resolution, no TOCTOU window. Per-endpoint DoH
+  bindings (WR-170) are guard-checked the same way (the guard wraps
+  the endpoint's DoH lookup). Orthogonal to the cache (which only
+  caches), to WR-194 pinning (which judges drift, not privateness),
+  and to WR-21 TLS pinning (handshake layer, not resolution layer). A
+  *failed* resolution is not a block — the inner error passes through
+  to the normal DNS-failure path.
+- **Proxies** — through an HTTP CONNECT (WR-27) or SOCKS5 (WR-171)
+  proxy the relay never dials the target directly, so the guard skips
+  the check and audits the skip once per endpoint. Export-side
+  validation is the proxy's responsibility.
+- **Pooling note** — with keep-alive pooling (the default), an
+  established connection is reused without re-resolving; a re-bind is
+  therefore caught on the next *new* connection's lookup, which is the
+  correct security semantic (the live connection already went to a
+  checked address). The pool key binds the guard mode, so an
+  allowlisted endpoint can never ride a guarded endpoint's agent, or
+  vice versa.
+- **Observability** — `GET /metrics` renders
+  `relay_outbound_ssrf_*`
+  (`lookups_total{result="checked"|"blocked"|"allowlisted"|"skipped"}`,
+  `blocks_total{category="..."}` — categories only, never IPs);
+  `sender.outboundSsrfGuard.getStats()` exposes the counters.
+  Invalid `allowPrivateTargets` values throw `RangeError` at startup.
+  The HTTP/2 session pool and the WebSocket pool manage their own
+  connections and keep the OS resolver — like the WR-194 pin, the
+  guard covers the HTTP/1.1 path only.
 
 ## DNS SRV endpoint discovery (opt-in, RFC 2782)
 
@@ -13392,6 +13463,22 @@ Requires Node 24+ (runs `.ts` directly via type stripping; zero dependencies).
   end-to-end through the relay server (delivery on matching baseline,
   dead-letter + `dns_pin_mismatch` audit on drift, drifted address never
   sees a byte).
+- `test/outbound-ssrf-guard.test.ts` — outbound SSRF guard (WR-373):
+  address classification (loopback, RFC 1918, link-local incl.
+  169.254.169.254, ULA, unspecified, multicast, IPv4-mapped IPv6,
+  unparsable fail-closed), private hits refused fail-closed
+  (`OutboundSsrfBlockedError`, `non_retryable`, error message carries
+  no IP), mixed answers poisoned by any private hit, re-bind to a
+  private address refused, allowlisted endpoints serve private
+  addresses (per-endpoint, same-hostname endpoints stay guarded) and
+  audit every serve, proxied endpoints skip and audit once, inner
+  failures pass through unjudged, per-endpoint DoH inner override,
+  activity-gated `relay_outbound_ssrf_*` exposition with no private IP
+  in any label, and end-to-end through the relay server (private target
+  dead-letters on attempt 1 with `outbound_ssrf_blocked` audit and zero
+  bytes to the downstream, allowlisted target delivers with
+  `outbound_ssrf_allowlisted` audit, proxied target tunnels with one
+  `outbound_ssrf_proxy_skipped` audit).
 - `test/e2e.test.ts` — end-to-end over real HTTP with the default sender: a
   flaky stub (500, 500, then 200) proves retries happen with visibly growing
   backoff and the payload arrives byte-identical (audit records `delivered`

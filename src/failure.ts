@@ -29,6 +29,12 @@
  *   before the wire request was built, so no downstream verdict exists
  *   and retrying is futile. The item is dead-lettered immediately and
  *   audited as `schema_violation`.
+ * - a WR-373 `OutboundSsrfBlockedError` → `"non_retryable"`: the
+ *   outbound SSRF guard refused the lookup before connect (a resolved
+ *   address was private), so no downstream verdict exists and retrying
+ *   is futile — the next attempt would resolve the same private
+ *   address. The item is dead-lettered immediately and audited as
+ *   `outbound_ssrf_blocked`.
  * - a WR-118 `AssertionFailedError` → `"assertion_failed"`: the
  *   downstream answered inside the rule's status whitelist, but the
  *   response body failed the endpoint's declarative assertions. The
@@ -148,6 +154,7 @@ import { CredentialSecretUnavailableError } from "./outbound-credentials.ts";
 import { AssertionFailedError } from "./response-assertions.ts";
 import { IntegrityMismatchError } from "./response-integrity.ts";
 import { ResponseTooLargeError } from "./response-limit.ts";
+import { OutboundSsrfBlockedError } from "./outbound-ssrf-guard.ts";
 
 /**
  * How a delivery failure should be treated by the retry queue.
@@ -1350,6 +1357,16 @@ export function classifyFailure(err: unknown): ClassifiedFailure {
   // same payload), so dead-letter immediately instead of burning the
   // retry budget and the backoff clock. Audited as `schema_violation`.
   if (err instanceof OutboundSchemaViolationError) {
+    return { failureClass: "non_retryable" };
+  }
+  // WR-373: an SSRF-guard refusal is a local resolution verdict, not a
+  // downstream verdict — the lookup was refused before connect (a
+  // resolved address was private), so the wire request was never
+  // built, let alone sent. Retrying can never succeed for this item
+  // (the next attempt resolves the same private address), so
+  // dead-letter immediately instead of burning the retry budget and
+  // the backoff clock. Audited as `outbound_ssrf_blocked`.
+  if (err instanceof OutboundSsrfBlockedError) {
     return { failureClass: "non_retryable" };
   }
   // WR-118: an assertion failure is a retryable delivery failure — the

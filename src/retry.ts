@@ -96,6 +96,7 @@ import {
   type FailureClass,
 } from "./failure.ts";
 import { OcspError } from "./ocsp.ts";
+import { OutboundSsrfBlockedError } from "./outbound-ssrf-guard.ts";
 import { PhaseTimeoutError, type PhaseTimeoutPhase } from "./phase-timeouts.ts";
 import {
   AssertionFailedError,
@@ -9788,7 +9789,13 @@ export class RetryQueue {
           // backoff/concurrency, failover, weighted) must not learn
           // anything from it: recording a "success" would reset failure
           // streaks the endpoint actually earned.
-          const reachedDownstream = !(err instanceof PayloadTransformError);
+          // WR-373: an OutboundSsrfBlockedError is the same shape — the
+          // guard refused the lookup before connect, so the endpoint was
+          // never contacted either. Recording a "success" would reset
+          // failure streaks for an endpoint that was never even dialed.
+          const reachedDownstream =
+            !(err instanceof PayloadTransformError) &&
+            !(err instanceof OutboundSsrfBlockedError);
           // WR-91: leader-only, like the success path above — a follower's
           // poison-payload verdict is logical (its own dead letter), not
           // a second physical observation of the endpoint.

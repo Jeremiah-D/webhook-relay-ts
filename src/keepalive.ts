@@ -20,6 +20,7 @@ import {
 } from "./socks5.ts";
 import { tlsSniPoolKeyFragment, type ResolvedTlsSniOverride } from "./tls-sni.ts";
 import type { MinTlsVersion } from "./tls-version.ts";
+import type { SsrfGuardAgentBinding } from "./outbound-ssrf-guard.ts";
 
 /**
  * Outbound keep-alive connection pool (WR-24).
@@ -627,9 +628,13 @@ export class OutboundConnectionPool {
    * server re-sends no certificate, so there would be nothing to
    * check, exactly the pinned-agent rationale. Endpoints without an
    * override entry pass `undefined` and keep the exact historical pool
-   * keys.
+   * keys. `ssrf` (see `src/outbound-ssrf-guard.ts`) binds the agent to
+   * one SSRF-guard mode, so a connection dialed through an allowlisted
+   * endpoint's lookup can never serve a guarded endpoint, or vice
+   * versa. Endpoints without a guard binding pass `undefined` and keep
+   * the exact historical pool keys.
    */
-  agentFor(url: URL, pins?: readonly string[], proxyUrl?: string, clientCertId?: string, tlsSni?: ResolvedTlsSniOverride, minTlsVersion?: MinTlsVersion, ocsp?: boolean, caBundle?: string, doh?: DohAgentBinding): HttpAgent {
+  agentFor(url: URL, pins?: readonly string[], proxyUrl?: string, clientCertId?: string, tlsSni?: ResolvedTlsSniOverride, minTlsVersion?: MinTlsVersion, ocsp?: boolean, caBundle?: string, doh?: DohAgentBinding, ssrf?: SsrfGuardAgentBinding): HttpAgent {
     if (url.protocol !== "http:" && url.protocol !== "https:") {
       throw new Error(`OutboundConnectionPool: unsupported protocol ${url.protocol}`);
     }
@@ -684,6 +689,14 @@ export class OutboundConnectionPool {
     if (doh !== undefined) {
       key += `|doh:${createHash("sha256").update(doh.url).digest("hex").slice(0, 16)}`;
     }
+    // WR-373: an SSRF-guarded endpoint gets its own agent per guard
+    // mode — a connection dialed through an allowlisted endpoint's
+    // lookup must never serve a guarded endpoint (the guarded lookup
+    // would refuse the private address the allowlisted one served),
+    // or vice versa. The mode is a small enum, safe to embed.
+    if (ssrf !== undefined) {
+      key += `|ssrf:${ssrf.mode}`;
+    }
     let entry = this.entries.get(key);
     if (entry === undefined) {
       // WR-134: the fixed cap is the *initial* cap, clamped into
@@ -706,6 +719,10 @@ export class OutboundConnectionPool {
         // WR-170: a per-endpoint DoH lookup overrides the pool-level one —
         // the most specific resolver wins.
         ...(doh !== undefined ? { lookup: doh.lookup } : {}),
+        // WR-373: the SSRF-guarded lookup wins over the DoH lookup — it
+        // wraps it, so the guard judges exactly the addresses the
+        // connection will use.
+        ...(ssrf !== undefined ? { lookup: ssrf.lookup } : {}),
         // 0 disables Node's internal free-socket reaping: the pool reaps
         // on its own unref'd timer instead, so idle sockets can be
         // unref'd without racing the agent's timer.
