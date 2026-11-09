@@ -28,7 +28,7 @@ import {
   selectSignatureAlgorithmVerifier,
   type SignatureAlgorithmRule,
 } from "./signature-alg.ts";
-import { RetryQueue, errorBudgetBurnAuditEvent, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeliveryDeadlineConfig, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type ErrorBudgetConfig, type ErrorBudgetRevision, type FailoverEndpointConfig, type FailoverRevision, type QuorumRetention, type QuorumRetentionRevision, type RetryItem, type Sender, type SenderCallOptions, type MaintenanceWindowTransition, type SloRiskConfig, type SloRiskRevision, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
+import { RetryQueue, errorBudgetBurnAuditEvent, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeliveryDeadlineConfig, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type ErrorBudgetConfig, type ErrorBudgetRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type QuorumRetention, type QuorumRetentionRevision, type RetryItem, type Sender, type SenderCallOptions, type MaintenanceWindowTransition, type SloRiskConfig, type SloRiskRevision, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
 import { parseDeliverAtHeader, DELIVER_AT_HEADER } from "./retry.ts";
 import type { ShadowDeliveredInfo, ShadowFailedInfo, ShadowTargetConfig, ShadowTargetsConfig } from "./retry.ts";
 import type {
@@ -6325,6 +6325,27 @@ export interface RelayServer extends Server {
    */
   getFailoverConfig?: (endpoint: string) => FailoverEndpointConfig | undefined;
   /**
+   * WR-366: live-redirect the failover-switch observer at runtime
+   * — no restart. Replaces the operator callback the server
+   * forwards each switch to, after the switch itself is audited as
+   * `failover_switched`; the audit can never be bypassed by a
+   * replacement. `null` clears back to audit-only (switches are
+   * still audited, just no longer forwarded to an operator). A
+   * non-function value throws `RangeError` and the live callback is
+   * untouched; replacing with the same reference (or clearing when
+   * already unset) is a silent no-op. A real replacement is audited
+   * as `failover_switch_callback_revised` with `previous` /
+   * `current` recording only 'set' / 'cleared' presence, never a
+   * function body. Always set; throws `Error` when failover was
+   * never configured — enabling it needs a restart. The new
+   * callback takes effect from the next switch; the switching
+   * thresholds, the failback quiet period, and the targets list
+   * are untouched.
+   */
+  reviseFailoverSwitchCallback?: (
+    cb: ((event: FailoverSwitchEvent) => void) | null
+  ) => void;
+  /**
    * WR-350: revise the live quorum retention tuning at runtime
    * (`retentionMs` / `maxFanouts`, partial — omitted fields keep their
    * live values). The new values take effect at the next lazy retention
@@ -8257,6 +8278,13 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // `circuit_closed` audit.
   let operatorCircuitStateChangeCallback: CircuitStateChangeCallback | undefined =
     opts.retry?.onCircuitStateChange;
+  // WR-366: the operator's failover-switch callback, held in a mutable
+  // cell so `server.reviseFailoverSwitchCallback` can replace it at
+  // runtime. The audit wrapper below reads this cell — never the
+  // operator callback directly — so replacing the operator callback
+  // cannot bypass the `failover_switched` audit.
+  let operatorFailoverSwitchCallback: ((event: FailoverSwitchEvent) => void) | undefined =
+    opts.retry?.onFailoverSwitch;
   const queue = new RetryQueue({
     // WR-146: the queue talks to the hedged wrapper (a pure pass-through
     // when hedging is off) so the server's `defaultSender` handle keeps
@@ -8708,7 +8736,10 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         reason: event.reason,
         at: event.at,
       });
-      opts.retry?.onFailoverSwitch?.(event);
+      // WR-366: the wrapper reads the mutable operator cell — the
+      // queue's callback is never swapped, so a runtime callback
+      // replacement cannot bypass this audit.
+      operatorFailoverSwitchCallback?.(event);
     },
     // Wrap the caller's hook so every canary rollout transition is
     // audited, not just observed.
@@ -16255,6 +16286,41 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // `undefined` for endpoints without failover config.
   server.getFailoverConfig = (endpoint: string): FailoverEndpointConfig | undefined =>
     queue.getFailoverConfig(endpoint);
+
+  // WR-366: live failover-switch callback replacement. Only the
+  // server-side operator-callback cell moves — the queue's own
+  // callback (the `failover_switched` audit wrapper) is never
+  // touched, so a replacement cannot bypass the audit. A
+  // non-function callback throws `RangeError` and the live cell is
+  // untouched; a same-reference replacement (or clearing when
+  // already unset) is a silent no-op. A real replacement is audited
+  // as `failover_switch_callback_revised` with `previous` /
+  // `current` recording only 'set' / 'cleared' presence, never a
+  // function body. With failover unconfigured the queue throws
+  // the canonical "must restart" Error.
+  server.reviseFailoverSwitchCallback = (
+    cb: ((event: FailoverSwitchEvent) => void) | null
+  ): void => {
+    if (!queue.failoverConfigured()) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseFailoverSwitchCallback(cb);
+    }
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseFailoverSwitchCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === operatorFailoverSwitchCallback) return;
+    const prev = operatorFailoverSwitchCallback === undefined ? "cleared" : "set";
+    const nextPresence = next === undefined ? "cleared" : "set";
+    operatorFailoverSwitchCallback = next;
+    opts.auditLog.append({
+      event: "failover_switch_callback_revised",
+      previous: prev,
+      current: nextPresence,
+    });
+  };
 
   // WR-350: live quorum retention tuning revision. The method is always
   // set (like reviseFailover above); with quorum unconfigured the queue

@@ -2477,6 +2477,8 @@ export interface RetryQueueOptions {
    * primary, or manual reset). Edge-triggered — one call per switch, not
    * one per failed attempt. The server audits these as
    * `failover_switched`; library users get the hook directly.
+   * Live-revisable via `RetryQueue.reviseFailoverSwitchCallback` —
+   * `null` clears back to no observer.
    */
   onFailoverSwitch?: (event: FailoverSwitchEvent) => void;
   /**
@@ -4553,7 +4555,12 @@ export class RetryQueue {
   private readonly quorum?: QuorumFanoutSet;
   /** WR-39: active/standby target selection; undefined when not configured. */
   private readonly failover?: FailoverManager;
-  private readonly onFailoverSwitch?: (event: FailoverSwitchEvent) => void;
+  // WR-366: deliberately *not* readonly — `reviseFailoverSwitchCallback`
+  // replaces the live failover-switch observer at runtime. The server's
+  // audit closure (which forwards to the operator callback) is held
+  // here when the queue runs under `RelayServer`; direct queue users
+  // hold their own callback in the same field.
+  private onFailoverSwitch?: (event: FailoverSwitchEvent) => void;
   /** `relay_failover_switches_total`, one counter per (endpoint, from, to). */
   private readonly failoverSwitchCounts = new Map<
     string,
@@ -8124,6 +8131,11 @@ export class RetryQueue {
   /** Whether the circuit-breaker subsystem is enabled (queue-level). */
   circuitBreakerConfigured(): boolean {
     return this.circuitBreakerOpts !== undefined;
+  }
+
+  /** WR-366: whether the failover subsystem is enabled (queue-level). */
+  failoverConfigured(): boolean {
+    return this.failover !== undefined;
   }
 
   /** Whether the per-endpoint quota subsystem is enabled (queue-level). */
@@ -12195,6 +12207,41 @@ export class RetryQueue {
     const next = cb ?? undefined;
     if (next === this.circuitBreakerOnStateChange) return;
     this.circuitBreakerOnStateChange = next;
+  }
+
+  /**
+   * WR-366: live-redirect the failover-switch observer — the
+   * queue-side setter behind
+   * `RelayServer.reviseFailoverSwitchCallback`. The new callback
+   * takes effect from the next switch; switches that already fired
+   * are never re-delivered. `null` clears back to no observer (the
+   * manager keeps switching exactly as before — only the
+   * observation stops). A non-function value throws `RangeError`
+   * and the live callback is untouched; replacing with the same
+   * reference (or clearing when already unset) is a no-op. Only
+   * the observer moves: the switching thresholds, the failback
+   * quiet period, the targets list, and the accumulated failure
+   * counts are untouched. Throws `Error` when failover was never
+   * configured — enabling it needs a restart. Under `RelayServer`
+   * the field holds the server's audit closure, so direct calls
+   * here would replace the audit wrapper; server users must go
+   * through `RelayServer.reviseFailoverSwitchCallback`, which swaps
+   * only the operator cell behind the audit closure.
+   */
+  reviseFailoverSwitchCallback(cb: ((event: FailoverSwitchEvent) => void) | null): void {
+    if (this.failover === undefined) {
+      throw new Error(
+        "reviseFailoverSwitchCallback: failover is not configured — enabling it requires a restart"
+      );
+    }
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseFailoverSwitchCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === this.onFailoverSwitch) return;
+    this.onFailoverSwitch = next;
   }
 
   /**

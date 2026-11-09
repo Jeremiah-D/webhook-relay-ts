@@ -3985,6 +3985,23 @@ const server = createRelayServer({
   throws — enabling it needs a restart. Thresholds are per logical
   endpoint; the targets list itself is never revised. This is the
   switching threshold; WR-39 is the switching mechanism itself.
+- **Live callback redirection (WR-366)** — `relay.reviseFailoverSwitchCallback(cb)`
+  / `queue.reviseFailoverSwitchCallback(cb)` swaps the operator
+  callback that observes every switch at runtime, no restart: the
+  next switch (auto, manual `resetFailover`, or failback canary)
+  enters the new callback and the old one goes silent. `null` clears
+  back to audit-only — switches keep happening and are still audited
+  as `failover_switched`, just no longer forwarded. A non-function
+  value throws `RangeError` and the live callback is untouched; a
+  same-reference replacement (or clearing when already unset) is a
+  silent no-op. A real replacement is audited as
+  `failover_switch_callback_revised` with `previous` / `current`
+  recording only 'set' / 'cleared' presence, and the audit can never
+  be bypassed by a replacement. Revising with failover unconfigured
+  throws — enabling it needs a restart. Only the observer moves:
+  thresholds, the failback quiet period, and the targets list are
+  untouched. WR-349 owns the switching thresholds; WR-365 is the
+  same family for the circuit-breaker state-change hook.
 - **Dead letters** record the physical target they died on
   (`failoverEndpoint` remembers the logical endpoint), so a replay
   re-resolves against the *current* active target instead of pinning to
