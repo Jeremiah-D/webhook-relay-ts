@@ -68,7 +68,7 @@ import {
   type ResolvedHttpHardening,
 } from "./http-hardening.ts";
 import type { LatencyPhaseOptions, OrderedAuditEvent, OrderedModeOptions } from "./retry.ts";
-import type { BulkheadRevision, BulkheadRevisionSnapshot, CircuitProbeRevision, CircuitThresholdPatch, DeliveryWindowListEntry, DeliveryWindowSnapshot, EndpointConcurrencySnapshot, EndpointQuotaSnapshot, EndpointRetryBudgetSnapshot, EndpointRetryPolicyRevision, GlobalConcurrencyStats, GlobalRateLimitRevision, GlobalRateLimitStats, HolidayCalendarConfig, HolidayCalendarSnapshot, MinNormalShareSnapshot, ResolvedCircuitProbe, ResolvedCircuitThresholds, ResolvedEndpointRetryPolicy, StatusRetryPolicyConfig, TenantBudgetSnapshot, TenantConcurrencySnapshot, TenantRetryBudgetRevision } from "./retry.ts";
+import type { BulkheadRevision, BulkheadRevisionSnapshot, CircuitProbeRevision, CircuitThresholdPatch, DeliveryWindowListEntry, DeliveryWindowSnapshot, EndpointConcurrencySnapshot, EndpointDependencyCallbacksRevision, EndpointDependencyTransitionInfo, EndpointQuotaSnapshot, EndpointRetryBudgetSnapshot, EndpointRetryPolicyRevision, GlobalConcurrencyStats, GlobalRateLimitRevision, GlobalRateLimitStats, HolidayCalendarConfig, HolidayCalendarSnapshot, MinNormalShareSnapshot, ResolvedCircuitProbe, ResolvedCircuitThresholds, ResolvedEndpointRetryPolicy, StatusRetryPolicyConfig, TenantBudgetSnapshot, TenantConcurrencySnapshot, TenantRetryBudgetRevision } from "./retry.ts";
 import {
   DEFAULT_STATUS_RETRY_MULTIPLIER,
   assertValidStatusRetryPolicy,
@@ -6414,6 +6414,31 @@ export interface RelayServer extends Server {
    */
   reviseEndpointAutoDisableCallbacks?: (patch: EndpointAutoDisableCallbacksRevision) => void;
   /**
+   * WR-370: live-redirect the endpoint dependency-block/unblock
+   * observers at runtime — no restart. Replaces the operator callbacks
+   * the server forwards each transition to, after the transition
+   * itself is audited as `endpoint_dependency_blocked` /
+   * `endpoint_dependency_unblocked`; the audit can never be bypassed
+   * by a replacement. The patch is partial — an omitted field keeps
+   * its live value — and `null` clears that hook back to audit-only
+   * (the graph keeps parking and resuming and the transitions are
+   * still audited, just no longer forwarded to an operator). An empty
+   * or non-object patch throws `RangeError`, as does a non-function
+   * value for a provided field, and the live callbacks are untouched;
+   * a patch identical to the live values is a silent no-op. A real
+   * revision is audited as `endpoint_dependency_callbacks_revised`
+   * with per-hook `onEndpointDependencyBlocked` /
+   * `onEndpointDependencyUnblocked` ('set' / 'cleared' / 'unchanged')
+   * and `oldOnEndpointDependencyBlocked` /
+   * `oldOnEndpointDependencyUnblocked` ('set' / 'absent') presence,
+   * never a function body. Always set; throws `Error` when the
+   * dependency graph was never configured — enabling it needs a
+   * restart. The new callbacks take effect from the next transition;
+   * the dependency graph, the blocked set, the parked items, and their
+   * recheck cadence are untouched.
+   */
+  reviseEndpointDependencyCallbacks?: (patch: EndpointDependencyCallbacksRevision) => void;
+  /**
    * WR-350: revise the live quorum retention tuning at runtime
    * (`retentionMs` / `maxFanouts`, partial — omitted fields keep their
    * live values). The new values take effect at the next lazy retention
@@ -8384,6 +8409,18 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     | undefined = opts.retry?.onEndpointAutoDisabled;
   let operatorEndpointEnabledCallback: ((info: EndpointEnabledInfo) => void) | undefined =
     opts.retry?.onEndpointEnabled;
+  // WR-370: the operator's dependency-block/unblock callbacks, held in
+  // mutable cells so `server.reviseEndpointDependencyCallbacks` can
+  // replace them at runtime. The audit wrappers below read these cells
+  // — never the operator callbacks directly — so replacing an operator
+  // callback cannot bypass the `endpoint_dependency_blocked` /
+  // `endpoint_dependency_unblocked` audit.
+  let operatorEndpointDependencyBlockedCallback:
+    | ((info: EndpointDependencyTransitionInfo) => void)
+    | undefined = opts.retry?.onEndpointDependencyBlocked;
+  let operatorEndpointDependencyUnblockedCallback:
+    | ((info: EndpointDependencyTransitionInfo) => void)
+    | undefined = opts.retry?.onEndpointDependencyUnblocked;
   const queue = new RetryQueue({
     // WR-146: the queue talks to the hedged wrapper (a pure pass-through
     // when hedging is off) so the server's `defaultSender` handle keeps
@@ -9169,7 +9206,10 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     },
     // WR-199: audit dependency-block transitions (edge-triggered — one
     // line per block/unblock, not per parked dispatch); the caller's own
-    // hooks still fire afterwards.
+    // hooks still fire afterwards. WR-370: the wrappers read the
+    // mutable operator cells — the operator callbacks are never
+    // swapped, so a runtime callback replacement cannot bypass this
+    // audit.
     onEndpointDependencyBlocked: (info) => {
       opts.auditLog.append({
         event: "endpoint_dependency_blocked",
@@ -9177,7 +9217,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         dependency: info.dependency,
         ...(info.tenant !== undefined ? { tenant: info.tenant } : {}),
       });
-      opts.retry?.onEndpointDependencyBlocked?.(info);
+      operatorEndpointDependencyBlockedCallback?.(info);
     },
     onEndpointDependencyUnblocked: (info) => {
       opts.auditLog.append({
@@ -9186,7 +9226,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         dependency: info.dependency,
         ...(info.tenant !== undefined ? { tenant: info.tenant } : {}),
       });
-      opts.retry?.onEndpointDependencyUnblocked?.(info);
+      operatorEndpointDependencyUnblockedCallback?.(info);
     },
     // WR-149: audit replay-idempotency guard decisions; the caller's own
     // hooks still fire afterwards. WR-368: the wrappers read the
@@ -16646,6 +16686,86 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     operatorEndpointAutoDisabledCallback = nextDisabled;
     operatorEndpointEnabledCallback = nextEnabled;
     opts.auditLog.append({ event: "endpoint_auto_disable_callbacks_revised", ...payload });
+  };
+
+  // WR-370: live endpoint dependency-block/unblock callback replacement.
+  // Only the server-side operator-callback cells move — the queue's own
+  // callbacks (the `endpoint_dependency_blocked` /
+  // `endpoint_dependency_unblocked` audit wrappers) are never touched,
+  // so a replacement cannot bypass the audit. The patch is partial: an
+  // omitted field keeps its live value; `null` clears that hook back to
+  // audit-only. An empty or non-object patch throws `RangeError`, as
+  // does a non-function value for a provided field, and the live cells
+  // are untouched; a patch identical to the live values is a silent
+  // no-op. A real revision is audited as
+  // `endpoint_dependency_callbacks_revised` with per-hook presence
+  // (`onEndpointDependencyBlocked` / `onEndpointDependencyUnblocked`:
+  // 'set' / 'cleared' / 'unchanged'; `oldOnEndpointDependencyBlocked` /
+  // `oldOnEndpointDependencyUnblocked`: 'set' / 'absent'), never a
+  // function body. With the dependency graph unconfigured the queue
+  // throws the canonical "must restart" Error.
+  server.reviseEndpointDependencyCallbacks = (patch: EndpointDependencyCallbacksRevision): void => {
+    if (!queue.endpointDependenciesConfigured()) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseEndpointDependencyCallbacks(patch);
+    }
+    if (patch === null || typeof patch !== "object") {
+      throw new RangeError(
+        "reviseEndpointDependencyCallbacks: patch must be an object with at least one of onEndpointDependencyBlocked / onEndpointDependencyUnblocked"
+      );
+    }
+    const hasBlocked = patch.onEndpointDependencyBlocked !== undefined;
+    const hasUnblocked = patch.onEndpointDependencyUnblocked !== undefined;
+    if (!hasBlocked && !hasUnblocked) {
+      throw new RangeError(
+        "reviseEndpointDependencyCallbacks: patch must set at least one of onEndpointDependencyBlocked / onEndpointDependencyUnblocked"
+      );
+    }
+    if (
+      hasBlocked &&
+      patch.onEndpointDependencyBlocked !== null &&
+      typeof patch.onEndpointDependencyBlocked !== "function"
+    ) {
+      throw new RangeError(
+        "reviseEndpointDependencyCallbacks: onEndpointDependencyBlocked must be a function or null"
+      );
+    }
+    if (
+      hasUnblocked &&
+      patch.onEndpointDependencyUnblocked !== null &&
+      typeof patch.onEndpointDependencyUnblocked !== "function"
+    ) {
+      throw new RangeError(
+        "reviseEndpointDependencyCallbacks: onEndpointDependencyUnblocked must be a function or null"
+      );
+    }
+    const nextBlocked = hasBlocked
+      ? patch.onEndpointDependencyBlocked ?? undefined
+      : operatorEndpointDependencyBlockedCallback;
+    const nextUnblocked = hasUnblocked
+      ? patch.onEndpointDependencyUnblocked ?? undefined
+      : operatorEndpointDependencyUnblockedCallback;
+    if (
+      nextBlocked === operatorEndpointDependencyBlockedCallback &&
+      nextUnblocked === operatorEndpointDependencyUnblockedCallback
+    ) {
+      return;
+    }
+    const payload = {
+      onEndpointDependencyBlocked: hasBlocked
+        ? (nextBlocked === undefined ? "cleared" : "set")
+        : "unchanged",
+      oldOnEndpointDependencyBlocked:
+        operatorEndpointDependencyBlockedCallback === undefined ? "absent" : "set",
+      onEndpointDependencyUnblocked: hasUnblocked
+        ? (nextUnblocked === undefined ? "cleared" : "set")
+        : "unchanged",
+      oldOnEndpointDependencyUnblocked:
+        operatorEndpointDependencyUnblockedCallback === undefined ? "absent" : "set",
+    };
+    operatorEndpointDependencyBlockedCallback = nextBlocked;
+    operatorEndpointDependencyUnblockedCallback = nextUnblocked;
+    opts.auditLog.append({ event: "endpoint_dependency_callbacks_revised", ...payload });
   };
 
   // WR-350: live quorum retention tuning revision. The method is always

@@ -4177,6 +4177,19 @@ const server = createRelayServer({
   (`endpoint`, `dependency`, optional `tenant`).
   `queue.getEndpointDependencyStats()` lists currently blocked
   dependents with their cumulative parked/transition counters.
+- **Live-revisable observers (WR-370)** — the block/unblock callbacks
+  can be redirected at runtime with no restart via
+  `queue.reviseEndpointDependencyCallbacks({ onEndpointDependencyBlocked,
+  onEndpointDependencyUnblocked })` (or the server's same-named
+  method): the patch is partial, `null` clears a hook back to
+  audit-only, and a same-value patch is a silent no-op. The graph,
+  the blocked set, parked items, and their recheck cadence are
+  untouched — only the observation moves, so a downstream-alert
+  recipient can be swapped mid-incident. A real revision is audited
+  as `endpoint_dependency_callbacks_revised` with per-hook presence
+  (`set` / `cleared` / `unchanged`, plus `old…` `set` / `absent`),
+  never a function body. Revising with no dependency graph configured
+  throws `Error` — enabling the graph needs a restart.
 - **Orthogonality** — failover (WR-39) switches targets *within* one
   logical endpoint and quorum (WR-106) confirms M-of-N fan-out *for* one
   endpoint; the dependency graph decides *whether* an endpoint may

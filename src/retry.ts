@@ -1332,6 +1332,8 @@ export interface TenantRetryBudgetRevision {
 /**
  * Fired once when an endpoint becomes blocked by a dependency, and once
  * when it recovers (WR-199, edge-triggered — not per parked dispatch).
+ * Live-revisable via `RetryQueue.reviseEndpointDependencyCallbacks`
+ * (WR-370) — `null` clears the hook back to no observer.
  */
 export interface EndpointDependencyTransitionInfo {
   /** The dependent endpoint (`targetUrl`) that paused or resumed. */
@@ -3271,6 +3273,21 @@ export interface EndpointAutoDisableCallbacksRevision {
 }
 
 /**
+ * WR-370: patch for `RetryQueue.reviseEndpointDependencyCallbacks` /
+ * `RelayServer.reviseEndpointDependencyCallbacks`. Each field is
+ * optional — an omitted field keeps its live value; `null` clears that
+ * hook back to no observer (the graph keeps parking and resuming
+ * exactly as before — only the observation stops). At least one field
+ * must be present, else the patch throws `RangeError` and the live
+ * hooks are untouched. Throws `Error` when the dependency graph was
+ * never configured — enabling it needs a restart.
+ */
+export interface EndpointDependencyCallbacksRevision {
+  onEndpointDependencyBlocked?: ((info: EndpointDependencyTransitionInfo) => void) | null;
+  onEndpointDependencyUnblocked?: ((info: EndpointDependencyTransitionInfo) => void) | null;
+}
+
+/**
  * Effective hot-reloadable config for one (tenant, endpoint) — the
  * WR-88 config-snapshot read shape. Returned by
  * `RetryQueue.endpointConfig`: `maxConcurrentPerEndpoint` is always the
@@ -4289,8 +4306,13 @@ export class RetryQueue {
   private readonly dependencyParkedBy = new Map<string, number>();
   /** WR-199: cumulative blocked/unblocked transitions, per scoped key. */
   private readonly dependencyTransitionsBy = new Map<string, number>();
-  private readonly onEndpointDependencyBlocked?: (info: EndpointDependencyTransitionInfo) => void;
-  private readonly onEndpointDependencyUnblocked?: (info: EndpointDependencyTransitionInfo) => void;
+  // WR-370: deliberately *not* readonly — `reviseEndpointDependencyCallbacks`
+  // replaces the live dependency-block/unblock observers at runtime. The
+  // server's audit closures (which forward to the operator callbacks) are
+  // held here when the queue runs under `RelayServer`; direct queue users
+  // hold their own callbacks in the same fields.
+  private onEndpointDependencyBlocked?: (info: EndpointDependencyTransitionInfo) => void;
+  private onEndpointDependencyUnblocked?: (info: EndpointDependencyTransitionInfo) => void;
   private readonly payloadEncryptor?: PayloadEncryptor;
   /** WR-54: opt-in sealed response-body capture on `delivered` audit events. */
   private readonly responseBodyCapture: boolean;
@@ -8215,6 +8237,11 @@ export class RetryQueue {
   /** WR-369: whether the auto-disable subsystem is enabled (queue-level). */
   autoDisableConfigured(): boolean {
     return this.autoDisable !== undefined;
+  }
+
+  /** WR-370: whether the endpoint-dependency subsystem is enabled (queue-level). */
+  endpointDependenciesConfigured(): boolean {
+    return this.endpointDependencies !== undefined;
   }
 
   /** Whether the per-endpoint quota subsystem is enabled (queue-level). */
@@ -12517,6 +12544,77 @@ export class RetryQueue {
     if (nextDisabled === this.onEndpointAutoDisabled && nextEnabled === this.onEndpointEnabled) return;
     this.onEndpointAutoDisabled = nextDisabled;
     this.onEndpointEnabled = nextEnabled;
+  }
+
+  /**
+   * WR-370: live-redirect the endpoint dependency-block/unblock
+   * observers — the queue-side setter behind
+   * `RelayServer.reviseEndpointDependencyCallbacks`. The new hooks take
+   * effect from the next transition; transitions that already fired are
+   * never re-delivered. `null` clears a hook back to no observer (the
+   * graph keeps parking and resuming exactly as before — only the
+   * observation stops). An omitted field keeps its live value, so one
+   * hook can move without touching the other. An empty or non-object
+   * patch throws `RangeError`; a non-function value for a provided
+   * field throws `RangeError` and the live hooks are left completely
+   * intact. A patch identical to the live values is a no-op. Only the
+   * observers move: the dependency graph, the blocked set, the parked
+   * items, and their recheck cadence are untouched. Throws `Error`
+   * when the dependency graph was never configured — the block/unblock
+   * events only ever fire when the graph is set, so enabling it needs
+   * a restart. Under `RelayServer` the fields hold the server's audit
+   * closures, so direct calls here would replace the audit wrappers;
+   * server users must go through
+   * `RelayServer.reviseEndpointDependencyCallbacks`, which swaps only
+   * the operator cells behind the audit closures. The queue itself
+   * holds no audit log — the server audits a real revision as
+   * `endpoint_dependency_callbacks_revised`.
+   */
+  reviseEndpointDependencyCallbacks(patch: EndpointDependencyCallbacksRevision): void {
+    if (this.endpointDependencies === undefined) {
+      throw new Error(
+        "reviseEndpointDependencyCallbacks: endpoint dependencies are not configured — enabling them requires a restart"
+      );
+    }
+    if (patch === null || typeof patch !== "object") {
+      throw new RangeError(
+        "reviseEndpointDependencyCallbacks: patch must be an object with at least one of onEndpointDependencyBlocked / onEndpointDependencyUnblocked"
+      );
+    }
+    const hasBlocked = patch.onEndpointDependencyBlocked !== undefined;
+    const hasUnblocked = patch.onEndpointDependencyUnblocked !== undefined;
+    if (!hasBlocked && !hasUnblocked) {
+      throw new RangeError(
+        "reviseEndpointDependencyCallbacks: patch must set at least one of onEndpointDependencyBlocked / onEndpointDependencyUnblocked"
+      );
+    }
+    if (
+      hasBlocked &&
+      patch.onEndpointDependencyBlocked !== null &&
+      typeof patch.onEndpointDependencyBlocked !== "function"
+    ) {
+      throw new RangeError(
+        "reviseEndpointDependencyCallbacks: onEndpointDependencyBlocked must be a function or null"
+      );
+    }
+    if (
+      hasUnblocked &&
+      patch.onEndpointDependencyUnblocked !== null &&
+      typeof patch.onEndpointDependencyUnblocked !== "function"
+    ) {
+      throw new RangeError(
+        "reviseEndpointDependencyCallbacks: onEndpointDependencyUnblocked must be a function or null"
+      );
+    }
+    const nextBlocked = hasBlocked
+      ? patch.onEndpointDependencyBlocked ?? undefined
+      : this.onEndpointDependencyBlocked;
+    const nextUnblocked = hasUnblocked
+      ? patch.onEndpointDependencyUnblocked ?? undefined
+      : this.onEndpointDependencyUnblocked;
+    if (nextBlocked === this.onEndpointDependencyBlocked && nextUnblocked === this.onEndpointDependencyUnblocked) return;
+    this.onEndpointDependencyBlocked = nextBlocked;
+    this.onEndpointDependencyUnblocked = nextUnblocked;
   }
 
   /**
