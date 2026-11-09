@@ -28,7 +28,7 @@ import {
   selectSignatureAlgorithmVerifier,
   type SignatureAlgorithmRule,
 } from "./signature-alg.ts";
-import { RetryQueue, errorBudgetBurnAuditEvent, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutRevision, type DeliveryDeadlineConfig, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type ErrorBudgetConfig, type ErrorBudgetRevision, type FailoverEndpointConfig, type FailoverRevision, type QuorumRetention, type QuorumRetentionRevision, type RetryItem, type Sender, type SenderCallOptions, type MaintenanceWindowTransition, type SloRiskConfig, type SloRiskRevision, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
+import { RetryQueue, errorBudgetBurnAuditEvent, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeliveryDeadlineConfig, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type ErrorBudgetConfig, type ErrorBudgetRevision, type FailoverEndpointConfig, type FailoverRevision, type QuorumRetention, type QuorumRetentionRevision, type RetryItem, type Sender, type SenderCallOptions, type MaintenanceWindowTransition, type SloRiskConfig, type SloRiskRevision, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
 import { parseDeliverAtHeader, DELIVER_AT_HEADER } from "./retry.ts";
 import type { ShadowDeliveredInfo, ShadowFailedInfo, ShadowTargetConfig, ShadowTargetsConfig } from "./retry.ts";
 import type {
@@ -6972,6 +6972,27 @@ export interface RelayServer extends Server {
    */
   getCircuitBreakerProbeDefaults?: () => ResolvedCircuitProbe | undefined;
   /**
+   * WR-365: live-redirect the circuit state-change observer at
+   * runtime — no restart. Replaces the operator callback the server
+   * forwards each transition to, after the transition itself is
+   * audited as `circuit_open` / `circuit_half_open` /
+   * `circuit_closed`; the audit can never be bypassed by a
+   * replacement. `null` clears back to audit-only (transitions are
+   * still audited, just no longer forwarded to an operator). A
+   * non-function value throws `RangeError` and the live callback is
+   * untouched; replacing with the same reference (or clearing when
+   * already unset) is a silent no-op. A real replacement is audited
+   * as `circuit_state_change_callback_revised` with `previous` /
+   * `current` recording only 'set' / 'cleared' presence, never a
+   * function body. Always set; throws `Error` when the circuit
+   * breaker was never configured — enabling it needs a restart. The
+   * new callback takes effect from the next transition; the breaker,
+   * its thresholds, and the half-open slow-start hook are untouched.
+   */
+  reviseCircuitStateChangeCallback?: (
+    cb: CircuitStateChangeCallback | null
+  ) => void;
+  /**
    * WR-331: revise one endpoint's live half-open probe knobs at
    * runtime — no restart. The patch merges over the endpoint's live
    * effective probe values; an illegal patch (or an empty patch)
@@ -8228,6 +8249,14 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // cannot bypass the `error_budget_burn` audit.
   let operatorAlertCallback: ((info: BurnRateAlertInfo) => void) | undefined =
     opts.retry?.errorBudget?.onBurnRateAlert;
+  // WR-365: the operator's circuit state-change callback, held in a
+  // mutable cell so `server.reviseCircuitStateChangeCallback` can
+  // replace it at runtime. The audit wrapper below reads this cell —
+  // never the operator callback directly — so replacing the operator
+  // callback cannot bypass the `circuit_open` / `circuit_half_open` /
+  // `circuit_closed` audit.
+  let operatorCircuitStateChangeCallback: CircuitStateChangeCallback | undefined =
+    opts.retry?.onCircuitStateChange;
   const queue = new RetryQueue({
     // WR-146: the queue talks to the hedged wrapper (a pure pass-through
     // when hedging is off) so the server's `defaultSender` handle keeps
@@ -9003,7 +9032,10 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         from,
         to,
       });
-      opts.retry?.onCircuitStateChange?.(endpoint, from, to, tenant);
+      // WR-365: the wrapper reads the mutable operator cell — the
+      // queue's callback is never swapped, so a runtime callback
+      // replacement cannot bypass this audit.
+      operatorCircuitStateChangeCallback?.(endpoint, from, to, tenant);
     },
     // WR-199: audit dependency-block transitions (edge-triggered — one
     // line per block/unblock, not per parked dispatch); the caller's own
@@ -17198,6 +17230,42 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     server.getCircuitBreakerProbeDefaults = (): ResolvedCircuitProbe | undefined =>
       queue.getCircuitBreakerProbeDefaults();
   }
+
+  // WR-365: live circuit state-change callback replacement. Only the
+  // server-side operator-callback cell moves — the queue's own
+  // callback (the `circuit_open` / `circuit_half_open` /
+  // `circuit_closed` audit wrapper) is never touched, so a
+  // replacement cannot bypass the audit. A non-function callback
+  // throws `RangeError` and the live cell is untouched; a
+  // same-reference replacement (or clearing when already unset) is a
+  // silent no-op. A real replacement is audited as
+  // `circuit_state_change_callback_revised` with `previous` /
+  // `current` recording only 'set' / 'cleared' presence, never a
+  // function body. With the breaker unconfigured the queue throws
+  // the canonical "must restart" Error.
+  server.reviseCircuitStateChangeCallback = (
+    cb: CircuitStateChangeCallback | null
+  ): void => {
+    if (!queue.circuitBreakerConfigured()) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseCircuitStateChangeCallback(cb);
+    }
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseCircuitStateChangeCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === operatorCircuitStateChangeCallback) return;
+    const prev = operatorCircuitStateChangeCallback === undefined ? "cleared" : "set";
+    const nextPresence = next === undefined ? "cleared" : "set";
+    operatorCircuitStateChangeCallback = next;
+    opts.auditLog.append({
+      event: "circuit_state_change_callback_revised",
+      previous: prev,
+      current: nextPresence,
+    });
+  };
 
   // WR-331: live half-open probe revision / removal for one
   // endpoint. Mirrors the WR-319 threshold layer: the queue does

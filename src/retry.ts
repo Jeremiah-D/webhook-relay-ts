@@ -1822,6 +1822,21 @@ export interface ScheduledRestoredInfo {
   skippedLines: number;
 }
 
+/**
+ * Circuit state-change observer (WR-365): called on every transition
+ * (closed->open, open->half_open, half_open->closed, half_open->open).
+ * The fourth argument is the tenant (WR-48) whose breaker instance
+ * transitioned; absent for the default tenant. Live-revisable via
+ * `RetryQueue.reviseCircuitStateChangeCallback` — `null` clears back
+ * to no observer.
+ */
+export type CircuitStateChangeCallback = (
+  endpoint: string,
+  from: CircuitState,
+  to: CircuitState,
+  tenant?: string
+) => void;
+
 export interface RetryQueueOptions {
   /** Sender function; defaults to a no-op success sender. Injectable for tests. */
   sender?: Sender;
@@ -2043,12 +2058,7 @@ export interface RetryQueueOptions {
    * The fourth argument is the tenant (WR-48) whose breaker instance
    * transitioned; absent for the default tenant.
    */
-  onCircuitStateChange?: (
-    endpoint: string,
-    from: CircuitState,
-    to: CircuitState,
-    tenant?: string
-  ) => void;
+  onCircuitStateChange?: CircuitStateChangeCallback;
   /**
    * WR-199: endpoint dependency graph (see `src/endpoint-dependencies.ts`).
    * An endpoint may declare `dependsOn` target URL(s); while any
@@ -4125,12 +4135,12 @@ export class RetryQueue {
    * nothing more.
    */
   private readonly errorBudget?: ErrorBudgetMonitor;
-  private readonly circuitBreakerOnStateChange?: (
-    endpoint: string,
-    from: CircuitState,
-    to: CircuitState,
-    tenant?: string
-  ) => void;
+  // WR-365: deliberately *not* readonly — `reviseCircuitStateChangeCallback`
+  // replaces the live state-change observer at runtime. The server's
+  // audit closure (which forwards to the operator callback) is held
+  // here when the queue runs under `RelayServer`; direct queue users
+  // hold their own callback in the same field.
+  private circuitBreakerOnStateChange?: CircuitStateChangeCallback;
   private readonly onConfigChange?: (endpoint: string, changes: ConfigChange[]) => void;
   /** WR-50: operator pause/resume transition hooks (audited by the server). */
   private readonly onEndpointPaused?: (info: EndpointPauseInfo) => void;
@@ -12147,6 +12157,44 @@ export class RetryQueue {
   getCircuitBreakerProbeDefaults(): ResolvedCircuitProbe | undefined {
     if (this.circuitBreakerOpts === undefined) return undefined;
     return resolveCircuitProbeOptions(this.circuitBreakerOpts);
+  }
+
+  /**
+   * WR-365: live-redirect the circuit state-change observer — the
+   * queue-side setter behind
+   * `RelayServer.reviseCircuitStateChangeCallback`. The new callback
+   * takes effect from the next state transition; transitions that
+   * already fired are never re-delivered. `null` clears back to no
+   * observer (the breaker keeps tripping and recovering exactly as
+   * before — only the observation stops). A non-function value throws
+   * `RangeError` and the live callback is untouched; replacing with
+   * the same reference (or clearing when already unset) is a no-op.
+   * Only the observer moves: thresholds, probe knobs, the clock, the
+   * accumulated outcomes, and the open-episode latches are untouched,
+   * and the half-open slow-start hook (WR-148) still runs on every
+   * half-open close — it lives in the breaker's own `onStateChange`
+   * closure ahead of this field, not in the observer. Throws `Error`
+   * when the circuit breaker was never configured — enabling it needs
+   * a restart. Under `RelayServer` the field holds the server's audit
+   * closure, so direct calls here would replace the audit wrapper;
+   * server users must go through
+   * `RelayServer.reviseCircuitStateChangeCallback`, which swaps only
+   * the operator cell behind the audit closure.
+   */
+  reviseCircuitStateChangeCallback(cb: CircuitStateChangeCallback | null): void {
+    if (this.circuitBreakerOpts === undefined) {
+      throw new Error(
+        "reviseCircuitStateChangeCallback: circuit breaker is not configured — enabling it requires a restart"
+      );
+    }
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseCircuitStateChangeCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === this.circuitBreakerOnStateChange) return;
+    this.circuitBreakerOnStateChange = next;
   }
 
   /**

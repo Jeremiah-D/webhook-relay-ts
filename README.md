@@ -1035,8 +1035,16 @@ reliability primitives that matter for any signed-payload pipeline.
   `trips` / `tripMode` / `errorRate` / `errorRateSamples`,
   `circuitBlockedCount()` counts parked attempts, and every
   transition is audited as `circuit_open` / `circuit_half_open` /
-  `circuit_closed` with the endpoint. Injectable clock for deterministic
-  tests. WR-104 adds an opt-in `tripMode: "error-rate"`: a rolling window
+  `circuit_closed` with the endpoint. WR-365 adds the live redirection
+  of the state-change observer: `reviseCircuitStateChangeCallback(cb |
+  null)` swaps the operator callback the server forwards each
+  transition to — the audit itself can never be bypassed by a
+  replacement, and `null` clears back to audit-only (transitions are
+  still audited, just no longer forwarded). A real replacement is
+  audited as `circuit_state_change_callback_revised` with `previous` /
+  `current` recording only 'set' / 'cleared' presence, never a
+  function body; a same-reference replacement is a silent no-op.
+  Injectable clock for deterministic tests. WR-104 adds an opt-in `tripMode: "error-rate"`: a rolling window
   of the last `errorRateWindowSize` outcomes (default 20) trips the
   circuit once the window holds at least `errorRateMinSamples` outcomes
   (default 10, always ≥ 2) and the failure rate reaches
