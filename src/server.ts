@@ -68,7 +68,7 @@ import {
   type ResolvedHttpHardening,
 } from "./http-hardening.ts";
 import type { LatencyPhaseOptions, OrderedAuditEvent, OrderedModeOptions } from "./retry.ts";
-import type { BulkheadRevision, BulkheadRevisionSnapshot, CircuitProbeRevision, CircuitThresholdPatch, DeliveryWindowListEntry, DeliveryWindowSnapshot, EndpointConcurrencySnapshot, EndpointDependencyCallbacksRevision, EndpointDependencyTransitionInfo, EndpointQuotaSnapshot, EndpointRetryBudgetSnapshot, EndpointRetryPolicyRevision, GlobalConcurrencyStats, GlobalRateLimitRevision, GlobalRateLimitStats, HolidayCalendarConfig, HolidayCalendarSnapshot, MinNormalShareSnapshot, ResolvedCircuitProbe, ResolvedCircuitThresholds, ResolvedEndpointRetryPolicy, StatusRetryPolicyConfig, TenantBudgetSnapshot, TenantConcurrencySnapshot, TenantRetryBudgetRevision } from "./retry.ts";
+import type { BulkheadRevision, BulkheadRevisionSnapshot, CircuitProbeRevision, CircuitThresholdPatch, DeliveryWindowListEntry, DeliveryWindowSnapshot, EndpointConcurrencySnapshot, EndpointDegradedCallbacksRevision, EndpointDependencyCallbacksRevision, EndpointDependencyTransitionInfo, EndpointQuotaSnapshot, EndpointRetryBudgetSnapshot, EndpointRetryPolicyRevision, GlobalConcurrencyStats, GlobalRateLimitRevision, GlobalRateLimitStats, HolidayCalendarConfig, HolidayCalendarSnapshot, MinNormalShareSnapshot, ResolvedCircuitProbe, ResolvedCircuitThresholds, ResolvedEndpointRetryPolicy, StatusRetryPolicyConfig, TenantBudgetSnapshot, TenantConcurrencySnapshot, TenantRetryBudgetRevision } from "./retry.ts";
 import type { QueueDepthBreachInfo } from "./queue-depth.ts";
 import {
   DEFAULT_STATUS_RETRY_MULTIPLIER,
@@ -5954,6 +5954,27 @@ export interface RelayServer extends Server {
    */
   getEndpointHealthConfig?: () => EndpointHealthConfig | undefined;
   /**
+   * WR-372: live-redirect the endpoint degrade/recover observers —
+   * the operator callbacks that fire once per degradation episode and
+   * once per recovery. The patch is partial: an omitted field keeps
+   * its live value; `null` clears that hook back to audit-only (the
+   * scoring keeps degrading and recovering exactly as before — only
+   * the observation stops). An empty or non-object patch throws
+   * `RangeError`, as does a non-function value for a provided field,
+   * and the live callbacks are untouched; a patch identical to the
+   * live values is a silent no-op. A real revision is audited as
+   * `endpoint_degraded_callbacks_revised` with per-hook
+   * `onEndpointDegraded` / `onEndpointRecovered` ('set' / 'cleared' /
+   * 'unchanged') and `oldOnEndpointDegraded` /
+   * `oldOnEndpointRecovered` ('set' / 'absent') presence, never a
+   * function body. Always set; throws `Error` when health scoring was
+   * never configured — enabling it needs a restart. The new callbacks
+   * take effect from the next transition; the scores, thresholds,
+   * hysteresis, degraded state, and `consecutiveLowScores` are
+   * untouched.
+   */
+  reviseEndpointDegradedCallbacks?: (patch: EndpointDegradedCallbacksRevision) => void;
+  /**
    * WR-357: revise the live fail2ban thresholds at runtime
    * (`maxConsecutiveFailures` / `banDurationMs` / `maxEntries`,
    * partial — omitted fields keep their live values). The new values
@@ -8446,6 +8467,16 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // callback cannot bypass the `queue_depth_breached` audit.
   let operatorQueueDepthBreachCallback: ((info: QueueDepthBreachInfo) => void) | undefined =
     opts.retry?.onQueueDepthBreach;
+  // WR-372: the operator's endpoint degrade/recover callbacks, held in
+  // mutable cells so `server.reviseEndpointDegradedCallbacks` can
+  // replace them at runtime. The audit wrappers below read these cells
+  // — never the operator callbacks directly — so replacing an operator
+  // callback cannot bypass the `endpoint_degraded` /
+  // `endpoint_recovered` audit.
+  let operatorEndpointDegradedCallback: ((info: EndpointDegradedInfo) => void) | undefined =
+    (opts.endpointHealth ?? opts.retry?.endpointHealth)?.onEndpointDegraded;
+  let operatorEndpointRecoveredCallback: ((info: EndpointRecoveredInfo) => void) | undefined =
+    (opts.endpointHealth ?? opts.retry?.endpointHealth)?.onEndpointRecovered;
   const queue = new RetryQueue({
     // WR-146: the queue talks to the hedged wrapper (a pure pass-through
     // when hedging is off) so the server's `defaultSender` handle keeps
@@ -9011,7 +9042,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
                 consecutiveLowScores: info.consecutiveLowScores,
                 at: new Date(info.at).toISOString(),
               });
-              (opts.endpointHealth ?? opts.retry?.endpointHealth)?.onEndpointDegraded?.(info);
+              operatorEndpointDegradedCallback?.(info);
             },
             onEndpointRecovered: (info: EndpointRecoveredInfo) => {
               opts.auditLog.append({
@@ -9021,7 +9052,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
                 score: info.score,
                 at: new Date(info.at).toISOString(),
               });
-              (opts.endpointHealth ?? opts.retry?.endpointHealth)?.onEndpointRecovered?.(info);
+              operatorEndpointRecoveredCallback?.(info);
             },
           },
         }
@@ -15907,6 +15938,89 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     server.getEndpointHealthConfig = (): EndpointHealthConfig =>
       queue.getEndpointHealthConfig()!;
   }
+
+  // WR-372: live endpoint degrade/recover observer revision. The
+  // method is always set (like reviseEndpointDependencyCallbacks
+  // above); with health scoring unconfigured the queue throws the
+  // canonical "must restart" Error. The audit wrappers read the
+  // operator cells, never the operator callbacks directly, so a
+  // replacement cannot bypass the `endpoint_degraded` /
+  // `endpoint_recovered` audit. The patch is partial: an omitted
+  // field keeps its live value; `null` clears that hook back to
+  // audit-only. An empty or non-object patch throws `RangeError`, as
+  // does a non-function value for a provided field, and the live cells
+  // are untouched; a patch identical to the live values is a silent
+  // no-op. A real revision is audited as
+  // `endpoint_degraded_callbacks_revised` with per-hook presence
+  // (`onEndpointDegraded` / `onEndpointRecovered`: 'set' / 'cleared' /
+  // 'unchanged'; `oldOnEndpointDegraded` / `oldOnEndpointRecovered`:
+  // 'set' / 'absent'), never a function body. The new callbacks take
+  // effect from the next transition; the scores, thresholds,
+  // hysteresis, degraded state, and `consecutiveLowScores` are
+  // untouched.
+  server.reviseEndpointDegradedCallbacks = (patch: EndpointDegradedCallbacksRevision): void => {
+    if (queue.getEndpointHealthConfig() === undefined) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseEndpointDegradedCallbacks(patch);
+    }
+    if (patch === null || typeof patch !== "object") {
+      throw new RangeError(
+        "reviseEndpointDegradedCallbacks: patch must be an object with at least one of onEndpointDegraded / onEndpointRecovered"
+      );
+    }
+    const hasDegraded = patch.onEndpointDegraded !== undefined;
+    const hasRecovered = patch.onEndpointRecovered !== undefined;
+    if (!hasDegraded && !hasRecovered) {
+      throw new RangeError(
+        "reviseEndpointDegradedCallbacks: patch must set at least one of onEndpointDegraded / onEndpointRecovered"
+      );
+    }
+    if (
+      hasDegraded &&
+      patch.onEndpointDegraded !== null &&
+      typeof patch.onEndpointDegraded !== "function"
+    ) {
+      throw new RangeError(
+        "reviseEndpointDegradedCallbacks: onEndpointDegraded must be a function or null"
+      );
+    }
+    if (
+      hasRecovered &&
+      patch.onEndpointRecovered !== null &&
+      typeof patch.onEndpointRecovered !== "function"
+    ) {
+      throw new RangeError(
+        "reviseEndpointDegradedCallbacks: onEndpointRecovered must be a function or null"
+      );
+    }
+    const nextDegraded = hasDegraded
+      ? patch.onEndpointDegraded ?? undefined
+      : operatorEndpointDegradedCallback;
+    const nextRecovered = hasRecovered
+      ? patch.onEndpointRecovered ?? undefined
+      : operatorEndpointRecoveredCallback;
+    if (
+      nextDegraded === operatorEndpointDegradedCallback &&
+      nextRecovered === operatorEndpointRecoveredCallback
+    ) {
+      return;
+    }
+    const payload = {
+      onEndpointDegraded: hasDegraded
+        ? (nextDegraded === undefined ? "cleared" : "set")
+        : "unchanged",
+      oldOnEndpointDegraded:
+        operatorEndpointDegradedCallback === undefined ? "absent" : "set",
+      onEndpointRecovered: hasRecovered
+        ? (nextRecovered === undefined ? "cleared" : "set")
+        : "unchanged",
+      oldOnEndpointRecovered:
+        operatorEndpointRecoveredCallback === undefined ? "absent" : "set",
+    };
+    operatorEndpointDegradedCallback = nextDegraded;
+    operatorEndpointRecoveredCallback = nextRecovered;
+    opts.auditLog.append({ event: "endpoint_degraded_callbacks_revised", ...payload });
+  };
 
   // WR-357: fail2ban threshold runtime revision. The method is always
   // set; with fail2ban unconfigured the canonical must-restart Error

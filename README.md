@@ -612,10 +612,22 @@ reliability primitives that matter for any signed-payload pipeline.
   untouched; an empty or same-value patch is a silent no-op. A real
   revision is audited exactly once as `endpoint_health_revised` with
   `previous` / `current`. Enabling scoring when it was never configured
-  still requires a restart. Covered by `test/endpoint-health.test.ts`
-  and `test/endpoint-health-revision.test.ts` (14 tests: threshold and
+  still requires a restart. Live callback revision (WR-372):
+  `server.reviseEndpointDegradedCallbacks(patch)` swaps the
+  degrade/recover observers without a restart (partial — omitted
+  fields keep their live values; `null` clears a hook back to
+  audit-only). The trackers read the live hooks at fire time, so a
+  revision reaches already-built per-tenant trackers and tenants born
+  later alike; scores, thresholds, hysteresis, degraded state, and
+  `consecutiveLowScores` are untouched. A real revision is audited as
+  `endpoint_degraded_callbacks_revised` with per-hook presence. Covered
+  by `test/endpoint-health.test.ts` and
+  `test/endpoint-health-revision.test.ts` (14 tests: threshold and
   weight flips, SLO and sample-window effects, multi-tenant fan-out,
-  late-born tenants, no-op and must-restart cases, server audit).
+  late-born tenants, no-op and must-restart cases, server audit), plus
+  `test/endpoint-degraded-callbacks-revision.test.ts` (12 tests: live
+  swaps on built and late-born trackers, clearing, partial patches,
+  no-op and must-restart cases, server audit).
 - `src/audit.ts` — append-only JSONL audit log (`append` / `readAll`) plus an
   indexed query (`query({ event, endpoint, since, until, limit })`): a lazily
   maintained line-offset index maps each complete line to its `ts`/`event`/

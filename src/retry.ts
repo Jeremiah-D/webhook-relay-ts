@@ -3290,6 +3290,21 @@ export interface EndpointDependencyCallbacksRevision {
 }
 
 /**
+ * WR-372: patch for `RetryQueue.reviseEndpointDegradedCallbacks` /
+ * `RelayServer.reviseEndpointDegradedCallbacks`. Each field is
+ * optional — an omitted field keeps its live value; `null` clears that
+ * hook back to no observer (the scoring keeps degrading and recovering
+ * exactly as before — only the observation stops). At least one field
+ * must be present, else the patch throws `RangeError` and the live
+ * hooks are untouched. Throws `Error` when health scoring was never
+ * configured — enabling it needs a restart.
+ */
+export interface EndpointDegradedCallbacksRevision {
+  onEndpointDegraded?: ((info: EndpointDegradedInfo) => void) | null;
+  onEndpointRecovered?: ((info: EndpointRecoveredInfo) => void) | null;
+}
+
+/**
  * Effective hot-reloadable config for one (tenant, endpoint) — the
  * WR-88 config-snapshot read shape. Returned by
  * `RetryQueue.endpointConfig`: `maxConcurrentPerEndpoint` is always the
@@ -4382,8 +4397,13 @@ export class RetryQueue {
   private readonly endpointHealths = new Map<string, EndpointHealthTracker>();
   /** WR-179: endpoint-health options; undefined when disabled. WR-359: live-revisable — `reviseEndpointHealth` replaces this with the merged options so tenants born later start from the revised values. */
   private endpointHealthOpts?: EndpointHealthOptions;
-  private readonly onEndpointDegraded?: (info: EndpointDegradedInfo) => void;
-  private readonly onEndpointRecovered?: (info: EndpointRecoveredInfo) => void;
+  // WR-372: deliberately *not* readonly — `reviseEndpointDegradedCallbacks`
+  // replaces the live degrade/recover observers at runtime. The server's
+  // audit closures (which forward to the operator callbacks) are held
+  // here when the queue runs under `RelayServer`; direct queue users
+  // hold their own callbacks in the same fields.
+  private onEndpointDegraded?: (info: EndpointDegradedInfo) => void;
+  private onEndpointRecovered?: (info: EndpointRecoveredInfo) => void;
   /** WR-359: receives the single `endpoint_health_revised` audit event per real revision. */
   private readonly onEndpointHealthAudit?: (event: EndpointHealthRevisedAuditEvent) => void;
   private readonly onSloRisk?: (info: SloRiskInfo) => void;
@@ -5883,19 +5903,20 @@ export class RetryQueue {
     const key = tenantInstanceKey(tenant);
     let h = this.endpointHealths.get(key);
     if (h === undefined) {
-      const onEndpointDegraded = this.onEndpointDegraded;
-      const onEndpointRecovered = this.onEndpointRecovered;
+      // WR-372: the tracker closures read the live queue fields at fire
+      // time — never a snapshot taken here. A callback revised after
+      // this tracker was built still reaches it, and a tracker built
+      // before any callback was set starts observing as soon as one is
+      // revised in. The closures are always installed (even when both
+      // hooks are currently unset): the tracker only ever invokes them
+      // with `?.`, so an unset hook is a silent no-op either way.
       h = new EndpointHealthTracker({
         ...this.endpointHealthOpts,
         circuitState: (endpoint) => this.breakerFor(tenant)?.state(endpoint) ?? "closed",
-        onEndpointDegraded:
-          onEndpointDegraded === undefined
-            ? undefined
-            : (info) => onEndpointDegraded({ ...info, ...(tenant === undefined ? {} : { tenant }) }),
-        onEndpointRecovered:
-          onEndpointRecovered === undefined
-            ? undefined
-            : (info) => onEndpointRecovered({ ...info, ...(tenant === undefined ? {} : { tenant }) }),
+        onEndpointDegraded: (info) =>
+          this.onEndpointDegraded?.({ ...info, ...(tenant === undefined ? {} : { tenant }) }),
+        onEndpointRecovered: (info) =>
+          this.onEndpointRecovered?.({ ...info, ...(tenant === undefined ? {} : { tenant }) }),
       });
       this.endpointHealths.set(key, h);
     }
@@ -6872,6 +6893,81 @@ export class RetryQueue {
       current: { ...next },
     });
     return { ...next };
+  }
+
+  /**
+   * WR-372: live-redirect the endpoint degrade/recover observers —
+   * the queue-side setter behind
+   * `RelayServer.reviseEndpointDegradedCallbacks`. The new hooks take
+   * effect from the next transition; transitions that already fired
+   * are never re-delivered. `null` clears a hook back to no observer
+   * (the scoring keeps degrading and recovering exactly as before —
+   * only the observation stops). An omitted field keeps its live
+   * value, so one hook can move without touching the other. An empty
+   * or non-object patch throws `RangeError`; a non-function value for
+   * a provided field throws `RangeError` and the live hooks are left
+   * completely intact. A patch identical to the live values is a
+   * no-op. Only the observers move: the scores, EWMA, samples,
+   * thresholds, hysteresis, degraded state, and
+   * `consecutiveLowScores` are untouched. Throws `Error` when health
+   * scoring was never configured — the degrade / recover transitions
+   * only ever fire when scoring is set, so enabling it needs a
+   * restart. The per-tenant trackers read these fields live at fire
+   * time (see `endpointHealthFor`), so a revision reaches trackers
+   * built before it — including tenants born earlier — with no fan-out
+   * pass. Under `RelayServer` the fields hold the server's audit
+   * closures, so direct calls here would replace the audit wrappers;
+   * server users must go through
+   * `RelayServer.reviseEndpointDegradedCallbacks`, which swaps only
+   * the operator cells behind the audit closures. The queue itself
+   * holds no audit log — the server audits a real revision as
+   * `endpoint_degraded_callbacks_revised`.
+   */
+  reviseEndpointDegradedCallbacks(patch: EndpointDegradedCallbacksRevision): void {
+    if (this.endpointHealthOpts === undefined) {
+      throw new Error(
+        "reviseEndpointDegradedCallbacks: endpoint health scoring is not configured — enabling it requires a restart"
+      );
+    }
+    if (patch === null || typeof patch !== "object") {
+      throw new RangeError(
+        "reviseEndpointDegradedCallbacks: patch must be an object with at least one of onEndpointDegraded / onEndpointRecovered"
+      );
+    }
+    const hasDegraded = patch.onEndpointDegraded !== undefined;
+    const hasRecovered = patch.onEndpointRecovered !== undefined;
+    if (!hasDegraded && !hasRecovered) {
+      throw new RangeError(
+        "reviseEndpointDegradedCallbacks: patch must set at least one of onEndpointDegraded / onEndpointRecovered"
+      );
+    }
+    if (
+      hasDegraded &&
+      patch.onEndpointDegraded !== null &&
+      typeof patch.onEndpointDegraded !== "function"
+    ) {
+      throw new RangeError(
+        "reviseEndpointDegradedCallbacks: onEndpointDegraded must be a function or null"
+      );
+    }
+    if (
+      hasRecovered &&
+      patch.onEndpointRecovered !== null &&
+      typeof patch.onEndpointRecovered !== "function"
+    ) {
+      throw new RangeError(
+        "reviseEndpointDegradedCallbacks: onEndpointRecovered must be a function or null"
+      );
+    }
+    const nextDegraded = hasDegraded
+      ? patch.onEndpointDegraded ?? undefined
+      : this.onEndpointDegraded;
+    const nextRecovered = hasRecovered
+      ? patch.onEndpointRecovered ?? undefined
+      : this.onEndpointRecovered;
+    if (nextDegraded === this.onEndpointDegraded && nextRecovered === this.onEndpointRecovered) return;
+    this.onEndpointDegraded = nextDegraded;
+    this.onEndpointRecovered = nextRecovered;
   }
 
   /**

@@ -104,11 +104,15 @@ export interface EndpointHealthOptions {
    * Called once per degradation episode: the score fell strictly below
    * `degradeThreshold`. The info carries the consecutive low-score
    * count (1 at the crossing) so alerting can grade severity.
+   * Live-revisable via `RetryQueue.reviseEndpointDegradedCallbacks`
+   * (WR-372) — `null` clears back to no observer.
    */
   onEndpointDegraded?: (info: EndpointDegradedInfo) => void;
   /**
    * Called once per recovery: a degraded endpoint's score climbed
-   * strictly above `recoverThreshold`.
+   * strictly above `recoverThreshold`. Live-revisable via
+   * `RetryQueue.reviseEndpointDegradedCallbacks` (WR-372) — `null`
+   * clears back to no observer.
    */
   onEndpointRecovered?: (info: EndpointRecoveredInfo) => void;
   /**
