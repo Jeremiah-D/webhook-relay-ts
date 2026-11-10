@@ -4957,6 +4957,19 @@ budget; a downstream parser with a deeper budget dies outright).
   iterative (explicit stack), so the guard itself cannot be
   stack-exhausted.
 - Invalid values (non-integer, `< 1`) throw `RangeError` at startup.
+- **Live revision (WR-383)** — `server.reviseMaxJsonDepth(depth)`
+  replaces the global depth limit at runtime: the next HTTP request's
+  intake is judged by the new depth, while in-flight requests keep the
+  depth they were parsed under and established WS connections keep
+  their handshake-time depth. An illegal value (non-positive-integer)
+  throws `RangeError` with the live limit untouched; a same-value
+  revision is a silent no-op. A real revision is audited as
+  `max_json_depth_revised` with `previous` / `current` (numbers; the
+  construction value — explicit or the 32-level default — as first
+  `previous`); `server.getMaxJsonDepth()` returns the live limit. The
+  global always has a value, so it is always revisable — there is no
+  "unconfigured" gate. Orthogonal to WR-382 `maxBodyBytes`: that
+  bounds volume, this bounds shape.
 
 ```ts
 const server = createRelayServer({

@@ -1641,7 +1641,9 @@ export interface RelayServerOptions {
    * Orthogonal to WR-25 `maxBodyBytes`: that bounds *volume*, this
    * bounds *shape* — a 1 KiB `[[[[...` bomb fits the size budget but
    * dies here. Default: 32 (`DEFAULT_MAX_JSON_DEPTH`). Invalid values
-   * throw `RangeError` at startup.
+   * throw `RangeError` at startup. Live-revisable (WR-383):
+   * `reviseMaxJsonDepth` replaces the global depth limit at runtime —
+   * the next intake is judged by the new depth; see the method docs.
    */
   maxJsonDepth?: number;
   /**
@@ -7068,6 +7070,27 @@ export interface RelayServer extends Server {
    */
   getMaxBodyBytes?: () => number;
   /**
+   * WR-383: revise the live global inbound JSON depth limit at runtime —
+   * the shape budget every intake judges JSON nesting against. The next
+   * HTTP request's intake is judged by the new depth; requests already
+   * admitted keep the depth they were parsed under, and established WS
+   * connections keep their handshake-time depth. An illegal value
+   * (non-positive-integer) throws `RangeError` and the live limit is
+   * untouched; a same-value revision is a no-op with no audit event. A
+   * real revision is audited as `max_json_depth_revised` with
+   * `previous` / `current` (numbers; the construction value — explicit
+   * or the 32-level default — as first `previous`), and returns the
+   * live limit. Always set: the global always has a value, so there is
+   * no "unconfigured" gate — it is always revisable. Orthogonal to
+   * WR-382 `maxBodyBytes`: that bounds volume, this bounds shape.
+   */
+  reviseMaxJsonDepth?: (maxJsonDepth: number) => number;
+  /**
+   * WR-383: live global inbound JSON depth limit snapshot — the value
+   * the intake judges JSON nesting against. Always set.
+   */
+  getMaxJsonDepth?: () => number;
+  /**
    * WR-329: revise the live tenant-level outbound rate-limit defaults
    * at runtime (`burst` / `refillPerSecond` / `mode`, partial —
    * omitted fields keep their live values). The next `take()` /
@@ -8250,7 +8273,12 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   }
   // WR-173: inbound JSON depth guard — validated once at startup
   // (`undefined` = the 32-level default).
-  const maxJsonDepth = assertValidMaxJsonDepth(opts.maxJsonDepth ?? DEFAULT_MAX_JSON_DEPTH);
+  // WR-383: a `let`, not a `const` — the live holder for the global
+  // depth limit. Every intake gate resolves this binding per request
+  // (no startup copy), so `reviseMaxJsonDepth` reassigning it judges
+  // the next request by the new depth while in-flight intakes keep
+  // the depth they were parsed under.
+  let maxJsonDepth = assertValidMaxJsonDepth(opts.maxJsonDepth ?? DEFAULT_MAX_JSON_DEPTH);
   // WR-159: CORS policy for the operator plane — validated once at
   // startup (`undefined` = disabled, zero behavior change).
   let corsPolicy: ResolvedCorsPolicy | undefined;
@@ -12802,6 +12830,15 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
      */
     maxBodyBytes: number;
     /**
+     * WR-383: the JSON depth limit that governs this request's
+     * admission — the live global `maxJsonDepth` resolved when the
+     * gates started, before the body was read, so a revision landing
+     * mid-stream cannot re-judge a request already being parsed.
+     * Travels with the body so `admitOneEvent` applies the same
+     * parse-time depth to the WR-173 gate.
+     */
+    maxJsonDepth: number;
+    /**
      * The matched API key id and the guarding rule. The rule travels
      * with it so the admission pipeline knows whether the signature
      * check still applies (`requireSignature`) and which `keyId` to
@@ -12928,6 +12965,10 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     id: string,
     traceId: string
   ): Promise<IntakeGateResult | undefined> => {
+    // WR-383: resolve the live JSON depth limit now — before the body
+    // is read — so this request is judged by the depth in force when
+    // its intake started, even if `reviseMaxJsonDepth` lands mid-stream.
+    const intakeMaxJsonDepth = maxJsonDepth;
     // Inbound IP allowlist/denylist (WR-53): the outermost admission
     // gate — before the body is even read, before rate limiting, before
     // signature verification — so a hostile IP costs us zero bandwidth
@@ -13279,7 +13320,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       res.writeHead(400, { "content-type": "text/plain" }).end("Bad request");
       return undefined;
     }
-    return { body, maxBodyBytes: effectiveMaxBodyBytes, apiKey };
+    return { body, maxBodyBytes: effectiveMaxBodyBytes, maxJsonDepth: intakeMaxJsonDepth, apiKey };
   };
 
   /**
@@ -13361,7 +13402,16 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
      * the third enforcement point of the same per-endpoint budget.
      * Defaults to the global so unset means zero behavior change.
      */
-    bodyBudgetBytes: number = maxBodyBytes
+    bodyBudgetBytes: number = maxBodyBytes,
+    /**
+     * WR-383: the JSON depth limit this event is judged against — the
+     * live global `maxJsonDepth` resolved when the event's intake
+     * started (the gate result for HTTP/batch, the handshake for WS),
+     * so a revision landing mid-admission cannot re-judge an event
+     * already being parsed. Defaults to the live global so unset means
+     * zero behavior change.
+     */
+    jsonDepthLimit: number = maxJsonDepth
   ): Promise<AdmitOutcome> => {
     const signatureHeader = headers["x-signature"];
     const keyIdHeader = headers["x-key-id"];
@@ -13638,7 +13688,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // adaptation and schema validation, so every JSON.parse downstream
     // of here (adapters, schemas, content routing) only ever sees
     // bounded input. Non-JSON bodies skip the check entirely.
-    const depthVerdict = checkJsonDepth(body, maxJsonDepth);
+    const depthVerdict = checkJsonDepth(body, jsonDepthLimit);
     if (!depthVerdict.ok) {
       opts.auditLog.append({ ...correlation,
         event: "rejected",
@@ -13647,14 +13697,14 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         ...tenantLabel,
         reason: "json_too_deep",
         depth: depthVerdict.depth,
-        maxJsonDepth,
+        maxJsonDepth: jsonDepthLimit,
       });
       return {
         status: 400,
         id,
         traceId,
         reason: "json_too_deep",
-        detail: `JSON nesting depth ${depthVerdict.depth} exceeds the limit of ${maxJsonDepth}`,
+        detail: `JSON nesting depth ${depthVerdict.depth} exceeds the limit of ${jsonDepthLimit}`,
       };
     }
 
@@ -14341,7 +14391,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
             clientCertFingerprint: mtlsIdentity.fingerprint,
             clientCertSubject: mtlsIdentity.subject,
           };
-    const outcome = await admitOneEvent(id, traceId, gates.body, req.headers, pathname, mtlsCorrelation, gates.apiKey, inboundTrace, gates.maxBodyBytes);
+    const outcome = await admitOneEvent(id, traceId, gates.body, req.headers, pathname, mtlsCorrelation, gates.apiKey, inboundTrace, gates.maxBodyBytes, gates.maxJsonDepth);
     // WR-182: fail2ban bookkeeping — a 202 zeroes the sender IP's
     // consecutive-failure counter immediately; a 401 (signature
     // verification failure) or 403 increments it. Other admission
@@ -14602,7 +14652,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         correlation,
         undefined,
         itemTrace,
-        gates.maxBodyBytes
+        gates.maxBodyBytes,
+        gates.maxJsonDepth
       );
       const result: Record<string, unknown> = {
         index,
@@ -14866,7 +14917,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         correlation,
         undefined,
         itemTrace,
-        gates.maxBodyBytes
+        gates.maxBodyBytes,
+        gates.maxJsonDepth
       );
       if (outcome.status === 202) {
         accepted++;
@@ -15313,6 +15365,11 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // alone, so the endpoint's own budget governs every frame on the
     // connection — the transport layer, orthogonal to schema validation.
     const bodyBudget = selectEndpointBodyLimit(wsOpts.path, opts.endpointBodyLimits) ?? maxBodyBytes;
+    // WR-383: the JSON depth limit resolved at handshake time, so every
+    // event on this connection is judged by the depth in force when the
+    // connection was established — a later `reviseMaxJsonDepth` leaves
+    // established connections untouched (the WR-382 body-budget shape).
+    const wsJsonDepthLimit = maxJsonDepth;
 
     // WR-152: inbound permessage-deflate negotiation — only when opted
     // in, and only when the client offers it. The offer must carry both
@@ -15549,7 +15606,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         {},
         wsApiKey,
         itemTrace,
-        bodyBudget
+        bodyBudget,
+        wsJsonDepthLimit
       )
         .then((outcome) => {
           if (tornDown) return;
@@ -18085,6 +18143,37 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
 
   // WR-382: live global inbound body limit snapshot. Always set.
   server.getMaxBodyBytes = (): number => maxBodyBytes;
+
+  // WR-383: global inbound JSON depth-limit runtime revision. The limit is
+  // always set (explicit or the 32-level default), so unlike
+  // reviseTenantBodyLimits above there is no "unconfigured" gate — it is
+  // always revisable. A real revision is audited as `max_json_depth_revised`
+  // with the previous and current limits (numbers; the construction value
+  // as first `previous`); a same-value revision is a silent no-op.
+  server.reviseMaxJsonDepth = (next: number): number => {
+    // Validate-then-apply via the construction-time validator — an illegal
+    // value throws RangeError and the live limit is left completely intact.
+    const validated = assertValidMaxJsonDepth(next);
+    const previous = maxJsonDepth;
+    if (validated === previous) {
+      return previous;
+    }
+    // Reassign the live binding (the WR-382 scalar shape): every intake
+    // gate resolves this binding per request — no startup copy — so the
+    // next request is judged by the new depth while in-flight intakes keep
+    // the depth they were parsed under (captured in runIntakeGates) and
+    // established WS connections keep their handshake-time depth.
+    maxJsonDepth = validated;
+    opts.auditLog.append({
+      event: "max_json_depth_revised",
+      previous,
+      current: validated,
+    });
+    return validated;
+  };
+
+  // WR-383: live global inbound JSON depth limit snapshot. Always set.
+  server.getMaxJsonDepth = (): number => maxJsonDepth;
 
   // WR-310: relay-level global rate-limit snapshot. Only set when
   // `retry.globalRateLimit` was configured.
