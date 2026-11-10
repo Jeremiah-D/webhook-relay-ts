@@ -121,6 +121,22 @@ export const DEFAULT_STALE_SWEEP_INTERVAL_MS = 60_000;
 /** Milliseconds in a day. */
 export const MS_PER_DAY = 86_400_000;
 
+/**
+ * WR-378: a partial live revision of the two stale-pause knobs —
+ * omitted fields keep their live values. `now`, the timer factory, and
+ * the owner are never revisable: a retune carries them forward
+ * untouched.
+ */
+export type StalePauseRevision = Partial<
+  Pick<StalePauseOptions, "staleAfterDays" | "sweepIntervalMs">
+>;
+
+/** WR-378: the two live stale-pause knobs, all required. */
+export interface StalePauseConfig {
+  staleAfterDays: number;
+  sweepIntervalMs: number;
+}
+
 function assertStaleAfterDays(value: unknown): asserts value is number {
   if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
     throw new RangeError(`stalePause.staleAfterDays must be a finite number > 0, got ${String(value)}`);
@@ -158,9 +174,12 @@ export function resolveStaleAfterMs(staleAfterDays: StalePauseOptions["staleAfte
  * WR-50 parking semantics.
  */
 export class StalePauseSweeper {
-  private readonly staleAfterMs: number;
-  private readonly staleAfterDaysValue: number;
-  private readonly sweepIntervalMs: number;
+  // WR-378: not readonly — `retune()` moves the two knobs in place so
+  // the threshold and the sweep cadence are live-revisable. `now`, the
+  // timer factory, and the owner stay readonly: they are never revised.
+  private staleAfterMs: number;
+  private staleAfterDaysValue: number;
+  private sweepIntervalMs: number;
   private readonly now: () => number;
   private readonly setTimer: (fn: () => void, ms: number) => ReplayTimerHandle;
   private readonly clearTimer: (handle: ReplayTimerHandle) => void;
@@ -205,6 +224,69 @@ export class StalePauseSweeper {
   /** The configured idle threshold in days (for audit/stats composition). */
   staleAfterDays(): number {
     return this.staleAfterDaysValue;
+  }
+
+  /**
+   * WR-378: revise the two stale-pause knobs at runtime — no restart.
+   * The patch must be a non-empty object; the merged values are
+   * re-validated with the same two gates (and the same error text) as
+   * construction, so an illegal patch throws `RangeError` and the live
+   * values are left completely intact. Revising to the live values is
+   * a silent no-op. Takes effect on the next `sweepNow()`: a tightened
+   * threshold pauses endpoints already past the new threshold on the
+   * next sweep, a widened one leaves them unpaused, and an already
+   * paused endpoint is never resumed by a revision — resuming still
+   * goes through the ordinary `resumeEndpoint` path. Revising
+   * `sweepIntervalMs` while the sweeper is started clears the pending
+   * timer and re-arms immediately at the new interval, so even a
+   * timer already waiting is rescheduled; while stopped, the new
+   * interval simply applies at the next `start()`. The idle baselines
+   * (last success / first sighting / resume instant) are never
+   * recomputed. Returns the live config.
+   */
+  retune(patch: StalePauseRevision): StalePauseConfig {
+    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new RangeError(`stalePause revision must be an object, got ${JSON.stringify(patch)}`);
+    }
+    if (Object.keys(patch).length === 0) {
+      throw new RangeError("stalePause revision must not be empty");
+    }
+    // Validate-then-apply: both merged values must pass the
+    // construction gates before any live value moves.
+    const nextDays = patch.staleAfterDays ?? this.staleAfterDaysValue;
+    const nextIntervalMs = patch.sweepIntervalMs ?? this.sweepIntervalMs;
+    const nextStaleAfterMs = resolveStaleAfterMs(nextDays);
+    if (!Number.isFinite(nextIntervalMs) || nextIntervalMs <= 0) {
+      throw new RangeError(
+        `stalePause.sweepIntervalMs must be a finite number > 0, got ${String(patch.sweepIntervalMs)}`
+      );
+    }
+    if (nextDays === this.staleAfterDaysValue && nextIntervalMs === this.sweepIntervalMs) {
+      return this.config();
+    }
+    const intervalChanged = nextIntervalMs !== this.sweepIntervalMs;
+    this.staleAfterDaysValue = nextDays;
+    this.staleAfterMs = nextStaleAfterMs;
+    this.sweepIntervalMs = nextIntervalMs;
+    if (intervalChanged && this.started) {
+      // Clear the pending timer and re-arm at the new interval now —
+      // otherwise the new cadence would only take effect after the
+      // timer armed under the old interval fires.
+      this.clearPending();
+      this.arm();
+    }
+    return this.config();
+  }
+
+  /**
+   * WR-378: the live two-knob config. A snapshot — mutating the
+   * returned object never moves the sweeper.
+   */
+  config(): StalePauseConfig {
+    return {
+      staleAfterDays: this.staleAfterDaysValue,
+      sweepIntervalMs: this.sweepIntervalMs,
+    };
   }
 
   /** Arm the sweep schedule. Idempotent. */

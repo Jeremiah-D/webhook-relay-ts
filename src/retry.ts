@@ -19,7 +19,9 @@ import {
   resolveStaleAfterMs,
   MS_PER_DAY,
   type StaleEndpointPausedEvent,
+  type StalePauseConfig,
   type StalePauseOptions,
+  type StalePauseRevision,
   type StalePauseSweepResult,
 } from "./stale-pause.ts";
 import { EndpointCircuitBreaker, resolveCircuitBreakerOptions, resolveCircuitProbe, resolveCircuitProbeOptions, resolveCircuitThresholds, type CircuitBreakerOptions, type CircuitProbeRevision, type CircuitState, type CircuitStats, type CircuitThresholdPatch, type ResolvedCircuitProbe, type ResolvedCircuitThresholds } from "./circuit.ts";
@@ -739,8 +741,10 @@ export type {
 export { DeadLetterRetentionSweeper, resolveRetentionTtl };
 export { StalePauseSweeper, resolveStaleAfterMs };
 export type {
+  StalePauseConfig,
   StalePauseOptions,
   StaleEndpointPausedEvent,
+  StalePauseRevision,
   StalePauseSweepResult,
 };
 export { EndpointAutoDisable };
@@ -2899,7 +2903,9 @@ export interface RetryQueueOptions {
    * not discarded). Disabled by default. Invalid values throw
    * `RangeError` at construction. Reachable over HTTP via the
    * `stalePause` server option; stats via `getStalePauseStats()` and
-   * the `relay_endpoint_auto_pauses_total` Prometheus counter.
+   * the `relay_endpoint_auto_pauses_total` Prometheus counter. WR-378:
+   * the two knobs are live-revisable via `reviseStalePause()` (see
+   * `getStalePauseConfig()` for the live values) — no restart.
    */
   stalePause?: StalePauseOptions;
   /**
@@ -7275,6 +7281,41 @@ export class RetryQueue {
    */
   getStalePauseSweeper(): StalePauseSweeper | undefined {
     return this.stalePauser;
+  }
+
+  /**
+   * WR-378: revise the live stale-pause knobs (partial — omitted
+   * fields keep their live values). Takes effect on the next
+   * `sweepNow()`: a tightened `staleAfterDays` pauses endpoints
+   * already past the new threshold on the next sweep, a widened one
+   * leaves them unpaused, and an already-paused endpoint is never
+   * resumed by a revision — resuming still goes through the ordinary
+   * `resumeEndpoint` path. Revising `sweepIntervalMs` while the
+   * sweeper is started clears the pending timer and re-arms
+   * immediately at the new interval; while stopped, the new interval
+   * applies at the next `start()`. Idle baselines are never
+   * recomputed. An illegal patch throws `RangeError` and the live
+   * values are untouched; an empty patch is a `RangeError`; revising
+   * to the live values is a no-op. Throws `Error` when stale-endpoint
+   * auto-pause was never configured — enabling it needs a restart.
+   * Returns the live config.
+   */
+  reviseStalePause(patch: StalePauseRevision): StalePauseConfig {
+    if (this.stalePauser === undefined) {
+      throw new Error(
+        "reviseStalePause: stalePause is not configured — enabling it requires a restart"
+      );
+    }
+    return this.stalePauser.retune(patch);
+  }
+
+  /**
+   * WR-378: the live two-knob stale-pause config, or `undefined` when
+   * the feature is off. A snapshot — mutating the returned object
+   * never moves the sweeper.
+   */
+  getStalePauseConfig(): StalePauseConfig | undefined {
+    return this.stalePauser?.config();
   }
 
   /**

@@ -53,7 +53,7 @@ import type {
   EndpointHealthRevision,
   EndpointRecoveredInfo,
 } from "./retry.ts";
-import type { StalePauseOptions } from "./retry.ts";
+import type { StalePauseConfig, StalePauseOptions, StalePauseRevision } from "./retry.ts";
 import {
   assertValidCorsPolicy,
   answerCorsPreflight,
@@ -6554,6 +6554,37 @@ export interface RelayServer extends Server {
    * otherwise.
    */
   getEscalationConfig?: () => EscalationConfig | undefined;
+  /**
+   * WR-378: revise the live stale-endpoint auto-pause knobs at runtime
+   * — no restart. The two knobs (`staleAfterDays`, `sweepIntervalMs`)
+   * take effect on the next sweep: a tightened threshold pauses
+   * endpoints already past the new threshold on the next sweep, a
+   * widened one leaves them unpaused, and an already-paused endpoint
+   * is never resumed by a revision — resuming still goes through the
+   * ordinary `resumeEndpoint` path. Revising `sweepIntervalMs` while
+   * the sweeper is started clears the pending timer and re-arms
+   * immediately at the new interval, so even a timer already waiting
+   * is rescheduled; while stopped, the new interval applies at the
+   * next `start()`. The idle baselines (last success / first sighting
+   * / resume instant) are never recomputed. An illegal patch throws
+   * `RangeError` and the live values are untouched; an empty patch is
+   * a `RangeError`; a same-value revision is a silent no-op with no
+   * audit event. A real revision is audited as
+   * `stale_pause_revised` with `previous` / `current` (the
+   * construction values as first `previous` — the defaults 30 days /
+   * 60 s when unset), and returns the live config. Always set; throws
+   * `Error` when `stalePause` was never configured — enabling it
+   * needs a restart. This revises the auto-pause threshold; WR-100 is
+   * the auto-pause mechanism itself, WR-50 the manual pause/resume
+   * operator switch, and WR-150 the failure-threshold auto-disable.
+   */
+  reviseStalePause?: (patch: StalePauseRevision) => StalePauseConfig;
+  /**
+   * WR-378: live stale-endpoint auto-pause config — the two knobs.
+   * Only set when `stalePause` was configured; `undefined`
+   * otherwise.
+   */
+  getStalePauseConfig?: () => StalePauseConfig | undefined;
   /**
    * WR-347: revise the live SLO-breach prediction knobs at runtime
    * — no restart. The five knobs (`warnRatio`, `ewmaAlpha`,
@@ -16891,6 +16922,47 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // `deadLetterEscalation` was configured.
   if (queue.getEscalationConfig() !== undefined) {
     server.getEscalationConfig = (): EscalationConfig => queue.getEscalationConfig()!;
+  }
+
+  // WR-378: stale-endpoint auto-pause knob runtime revision. The
+  // method is always set (like reviseErrorBudget above); with the
+  // sweeper unconfigured the queue throws Error — enabling it needs
+  // a restart. A real revision is audited as `stale_pause_revised`
+  // with the previous and current two-knob config (the construction
+  // values as first `previous` — the defaults 30 days / 60 s when
+  // unset); an empty or same-value patch is a silent no-op. The
+  // revision takes effect on the next sweep: a tightened threshold
+  // pauses endpoints already past it on the next sweep, a widened
+  // one leaves them unpaused, an already-paused endpoint is never
+  // resumed, and a revised sweep interval re-arms the pending timer
+  // immediately.
+  server.reviseStalePause = (patch: StalePauseRevision): StalePauseConfig => {
+    const prev = queue.getStalePauseConfig();
+    if (prev === undefined) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseStalePause(patch);
+    }
+    // Validate-then-apply inside retune: an illegal patch throws
+    // RangeError and the live values are left completely intact.
+    const next = queue.reviseStalePause(patch);
+    if (
+      next.staleAfterDays === prev.staleAfterDays &&
+      next.sweepIntervalMs === prev.sweepIntervalMs
+    ) {
+      return next;
+    }
+    opts.auditLog.append({
+      event: "stale_pause_revised",
+      previous: prev,
+      current: next,
+    });
+    return next;
+  };
+
+  // WR-378: live stale-endpoint auto-pause config. Only set when
+  // `stalePause` was configured.
+  if (queue.getStalePauseConfig() !== undefined) {
+    server.getStalePauseConfig = (): StalePauseConfig => queue.getStalePauseConfig()!;
   }
 
   // WR-353: live error-budget alert-callback replacement. The method

@@ -3230,6 +3230,21 @@ queue.sweepStaleEndpoints(); // manual sweep; the timer also sweeps every sweepI
 queue.getStalePauseStats();  // per-endpoint idleDays / pending / paused / autoPauses
 ```
 
+**Live revision (WR-378)** — both knobs are revisable at runtime, no
+restart: `queue.reviseStalePause({ staleAfterDays: 90 })` /
+`server.reviseStalePause(patch)` (and `getStalePauseConfig()` for the
+live values). A tightened threshold pauses endpoints already past it on
+the next sweep; a widened one leaves them unpaused. Revising
+`sweepIntervalMs` while the sweeper is running clears the pending timer
+and re-arms immediately at the new interval. An already-paused endpoint
+is never resumed by a revision — resuming still goes through the
+ordinary `resumeEndpoint` path — and the idle baselines are never
+recomputed. A real revision is audited as `stale_pause_revised` with
+`previous` / `current`; an empty or same-value patch is a silent no-op,
+and an illegal value throws `RangeError` leaving the live values
+untouched. On a relay where `stalePause` was never configured, revision
+throws `Error` — enabling the feature needs a restart.
+
 - **Idle means idle** — the clock is stamped on every genuinely
   successful delivery (`delivered`). A validator-rejected response
   (semantic failure) or a non-retryable 4xx does **not** count as
