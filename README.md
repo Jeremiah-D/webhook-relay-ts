@@ -942,6 +942,19 @@ reliability primitives that matter for any signed-payload pipeline.
   tighter or looser, first matching rule wins, and the gzip-bomb cap
   follows the endpoint's own budget. Invalid values throw `RangeError`
   at startup.
+- **Live-revisable (WR-382)** — `reviseMaxBodyBytes(bytes)` replaces
+  the global budget at runtime: the next HTTP request's intake and the
+  next WS handshake are sized by the new limit, while in-flight
+  requests and established WS connections keep the budget they were
+  parsed / handshook under. An illegal value (non-positive-integer)
+  throws `RangeError` with the live limit untouched; a same-value
+  revision is a silent no-op. A real revision is audited as
+  `max_body_bytes_revised` with `previous` / `current` (numbers; the
+  construction value — explicit or the 1 MiB default — as first
+  `previous`); `getMaxBodyBytes()` returns the live limit. The global
+  always has a value, so it is always revisable — there is no
+  "unconfigured" gate. Tenant budgets and endpoint rules are untouched;
+  precedence (tenant > endpoint > global) is unchanged.
 - Outbound request signing (`outboundSigning`, off by default): every delivery
   made by the default sender stamps `x-relay-signature: sha256=<hex>` — the
   HMAC-SHA256 of the forwarded body — plus `x-relay-key-id` when a `keyId`

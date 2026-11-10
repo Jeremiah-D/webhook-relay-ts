@@ -1625,6 +1625,9 @@ export interface RelayServerOptions {
    * read, and chunked or lying bodies are capped while streaming, so a
    * flood of giant payloads costs us almost nothing. Default: 1 MiB
    * (`DEFAULT_MAX_BODY_BYTES`). Invalid values throw `RangeError`.
+   * Live-revisable (WR-382): `reviseMaxBodyBytes` replaces the global
+   * budget at runtime — the fallback every intake falls back to when
+   * no tenant budget and no endpoint rule matched; see the method docs.
    */
   maxBodyBytes?: number;
   /**
@@ -7041,6 +7044,30 @@ export interface RelayServer extends Server {
    */
   getEndpointBodyLimits?: () => EndpointBodyLimitRule[] | undefined;
   /**
+   * WR-382: revise the live global inbound body limit at runtime —
+   * the fallback budget every intake falls back to when no tenant
+   * budget and no endpoint rule matched. The next HTTP request's
+   * intake and the next WS handshake are sized by the new limit;
+   * requests already admitted and established WS connections keep
+   * the budget they were parsed / handshook under. An illegal value
+   * (non-positive-integer) throws `RangeError` and the live limit is
+   * untouched; a same-value revision is a no-op with no audit event.
+   * A real revision is audited as `max_body_bytes_revised` with
+   * `previous` / `current` (numbers; the construction value —
+   * explicit or the 1 MiB default — as first `previous`), and returns
+   * the live limit. Always set: the global always has a value, so
+   * there is no "unconfigured" gate — it is always revisable.
+   * Tenant budgets and endpoint rules are untouched; precedence
+   * (tenant > endpoint > global) is unchanged.
+   */
+  reviseMaxBodyBytes?: (maxBodyBytes: number) => number;
+  /**
+   * WR-382: live global inbound body limit snapshot — the value the
+   * intake falls back to when no tenant budget and no endpoint rule
+   * matched. Always set.
+   */
+  getMaxBodyBytes?: () => number;
+  /**
    * WR-329: revise the live tenant-level outbound rate-limit defaults
    * at runtime (`burst` / `refillPerSecond` / `mode`, partial —
    * omitted fields keep their live values). The next `take()` /
@@ -8211,7 +8238,13 @@ function sameStatusRetryPolicy(
 export function createRelayServer(opts: RelayServerOptions): RelayServer {
   const latencyOpts = opts.retry?.latency;
   // RangeError on invalid values, at startup — never mid-request.
-  const maxBodyBytes = opts.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
+  // WR-382: a `let`, not a `const` — the live holder for the global
+  // limit. Every intake read point references this binding and
+  // resolves it per request / handshake (no startup copy), so
+  // `reviseMaxBodyBytes` reassigning it resizes the next request /
+  // handshake while in-flight intakes and established WS connections
+  // keep the budget they were parsed / handshook under.
+  let maxBodyBytes = opts.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
   if (!Number.isInteger(maxBodyBytes) || maxBodyBytes <= 0) {
     throw new RangeError("createRelayServer: `maxBodyBytes` must be a positive integer");
   }
@@ -18016,6 +18049,42 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     server.getEndpointBodyLimits = (): EndpointBodyLimitRule[] =>
       opts.endpointBodyLimits!.map((r) => ({ ...r }));
   }
+
+  // WR-382: global inbound body-limit runtime revision. The limit is
+  // always set (explicit or the 1 MiB default), so unlike
+  // reviseEndpointBodyLimits above there is no "unconfigured" gate —
+  // it is always revisable. A real revision is audited as
+  // `max_body_bytes_revised` with the previous and current limits
+  // (numbers; the construction value as first `previous`); a
+  // same-value revision is a silent no-op.
+  server.reviseMaxBodyBytes = (next: number): number => {
+    // Validate-then-apply: the new limit must pass the
+    // construction-time check — an illegal value throws RangeError
+    // and the live limit is left completely intact.
+    if (!Number.isInteger(next) || next <= 0) {
+      throw new RangeError("reviseMaxBodyBytes: `maxBodyBytes` must be a positive integer");
+    }
+    const previous = maxBodyBytes;
+    if (next === previous) {
+      return previous;
+    }
+    // Reassign the live binding (the WR-361 in-place shape for a
+    // scalar): every intake read point references this binding and
+    // resolves it per request / handshake — no startup copy — so the
+    // next request / handshake is sized by the new limit while
+    // in-flight intakes and established WS connections keep the
+    // budget they were parsed / handshook under.
+    maxBodyBytes = next;
+    opts.auditLog.append({
+      event: "max_body_bytes_revised",
+      previous,
+      current: next,
+    });
+    return next;
+  };
+
+  // WR-382: live global inbound body limit snapshot. Always set.
+  server.getMaxBodyBytes = (): number => maxBodyBytes;
 
   // WR-310: relay-level global rate-limit snapshot. Only set when
   // `retry.globalRateLimit` was configured.
