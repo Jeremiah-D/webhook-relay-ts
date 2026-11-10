@@ -67,6 +67,30 @@ export interface ResponseGuardConfig {
 }
 
 /**
+ * Runtime revision of one endpoint's guard (WR-380). Partial: omitted
+ * fields keep their live values; `null` clears that field back to its
+ * default — an un-named `maxResponseBytes` falls back to
+ * `DEFAULT_MAX_RESPONSE_BYTES` while the entry survives (the digest
+ * knob is the one keeping it guarded); clearing both fields deletes
+ * the entry and the endpoint falls back to unguarded behavior (64 KiB
+ * truncated capture, no digest check). Validated with
+ * `assertValidResponseGuardConfigValue` before anything is applied,
+ * so an illegal patch leaves the live record untouched.
+ */
+export interface ResponseGuardRevision {
+  /**
+   * New cap in bytes, or `null` to clear it back to the 4 MiB
+   * default. Must be a positive integer when present.
+   */
+  maxResponseBytes?: number | null;
+  /**
+   * New digest-verification flag, or `null` to clear it back to
+   * false. Must be a boolean when present.
+   */
+  verifyContentDigest?: boolean | null;
+}
+
+/**
  * Structured delivery failure: the downstream's response body ran past
  * the endpoint's `maxResponseBytes` (WR-169). Thrown by the default
  * sender after it truncated the read at the cap, so the relay never

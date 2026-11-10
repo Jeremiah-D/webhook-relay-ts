@@ -571,9 +571,11 @@ import {
 } from "./response-integrity.ts";
 import {
   assertValidResponseGuardConfig,
+  assertValidResponseGuardConfigValue,
   DEFAULT_MAX_RESPONSE_BYTES,
   ResponseTooLargeError,
   type ResponseGuardConfig,
+  type ResponseGuardRevision,
 } from "./response-limit.ts";
 import {
   resolveForwardHeadersConfig,
@@ -6387,6 +6389,42 @@ export interface RelayServer extends Server {
    */
   getDeliveryDeadlineConfig?: () => DeliveryDeadlineConfig | undefined;
   /**
+   * WR-380: revise the live per-endpoint downstream response guard at
+   * runtime (`maxResponseBytes` / `verifyContentDigest`, partial —
+   * omitted fields keep their live values; `null` clears that field
+   * back to its default — an un-named cap falls back to the 4 MiB
+   * default while the entry survives; clearing both fields deletes
+   * the entry and the endpoint falls back to unguarded behavior).
+   * The revision takes effect on the next attempt for that endpoint
+   * (the sender reads the live record per attempt); a response read
+   * already in flight keeps the cap it started under, and a delivery
+   * already resolved is never re-checked. An illegal patch throws
+   * `RangeError` and the live record is untouched; an empty patch is
+   * an `Error`; a same-value revision is a no-op with no audit event.
+   * A real revision is audited as `response_guard_revised` with
+   * `endpoint` plus `previous` / `current` (the construction values
+   * as first `previous`; `undefined` when the entry did not exist or
+   * was just deleted), and returns the live config for the endpoint
+   * (`undefined` when the entry was deleted). Always set — unlike the
+   * WR-341 deadline revision, a brand-new endpoint can be opted in
+   * without a restart (the guard code path is always live; only the
+   * record starts empty). Orthogonal to WR-168 (which owns the
+   * digest-verification mechanism itself), WR-169 (which owns the
+   * cap mechanism itself), WR-341 (which revises the per-endpoint
+   * delivery-deadline map in the same shape, for a different object),
+   * and WR-375 (which revises the outbound SSRF allowlist).
+   */
+  reviseResponseGuard?: (
+    endpoint: string,
+    patch: ResponseGuardRevision
+  ) => ResponseGuardConfig | undefined;
+  /**
+   * WR-380: live per-endpoint downstream response guard — a copy of
+   * the entry for `endpoint`, or `undefined` when the endpoint has no
+   * guard entry. Always set.
+   */
+  getResponseGuard?: (endpoint: string) => ResponseGuardConfig | undefined;
+  /**
    * WR-339: revise the live adaptive backoff config at runtime
    * (`minBaseMs` / `maxBaseMs` / `upFactor` / `downFactor`, partial —
    * omitted fields keep their live values). Retuning clamps every
@@ -8600,9 +8638,20 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       );
     }
   }
+  // WR-380: the live response-guard record. `createDefaultSender`
+  // captures this record by reference (read per attempt on the
+  // HTTP/1.1 and HTTP/2 paths), so the server holds the SAME object
+  // and hands it to both the main and the shadow sender;
+  // `reviseResponseGuard` mutates it in place — never replaces it —
+  // or the senders would keep reading a stale record. When
+  // unconfigured, the empty record behaves exactly like `undefined`
+  // (unguarded endpoints use the 64 KiB truncated capture), so revise
+  // can opt a brand-new endpoint in without a restart.
+  const liveResponseGuard: Record<string, ResponseGuardConfig> =
+    opts.responseGuard ?? {};
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, opts.awsSigV4, opts.awsSecretResolver, opts.outboundSchemas, opts.oauth2, undefined, opts.compressBrotli, opts.phaseTimeouts, opts.tlsCa, opts.chaos, onChaosInjectedAudit, opts.responseGuard, opts.doh, onDohFallbackAudit, proxyHealthMonitor, opts.outboundCredentials, opts.dnsPin, onDnsPinMismatchAudit, opts.cloudEvents, opts.outboundSsrfGuard, onOutboundSsrfBlockedAudit, onOutboundSsrfAllowlistedAudit, onOutboundSsrfProxySkippedAudit, opts.egressResidency, onEgressResidencyBlockedAudit)
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, opts.awsSigV4, opts.awsSecretResolver, opts.outboundSchemas, opts.oauth2, undefined, opts.compressBrotli, opts.phaseTimeouts, opts.tlsCa, opts.chaos, onChaosInjectedAudit, liveResponseGuard, opts.doh, onDohFallbackAudit, proxyHealthMonitor, opts.outboundCredentials, opts.dnsPin, onDnsPinMismatchAudit, opts.cloudEvents, opts.outboundSsrfGuard, onOutboundSsrfBlockedAudit, onOutboundSsrfAllowlistedAudit, onOutboundSsrfProxySkippedAudit, opts.egressResidency, onEgressResidencyBlockedAudit)
       : undefined;
   // WR-146: tail-latency hedging for outbound attempts (opt-in). The
   // wrapper sits around whichever sender the queue uses — the default
@@ -8785,10 +8834,12 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
                   // chaos stays off for shadow copies (pre-existing);
                   // the trailing slot is the WR-168/WR-169 responseGuard
                   // record — a shadow mirror's response read is bounded
-                  // the same way as the main delivery's.
+                  // the same way as the main delivery's. WR-380: the
+                  // same live record as the main sender, so a revision
+                  // governs shadow mirrors from the next attempt too.
                   undefined,
                   undefined,
-                  opts.responseGuard,
+                  liveResponseGuard,
                   // WR-170: shadow mirrors resolve through the same
                   // per-endpoint DoH config (each shadow sender keeps
                   // its own per-DoH-URL cache), with the same
@@ -16710,6 +16761,84 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   if (queue.getDeliveryDeadlineConfig() !== undefined) {
     server.getDeliveryDeadlineConfig = (): DeliveryDeadlineConfig => queue.getDeliveryDeadlineConfig()!;
   }
+
+  // WR-380: per-endpoint downstream response-guard runtime revision.
+  // The method is always set (unlike reviseDeliveryDeadline above):
+  // the guard code path is always live and the record starts empty
+  // when unconfigured, so a brand-new endpoint can be opted in
+  // without a restart. The sender reads the live record per attempt,
+  // so a revision governs the next attempt for that endpoint; a
+  // response read already in flight keeps the cap it started under
+  // (the sender captures the guard entry at attempt start). A real
+  // revision is audited as `response_guard_revised` with the
+  // endpoint plus previous / current (snapshots; `undefined` when the
+  // entry did not exist or was just deleted); an empty or same-value
+  // patch is a silent no-op.
+  server.reviseResponseGuard = (
+    endpoint: string,
+    patch: ResponseGuardRevision
+  ): ResponseGuardConfig | undefined => {
+    if (typeof endpoint !== "string" || endpoint.length === 0) {
+      throw new RangeError("reviseResponseGuard: endpoint must be a non-empty string");
+    }
+    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new RangeError("reviseResponseGuard: patch must be an object");
+    }
+    if (patch.maxResponseBytes === undefined && patch.verifyContentDigest === undefined) {
+      throw new Error("reviseResponseGuard: empty patch — nothing to revise");
+    }
+    // Validate-then-apply: build the candidate config first and run it
+    // through the same per-value validator as startup; an illegal
+    // patch throws RangeError and the live record is left completely
+    // intact. `null` clears that field; clearing both fields deletes
+    // the entry (the endpoint falls back to unguarded behavior).
+    const prev =
+      liveResponseGuard[endpoint] === undefined
+        ? undefined
+        : { ...liveResponseGuard[endpoint] };
+    const candidate: ResponseGuardConfig = { ...(liveResponseGuard[endpoint] ?? {}) };
+    if (patch.maxResponseBytes !== undefined) {
+      if (patch.maxResponseBytes === null) delete candidate.maxResponseBytes;
+      else candidate.maxResponseBytes = patch.maxResponseBytes;
+    }
+    if (patch.verifyContentDigest !== undefined) {
+      if (patch.verifyContentDigest === null) delete candidate.verifyContentDigest;
+      else candidate.verifyContentDigest = patch.verifyContentDigest;
+    }
+    assertValidResponseGuardConfigValue(candidate, `responseGuard["${endpoint}"]`);
+    const isEmpty =
+      candidate.maxResponseBytes === undefined && candidate.verifyContentDigest === undefined;
+    const same =
+      (prev === undefined && isEmpty) ||
+      (prev !== undefined &&
+        prev.maxResponseBytes === candidate.maxResponseBytes &&
+        prev.verifyContentDigest === candidate.verifyContentDigest);
+    if (same) {
+      return prev === undefined ? undefined : { ...prev };
+    }
+    // Mutate the live record in place — never replace the record
+    // object itself, or the senders' captured reference would go stale.
+    if (isEmpty) {
+      delete liveResponseGuard[endpoint];
+    } else {
+      liveResponseGuard[endpoint] = candidate;
+    }
+    const current = isEmpty ? undefined : { ...candidate };
+    opts.auditLog.append({
+      event: "response_guard_revised",
+      endpoint,
+      previous: prev,
+      current,
+    });
+    return current;
+  };
+
+  // WR-380: live per-endpoint downstream response guard. Always set;
+  // returns a copy so callers cannot mutate the live record through it.
+  server.getResponseGuard = (endpoint: string): ResponseGuardConfig | undefined => {
+    const entry = liveResponseGuard[endpoint];
+    return entry === undefined ? undefined : { ...entry };
+  };
 
   // WR-339: adaptive backoff config runtime revision. The method is
   // always set (like reviseSlowStart above); with the controller

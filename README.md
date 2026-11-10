@@ -4990,6 +4990,22 @@ const server = createRelayServer({
   capture, no digest check). Invalid values (non-positive-integer
   `maxResponseBytes`, non-boolean `verifyContentDigest`) throw
   `RangeError` at startup — never mid-delivery.
+- **Live revision (WR-380)** — `server.reviseResponseGuard(endpoint, patch)`
+  revises one endpoint's two knobs at runtime (`maxResponseBytes` /
+  `verifyContentDigest`, partial — omitted fields keep their live values;
+  `null` clears a field back to its default, an un-named cap falling back
+  to 4 MiB while the entry survives; clearing both fields deletes the
+  entry and the endpoint falls back to unguarded behavior). The sender
+  reads the live record on every attempt, so the next attempt for that
+  endpoint is governed by the new guard while a response read already in
+  flight keeps the cap it started under. Endpoints never configured at
+  startup can be opted in without a restart. An illegal patch throws
+  `RangeError` with the live record untouched; an empty patch is an
+  `Error`; a same-value revision is a silent no-op. A real revision is
+  audited as `response_guard_revised` (`endpoint` plus `previous` /
+  `current`); `server.getResponseGuard(endpoint)` returns a copy of the
+  live entry. This is the revision entry point only — WR-168 owns the
+  digest-verification mechanism and WR-169 the cap mechanism.
 
 ## GeoIP inbound country policy (opt-in)
 
