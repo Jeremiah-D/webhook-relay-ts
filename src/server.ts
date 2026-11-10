@@ -1658,7 +1658,8 @@ export interface RelayServerOptions {
    * (`POST /ingest/batch`) is subject to the same gate, so per-item
    * payloads are bounded by the outer envelope. Unset means exact
    * current global behavior. Invalid rules throw `RangeError` at
-   * startup.
+   * startup. Live-revisable (WR-381): `reviseEndpointBodyLimits`
+   * replaces the whole ruleset at runtime; see the method docs.
    */
   endpointBodyLimits?: EndpointBodyLimitRule[];
   /**
@@ -7016,6 +7017,29 @@ export interface RelayServer extends Server {
    * when `tenantBodyLimits` was configured; `undefined` otherwise.
    */
   getTenantBodyLimits?: () => TenantBodyLimits | undefined;
+  /**
+   * WR-381: revise the live per-endpoint inbound body limits at
+   * runtime (full replacement of the ruleset — an empty array clears
+   * every rule, so all paths fall back to the global `maxBodyBytes`).
+   * The next HTTP request's intake and the next WS handshake are sized
+   * by the new rules; requests already admitted and established WS
+   * connections keep the budget they were parsed / handshook under. An
+   * illegal ruleset throws `RangeError` and the live ruleset is
+   * untouched; a same-value revision is a no-op with no audit event. A
+   * real revision is audited as `endpoint_body_limits_revised` with
+   * `previous` / `current` (the full rulesets, deep-copied; the
+   * construction ruleset as first `previous`), and returns the live
+   * snapshot. Always set; throws `Error` when the rules were never
+   * configured — enabling them needs a restart.
+   */
+  reviseEndpointBodyLimits?: (rules: EndpointBodyLimitRule[]) => EndpointBodyLimitRule[];
+  /**
+   * WR-381: live per-endpoint inbound body limits snapshot — a copy of
+   * the ruleset, so callers can inspect (or mutate) it without
+   * touching the rules the intake resolves per request. Only set when
+   * `endpointBodyLimits` was configured; `undefined` otherwise.
+   */
+  getEndpointBodyLimits?: () => EndpointBodyLimitRule[] | undefined;
   /**
    * WR-329: revise the live tenant-level outbound rate-limit defaults
    * at runtime (`burst` / `refillPerSecond` / `mode`, partial —
@@ -17933,6 +17957,64 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // `tenantBodyLimits` was configured.
   if (opts.tenantBodyLimits !== undefined) {
     server.getTenantBodyLimits = (): TenantBodyLimits => ({ ...opts.tenantBodyLimits! });
+  }
+
+  // WR-381: per-endpoint inbound body-limit ruleset runtime revision.
+  // The method is always set (like reviseTenantBodyLimits above);
+  // with the ruleset unconfigured it throws Error — enabling the
+  // rules needs a restart. A real revision is audited as
+  // `endpoint_body_limits_revised` with the previous and current full
+  // rulesets (deep copies; the construction ruleset as first
+  // `previous`); a same-value revision is a silent no-op.
+  server.reviseEndpointBodyLimits = (rules: EndpointBodyLimitRule[]): EndpointBodyLimitRule[] => {
+    if (opts.endpointBodyLimits === undefined) {
+      throw new Error(
+        "reviseEndpointBodyLimits: per-endpoint body limits are not configured — enabling them requires a restart"
+      );
+    }
+    if (!Array.isArray(rules)) {
+      // assertValidEndpointBodyLimitRules lets `undefined` through
+      // (it means "not configured" at startup); a revision has no
+      // such reading — it must be an array, empty included.
+      throw new RangeError(
+        "endpointBodyLimits revision: expected an array of { pattern, maxBodyBytes } rules"
+      );
+    }
+    // Validate-then-apply: the replacement set must pass the
+    // construction-time validator — an illegal ruleset throws
+    // RangeError and the live ruleset is left completely intact.
+    assertValidEndpointBodyLimitRules(rules);
+    const previous: EndpointBodyLimitRule[] = opts.endpointBodyLimits.map((r) => ({ ...r }));
+    const next: EndpointBodyLimitRule[] = rules.map((r) => ({ ...r }));
+    const sameRuleset =
+      previous.length === next.length &&
+      previous.every(
+        (r, i) => r.pattern === next[i].pattern && r.maxBodyBytes === next[i].maxBodyBytes
+      );
+    if (sameRuleset) {
+      return previous;
+    }
+    // Rewrite the live array in place (WR-361 precedent): the intake
+    // resolves `opts.endpointBodyLimits` on every request and every WS
+    // handshake — no startup copy — so the next request / handshake is
+    // sized by the new rules while in-flight intakes and established
+    // WS connections keep the budget they were parsed / handshook under.
+    opts.endpointBodyLimits.splice(0, opts.endpointBodyLimits.length, ...next);
+    opts.auditLog.append({
+      event: "endpoint_body_limits_revised",
+      previous,
+      current: next.map((r) => ({ ...r })),
+    });
+    return next.map((r) => ({ ...r }));
+  };
+
+  // WR-381: live per-endpoint inbound body limits snapshot — a copy of
+  // the ruleset, so callers can inspect (or mutate) it without touching
+  // the rules the intake resolves per request. Only set when
+  // `endpointBodyLimits` was configured.
+  if (opts.endpointBodyLimits !== undefined) {
+    server.getEndpointBodyLimits = (): EndpointBodyLimitRule[] =>
+      opts.endpointBodyLimits!.map((r) => ({ ...r }));
   }
 
   // WR-310: relay-level global rate-limit snapshot. Only set when

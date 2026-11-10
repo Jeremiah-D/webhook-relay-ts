@@ -4856,6 +4856,19 @@ const server = createRelayServer({
 - Invalid rules (non-array, pattern not starting with `/`,
   non-positive-integer `maxBodyBytes`) throw `RangeError` at startup, so
   a bad config can never fail a request mid-flight.
+- **Live-revisable (WR-381)** — `reviseEndpointBodyLimits(rules)`
+  replaces the whole ruleset at runtime: the next HTTP request's intake
+  and the next WS handshake are sized by the new rules, while in-flight
+  requests and established WS connections keep the budget they were
+  parsed / handshook under. An empty array clears every rule (all paths
+  fall back to the global `maxBodyBytes`); an illegal ruleset throws
+  `RangeError` with the live ruleset untouched; a same-ruleset revision
+  is a silent no-op. A real revision is audited as
+  `endpoint_body_limits_revised` with `previous` / `current`
+  (full-ruleset snapshots); `getEndpointBodyLimits()` returns a copy of
+  the live ruleset. Revising requires the rules to have been configured
+  at startup — otherwise it throws `Error` (enabling them needs a
+  restart).
 
 ## Per-tenant inbound body budgets
 
