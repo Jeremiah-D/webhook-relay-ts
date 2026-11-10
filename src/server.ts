@@ -425,6 +425,7 @@ import {
   type OutboundSsrfBlockedInfo,
   type OutboundSsrfGuardOptions,
   type OutboundSsrfProxySkippedInfo,
+  type SsrfAllowlistRevision,
   type SsrfGuardAgentBinding,
 } from "./outbound-ssrf-guard.ts";
 import {
@@ -6403,6 +6404,30 @@ export interface RelayServer extends Server {
    * Only set when `dnsCache` was configured; `undefined` otherwise.
    */
   getDnsCacheConfig?: () => DnsCacheConfig | undefined;
+  /**
+   * WR-375: revise the live outbound SSRF guard allowlist at runtime
+   * (`true` allowlists the endpoint, `false` / `null` removes it back
+   * to the default guarded mode). A real revision is audited as
+   * `outbound_ssrf_allowlist_revised` with the added / removed
+   * endpoints and the current allowlist (endpoint URLs only — resolved
+   * private IPs never appear); a same-value revision is a silent
+   * no-op with no audit event. An illegal patch throws `RangeError`
+   * and the live allowlist is untouched. Always set; throws `Error`
+   * when the SSRF guard was never configured — enabling it needs a
+   * restart. The next dispatch after a revision re-binds the endpoint
+   * and takes the new mode. This revises the allowlist; WR-373 is the
+   * guard mechanism itself, WR-374 the egress residency gate (a
+   * country allowlist — a different dimension of the same outbound
+   * door), and WR-194 the DNS drift pin the guard wraps.
+   */
+  reviseOutboundSsrfAllowlist?: (patch: SsrfAllowlistRevision) => Record<string, boolean>;
+  /**
+   * WR-375: live outbound SSRF guard allowlist — the endpoints
+   * currently opted into intentional private targets. Always set;
+   * `{}` when the guard was never configured. Returns a fresh
+   * object, never a live reference.
+   */
+  getOutboundSsrfAllowlist?: () => Record<string, boolean>;
   /**
    * WR-345: revise the live dead-letter replay egress rate at runtime
    * (`replaysPerSecond`, partial — omitted fields keep their live
@@ -16605,6 +16630,48 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   if (sharedDnsCache !== undefined) {
     server.getDnsCacheConfig = (): DnsCacheConfig => sharedDnsCache.config();
   }
+
+  // WR-375: outbound SSRF guard allowlist live revision. The method is
+  // always set (like reviseDnsCache above); with the guard unconfigured
+  // the revision throws Error — enabling it needs a restart. A real
+  // revision is audited as `outbound_ssrf_allowlist_revised` with the
+  // added / removed endpoints and the current allowlist (endpoint URLs
+  // only — resolved private IPs never appear); a same-value revision is
+  // a silent no-op.
+  server.reviseOutboundSsrfAllowlist = (patch: SsrfAllowlistRevision): Record<string, boolean> => {
+    const guard = defaultSender?.outboundSsrfGuard;
+    if (guard === undefined) {
+      throw new Error(
+        "reviseOutboundSsrfAllowlist: outbound SSRF guard is not configured — enabling it requires a restart: " +
+          "the guard is created at startup and a running relay cannot start guarding resolutions without one"
+      );
+    }
+    const prev = guard.allowPrivateTargets();
+    // Validate-then-apply inside reviseAllowPrivateTargets: an illegal
+    // patch throws RangeError and the live allowlist is left intact.
+    const next = guard.reviseAllowPrivateTargets(patch);
+    const added = Object.keys(next)
+      .filter((u) => prev[u] !== true)
+      .sort();
+    const removed = Object.keys(prev)
+      .filter((u) => next[u] !== true)
+      .sort();
+    if (added.length === 0 && removed.length === 0) {
+      return next;
+    }
+    opts.auditLog.append({
+      event: "outbound_ssrf_allowlist_revised",
+      added,
+      removed,
+      current: next,
+    });
+    return next;
+  };
+
+  // WR-375: live outbound SSRF guard allowlist. Always set; `{}` when
+  // the guard was never configured.
+  server.getOutboundSsrfAllowlist = (): Record<string, boolean> =>
+    defaultSender?.outboundSsrfGuard?.allowPrivateTargets() ?? {};
 
   // WR-345: replay egress rate runtime revision. The method is always
   // set (like reviseAdaptiveBackoff above); with the gate unconfigured

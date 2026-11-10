@@ -97,6 +97,14 @@ export type SsrfAddressCategory =
 export type SsrfGuardMode = "guarded" | "allowlisted" | "proxied";
 
 /**
+ * WR-375: partial patch for
+ * {@link OutboundSsrfGuard.reviseAllowPrivateTargets}. `true`
+ * allowlists the endpoint; `false` or `null` removes it back to the
+ * default guarded mode.
+ */
+export type SsrfAllowlistRevision = Record<string, boolean | null>;
+
+/**
  * The per-endpoint binding the sender hands to the pool / one-off
  * request path: the `dns.lookup`-compatible resolver the agent dials
  * through, plus the mode the pool key binds (see `src/keepalive.ts`).
@@ -106,6 +114,17 @@ export interface SsrfGuardAgentBinding {
   mode: SsrfGuardMode;
   /** The `dns.lookup`-compatible resolver the agent dials through. */
   lookup: LookupFunction;
+}
+
+/**
+ * WR-375: a binding plus the allowlist revision it was built at.
+ * Internal only — `bindingFor` returns it as
+ * {@link SsrfGuardAgentBinding}; a binding whose revision is behind
+ * its target's stamp is stale and rebuilt, never returned.
+ */
+interface VersionedSsrfBinding extends SsrfGuardAgentBinding {
+  /** Allowlist revision stamp of the target at build time. */
+  revision: number;
 }
 
 /** Details of one blocked lookup, delivered to `onBlocked`. */
@@ -187,7 +206,8 @@ export interface OutboundSsrfGuardOptions {
    * `targetUrl` → `true`. Endpoints without an entry are guarded
    * (private addresses refused). Must be explicit — there is no
    * wildcard, and a hostname allowlist is deliberately not offered:
-   * the guard judges resolved IPs, not names.
+   * the guard judges resolved IPs, not names. Live-revisable via
+   * `reviseAllowPrivateTargets` (WR-375).
    */
   allowPrivateTargets?: Record<string, boolean>;
   /** Called once per blocked lookup. */
@@ -355,7 +375,12 @@ function classifyIpv6(address: string): SsrfAddressCategory {
 
 export class OutboundSsrfGuard {
   private readonly inner: LookupFunction;
-  private readonly allowPrivateTargets: Readonly<Record<string, boolean>>;
+  /**
+   * WR-375: live-revisable via `reviseAllowPrivateTargets` — no longer
+   * `readonly`. Only `true` entries are stored; `false` / `null` in a
+   * revision removes the entry back to the default guarded mode.
+   */
+  private allowPrivateTargetsMap: Record<string, boolean>;
   private readonly now: () => number;
   private readonly onBlocked?: (info: OutboundSsrfBlockedInfo) => void;
   private readonly onAllowlisted?: (info: OutboundSsrfAllowlistedInfo) => void;
@@ -367,6 +392,19 @@ export class OutboundSsrfGuard {
    * proxy-skip audit fires once per endpoint, not once per attempt.
    */
   private readonly bindings = new WeakMap<LookupFunction, Map<string, SsrfGuardAgentBinding>>();
+  /**
+   * WR-375: per-endpoint allowlist revision stamps. `bindingFor` bakes
+   * the allowlist mode into the returned binding (and the pool keys the
+   * agent on it), so a revised endpoint's cached binding would keep
+   * serving the old mode forever — the capture trap. A revision bumps
+   * the target's stamp; the next `bindingFor` for that target sees its
+   * cached binding is stale and rebuilds it from the live allowlist.
+   * The stamp is lazy eviction: the stale binding object is never
+   * returned again, and an already-built pooled agent drains on the
+   * WR-24 idle timeout. A `WeakMap` cannot be enumerated, so no
+   * iteration over `bindings` is needed — or possible.
+   */
+  private readonly allowlistRevisions = new Map<string, number>();
   /** Endpoints whose proxy skip was already audited. */
   private readonly proxySkipAudited = new Set<string>();
   private checked = 0;
@@ -415,7 +453,7 @@ export class OutboundSsrfGuard {
         }
       }
     }
-    this.allowPrivateTargets = opts.allowPrivateTargets ?? {};
+    this.allowPrivateTargetsMap = opts.allowPrivateTargets ?? {};
     if (opts.now !== undefined && typeof opts.now !== "function") {
       throw new RangeError("OutboundSsrfGuard: now must be a function");
     }
@@ -468,11 +506,20 @@ export class OutboundSsrfGuard {
     }
     const key = `${targetUrl}\n${proxyUrl ?? ""}`;
     const existing = byInner.get(key);
-    if (existing !== undefined) return existing;
+    // WR-375: a binding built before the target's last allowlist
+    // revision is stale — rebuild it from the live allowlist instead
+    // of returning the captured mode. A current binding is still
+    // returned as-is, so the pool keeps a stable lookup per endpoint.
+    if (
+      existing !== undefined &&
+      (existing as VersionedSsrfBinding).revision === this.revisionOf(targetUrl)
+    ) {
+      return existing;
+    }
     const mode: SsrfGuardMode =
       proxyUrl !== undefined
         ? "proxied"
-        : this.allowPrivateTargets[targetUrl] === true
+        : this.allowPrivateTargetsMap[targetUrl] === true
           ? "allowlisted"
           : "guarded";
     if (mode === "proxied") {
@@ -496,12 +543,94 @@ export class OutboundSsrfGuard {
         });
       }
     }
-    const binding: SsrfGuardAgentBinding = {
+    const binding: VersionedSsrfBinding = {
       mode,
       lookup: this.makeLookup(inner, mode),
+      revision: this.revisionOf(targetUrl),
     };
     byInner.set(key, binding);
     return binding;
+  }
+
+  /** WR-375: the allowlist revision stamp of one target (0 = never revised). */
+  private revisionOf(targetUrl: string): number {
+    return this.allowlistRevisions.get(targetUrl) ?? 0;
+  }
+
+  /** WR-375: bump one target's stamp so its cached bindings rebuild. */
+  private bumpRevision(targetUrl: string): void {
+    this.allowlistRevisions.set(targetUrl, this.revisionOf(targetUrl) + 1);
+  }
+
+  /**
+   * WR-375: revise the live per-endpoint private-target allowlist
+   * (`true` allowlists the endpoint, `false` / `null` removes it back
+   * to the default guarded mode). The construction-time gates are
+   * re-run on every entry: a non-object or array patch, an empty
+   * patch, an empty target URL, or a value that is neither boolean
+   * nor `null` throws `RangeError` and the live allowlist is left
+   * completely intact. A same-value patch is a silent no-op that
+   * returns the current snapshot — it bumps no stamp, so cached
+   * bindings are not rebuilt. A real change bumps the changed
+   * targets' stamps: the next `bindingFor` for such a target rebuilds
+   * its binding from the live allowlist (in every inner / proxy
+   * variant), so the next dispatch takes the new mode — a new pool
+   * agent, since the pool key binds the mode — while already-built
+   * pooled connections drain on the WR-24 idle timeout. The
+   * classification itself never changes: the allowlist only decides
+   * whether a hit on a private address is served or refused.
+   * Returns the live allowlist snapshot. The cumulative
+   * `blocksByCategory` counters are never reset by a revision.
+   */
+  reviseAllowPrivateTargets(patch: SsrfAllowlistRevision): Record<string, boolean> {
+    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new RangeError(
+        `OutboundSsrfGuard: allowlist revision must be an object, got ${JSON.stringify(patch)}`
+      );
+    }
+    const entries = Object.entries(patch);
+    if (entries.length === 0) {
+      throw new RangeError("OutboundSsrfGuard: allowlist revision must not be empty");
+    }
+    // Validate-then-apply: an illegal entry throws RangeError and the
+    // live allowlist is left completely intact.
+    for (const [targetUrl, value] of entries) {
+      if (typeof targetUrl !== "string" || targetUrl.length === 0) {
+        throw new RangeError(
+          "OutboundSsrfGuard: allowlist revision keys must be non-empty target URLs"
+        );
+      }
+      if (value !== true && value !== false && value !== null) {
+        throw new RangeError(
+          `OutboundSsrfGuard: allowlist revision for ${targetUrl} must be a boolean or null, got ${JSON.stringify(value)}`
+        );
+      }
+    }
+    for (const [targetUrl, value] of entries) {
+      if (value === true) {
+        if (this.allowPrivateTargetsMap[targetUrl] !== true) {
+          this.allowPrivateTargetsMap[targetUrl] = true;
+          this.bumpRevision(targetUrl);
+        }
+      } else {
+        // `false` and `null` both remove the entry back to the default
+        // guarded mode; removing an absent entry is a no-op.
+        if (targetUrl in this.allowPrivateTargetsMap) {
+          delete this.allowPrivateTargetsMap[targetUrl];
+          this.bumpRevision(targetUrl);
+        }
+      }
+    }
+    return this.allowPrivateTargets();
+  }
+
+  /**
+   * WR-375: snapshot of the live allowlist. Reads the live values, so
+   * a runtime revision is visible immediately. Returns a fresh object,
+   * never a live reference.
+   */
+  allowPrivateTargets(): Record<string, boolean> {
+    return { ...this.allowPrivateTargetsMap };
   }
 
   /** Current counters; `blocksByCategory` is a fresh object on every call. */

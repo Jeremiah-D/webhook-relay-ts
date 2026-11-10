@@ -11631,6 +11631,29 @@ const server = createRelayServer({
   checked address). The pool key binds the guard mode, so an
   allowlisted endpoint can never ride a guarded endpoint's agent, or
   vice versa.
+- **Live revision** — `server.reviseOutboundSsrfAllowlist(patch)`
+  revises the allowlist at runtime (`true` allowlists the endpoint,
+  `false` / `null` removes it back to the default guarded mode), and
+  `server.getOutboundSsrfAllowlist()` reads the live allowlist (`{}`
+  when the guard was never configured). The guard-level
+  `OutboundSsrfGuard.reviseAllowPrivateTargets` / `allowPrivateTargets`
+  do the same for library users. A non-object or empty patch, an empty
+  target URL, or a non-boolean / non-`null` value throws `RangeError`
+  and leaves the live allowlist untouched; a same-value patch is a
+  silent no-op. A real revision is audited as
+  `outbound_ssrf_allowlist_revised` with the added / removed endpoints
+  and the current allowlist (endpoint URLs only — resolved private IPs
+  never appear). The next dispatch after a revision re-binds the
+  endpoint and takes the new mode: the guard stamps each endpoint's
+  cached binding with its allowlist revision, so a revised endpoint's
+  old binding — which baked the old mode in — is never returned again
+  (already-built pooled connections keep the old mode and drain on the
+  idle timeout; the pool key binds the mode, so the new binding gets a
+  new agent). The cumulative `blocksByCategory` counters are never
+  reset by a revision. Revising the allowlist never changes the
+  classification itself — only whether a hit on a private address is
+  served or refused. With the guard unconfigured, the server method
+  throws `Error`: enabling the guard needs a restart.
 - **Observability** — `GET /metrics` renders
   `relay_outbound_ssrf_*`
   (`lookups_total{result="checked"|"blocked"|"allowlisted"|"skipped"}`,
@@ -13579,6 +13602,20 @@ Requires Node 24+ (runs `.ts` directly via type stripping; zero dependencies).
   bytes to the downstream, allowlisted target delivers with
   `outbound_ssrf_allowlisted` audit, proxied target tunnels with one
   `outbound_ssrf_proxy_skipped` audit).
+- `test/outbound-ssrf-allowlist-revision.test.ts` — outbound SSRF guard
+  allowlist live revision (WR-375): allowlisting a bound endpoint
+  serves the private address on the next lookup (the capture trap —
+  the revised endpoint re-binds with the new mode), removing it refuses
+  again while the already-built binding keeps its old mode, proxied
+  endpoints keep the proxied mode and audit the skip once, illegal
+  patches throw `RangeError` with the live allowlist untouched,
+  same-value revisions are silent no-ops that keep the cached binding,
+  `false` / `null` both remove, `allowPrivateTargets()` returns a copy,
+  revisions never reset the cumulative block counters, and end-to-end
+  through the relay server (a blocked delivery dead-letters, then
+  delivers after `reviseOutboundSsrfAllowlist`, with
+  `outbound_ssrf_allowlist_revised` auditing added / removed / current
+  exactly; unconfigured guard throws the must-restart `Error`).
 - `test/egress-residency.test.ts` — egress data-residency gate (WR-374):
   allowed-country deliveries pass, disallowed-country and unmapped-IP
   deliveries refuse fail-closed (`EgressResidencyBlockedError`,
