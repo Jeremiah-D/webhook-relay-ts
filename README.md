@@ -12387,6 +12387,23 @@ cumulative escalations), and `GET /metrics` exposes
 `relay_dead_letter_escalations_total{endpoint[,tenant]}` (activity-gated —
 absent until the first alert fires).
 
+**Live revision (WR-377).** The six knobs (`windowMs`, `threshold`,
+`cooldownMs`, `maxAttempts`, `backoffMs`, `timeoutMs`) are live-revisable
+without a restart: `RetryQueue.reviseEscalation(patch)` /
+`RelayServer.reviseEscalation(patch)`, read back with
+`getEscalationConfig()`. A revision takes effect on the next dead letter:
+tightening the window prunes older samples on the next record, widening it
+never resurrects pruned samples, and an already-alerted scope is neither
+opened nor closed early — the next dead letter re-evaluates the latch
+under the new threshold; the alert retry knobs govern the next alert
+dispatch. An empty or illegal patch throws `RangeError` and leaves the
+live values untouched; a same-value revision is a silent no-op. A real
+server-side revision is audited as `escalation_revised` with `previous` /
+`current`. Revising requires the feature to be configured — on a relay
+without `deadLetterEscalation`, `reviseEscalation` throws `Error`
+(enabling it needs a restart). `url`, `signingSecret`, `keyId`, the
+transport, the clock, and the timers are never revisable.
+
 ### Multi-tenant isolation
 
 One relay can serve many tenants without them stepping on each other. An

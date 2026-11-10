@@ -28,7 +28,7 @@ import {
   selectSignatureAlgorithmVerifier,
   type SignatureAlgorithmRule,
 } from "./signature-alg.ts";
-import { RetryQueue, errorBudgetBurnAuditEvent, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeliveryDeadlineConfig, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type EndpointPauseCallbacksRevision, type EndpointPauseInfo, type ErrorBudgetConfig, type ErrorBudgetRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type QuorumRetention, type QuorumRetentionRevision, type ReplayCallbacksRevision, type ReplayForcedInfo, type ReplaySkippedInfo, type RetryItem, type Sender, type SenderCallOptions, type MaintenanceWindowTransition, type SloRiskConfig, type SloRiskRevision, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
+import { RetryQueue, errorBudgetBurnAuditEvent, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeliveryDeadlineConfig, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type EndpointPauseCallbacksRevision, type EndpointPauseInfo, type ErrorBudgetConfig, type ErrorBudgetRevision, type EscalationConfig, type EscalationRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type QuorumRetention, type QuorumRetentionRevision, type ReplayCallbacksRevision, type ReplayForcedInfo, type ReplaySkippedInfo, type RetryItem, type Sender, type SenderCallOptions, type MaintenanceWindowTransition, type SloRiskConfig, type SloRiskRevision, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
 import { parseDeliverAtHeader, DELIVER_AT_HEADER } from "./retry.ts";
 import type { ShadowDeliveredInfo, ShadowFailedInfo, ShadowTargetConfig, ShadowTargetsConfig } from "./retry.ts";
 import type {
@@ -6530,6 +6530,30 @@ export interface RelayServer extends Server {
    * otherwise.
    */
   getErrorBudgetConfig?: () => ErrorBudgetConfig | undefined;
+  /**
+   * WR-377: revise the six dead-letter storm escalation knobs at
+   * runtime — no restart. The patch must be a non-empty object; an
+   * illegal value throws `RangeError` and the live values are left
+   * completely intact; a same-value revision is a silent no-op with
+   * no audit event. A real revision is audited as
+   * `escalation_revised` with `previous` / `current` (the
+   * construction values as first `previous` — the defaults 10min /
+   * 20 / 1h / 2 / 1000ms / 5000ms when unset), and returns the live
+   * config. Always set; throws `Error` when `deadLetterEscalation`
+   * was never configured — enabling it needs a restart. The revision
+   * takes effect on the next `recordDeadLetter`: a tightened window
+   * prunes older samples on the next record, a widened window never
+   * resurrects pruned samples, and an already-alerted scope is
+   * neither opened nor closed early — the next dead letter
+   * re-evaluates the latch under the new threshold.
+   */
+  reviseEscalation?: (patch: EscalationRevision) => EscalationConfig;
+  /**
+   * WR-377: live dead-letter storm escalation config — the six knobs.
+   * Only set when `deadLetterEscalation` was configured; `undefined`
+   * otherwise.
+   */
+  getEscalationConfig?: () => EscalationConfig | undefined;
   /**
    * WR-347: revise the live SLO-breach prediction knobs at runtime
    * — no restart. The five knobs (`warnRatio`, `ewmaAlpha`,
@@ -16822,6 +16846,51 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // `errorBudget` was configured.
   if (queue.getErrorBudgetConfig() !== undefined) {
     server.getErrorBudgetConfig = (): ErrorBudgetConfig => queue.getErrorBudgetConfig()!;
+  }
+
+  // WR-377: dead-letter storm escalation knob runtime revision. The
+  // method is always set (like reviseErrorBudget above); with the
+  // escalator unconfigured the queue throws Error — enabling it needs
+  // a restart. A real revision is audited as `escalation_revised`
+  // with the previous and current six-knob config (the construction
+  // values as first `previous` — the defaults 10min / 20 / 1h / 2 /
+  // 1000ms / 5000ms when unset); an empty or same-value patch is a
+  // silent no-op. The revision takes effect on the next
+  // `recordDeadLetter`: a tightened window prunes older samples on
+  // the next record, a widened window never resurrects pruned
+  // samples, and an already-alerted scope is untouched until the
+  // next dead letter re-evaluates it.
+  server.reviseEscalation = (patch: EscalationRevision): EscalationConfig => {
+    const prev = queue.getEscalationConfig();
+    if (prev === undefined) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseEscalation(patch);
+    }
+    // Validate-then-apply inside retune: an illegal patch throws
+    // RangeError and the live values are left completely intact.
+    const next = queue.reviseEscalation(patch);
+    if (
+      next.windowMs === prev.windowMs &&
+      next.threshold === prev.threshold &&
+      next.cooldownMs === prev.cooldownMs &&
+      next.maxAttempts === prev.maxAttempts &&
+      next.backoffMs === prev.backoffMs &&
+      next.timeoutMs === prev.timeoutMs
+    ) {
+      return next;
+    }
+    opts.auditLog.append({
+      event: "escalation_revised",
+      previous: prev,
+      current: next,
+    });
+    return next;
+  };
+
+  // WR-377: live dead-letter storm escalation config. Only set when
+  // `deadLetterEscalation` was configured.
+  if (queue.getEscalationConfig() !== undefined) {
+    server.getEscalationConfig = (): EscalationConfig => queue.getEscalationConfig()!;
   }
 
   // WR-353: live error-budget alert-callback replacement. The method

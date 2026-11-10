@@ -350,6 +350,8 @@ import {
   type DeadLetterEscalationOptions,
   type DeadLetterEscalationStatsRow,
   type DeadLetterEscalatedInfo,
+  type EscalationConfig,
+  type EscalationRevision,
 } from "./escalation.ts";
 import {
   OutboundCoalescer,
@@ -568,7 +570,9 @@ export type {
   DeadLetterEscalationFailedInfo,
   DeadLetterEscalationOptions,
   DeadLetterEscalationStatsRow,
+  EscalationConfig,
   EscalationPostResult,
+  EscalationRevision,
 };
 
 export type { CircuitBreakerOptions, CircuitProbeRevision, CircuitState, CircuitStats, CircuitThresholdPatch, ResolvedCircuitProbe, ResolvedCircuitThresholds };
@@ -11505,6 +11509,37 @@ export class RetryQueue {
    */
   acknowledgeDeadLetterEscalation(tenant: string | undefined, endpoint: string): void {
     this.escalation?.acknowledge(tenant, endpoint);
+  }
+
+  /**
+   * WR-377: revise the six dead-letter storm escalation knobs at
+   * runtime — no restart. The patch must be a non-empty object; an
+   * illegal value throws `RangeError` and the live values are left
+   * completely intact; revising to the live values is a silent no-op.
+   * Takes effect on the next `recordDeadLetter`: a tightened window
+   * prunes older samples on the next record, a widened window never
+   * resurrects pruned samples, and an already-alerted scope is
+   * neither opened nor closed early — the next dead letter
+   * re-evaluates the latch under the new threshold. Throws `Error`
+   * when escalation was never configured — enabling it needs a
+   * restart. Returns the live config.
+   */
+  reviseEscalation(patch: EscalationRevision): EscalationConfig {
+    if (this.escalation === undefined) {
+      throw new Error(
+        "reviseEscalation: escalation is not configured — enabling it requires a restart"
+      );
+    }
+    return this.escalation.retune(patch);
+  }
+
+  /**
+   * WR-377: the live six-knob escalation config, or `undefined` when
+   * the feature is off. A snapshot — mutating the returned object
+   * never moves the escalator.
+   */
+  getEscalationConfig(): EscalationConfig | undefined {
+    return this.escalation?.getConfig();
   }
 
   /**

@@ -191,6 +191,31 @@ export interface ResolvedDeadLetterEscalationConfig {
   clearTimer: (handle: { clear(): void }) => void;
 }
 
+/**
+ * WR-377: the six live dead-letter storm escalation knobs, all
+ * required. `url`, `signingSecret`, `keyId`, the transport, the clock,
+ * and the timers are never revisable — a retune only moves these six.
+ */
+export interface EscalationConfig {
+  windowMs: number;
+  threshold: number;
+  cooldownMs: number;
+  maxAttempts: number;
+  backoffMs: number;
+  timeoutMs: number;
+}
+
+/**
+ * WR-377: a partial live revision of the six escalation knobs —
+ * omitted fields keep their live values.
+ */
+export type EscalationRevision = Partial<
+  Pick<
+    ResolvedDeadLetterEscalationConfig,
+    "windowMs" | "threshold" | "cooldownMs" | "maxAttempts" | "backoffMs" | "timeoutMs"
+  >
+>;
+
 function originOf(raw: string): string {
   return new URL(raw).origin;
 }
@@ -412,6 +437,78 @@ export class DeadLetterStormEscalator {
    */
   setSelfCheck(fn: (url: string) => boolean): void {
     this.selfCheck = fn;
+  }
+
+  /**
+   * WR-377: revise the six storm knobs at runtime — no restart. The
+   * patch must be a non-empty object; the merged config is re-validated
+   * with the same six gates (and the same error text) as construction,
+   * so an illegal patch throws `RangeError` and the live values are
+   * left completely intact. Revising to the live values is a silent
+   * no-op. Takes effect on the next `recordDeadLetter`: the prune
+   * cutoff and the threshold/cooldown evaluation read the live values,
+   * so tightening the window prunes older samples on the next record
+   * while widening it never resurrects samples already pruned —
+   * already-accumulated timestamps are never recomputed. An
+   * already-alerted scope is neither opened nor closed early by a
+   * retune; the next dead letter re-evaluates the latch under the new
+   * threshold. The alert retry knobs (`maxAttempts`/`backoffMs`/
+   * `timeoutMs`) govern the next alert dispatch. Returns the live
+   * config.
+   */
+  retune(patch: EscalationRevision): EscalationConfig {
+    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new RangeError(`escalation revision must be an object, got ${JSON.stringify(patch)}`);
+    }
+    if (Object.keys(patch).length === 0) {
+      throw new RangeError("escalation revision must not be empty");
+    }
+    // Validate-then-apply: the merged config must pass the
+    // construction gates before the live values move. `url`,
+    // `signingSecret`, `keyId`, the transport, the clock, and the
+    // timers are carried over unchanged — only the six knobs move.
+    const resolved = resolveDeadLetterEscalationConfig({
+      url: this.config.url,
+      signingSecret: this.config.signingSecret,
+      keyId: this.config.keyId,
+      windowMs: patch.windowMs ?? this.config.windowMs,
+      threshold: patch.threshold ?? this.config.threshold,
+      cooldownMs: patch.cooldownMs ?? this.config.cooldownMs,
+      maxAttempts: patch.maxAttempts ?? this.config.maxAttempts,
+      backoffMs: patch.backoffMs ?? this.config.backoffMs,
+      timeoutMs: patch.timeoutMs ?? this.config.timeoutMs,
+      post: this.config.post,
+      now: this.config.now,
+      setTimer: this.config.setTimer,
+      clearTimer: this.config.clearTimer,
+    })!;
+    // The reads in `recordDeadLetter`/`dispatch`/`attempt` are already
+    // live (`this.config.windowMs` etc.), so assigning the six fields
+    // in place is the whole revision — no state is recomputed.
+    this.config.windowMs = resolved.windowMs;
+    this.config.threshold = resolved.threshold;
+    this.config.cooldownMs = resolved.cooldownMs;
+    this.config.maxAttempts = resolved.maxAttempts;
+    this.config.backoffMs = resolved.backoffMs;
+    this.config.timeoutMs = resolved.timeoutMs;
+    return this.getConfig();
+  }
+
+  /**
+   * WR-377: the live six-knob config. A snapshot — mutating the
+   * returned object never moves the escalator. Named `getConfig`
+   * (not `config`) because the class already holds the resolved
+   * config in a private field of that name.
+   */
+  getConfig(): EscalationConfig {
+    return {
+      windowMs: this.config.windowMs,
+      threshold: this.config.threshold,
+      cooldownMs: this.config.cooldownMs,
+      maxAttempts: this.config.maxAttempts,
+      backoffMs: this.config.backoffMs,
+      timeoutMs: this.config.timeoutMs,
+    };
   }
 
   /** Stop retrying in-flight alerts; pending timers are cancelled. */
