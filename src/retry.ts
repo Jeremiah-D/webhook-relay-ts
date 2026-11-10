@@ -97,6 +97,7 @@ import {
 } from "./failure.ts";
 import { OcspError } from "./ocsp.ts";
 import { OutboundSsrfBlockedError } from "./outbound-ssrf-guard.ts";
+import { EgressResidencyBlockedError } from "./egress-residency.ts";
 import { PhaseTimeoutError, type PhaseTimeoutPhase } from "./phase-timeouts.ts";
 import {
   AssertionFailedError,
@@ -9793,9 +9794,14 @@ export class RetryQueue {
           // guard refused the lookup before connect, so the endpoint was
           // never contacted either. Recording a "success" would reset
           // failure streaks for an endpoint that was never even dialed.
+          // WR-374: an EgressResidencyBlockedError is the same shape —
+          // the gate refused the delivery before connect (a resolved
+          // address outside the tenant's allowed countries), so the
+          // endpoint was never contacted either.
           const reachedDownstream =
             !(err instanceof PayloadTransformError) &&
-            !(err instanceof OutboundSsrfBlockedError);
+            !(err instanceof OutboundSsrfBlockedError) &&
+            !(err instanceof EgressResidencyBlockedError);
           // WR-91: leader-only, like the success path above — a follower's
           // poison-payload verdict is logical (its own dead letter), not
           // a second physical observation of the endpoint.

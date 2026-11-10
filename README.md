@@ -786,6 +786,23 @@ reliability primitives that matter for any signed-payload pipeline.
   trusted-proxy semantics either way. Wired into the server via
   `geoIp: { table, policy }` (off by default; invalid tables/policies
   throw `RangeError` at startup).
+- `src/egress-residency.ts` — egress data-residency gate
+  (`EgressResidencyGate`, WR-374): the outbound mirror of WR-158 — the
+  same operator-curated CIDR → country table (`geoip.ts`'s
+  `lookupGeoCountry`, first match wins) plus the WR-92 `DnsCache` for
+  resolution, applied per tenant before connect. Each tenant may
+  configure `allowedEgressCountries` (ISO 3166-1 alpha-2 list; tenants
+  without an entry are unlimited); every resolved address is judged,
+  and one address in a disallowed country — or one address the table
+  does not map — refuses the whole delivery fail-closed with
+  `EgressResidencyBlockedError` (`non_retryable`: dead-letter on the
+  first attempt, no retry budget, no breaker touch), audited as
+  `egress_residency_blocked` (tenant, endpoint, country). A DNS failure
+  propagates unjudged. The list is live-revisable per tenant
+  (`reviseAllowedCountries`, `null` clears back to unlimited), so a
+  dead letter replays once the operator relaxes the list. Wired into
+  the server via `egressResidency: { table, allowedEgressCountries }`
+  (off by default; invalid values throw `RangeError` at startup).
 - `src/source-baseline.ts` — inbound source baseline anomaly detection
   (`SourceBaselineDetector`, WR-63): opt-in per-endpoint learning of the
   sender baseline — (source IP, approximate TLS fingerprint) triples. The
@@ -11624,6 +11641,89 @@ const server = createRelayServer({
   connections and keep the OS resolver — like the WR-194 pin, the
   guard covers the HTTP/1.1 path only.
 
+## Egress data-residency gate (opt-in)
+
+GeoIP (WR-158) guards the *inbound* path — which countries may dial
+*in*. Nothing stops the relay itself from egressing a tenant's payload
+to a country that tenant's data-residency rules forbid: an endpoint
+that moves hosting from Frankfurt to a disallowed jurisdiction silently
+takes the tenant's data with it. The egress residency gate
+(`src/egress-residency.ts`, WR-374) is the outbound mirror of WR-158:
+the same operator-curated CIDR → country table (`geoip.ts`'s lookup,
+zero new dependencies, zero binary GeoIP database) plus the WR-92
+`DnsCache` for resolution, applied per tenant before connect.
+
+```ts
+const server = createRelayServer({
+  egressResidency: {
+    table: [
+      { cidr: "203.0.113.0/24", country: "DE" },  // operator-curated ranges
+      { cidr: "198.51.100.0/24", country: "US" },
+    ],
+    allowedEgressCountries: {
+      "tenant-eu": ["DE", "FR"],   // EU data-residency tenant
+      "tenant-us": ["US"],
+    },
+  },
+});
+```
+
+- **Fail-closed by default** — at delivery time the target hostname is
+  resolved and *every* resolved address is looked up in the table. One
+  address in a disallowed country — or one address the table does not
+  map at all — refuses the whole delivery with
+  `EgressResidencyBlockedError` before a single payload byte is written
+  (the dialer may pick any of them, so a mixed answer is not a partial
+  pass). An unmapped IP fails closed to country `"unknown"`, following
+  the WR-158 convention: what cannot be proven compliant is not let
+  through. The item dead-letters on the first attempt as
+  `\"non_retryable\"` — no retry budget burned, no circuit-breaker touch
+  (the endpoint was never contacted, mirroring the WR-115 rule and the
+  WR-373 SSRF rule). A failed resolution is not a residency verdict —
+  the resolver error propagates to the normal DNS-failure path.
+- **Opt-in, per tenant** — tenants without an entry are unlimited, so a
+  relay without the feature behaves exactly as before. An empty list
+  allows no country (a closed egress for that tenant). The gate judges
+  the *current* list on every attempt, so a dead-lettered item replays
+  successfully once the operator relaxes the tenant's list — via
+  `sender.egressResidencyGate.reviseAllowedCountries(tenant, [...])`
+  (or `null` to clear the tenant back to unlimited), or a config change
+  plus restart.
+- **Audit** — every block is audited as `egress_residency_blocked`
+  (tenant, endpoint, country, offending addresses). Resolved addresses
+  go into that audit event only — never into metrics labels, and never
+  into the error message (which also lands in the `dead_letter` audit's
+  `error` field).
+- **Layering** — the gate reuses the WR-158 table (same first-match-wins
+  order: document the more specific range first when ranges overlap)
+  and resolves through the WR-92 cache when one is configured (the
+  system resolver otherwise), so the pre-flight check rides cached
+  answers. Orthogonal to WR-373 (which refuses *private* addresses,
+  this gate refuses *foreign* ones — a delivery passes both), to WR-194
+  pinning (which judges drift, not country), and to WR-92 (which only
+  caches). The check runs in the sender's dispatch, before any
+  transport is chosen, so it covers HTTP/1.1, HTTP/2, and WebSocket —
+  unlike the lookup-time SSRF guard.
+- **Proxies** — a proxied delivery is still checked against the *target*
+  hostname's country: the payload still lands in that country, only via
+  the proxy. The proxy host's own egress is the proxy operator's
+  responsibility (the same split WR-373 documents, in the other
+  direction).
+- **Pooling note** — with keep-alive pooling (the default), an
+  established connection is reused without re-resolving; a re-bind is
+  therefore caught when the *next new connection* resolves, not
+  mid-stream on a live connection — the correct semantic (the live
+  connection already went to a checked address). The gate judges every
+  fresh dispatch, and the SSRF guard still judges every fresh
+  resolution.
+- **Observability** — `GET /metrics` renders
+  `relay_egress_residency_*`
+  (`lookups_total{result="checked"|"blocked"}`,
+  `blocks_total{country="..."}` — country codes only, never IPs, with
+  `"unknown"` for unmapped addresses);
+  `sender.egressResidencyGate.getStats()` exposes the counters.
+  Invalid tables or country lists throw `RangeError` at startup.
+
 ## DNS SRV endpoint discovery (opt-in, RFC 2782)
 
 An endpoint's `targetUrl` names a logical service, not necessarily a
@@ -13479,6 +13579,19 @@ Requires Node 24+ (runs `.ts` directly via type stripping; zero dependencies).
   bytes to the downstream, allowlisted target delivers with
   `outbound_ssrf_allowlisted` audit, proxied target tunnels with one
   `outbound_ssrf_proxy_skipped` audit).
+- `test/egress-residency.test.ts` — egress data-residency gate (WR-374):
+  allowed-country deliveries pass, disallowed-country and unmapped-IP
+  deliveries refuse fail-closed (`EgressResidencyBlockedError`,
+  `non_retryable`, error message carries the country but no IP), mixed
+  answers poisoned by any violating address, tenant isolation (one
+  tenant's ban is another's pass), unconfigured tenants unlimited,
+  IP-literal targets judged without resolving, CIDR table matched in
+  config order like `geoip.ts` (first match wins), DNS failures
+  propagating unjudged, live list relaxation and clearing, and
+  end-to-end through the relay server (blocked tenant dead-letters on
+  attempt 1 with `egress_residency_blocked` audit and zero bytes to the
+  downstream, allowed tenant delivers, and the dead letter replays
+  successfully once the operator relaxes the list).
 - `test/e2e.test.ts` — end-to-end over real HTTP with the default sender: a
   flaky stub (500, 500, then 200) proves retries happen with visibly growing
   backoff and the payload arrives byte-identical (audit records `delivered`

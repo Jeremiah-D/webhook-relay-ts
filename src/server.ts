@@ -427,6 +427,11 @@ import {
   type OutboundSsrfProxySkippedInfo,
   type SsrfGuardAgentBinding,
 } from "./outbound-ssrf-guard.ts";
+import {
+  EgressResidencyGate,
+  type EgressResidencyBlockedInfo,
+  type EgressResidencyOptions,
+} from "./egress-residency.ts";
 import { warmupOutboundPool, resolveWarmupOptions } from "./warmup.ts";
 import { AuditSink, type AuditSinkOptions } from "./audit-sink.ts";
 import { SyslogAuditSink, type SyslogAuditSinkOptions } from "./syslog-sink.ts";
@@ -1508,6 +1513,24 @@ export interface RelayServerOptions {
    * pre-WR-373 behavior. Invalid values throw `RangeError` at startup.
    */
   outboundSsrfGuard?: OutboundSsrfGuard | OutboundSsrfGuardOptions;
+  /**
+   * WR-374: egress data-residency gate (see `src/egress-residency.ts`) —
+   * a compiled `EgressResidencyGate` or options to build one. When set,
+   * the default sender resolves each delivery's target hostname
+   * (through the WR-92 cache when configured, the system resolver
+   * otherwise) and checks every resolved address's country against the
+   * delivery tenant's `allowedEgressCountries` list before any
+   * connection is opened: an address in a disallowed country — or an
+   * address the operator-curated GeoIP table does not map — refuses
+   * the delivery fail-closed. The item dead-letters without burning
+   * retry budget or touching the circuit breaker, and replays once the
+   * operator relaxes the tenant's list. Tenants without an entry are
+   * unlimited (opt-in). Blocks audit as `egress_residency_blocked`
+   * (tenant, endpoint, country). Counters render into `GET /metrics`
+   * as `relay_egress_residency_*`. `undefined` keeps the exact
+   * pre-WR-374 behavior. Invalid values throw `RangeError` at startup.
+   */
+  egressResidency?: EgressResidencyGate | EgressResidencyOptions;
   /**
    * Outbound connection warm-up (WR-70, see `src/warmup.ts`): at startup,
    * pre-establish keep-alive connections for the listed endpoint URLs on
@@ -2749,6 +2772,15 @@ export interface PooledSender extends Sender {
    */
   outboundSsrfGuard: OutboundSsrfGuard | undefined;
   /**
+   * WR-374: the egress data-residency gate, when configured — shared by
+   * every transport the sender dispatches. `undefined` when the feature
+   * is off. Counters render into `GET /metrics` as
+   * `relay_egress_residency_*` via `render()`; operators read them via
+   * `sender.egressResidencyGate.getStats()` and relax a tenant's list
+   * via `sender.egressResidencyGate.reviseAllowedCountries(...)`.
+   */
+  egressResidencyGate: EgressResidencyGate | undefined;
+  /**
    * WR-170: per-DoH-URL DNS caches for endpoints with a `doh` entry,
    * keyed by DoH URL. Operators read counters via
    * `sender.dohCaches.get(dohUrl)?.getStats()`; the underlying
@@ -3144,7 +3176,26 @@ export function createDefaultSender(
    * directly. A compiled `OutboundSsrfGuard` instance keeps its own
    * `onProxiedSkip`.
    */
-  onOutboundSsrfProxySkipped?: (info: OutboundSsrfProxySkippedInfo) => void
+  onOutboundSsrfProxySkipped?: (info: OutboundSsrfProxySkippedInfo) => void,
+  /**
+   * WR-374: egress data-residency gate (see `src/egress-residency.ts`) —
+   * a compiled `EgressResidencyGate` or options to build one. When set,
+   * the sender resolves each delivery's target hostname (through the
+   * WR-92 cache when configured, the system resolver otherwise) and
+   * checks every resolved address's country against the delivery
+   * tenant's `allowedEgressCountries` list before any connection is
+   * opened — a compiled instance keeps its own resolver. `undefined`
+   * keeps the exact pre-WR-374 behavior. Validated at startup.
+   */
+  egressResidency?: EgressResidencyGate | EgressResidencyOptions,
+  /**
+   * WR-374: called once per residency-refused delivery (a resolved
+   * address in a disallowed country, or unmapped by the
+   * operator-curated GeoIP table). `createRelayServer` audits these as
+   * `egress_residency_blocked`; library users get the hook directly. A
+   * compiled `EgressResidencyGate` instance keeps its own `onBlocked`.
+   */
+  onEgressResidencyBlocked?: (info: EgressResidencyBlockedInfo) => void
 ): PooledSender {
   if (tlsPins !== undefined) {
     for (const [endpoint, pins] of Object.entries(tlsPins)) {
@@ -3670,6 +3721,29 @@ export function createDefaultSender(
     } catch (err) {
       throw new RangeError(
         `createDefaultSender: invalid outboundSsrfGuard: ${(err as Error).message}`
+      );
+    }
+  }
+  // WR-374: compile the egress residency gate once — it resolves the
+  // target hostname through the shared WR-92 cache when one is
+  // configured (the system resolver otherwise), so the pre-flight check
+  // rides cached answers. A caller-supplied compiled instance keeps its
+  // own resolver and hooks; an explicit `resolve` in the options wins
+  // over the shared cache.
+  let resolvedEgressResidencyGate: EgressResidencyGate | undefined;
+  if (egressResidency !== undefined) {
+    try {
+      resolvedEgressResidencyGate =
+        egressResidency instanceof EgressResidencyGate
+          ? egressResidency
+          : new EgressResidencyGate({
+              ...egressResidency,
+              dnsCache: egressResidency.dnsCache ?? resolvedDnsCache,
+              onBlocked: onEgressResidencyBlocked ?? egressResidency.onBlocked,
+            });
+    } catch (err) {
+      throw new RangeError(
+        `createDefaultSender: invalid egressResidency: ${(err as Error).message}`
       );
     }
   }
@@ -5424,10 +5498,21 @@ export function createDefaultSender(
     // WR-205: `oauthDpopProof` is a fresh per-attempt DPoP resource
     // proof (`undefined` for non-DPoP endpoints) — built in
     // `attemptWithOAuth` so every delivery carries a unique `jti`.
-    const dispatch = (
+    const dispatch = async (
       oauthToken: string | undefined,
       oauthDpopProof?: string
     ): Promise<DownstreamResponse | void> => {
+      // WR-374: egress data-residency gate — resolve the target hostname
+      // and check every resolved address's country against the delivery
+      // tenant's allowlist before any connection is opened, on every
+      // transport (HTTP/1.1, HTTP/2, WebSocket). A refusal throws
+      // EgressResidencyBlockedError, which the queue classifies
+      // non_retryable (dead-letter, no retry budget, no breaker touch).
+      // Runs inside the deadline/adaptive-timeout race below, so a slow
+      // resolution cannot outlive the attempt's budget.
+      if (resolvedEgressResidencyGate !== undefined) {
+        await resolvedEgressResidencyGate.check(item.tenantId, item.targetUrl);
+      }
       // WebSocket (WR-45): ws:/wss: targets ride the pooled RFC 6455 path.
       // Proxied ws: is rejected above (explicit proxy + non-HTTP(S)
       // target), same as any other non-HTTP scheme.
@@ -5584,6 +5669,11 @@ export function createDefaultSender(
   // is off) — operators read counters via
   // `sender.outboundSsrfGuard.getStats()`.
   sender.outboundSsrfGuard = resolvedSsrfGuard;
+  // WR-374: the shared egress residency gate instance (undefined when
+  // the feature is off) — operators read counters via
+  // `sender.egressResidencyGate.getStats()` and relax a tenant's list
+  // via `sender.egressResidencyGate.reviseAllowedCountries(...)`.
+  sender.egressResidencyGate = resolvedEgressResidencyGate;
   // WR-170: per-DoH-URL DNS caches (empty when the feature is off) —
   // operators read counters via `sender.dohCaches.get(dohUrl)?.getStats()`.
   sender.dohCaches = dohCaches;
@@ -8189,6 +8279,22 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       at: info.at,
     });
   };
+  // WR-374: an egress residency refusal — one audit line per blocked
+  // delivery naming the tenant, the endpoint, and the offending country
+  // (audit-only: the resolved addresses ride along but never appear in
+  // metrics labels). The delivery was refused before connect and follows
+  // the non_retryable dead-letter path.
+  const onEgressResidencyBlockedAudit = (info: EgressResidencyBlockedInfo) => {
+    opts.auditLog.append({
+      event: "egress_residency_blocked",
+      ...(info.tenant === undefined ? {} : { tenant: info.tenant }),
+      endpoint: info.endpoint,
+      hostname: info.hostname,
+      country: info.country,
+      addresses: info.addresses,
+      at: info.at,
+    });
+  };
   // WR-165: a chaos-drill fault was injected — one audit line per fault
   // naming the endpoint, the fault kind, and the detail (latency or
   // synthetic status). Injected faults are always distinguishable from
@@ -8355,7 +8461,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   }
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, opts.awsSigV4, opts.awsSecretResolver, opts.outboundSchemas, opts.oauth2, undefined, opts.compressBrotli, opts.phaseTimeouts, opts.tlsCa, opts.chaos, onChaosInjectedAudit, opts.responseGuard, opts.doh, onDohFallbackAudit, proxyHealthMonitor, opts.outboundCredentials, opts.dnsPin, onDnsPinMismatchAudit, opts.cloudEvents, opts.outboundSsrfGuard, onOutboundSsrfBlockedAudit, onOutboundSsrfAllowlistedAudit, onOutboundSsrfProxySkippedAudit)
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, opts.awsSigV4, opts.awsSecretResolver, opts.outboundSchemas, opts.oauth2, undefined, opts.compressBrotli, opts.phaseTimeouts, opts.tlsCa, opts.chaos, onChaosInjectedAudit, opts.responseGuard, opts.doh, onDohFallbackAudit, proxyHealthMonitor, opts.outboundCredentials, opts.dnsPin, onDnsPinMismatchAudit, opts.cloudEvents, opts.outboundSsrfGuard, onOutboundSsrfBlockedAudit, onOutboundSsrfAllowlistedAudit, onOutboundSsrfProxySkippedAudit, opts.egressResidency, onEgressResidencyBlockedAudit)
       : undefined;
   // WR-146: tail-latency hedging for outbound attempts (opt-in). The
   // wrapper sits around whichever sender the queue uses — the default
@@ -10754,7 +10860,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       // new series. Absent entirely with a custom sender (no pool).
       res
         .writeHead(200, { "content-type": "text/plain; version=0.0.4" })
-        .end(queue.renderMetrics() + versionMetrics.render() + schemaMetrics.render() + (schemaRegistry?.renderMetrics() ?? "") + ipAclMetrics.render() + fail2banMetrics.render() + inboundTenantRateLimitMetrics.render() + operatorRateLimitMetrics.render() + (proxyHealthMonitor?.renderMetrics() ?? "") + certExpiryMonitor.render() + tlsVersionMonitor.render() + (ocspMonitor?.render() ?? "") + (usageMeter?.render() ?? "") + (defaultSender?.compressionStats.render() ?? "") + (defaultSender?.dnsCache?.render() ?? "") + (defaultSender?.dnsPin?.render() ?? "") + (defaultSender?.outboundSsrfGuard?.render() ?? "") + (defaultSender?.wsPool.renderMetrics() ?? "") + meshMetrics.render() + (defaultSender?.outboundSchemaMetrics?.render() ?? "") + (defaultSender?.chaosMetrics?.render() ?? "") + (reputation?.renderMetrics() ?? "") + hedgeMetrics.render() + (queue.getErrorBudgetMonitor()?.render() ?? ""));
+        .end(queue.renderMetrics() + versionMetrics.render() + schemaMetrics.render() + (schemaRegistry?.renderMetrics() ?? "") + ipAclMetrics.render() + fail2banMetrics.render() + inboundTenantRateLimitMetrics.render() + operatorRateLimitMetrics.render() + (proxyHealthMonitor?.renderMetrics() ?? "") + certExpiryMonitor.render() + tlsVersionMonitor.render() + (ocspMonitor?.render() ?? "") + (usageMeter?.render() ?? "") + (defaultSender?.compressionStats.render() ?? "") + (defaultSender?.dnsCache?.render() ?? "") + (defaultSender?.dnsPin?.render() ?? "") + (defaultSender?.outboundSsrfGuard?.render() ?? "") + (defaultSender?.egressResidencyGate?.render() ?? "") + (defaultSender?.wsPool.renderMetrics() ?? "") + meshMetrics.render() + (defaultSender?.outboundSchemaMetrics?.render() ?? "") + (defaultSender?.chaosMetrics?.render() ?? "") + (reputation?.renderMetrics() ?? "") + hedgeMetrics.render() + (queue.getErrorBudgetMonitor()?.render() ?? ""));
       return;
     }
     if (isEvents) {
