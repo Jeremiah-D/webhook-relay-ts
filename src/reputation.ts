@@ -66,6 +66,39 @@ export interface ReputationOptions {
   now?: () => number;
 }
 
+/**
+ * Live sender-reputation config — the six revisable knobs (WR-379).
+ * All fields are required: a snapshot always carries the full state,
+ * so an audit `previous` / `current` pair is self-describing.
+ */
+export interface ReputationConfig {
+  halfLifeMs: number;
+  lowThreshold: number;
+  highThreshold: number;
+  verifyFailurePenalty: number;
+  rateLimitPenalty: number;
+  schemaViolationPenalty: number;
+}
+
+/** Partial patch for `SenderReputationTracker.retune` (WR-379). */
+export type SenderReputationRevision = Partial<ReputationConfig>;
+
+/**
+ * The live config behind an options object: explicit knobs win, the
+ * rest fall back to the construction defaults. Shared by the tracker
+ * constructor and `retune()` so both read the same defaults.
+ */
+export function reputationConfigOf(opts: ReputationOptions): ReputationConfig {
+  return {
+    halfLifeMs: opts.halfLifeMs ?? 600_000,
+    lowThreshold: opts.lowThreshold ?? 40,
+    highThreshold: opts.highThreshold ?? 70,
+    verifyFailurePenalty: opts.verifyFailurePenalty ?? 25,
+    rateLimitPenalty: opts.rateLimitPenalty ?? 5,
+    schemaViolationPenalty: opts.schemaViolationPenalty ?? 10,
+  };
+}
+
 /** Fail with a RangeError naming the offending input. */
 function invalid(where: string, detail: string): never {
   throw new RangeError(`senderReputation: ${where}: ${detail}`);
@@ -169,25 +202,100 @@ const MAX_DEMERIT = 1000;
  * they never throw on hostile input (a sender key is an opaque string).
  */
 export class SenderReputationTracker {
-  private readonly halfLifeMs: number;
-  private readonly lowThreshold: number;
-  private readonly highThreshold: number;
-  private readonly penalties: Record<ReputationPenaltyKind, number>;
+  // WR-379: the six knobs are deliberately not `readonly` — `retune()`
+  // revises them in place at runtime. The clock and the per-sender
+  // state are never rebound by a revision.
+  private halfLifeMs: number;
+  private lowThreshold: number;
+  private highThreshold: number;
+  private penalties: Record<ReputationPenaltyKind, number>;
   private readonly now: () => number;
   private readonly senders = new Map<string, SenderState>();
   private readonly tightenBuckets = new Map<string, TightenBucket>();
 
   constructor(opts: ReputationOptions = {}) {
     assertValidReputationOptions(opts);
-    this.halfLifeMs = opts.halfLifeMs ?? 600_000;
-    this.lowThreshold = opts.lowThreshold ?? 40;
-    this.highThreshold = opts.highThreshold ?? 70;
+    const config = reputationConfigOf(opts);
+    this.halfLifeMs = config.halfLifeMs;
+    this.lowThreshold = config.lowThreshold;
+    this.highThreshold = config.highThreshold;
     this.penalties = {
-      verify_failure: opts.verifyFailurePenalty ?? 25,
-      rate_limit: opts.rateLimitPenalty ?? 5,
-      schema_violation: opts.schemaViolationPenalty ?? 10,
+      verify_failure: config.verifyFailurePenalty,
+      rate_limit: config.rateLimitPenalty,
+      schema_violation: config.schemaViolationPenalty,
     };
     this.now = opts.now ?? Date.now;
+  }
+
+  /** Current live config: the full six-knob snapshot. */
+  snapshot(): ReputationConfig {
+    return {
+      halfLifeMs: this.halfLifeMs,
+      lowThreshold: this.lowThreshold,
+      highThreshold: this.highThreshold,
+      verifyFailurePenalty: this.penalties.verify_failure,
+      rateLimitPenalty: this.penalties.rate_limit,
+      schemaViolationPenalty: this.penalties.schema_violation,
+    };
+  }
+
+  /**
+   * Revise the six knobs live (WR-379). The patch is partial: an
+   * omitted field keeps its live value. The merged config must pass
+   * the construction gates — the `low < high` cross-check runs on the
+   * merged values, so patching only `lowThreshold` above the live
+   * `highThreshold` throws. Validate-then-apply: an illegal patch
+   * throws `RangeError` and the live values are left completely
+   * intact; an empty or non-object patch throws `RangeError` too. A
+   * same-value patch is a silent no-op (the caller skips the audit).
+   * A real revision takes effect from the next evaluation — the
+   * half-life only governs decay after the revision (already
+   * accumulated demerit is neither rescaled nor cleared), the
+   * thresholds only govern the next `checkThresholds` (a sender
+   * already degraded is not re-judged, and one not yet degraded is
+   * not downgraded by a tightened `lowThreshold` alone), and the
+   * penalty weights only govern later `recordPenalty` calls.
+   * Accumulated demerit, scores, degraded state, and `downgrades`
+   * counts are untouched. Returns the live config after the revision.
+   */
+  retune(patch: SenderReputationRevision): ReputationConfig {
+    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new RangeError(`sender reputation revision must be an object, got ${JSON.stringify(patch)}`);
+    }
+    if (
+      patch.halfLifeMs === undefined &&
+      patch.lowThreshold === undefined &&
+      patch.highThreshold === undefined &&
+      patch.verifyFailurePenalty === undefined &&
+      patch.rateLimitPenalty === undefined &&
+      patch.schemaViolationPenalty === undefined
+    ) {
+      throw new RangeError(
+        "sender reputation revision must set at least one of halfLifeMs, lowThreshold, highThreshold, verifyFailurePenalty, rateLimitPenalty, schemaViolationPenalty"
+      );
+    }
+    const next: ReputationConfig = {
+      halfLifeMs: patch.halfLifeMs ?? this.halfLifeMs,
+      lowThreshold: patch.lowThreshold ?? this.lowThreshold,
+      highThreshold: patch.highThreshold ?? this.highThreshold,
+      verifyFailurePenalty: patch.verifyFailurePenalty ?? this.penalties.verify_failure,
+      rateLimitPenalty: patch.rateLimitPenalty ?? this.penalties.rate_limit,
+      schemaViolationPenalty: patch.schemaViolationPenalty ?? this.penalties.schema_violation,
+    };
+    // Validate-then-apply: the merged values must pass the
+    // construction gates before any live value moves. The merged
+    // config always carries both thresholds, so the `low < high`
+    // cross-check runs on the values that will actually go live.
+    assertValidReputationOptions(next);
+    this.halfLifeMs = next.halfLifeMs;
+    this.lowThreshold = next.lowThreshold;
+    this.highThreshold = next.highThreshold;
+    this.penalties = {
+      verify_failure: next.verifyFailurePenalty,
+      rate_limit: next.rateLimitPenalty,
+      schema_violation: next.schemaViolationPenalty,
+    };
+    return this.snapshot();
   }
 
   private stateFor(key: string, at: number): SenderState {

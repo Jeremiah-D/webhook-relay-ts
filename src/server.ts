@@ -287,9 +287,11 @@ import { InboundApiKeyAuth, type ApiKeyOptions, type EndpointApiKeyRule } from "
 import {
   SenderReputationTracker,
   assertValidReputationOptions,
+  type ReputationConfig,
   type ReputationOptions,
   type ReputationPenaltyKind,
   type ReputationTransition,
+  type SenderReputationRevision,
 } from "./reputation.ts";
 import {
   bearerToken,
@@ -6176,6 +6178,36 @@ export interface RelayServer extends Server {
    * otherwise.
    */
   getEndpointHealthConfig?: () => EndpointHealthConfig | undefined;
+  /**
+   * WR-379: revise the live inbound sender reputation scoring knobs
+   * at runtime (`halfLifeMs` / `lowThreshold` / `highThreshold` /
+   * `verifyFailurePenalty` / `rateLimitPenalty` /
+   * `schemaViolationPenalty`, partial — omitted fields keep their
+   * live values). The half-life only governs decay after the
+   * revision, the thresholds only govern the next threshold check
+   * (already-degraded senders are not re-judged, not-yet-degraded
+   * ones are not downgraded by a tightened `lowThreshold` alone), and
+   * the penalty weights only govern later penalties; accumulated
+   * demerit, scores, degraded state, and downgrade counts are
+   * untouched. An illegal patch throws `RangeError` and the live
+   * values are untouched; an empty patch is a `RangeError`; a
+   * same-value revision is a no-op with no audit event. A real
+   * revision is audited as `sender_reputation_revised` with
+   * `previous` / `current` (all six knobs), and returns the live
+   * config. Always set; throws `Error` when `senderReputation` was
+   * never configured — enabling it needs a restart. Orthogonal to
+   * WR-119 (which owns the scoring mechanism itself), WR-359 (which
+   * revises the outbound endpoint-health knobs), WR-357 (which
+   * revises the inbound fail2ban thresholds), and WR-361 (which
+   * revises the per-tenant inbound body budget).
+   */
+  reviseSenderReputation?: (patch: SenderReputationRevision) => ReputationConfig;
+  /**
+   * WR-379: live inbound sender reputation config — the six scoring
+   * knobs. Only set when `senderReputation` was configured;
+   * `undefined` otherwise.
+   */
+  getSenderReputationConfig?: () => ReputationConfig | undefined;
   /**
    * WR-372: live-redirect the endpoint degrade/recover observers —
    * the operator callbacks that fire once per degradation episode and
@@ -16322,6 +16354,49 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   if (queue.getEndpointHealthConfig() !== undefined) {
     server.getEndpointHealthConfig = (): EndpointHealthConfig =>
       queue.getEndpointHealthConfig()!;
+  }
+
+  // WR-379: inbound sender reputation six-knob runtime revision. The
+  // method is always set (like reviseEndpointHealth above); with
+  // senderReputation unconfigured the canonical must-restart Error is
+  // thrown — enabling it needs a restart. A real revision is audited
+  // as `sender_reputation_revised` with the previous and current
+  // config (all six knobs, the construction values as first
+  // `previous`); an empty patch throws RangeError inside retune; a
+  // same-value revision is a silent no-op.
+  server.reviseSenderReputation = (patch: SenderReputationRevision): ReputationConfig => {
+    if (reputation === undefined) {
+      throw new Error(
+        "reviseSenderReputation: sender reputation is not configured — enabling it requires a restart: " +
+          "the tracker is created at startup and a running relay cannot start scoring senders without one"
+      );
+    }
+    const prev = reputation.snapshot();
+    // Validate-then-apply inside retune: an illegal patch throws
+    // RangeError and the live values are left completely intact.
+    const next = reputation.retune(patch);
+    if (
+      next.halfLifeMs === prev.halfLifeMs &&
+      next.lowThreshold === prev.lowThreshold &&
+      next.highThreshold === prev.highThreshold &&
+      next.verifyFailurePenalty === prev.verifyFailurePenalty &&
+      next.rateLimitPenalty === prev.rateLimitPenalty &&
+      next.schemaViolationPenalty === prev.schemaViolationPenalty
+    ) {
+      return next;
+    }
+    opts.auditLog.append({
+      event: "sender_reputation_revised",
+      previous: prev,
+      current: next,
+    });
+    return next;
+  };
+
+  // WR-379: live inbound sender reputation config. Only set when
+  // `senderReputation` was configured.
+  if (reputation !== undefined) {
+    server.getSenderReputationConfig = (): ReputationConfig => reputation.snapshot();
   }
 
   // WR-372: live endpoint degrade/recover observer revision. The

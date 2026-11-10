@@ -12179,6 +12179,23 @@ createRelayServer({
   `[0, 100]`, a missing `low < high` gap, or negative penalties throw
   `RangeError` at startup. Off by default: unset means zero behavior
   change. Zero dependencies.
+- **Live revision (WR-379)** — `server.reviseSenderReputation(patch)`
+  revises the six knobs without a restart (partial: omitted fields keep
+  their live values; `server.getSenderReputationConfig()` reads the full
+  snapshot). The half-life only governs decay *after* the revision, the
+  thresholds only govern the *next* threshold check (a degraded sender is
+  not re-judged, and a tightened `lowThreshold` alone never downgrades
+  anyone), and the penalty weights only govern *later* penalties —
+  accumulated demerit, scores, degraded state, and downgrade counts are
+  never rescaled or cleared. An illegal patch (including a patch that
+  would leave `lowThreshold >= highThreshold` after merging) throws
+  `RangeError` and the live values are untouched; a same-value patch is a
+  silent no-op. A real revision audits as `sender_reputation_revised`
+  with `previous` / `current` (all six knobs). Unconfigured, the method
+  throws the must-restart `Error` — enabling scoring needs a restart.
+  Unlike WR-359 (outbound endpoint health), this is the *inbound* trust
+  valve; unlike WR-357 (fail2ban), it revises the scoring knobs, not the
+  ban thresholds.
 
 ## Delivery lifecycle
 
