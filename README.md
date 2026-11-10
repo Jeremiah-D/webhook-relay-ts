@@ -11709,14 +11709,21 @@ const server = createRelayServer({
   allows no country (a closed egress for that tenant). The gate judges
   the *current* list on every attempt, so a dead-lettered item replays
   successfully once the operator relaxes the tenant's list — via
-  `sender.egressResidencyGate.reviseAllowedCountries(tenant, [...])`
-  (or `null` to clear the tenant back to unlimited), or a config change
-  plus restart.
+  `server.reviseEgressResidency(tenant, [...])` (WR-376, or `null` to
+  clear the tenant back to unlimited), or a config change plus restart.
+  The gate-level `sender.egressResidencyGate.reviseAllowedCountries(...)`
+  performs the same revision silently and stays usable by library users;
+  operators should use the server method so the change is audited.
 - **Audit** — every block is audited as `egress_residency_blocked`
-  (tenant, endpoint, country, offending addresses). Resolved addresses
-  go into that audit event only — never into metrics labels, and never
-  into the error message (which also lands in the `dead_letter` audit's
-  `error` field).
+  (tenant, endpoint, country, offending addresses). Every *revision*
+  of a tenant's list is audited as `egress_residency_revised` (tenant,
+  previous, current — `current` absent when the tenant is cleared back
+  to unlimited, since lifting a residency restriction is the operation
+  that most needs a trace); a same-set revision is a silent no-op with
+  no event. Both events are queryable via `GET /audit` (WR-04).
+  Resolved addresses go into the block audit event only — never into
+  metrics labels, and never into the error message (which also lands in
+  the `dead_letter` audit's `error` field).
 - **Layering** — the gate reuses the WR-158 table (same first-match-wins
   order: document the more specific range first when ranges overlap)
   and resolves through the WR-92 cache when one is configured (the
@@ -13629,6 +13636,18 @@ Requires Node 24+ (runs `.ts` directly via type stripping; zero dependencies).
   attempt 1 with `egress_residency_blocked` audit and zero bytes to the
   downstream, allowed tenant delivers, and the dead letter replays
   successfully once the operator relaxes the list).
+- `test/egress-residency-revision-audit.test.ts` — egress data-residency
+  revision audit (WR-376): adding / removing a country audits
+  `egress_residency_revised` with previous / current exactly, `null`
+  clears back to unlimited and audits `current` absent, same-set
+  revisions (order-insensitive) are silent no-ops with no audit,
+  illegal country codes throw `RangeError` with the live list untouched
+  and no audit, a first revision for a new tenant audits `previous`
+  undefined, an unconfigured gate throws the must-restart `Error` on
+  revise and returns `undefined` on get, `getEgressResidency()` returns
+  a copy, the revision event is queryable via `GET /audit`, and
+  end-to-end through the relay server (a blocked delivery dead-letters,
+  then delivers after `reviseEgressResidency` relaxes the list).
 - `test/e2e.test.ts` — end-to-end over real HTTP with the default sender: a
   flaky stub (500, 500, then 200) proves retries happen with visibly growing
   backoff and the payload arrives byte-identical (audit records `delivered`

@@ -2778,7 +2778,10 @@ export interface PooledSender extends Sender {
    * is off. Counters render into `GET /metrics` as
    * `relay_egress_residency_*` via `render()`; operators read them via
    * `sender.egressResidencyGate.getStats()` and relax a tenant's list
-   * via `sender.egressResidencyGate.reviseAllowedCountries(...)`.
+   * via `server.reviseEgressResidency(tenant, [...])` (WR-376: the
+   * audited operator path — the gate-level
+   * `reviseAllowedCountries(...)` stays usable by library users but
+   * leaves no audit trail).
    */
   egressResidencyGate: EgressResidencyGate | undefined;
   /**
@@ -6428,6 +6431,32 @@ export interface RelayServer extends Server {
    * object, never a live reference.
    */
   getOutboundSsrfAllowlist?: () => Record<string, boolean>;
+  /**
+   * WR-376: revise one tenant's egress data-residency allowlist at
+   * runtime (`countries` replaces the list; `null` clears the tenant
+   * back to unlimited). A real revision is audited as
+   * `egress_residency_revised` with the tenant and the previous /
+   * current lists (an audit trail for the most compliance-sensitive
+   * relaxation the relay performs — widening where a tenant's data
+   * may leave to); a same-set revision (order-insensitive) is a
+   * silent no-op with no audit event. An illegal country list throws
+   * `RangeError` and the live list is untouched. Always set; throws
+   * `Error` when the egress residency gate was never configured —
+   * enabling it needs a restart. The next dispatch after a revision
+   * judges the new list, so a dead letter replays once the operator
+   * relaxes it. This is only the audited server skin over the gate;
+   * WR-374 is the gate mechanism itself and its silent
+   * `reviseAllowedCountries` stays usable by library users, and
+   * WR-158 is the inbound GeoIP mirror of the same table.
+   */
+  reviseEgressResidency?: (tenant: string, countries: string[] | null) => string[] | undefined;
+  /**
+   * WR-376: live egress data-residency allowlist for one tenant.
+   * Always set; `undefined` when the tenant is unlimited (no entry)
+   * or the gate was never configured. Returns a fresh array, never a
+   * live reference.
+   */
+  getEgressResidency?: (tenant: string) => string[] | undefined;
   /**
    * WR-345: revise the live dead-letter replay egress rate at runtime
    * (`replaysPerSecond`, partial — omitted fields keep their live
@@ -16672,6 +16701,52 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // the guard was never configured.
   server.getOutboundSsrfAllowlist = (): Record<string, boolean> =>
     defaultSender?.outboundSsrfGuard?.allowPrivateTargets() ?? {};
+
+  // WR-376: audited egress data-residency revision. The method is
+  // always set (like reviseOutboundSsrfAllowlist above); with the gate
+  // unconfigured the revision throws Error — enabling it needs a
+  // restart. A real revision is audited as `egress_residency_revised`
+  // with the tenant and the previous / current lists (`current:
+  // undefined` when the tenant is cleared back to unlimited — lifting
+  // a residency restriction is the operation that most needs a trace);
+  // a same-set revision (order-insensitive) is a silent no-op. The
+  // gate validates the country list first, so an illegal list throws
+  // RangeError and the live list is left completely intact.
+  server.reviseEgressResidency = (tenant: string, countries: string[] | null): string[] | undefined => {
+    const gate = defaultSender?.egressResidencyGate;
+    if (gate === undefined) {
+      throw new Error(
+        "reviseEgressResidency: egress residency gate is not configured — enabling it requires a restart: " +
+          "the gate is created at startup and a running relay cannot start gating egress without one"
+      );
+    }
+    const prev = gate.allowedCountries(tenant);
+    // Validate-then-apply inside reviseAllowedCountries: an illegal
+    // list throws RangeError and the live list is left intact.
+    const next = gate.reviseAllowedCountries(tenant, countries);
+    const sameSet =
+      (prev === undefined && next === undefined) ||
+      (prev !== undefined &&
+        next !== undefined &&
+        prev.length === next.length &&
+        next.every((cc) => prev.includes(cc)));
+    if (sameSet) {
+      return next;
+    }
+    opts.auditLog.append({
+      event: "egress_residency_revised",
+      tenant,
+      previous: prev,
+      current: next,
+    });
+    return next;
+  };
+
+  // WR-376: live egress data-residency allowlist for one tenant.
+  // Always set; `undefined` when the tenant is unlimited or the gate
+  // was never configured.
+  server.getEgressResidency = (tenant: string): string[] | undefined =>
+    defaultSender?.egressResidencyGate?.allowedCountries(tenant);
 
   // WR-345: replay egress rate runtime revision. The method is always
   // set (like reviseAdaptiveBackoff above); with the gate unconfigured
