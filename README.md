@@ -12317,6 +12317,21 @@ written to the audit log, so the log is the machine's trace.
   the endpoint's circuit is open, the attempt is *parked* instead: it is
   rescheduled after the remaining cooldown without consuming the retry
   budget (still `delivering`, audited via `circuit_open` on the trip).
+- **Live-revisable observer (WR-384)** — the failed-attempt callback can be
+  swapped without a restart: `queue.reviseAttemptFailedCallback(cb)`
+  (library) or `server.reviseAttemptFailedCallback(cb)` (relay). `null`
+  clears back to audit-only — retries keep scheduling and are still
+  audited as `retrying`, only the operator forwarding stops. The new
+  callback takes effect from the next scheduled failure; failures already
+  reported are never re-delivered, and the retry schedule, backoff, and
+  budget gates are untouched. A real revision is audited as
+  `attempt_failed_callback_revised` (`previous` / `current`: 'set' /
+  'cleared'); a same-reference revision is a silent no-op, and a
+  non-function value throws `RangeError` with the live callback untouched.
+  There is no must-restart gate: the hook defaults to absent and the
+  retry mechanism is always on. Server users must use the server method —
+  calling the queue method on a server-owned queue would replace the
+  audit wrapper.
 - `delivering` → **`dead_letter`** when `maxAttempts` is exhausted. The
   entry keeps `attempts`, `lastError`, and `deadLetteredAt` — everything an
   operator needs to diagnose it, without the raw payload on the operator

@@ -28,7 +28,7 @@ import {
   selectSignatureAlgorithmVerifier,
   type SignatureAlgorithmRule,
 } from "./signature-alg.ts";
-import { RetryQueue, errorBudgetBurnAuditEvent, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeliveryDeadlineConfig, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type EndpointPauseCallbacksRevision, type EndpointPauseInfo, type ErrorBudgetConfig, type ErrorBudgetRevision, type EscalationConfig, type EscalationRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type QuorumRetention, type QuorumRetentionRevision, type ReplayCallbacksRevision, type ReplayForcedInfo, type ReplaySkippedInfo, type RetryItem, type Sender, type SenderCallOptions, type MaintenanceWindowTransition, type SloRiskConfig, type SloRiskRevision, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
+import { RetryQueue, errorBudgetBurnAuditEvent, type AttemptFailedInfo, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeliveryDeadlineConfig, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type EndpointPauseCallbacksRevision, type EndpointPauseInfo, type ErrorBudgetConfig, type ErrorBudgetRevision, type EscalationConfig, type EscalationRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type QuorumRetention, type QuorumRetentionRevision, type ReplayCallbacksRevision, type ReplayForcedInfo, type ReplaySkippedInfo, type RetryItem, type Sender, type SenderCallOptions, type MaintenanceWindowTransition, type SloRiskConfig, type SloRiskRevision, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
 import { parseDeliverAtHeader, DELIVER_AT_HEADER } from "./retry.ts";
 import type { ShadowDeliveredInfo, ShadowFailedInfo, ShadowTargetConfig, ShadowTargetsConfig } from "./retry.ts";
 import type {
@@ -7618,6 +7618,27 @@ export interface RelayServer extends Server {
    */
   reviseQueueDepthBreachCallback?: (cb: ((info: QueueDepthBreachInfo) => void) | null) => void;
   /**
+   * WR-384: live-redirect the failed-attempt observer — the operator
+   * callback that fires once per failed attempt that schedules a retry
+   * (every non-terminal failure, with the scheduled delay). `null`
+   * clears back to audit-only (retries keep scheduling and are still
+   * audited as `retrying`, just no longer forwarded to an operator).
+   * A non-function value throws `RangeError` and the live callback is
+   * untouched; replacing with the same reference (or clearing when
+   * already unset) is a silent no-op. A real replacement is audited
+   * as `attempt_failed_callback_revised` with `previous` / `current`
+   * recording only 'set' / 'cleared' presence, never a function body.
+   * Always set; there is no must-restart gate — the hook defaults to
+   * absent and the retry mechanism is always on. The new callback
+   * takes effect from the next scheduled failure; failures already
+   * reported are never re-delivered, and the retry schedule, backoff,
+   * and budget gates are untouched. Direct queue users use
+   * `RetryQueue.reviseAttemptFailedCallback` instead — calling the
+   * queue method on a server-owned queue would replace the audit
+   * wrapper.
+   */
+  reviseAttemptFailedCallback?: (cb: ((info: AttemptFailedInfo) => void) | null) => void;
+  /**
    * WR-331: revise one endpoint's live half-open probe knobs at
    * runtime — no restart. The patch merges over the endpoint's live
    * effective probe values; an illegal patch (or an empty patch)
@@ -9020,6 +9041,13 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // callback cannot bypass the `queue_depth_breached` audit.
   let operatorQueueDepthBreachCallback: ((info: QueueDepthBreachInfo) => void) | undefined =
     opts.retry?.onQueueDepthBreach;
+  // WR-384: the operator's failed-attempt callback, held in a mutable
+  // cell so `server.reviseAttemptFailedCallback` can replace it at
+  // runtime. The audit wrapper below reads this cell — never the
+  // operator callback directly — so replacing the operator callback
+  // cannot bypass the `retrying` audit.
+  let operatorAttemptFailedCallback: ((info: AttemptFailedInfo) => void) | undefined =
+    opts.retry?.onAttemptFailed;
   // WR-372: the operator's endpoint degrade/recover callbacks, held in
   // mutable cells so `server.reviseEndpointDegradedCallbacks` can
   // replace them at runtime. The audit wrappers below read these cells
@@ -9690,7 +9718,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // Wrap the caller's onAttemptFailed so every failed attempt that
     // schedules a retry is audited as `retrying` with its error and the
     // scheduled delay — the retry trajectory behind
-    // `GET /deliveries/:traceId` (WR-43).
+    // `GET /deliveries/:traceId` (WR-43). The wrapper forwards to the
+    // WR-384 operator cell, never to the constructor callback directly,
+    // so a live revision cannot bypass the audit.
     onAttemptFailed: (info) => {
       opts.auditLog.append({
         event: "retrying",
@@ -9702,7 +9732,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         error: info.error,
         nextDelayMs: info.nextDelayMs,
       });
-      opts.retry?.onAttemptFailed?.(info);
+      operatorAttemptFailedCallback?.(info);
     },
     onDeadLetter: (item, attempts, lastError, failureClass, summary) => {
       // WR-89: the rotation certificate id used by this delivery's
@@ -18954,6 +18984,40 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     operatorQueueDepthBreachCallback = next;
     opts.auditLog.append({
       event: "queue_depth_breach_callback_revised",
+      previous: prev,
+      current: nextPresence,
+    });
+  };
+
+  // WR-384: live failed-attempt observer revision. The method is
+  // always set; there is no must-restart gate — the hook defaults to
+  // absent and the retry mechanism is always on. Only the operator
+  // cell moves: the queue's audit wrapper (which appends `retrying`
+  // first, then forwards to the cell) is never touched, so a
+  // replacement cannot bypass the audit. A non-function callback
+  // throws `RangeError` and the live cell is untouched; a
+  // same-reference replacement (or clearing when already unset) is a
+  // silent no-op. A real replacement is audited as
+  // `attempt_failed_callback_revised` with `previous` / `current`
+  // recording only 'set' / 'cleared' presence, never a function body.
+  // The new callback takes effect from the next scheduled failure;
+  // failures already reported are never re-delivered, and the retry
+  // schedule, backoff, and budget gates are untouched.
+  server.reviseAttemptFailedCallback = (
+    cb: ((info: AttemptFailedInfo) => void) | null
+  ): void => {
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseAttemptFailedCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === operatorAttemptFailedCallback) return;
+    const prev = operatorAttemptFailedCallback === undefined ? "cleared" : "set";
+    const nextPresence = next === undefined ? "cleared" : "set";
+    operatorAttemptFailedCallback = next;
+    opts.auditLog.append({
+      event: "attempt_failed_callback_revised",
       previous: prev,
       current: nextPresence,
     });

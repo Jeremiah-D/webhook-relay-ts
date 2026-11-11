@@ -2411,6 +2411,12 @@ export interface RetryQueueOptions {
    * error and the scheduled delay) so `GET /deliveries/:traceId` can
    * render the retry trajectory. Failures that dead-letter instead of
    * retrying go through `onDeadLetter`, not here.
+   *
+   * Live-revisable via `RetryQueue.reviseAttemptFailedCallback` (WR-384) —
+   * `null` clears back to no observer. Under `RelayServer` this field
+   * holds the server's audit closure, so direct calls there would
+   * replace the audit wrapper; server users must go through
+   * `RelayServer.reviseAttemptFailedCallback` instead.
    */
   onAttemptFailed?: (info: AttemptFailedInfo) => void;
   /**
@@ -4553,7 +4559,12 @@ export class RetryQueue {
   /** WR-95: per-tenant latency phase trackers (WR-48 scoping). */
   private readonly latencyPhaseTrackers = new Map<string, LatencyPhasesTracker>();
   private readonly onRetryBudgetDepleted?: (info: RetryBudgetDepletedInfo) => void;
-  private readonly onAttemptFailed?: (info: AttemptFailedInfo) => void;
+  // WR-384: deliberately *not* readonly — `reviseAttemptFailedCallback`
+  // replaces the live failed-attempt observer at runtime. The server's
+  // audit closure (which forwards to the operator callback) is held here
+  // when the queue runs under `RelayServer`; direct queue users hold
+  // their own callback in the same field.
+  private onAttemptFailed?: (info: AttemptFailedInfo) => void;
   /**
    * WR-145: per-endpoint drill configs, keyed by exact `targetUrl` (the
    * logical endpoint, stable across WR-39 failover). Empty when the
@@ -12547,6 +12558,36 @@ export class RetryQueue {
     const next = cb ?? undefined;
     if (next === this.onQueueDepthBreach) return;
     this.onQueueDepthBreach = next;
+  }
+
+  /**
+   * WR-384: live-redirect the failed-attempt observer — the queue-side
+   * setter behind `RelayServer.reviseAttemptFailedCallback`. The new
+   * callback takes effect from the next scheduled failure; failures
+   * already reported are never re-delivered, and in-flight / already
+   * scheduled retries keep their delay and budget gates — only the
+   * observation moves. `null` clears back to no observer (retry
+   * scheduling and the `retrying` audit continue exactly as before —
+   * only the forwarding stops). A non-function value throws
+   * `RangeError` and the live callback is untouched; replacing with
+   * the same reference (or clearing when already unset) is a no-op.
+   * There is no must-restart gate: the hook defaults to absent and
+   * the retry mechanism is always on (like WR-367's pause hooks,
+   * unlike WR-365/WR-371's feature gates). Under `RelayServer` the
+   * field holds the server's audit closure, so direct calls here
+   * would replace the audit wrapper; server users must go through
+   * `RelayServer.reviseAttemptFailedCallback`, which swaps only the
+   * operator cell behind the audit closure.
+   */
+  reviseAttemptFailedCallback(cb: ((info: AttemptFailedInfo) => void) | null): void {
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseAttemptFailedCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === this.onAttemptFailed) return;
+    this.onAttemptFailed = next;
   }
 
   /**
