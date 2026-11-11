@@ -12657,6 +12657,20 @@ accepted→delivered latency clock keeps running) and is audited as
 to 64 KiB of the response body for the validator (`truncated: true` when
 cut); a custom sender that returns no response skips validation.
 
+**Live callback redirection (WR-386)** — `relay.reviseSemanticFailureCallback(cb)`
+/ `queue.reviseSemanticFailureCallback(cb)` swaps the operator callback that
+observes each semantic failure at runtime, no restart: the next semantic
+failure enters the new callback and the old one goes silent, failures already
+reported are never re-delivered, and `null` clears back to audit-only
+(semantic failures keep retrying and dead-lettering and are still audited as
+`failed`, just no longer forwarded). A non-function value throws `RangeError`
+and the live callback is untouched; replacing with the same reference (or
+clearing when already unset) is a silent no-op. A real revision is audited as
+`semantic_failure_callback_revised` with `previous` / `current` ('set' /
+'cleared' presence, never a function body) — and the audit can never be
+bypassed by a replacement. With no response validator configured, revision
+throws `Error` — enabling observation needs a restart.
+
 **Response assertions:** the declarative sibling of the validators above
 (see *Per-endpoint response assertions*). Per-endpoint rules in
 `retry: { responseAssertions }` bind an exact `targetUrl` to a status

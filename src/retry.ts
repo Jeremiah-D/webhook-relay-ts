@@ -2347,6 +2347,12 @@ export interface RetryQueueOptions {
    * Called once per delivery attempt that fails downstream semantic
    * validation. The server audits these as `failed` with
    * `reason: "semantic_failed"`.
+   *
+   * Live-revisable via `RetryQueue.reviseSemanticFailureCallback` (WR-386) —
+   * `null` clears back to no observer. Under `RelayServer` this field
+   * holds the server's audit closure, so direct calls there would
+   * replace the audit wrapper; server users must go through
+   * `RelayServer.reviseSemanticFailureCallback` instead.
    */
   onSemanticFailure?: (info: SemanticFailureInfo) => void;
   /**
@@ -4509,7 +4515,9 @@ export class RetryQueue {
    */
   private readonly endpointResponseValidators = new Map<string, ResponseValidator>();
   private readonly globalResponseValidator?: ResponseValidator;
-  private readonly onSemanticFailure?: (info: SemanticFailureInfo) => void;
+  // WR-386: deliberately *not* readonly — `reviseSemanticFailureCallback`
+  // swaps this field live (see `reviseAttemptFailedCallback`, WR-384).
+  private onSemanticFailure?: (info: SemanticFailureInfo) => void;
   /**
    * WR-118: per-endpoint declarative response assertion rules, keyed by
    * exact `targetUrl` (with the same physical-target → logical-endpoint
@@ -8408,6 +8416,14 @@ export class RetryQueue {
   /** WR-371: whether the queue-depth alert subsystem is enabled (queue-level). */
   queueDepthAlertConfigured(): boolean {
     return this.queueDepthAlert !== undefined;
+  }
+
+  /** WR-386: whether any response validator is configured (queue-level) — a global validator or at least one per-endpoint validator. */
+  responseValidatorConfigured(): boolean {
+    return (
+      this.globalResponseValidator !== undefined ||
+      this.endpointResponseValidators.size > 0
+    );
   }
 
   /** Whether the per-endpoint quota subsystem is enabled (queue-level). */
@@ -12588,6 +12604,41 @@ export class RetryQueue {
     const next = cb ?? undefined;
     if (next === this.onAttemptFailed) return;
     this.onAttemptFailed = next;
+  }
+
+  /**
+   * WR-386: live-redirect the semantic-failure observer — the queue-side
+   * setter behind `RelayServer.reviseSemanticFailureCallback`. The new
+   * callback takes effect from the next semantic failure; failures
+   * already reported are never re-delivered, and the retry / dead-letter
+   * / circuit path of a semantic failure is untouched — only the
+   * observation moves. `null` clears back to no observer (semantic
+   * failures keep retrying and dead-lettering exactly as before — only
+   * the forwarding stops). A non-function value throws `RangeError`
+   * and the live callback is untouched; replacing with the same
+   * reference (or clearing when already unset) is a no-op. Throws
+   * `Error` when no response validator is configured — semantic
+   * failures can only happen with a validator in place, so enabling
+   * observation needs a restart. Under `RelayServer` the field holds
+   * the server's audit closure, so direct calls here would replace
+   * the audit wrapper; server users must go through
+   * `RelayServer.reviseSemanticFailureCallback`, which swaps only the
+   * operator cell behind the audit closure.
+   */
+  reviseSemanticFailureCallback(cb: ((info: SemanticFailureInfo) => void) | null): void {
+    if (!this.responseValidatorConfigured()) {
+      throw new Error(
+        "reviseSemanticFailureCallback: no response validator is configured — enabling semantic failure observation requires a restart"
+      );
+    }
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseSemanticFailureCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === this.onSemanticFailure) return;
+    this.onSemanticFailure = next;
   }
 
   /**

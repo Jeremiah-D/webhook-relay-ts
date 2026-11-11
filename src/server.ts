@@ -28,7 +28,7 @@ import {
   selectSignatureAlgorithmVerifier,
   type SignatureAlgorithmRule,
 } from "./signature-alg.ts";
-import { RetryQueue, errorBudgetBurnAuditEvent, type AttemptFailedInfo, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeliveryDeadlineConfig, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type DownstreamResponseSummary, type EndpointPauseCallbacksRevision, type EndpointPauseInfo, type ErrorBudgetConfig, type ErrorBudgetRevision, type EscalationConfig, type EscalationRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type FailureClass, type QuorumRetention, type QuorumRetentionRevision, type ReplayCallbacksRevision, type ReplayForcedInfo, type ReplaySkippedInfo, type RetryItem, type Sender, type SenderCallOptions, type MaintenanceWindowTransition, type SloRiskConfig, type SloRiskRevision, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
+import { RetryQueue, errorBudgetBurnAuditEvent, type AttemptFailedInfo, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeliveryDeadlineConfig, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type DownstreamResponseSummary, type EndpointPauseCallbacksRevision, type EndpointPauseInfo, type ErrorBudgetConfig, type ErrorBudgetRevision, type EscalationConfig, type EscalationRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type FailureClass, type QuorumRetention, type QuorumRetentionRevision, type ReplayCallbacksRevision, type ReplayForcedInfo, type ReplaySkippedInfo, type RetryItem, type Sender, type SenderCallOptions, type SemanticFailureInfo, type MaintenanceWindowTransition, type SloRiskConfig, type SloRiskRevision, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
 import { parseDeliverAtHeader, DELIVER_AT_HEADER } from "./retry.ts";
 import type { ShadowDeliveredInfo, ShadowFailedInfo, ShadowTargetConfig, ShadowTargetsConfig } from "./retry.ts";
 import type {
@@ -7639,6 +7639,28 @@ export interface RelayServer extends Server {
    */
   reviseAttemptFailedCallback?: (cb: ((info: AttemptFailedInfo) => void) | null) => void;
   /**
+   * WR-386: live-redirect the semantic-failure observer — the operator
+   * callback that fires once per delivery attempt that fails downstream
+   * semantic validation (downstream answered 2xx but the validator
+   * said no). `null` clears back to audit-only (semantic failures keep
+   * retrying and dead-lettering and are still audited as `failed` with
+   * reason `semantic_failed`, just no longer forwarded to an operator).
+   * A non-function value throws `RangeError` and the live callback is
+   * untouched; replacing with the same reference (or clearing when
+   * already unset) is a silent no-op. A real replacement is audited
+   * as `semantic_failure_callback_revised` with `previous` / `current`
+   * recording only 'set' / 'cleared' presence, never a function body.
+   * Always set; throws `Error` when no response validator was
+   * configured — enabling it needs a restart. The new callback takes
+   * effect from the next semantic failure; failures already reported
+   * are never re-delivered, and the retry / dead-letter / circuit path
+   * is untouched. Direct queue users use
+   * `RetryQueue.reviseSemanticFailureCallback` instead — calling the
+   * queue method on a server-owned queue would replace the audit
+   * wrapper.
+   */
+  reviseSemanticFailureCallback?: (cb: ((info: SemanticFailureInfo) => void) | null) => void;
+  /**
    * WR-385: live-redirect the delivered observer — the operator
    * callback that fires once per successful delivery, with the attempt
    * count and the WR-54 downstream response summary. `null` clears
@@ -9101,6 +9123,13 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // cannot bypass the `retrying` audit.
   let operatorAttemptFailedCallback: ((info: AttemptFailedInfo) => void) | undefined =
     opts.retry?.onAttemptFailed;
+  // WR-386: the operator's semantic-failure callback, held in a mutable
+  // cell so `server.reviseSemanticFailureCallback` can replace it at
+  // runtime. The audit wrapper below reads this cell — never the
+  // operator callback directly — so replacing the operator callback
+  // cannot bypass the `failed` (reason `semantic_failed`) audit.
+  let operatorSemanticFailureCallback: ((info: SemanticFailureInfo) => void) | undefined =
+    opts.retry?.onSemanticFailure;
   // WR-385: the operator's delivered / dead-letter callbacks, held in
   // mutable cells so `server.reviseDeliveredCallback` /
   // `server.reviseDeadLetterCallback` can replace them at runtime. The
@@ -9744,6 +9773,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     },
     // Wrap the caller's onSemanticFailure so every semantic failure is
     // audited as `failed` with reason `semantic_failed`, not just observed.
+    // The wrapper forwards to the WR-386 operator cell, never to the
+    // constructor callback directly, so a live revision cannot bypass
+    // the audit.
     onSemanticFailure: (info) => {
       opts.auditLog.append({
         event: "failed",
@@ -9755,7 +9787,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         reason: "semantic_failed",
         semanticReason: info.reason,
       });
-      opts.retry?.onSemanticFailure?.(info);
+      operatorSemanticFailureCallback?.(info);
     },
     // Wrap the caller's onAssertionFailure so every assertion failure
     // is audited as `failed` with reason `assertion_failed`, not just
@@ -19098,6 +19130,45 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     operatorAttemptFailedCallback = next;
     opts.auditLog.append({
       event: "attempt_failed_callback_revised",
+      previous: prev,
+      current: nextPresence,
+    });
+  };
+
+  // WR-386: live semantic-failure observer revision. The method is
+  // always set; with no response validator configured the queue throws
+  // the canonical "must restart" Error (delegated below, exactly like
+  // WR-371's queue-depth gate). Only the operator cell moves: the
+  // queue's audit wrapper (which appends `failed` with reason
+  // `semantic_failed` first, then forwards to the cell) is never
+  // touched, so a replacement cannot bypass the audit. A non-function
+  // callback throws `RangeError` and the live cell is untouched; a
+  // same-reference replacement (or clearing when already unset) is a
+  // silent no-op. A real replacement is audited as
+  // `semantic_failure_callback_revised` with `previous` / `current`
+  // recording only 'set' / 'cleared' presence, never a function body.
+  // The new callback takes effect from the next semantic failure;
+  // failures already reported are never re-delivered, and the retry /
+  // dead-letter / circuit path is untouched.
+  server.reviseSemanticFailureCallback = (
+    cb: ((info: SemanticFailureInfo) => void) | null
+  ): void => {
+    if (!queue.responseValidatorConfigured()) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseSemanticFailureCallback(cb);
+    }
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseSemanticFailureCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === operatorSemanticFailureCallback) return;
+    const prev = operatorSemanticFailureCallback === undefined ? "cleared" : "set";
+    const nextPresence = next === undefined ? "cleared" : "set";
+    operatorSemanticFailureCallback = next;
+    opts.auditLog.append({
+      event: "semantic_failure_callback_revised",
       previous: prev,
       current: nextPresence,
     });
