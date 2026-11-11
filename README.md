@@ -4222,7 +4222,10 @@ const server = createRelayServer({
   / `canary_promoted`, and counted in
   `relay_canary_rollout_events_total{endpoint,candidate,event}`.
   `queue.getCanaryStats()` shows each endpoint's state, step,
-  percent, and step budget counters.
+  percent, and step budget counters. The observer is live-revisable
+  (WR-393) via `reviseCanaryRolloutEventCallback` on the queue and the
+  server (`null` clears back to audit-only); a revision never
+  re-delivers a transition already reported.
 - **Live ramp revision (WR-351)** — the ramp tuning is revisable at
   runtime via `reviseCanaryRollout(endpoint, { steps?, dwellMs?,
   maxConsecutiveStepFailures?, maxStepFailureRate?, minStepSamples? })`

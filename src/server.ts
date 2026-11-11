@@ -28,7 +28,7 @@ import {
   selectSignatureAlgorithmVerifier,
   type SignatureAlgorithmRule,
 } from "./signature-alg.ts";
-import { RetryQueue, errorBudgetBurnAuditEvent, type AssertionFailureInfo, type AttemptFailedInfo, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeliveryDeadlineConfig, type DeliveryDeadlineExceededInfo, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type DownstreamResponseSummary, type EndpointPauseCallbacksRevision, type EndpointPauseInfo, type ErrorBudgetConfig, type ErrorBudgetRevision, type EscalationConfig, type EscalationRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type FailureClass, type QuorumRetention, type QuorumRetentionRevision, type ReplayCallbacksRevision, type ReplayForcedInfo, type ReplaySkippedInfo, type RetryItem, type RetryBudgetDepletedInfo, type Sender, type SenderCallOptions, type SemanticFailureInfo, type MaintenanceWindowTransition, type SloMissInfo, type SloRiskConfig, type SloRiskRevision, type TenantBudgetAuditEvent, type UrgentDowngradedEvent, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
+import { RetryQueue, errorBudgetBurnAuditEvent, type AssertionFailureInfo, type AttemptFailedInfo, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutEvent, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeliveryDeadlineConfig, type DeliveryDeadlineExceededInfo, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type DownstreamResponseSummary, type EndpointPauseCallbacksRevision, type EndpointPauseInfo, type ErrorBudgetConfig, type ErrorBudgetRevision, type EscalationConfig, type EscalationRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type FailureClass, type QuorumRetention, type QuorumRetentionRevision, type ReplayCallbacksRevision, type ReplayForcedInfo, type ReplaySkippedInfo, type RetryItem, type RetryBudgetDepletedInfo, type Sender, type SenderCallOptions, type SemanticFailureInfo, type MaintenanceWindowTransition, type SloMissInfo, type SloRiskConfig, type SloRiskRevision, type TenantBudgetAuditEvent, type UrgentDowngradedEvent, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
 import { parseDeliverAtHeader, DELIVER_AT_HEADER } from "./retry.ts";
 import type { ShadowDeliveredInfo, ShadowFailedInfo, ShadowTargetConfig, ShadowTargetsConfig } from "./retry.ts";
 import type {
@@ -7805,6 +7805,31 @@ export interface RelayServer extends Server {
     cb: ((event: TenantBudgetAuditEvent) => void) | null
   ) => void;
   /**
+   * WR-393: live-redirect the canary-rollout-event observer — the
+   * operator callback that fires on every canary rollout transition
+   * (step advance, rollback, promotion; WR-214). `null` clears back to
+   * audit-only (the rollout keeps advancing, rolling back, and
+   * promoting and is still audited as `canary_step_advanced` /
+   * `canary_rolled_back` / `canary_promoted` and counted, just no
+   * longer forwarded to an operator). A non-function value throws
+   * `RangeError` and the live callback is untouched; replacing with the
+   * same reference (or clearing when already unset) is a silent no-op.
+   * A real replacement is audited as
+   * `canary_rollout_event_callback_revised` with `previous` / `current`
+   * recording only 'set' / 'cleared' presence, never a function body.
+   * Always set; throws `Error` when no canary rollout was configured —
+   * enabling it needs a restart. The new callback takes effect from the
+   * next transition; transitions already reported are never
+   * re-delivered, and the ramp tuning, rollback gates, and counters are
+   * untouched. Direct queue users use
+   * `RetryQueue.reviseCanaryRolloutEventCallback` instead — calling the
+   * queue method on a server-owned queue would replace the audit
+   * wrapper.
+   */
+  reviseCanaryRolloutEventCallback?: (
+    cb: ((event: CanaryRolloutEvent) => void) | null
+  ) => void;
+  /**
    * WR-385: live-redirect the delivered observer — the operator
    * callback that fires once per successful delivery, with the attempt
    * count and the WR-54 downstream response summary. `null` clears
@@ -9321,6 +9346,15 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // cannot bypass the `budget_exceeded` audit.
   let operatorBudgetExceededCallback: ((event: TenantBudgetAuditEvent) => void) | undefined =
     opts.retry?.onBudgetExceeded;
+  // WR-393: the operator's canary-rollout-event callback, held in a
+  // mutable cell so `server.reviseCanaryRolloutEventCallback` can
+  // replace it at runtime. The audit wrapper below reads this cell —
+  // never the operator callback directly — so replacing the operator
+  // callback cannot bypass the `canary_step_advanced` /
+  // `canary_rolled_back` / `canary_promoted` audit.
+  let operatorCanaryRolloutEventCallback:
+    | ((event: CanaryRolloutEvent) => void)
+    | undefined = opts.retry?.onCanaryRolloutEvent;
   // WR-385: the operator's delivered / dead-letter callbacks, held in
   // mutable cells so `server.reviseDeliveredCallback` /
   // `server.reviseDeadLetterCallback` can replace them at runtime. The
@@ -9823,7 +9857,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         ...(event.stepFailures !== undefined ? { stepFailures: event.stepFailures } : {}),
         at: event.at,
       });
-      opts.retry?.onCanaryRolloutEvent?.(event);
+      // WR-393: forward to the operator cell, never to the constructor
+      // callback directly, so a live revision cannot bypass the audit.
+      operatorCanaryRolloutEventCallback?.(event);
     },
     // An explicit server-level `completionCallback` wins over the nested
     // `retry.completionCallback`; either way the queue owns the sender.
@@ -19595,6 +19631,45 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     operatorBudgetExceededCallback = next;
     opts.auditLog.append({
       event: "budget_exceeded_callback_revised",
+      previous: prev,
+      current: nextPresence,
+    });
+  };
+
+  // WR-393: live canary-rollout-event observer revision. The method is
+  // always set; with no canary rollout configured the queue throws the
+  // canonical "must restart" Error (delegated below, exactly like
+  // WR-366's failover gate). Only the operator cell moves: the queue's
+  // audit wrapper (which appends `canary_step_advanced` /
+  // `canary_rolled_back` / `canary_promoted` first, then forwards to
+  // the cell) is never touched, so a replacement cannot bypass the
+  // audit. A non-function callback throws `RangeError` and the live
+  // cell is untouched; a same-reference replacement (or clearing when
+  // already unset) is a silent no-op. A real replacement is audited as
+  // `canary_rollout_event_callback_revised` with `previous` / `current`
+  // recording only 'set' / 'cleared' presence, never a function body.
+  // The new callback takes effect from the next transition; transitions
+  // already reported are never re-delivered, and the ramp steps, the
+  // dwell, the rollback gates, and the counters are untouched.
+  server.reviseCanaryRolloutEventCallback = (
+    cb: ((event: CanaryRolloutEvent) => void) | null
+  ): void => {
+    if (!queue.canaryConfigured()) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseCanaryRolloutEventCallback(cb);
+    }
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseCanaryRolloutEventCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === operatorCanaryRolloutEventCallback) return;
+    const prev = operatorCanaryRolloutEventCallback === undefined ? "cleared" : "set";
+    const nextPresence = next === undefined ? "cleared" : "set";
+    operatorCanaryRolloutEventCallback = next;
+    opts.auditLog.append({
+      event: "canary_rollout_event_callback_revised",
       previous: prev,
       current: nextPresence,
     });

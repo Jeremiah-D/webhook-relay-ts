@@ -2569,6 +2569,8 @@ export interface RetryQueueOptions {
    * promotion). Edge-triggered — one call per transition, not one per
    * dispatch. The server audits these; library users get the hook
    * directly.
+   * Live-revisable via `RetryQueue.reviseCanaryRolloutEventCallback` —
+   * `null` clears back to no observer.
    */
   onCanaryRolloutEvent?: (event: CanaryRolloutEvent) => void;
   /**
@@ -4776,7 +4778,12 @@ export class RetryQueue {
   >();
   /** WR-214: staged candidate promotion; undefined when not configured. */
   private readonly canary?: CanaryRolloutManager;
-  private readonly onCanaryRolloutEvent?: (event: CanaryRolloutEvent) => void;
+  // WR-393: deliberately *not* readonly — `reviseCanaryRolloutEventCallback`
+  // replaces the live canary-rollout-event observer at runtime. The
+  // server's audit closure (which forwards to the operator callback) is
+  // held here when the queue runs under `RelayServer`; direct queue
+  // users hold their own callback in the same field.
+  private onCanaryRolloutEvent?: (event: CanaryRolloutEvent) => void;
   /** `relay_canary_rollout_events_total`, one counter per (endpoint, candidate, event). */
   private readonly canaryEventCounts = new Map<string, CanaryRolloutMetricsInput>();
   /** WR-66: smooth weighted round-robin routing; undefined when not configured. */
@@ -8465,6 +8472,11 @@ export class RetryQueue {
   /** WR-366: whether the failover subsystem is enabled (queue-level). */
   failoverConfigured(): boolean {
     return this.failover !== undefined;
+  }
+
+  /** WR-393: whether the canary rollout subsystem is enabled (queue-level). */
+  canaryConfigured(): boolean {
+    return this.canary !== undefined;
   }
 
   /** WR-368: whether the replay-idempotency subsystem is enabled (queue-level). */
@@ -13001,6 +13013,47 @@ export class RetryQueue {
     const next = cb ?? undefined;
     if (next === this.onBudgetExceeded) return;
     this.onBudgetExceeded = next;
+  }
+
+  /**
+   * WR-393: live-redirect the canary-rollout-event observer — the
+   * queue-side setter behind
+   * `RelayServer.reviseCanaryRolloutEventCallback`. The new callback
+   * takes effect from the next rollout transition; transitions already
+   * reported are never re-delivered, and the ramp steps, the dwell,
+   * the rollback gates, the step budget counters, and
+   * `reviseCanaryRollout` / `getCanaryStats()` are untouched — only the
+   * observation moves. `null` clears back to no observer (the rollout
+   * keeps advancing, rolling back, and promoting exactly as before and
+   * is still audited as `canary_step_advanced` / `canary_rolled_back` /
+   * `canary_promoted` and counted in
+   * `relay_canary_rollout_events_total` — only the forwarding stops).
+   * A non-function value throws `RangeError` and the live callback is
+   * untouched; replacing with the same reference (or clearing when
+   * already unset) is a no-op. Throws `Error` when no canary rollout
+   * is configured — transitions can only happen with `canaryRollouts`
+   * in place, so enabling observation needs a restart. Under
+   * `RelayServer` the field holds the server's audit closure, so direct
+   * calls here would replace the audit wrapper; server users must go
+   * through `RelayServer.reviseCanaryRolloutEventCallback`, which swaps
+   * only the operator cell behind the audit closure.
+   */
+  reviseCanaryRolloutEventCallback(
+    cb: ((event: CanaryRolloutEvent) => void) | null
+  ): void {
+    if (!this.canaryConfigured()) {
+      throw new Error(
+        "reviseCanaryRolloutEventCallback: canary rollout is not configured — enabling canary-rollout-event observation requires a restart"
+      );
+    }
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseCanaryRolloutEventCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === this.onCanaryRolloutEvent) return;
+    this.onCanaryRolloutEvent = next;
   }
 
   /**
