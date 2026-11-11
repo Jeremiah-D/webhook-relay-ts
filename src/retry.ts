@@ -2389,6 +2389,12 @@ export interface RetryQueueOptions {
    * Called once per delivery attempt that fails a response assertion.
    * The server audits these as `failed` with
    * `reason: "assertion_failed"`.
+   *
+   * Live-revisable via `RetryQueue.reviseAssertionFailureCallback` (WR-390) —
+   * `null` clears back to no observer. Under `RelayServer` this field
+   * holds the server's audit closure, so direct calls there would
+   * replace the audit wrapper; server users must go through
+   * `RelayServer.reviseAssertionFailureCallback` instead.
    */
   onAssertionFailure?: (info: AssertionFailureInfo) => void;
   /**
@@ -4560,7 +4566,9 @@ export class RetryQueue {
    * behavior.
    */
   private readonly responseAssertionRules = new Map<string, ResponseAssertionRule>();
-  private readonly onAssertionFailure?: (info: AssertionFailureInfo) => void;
+  // WR-390: deliberately *not* readonly — `reviseAssertionFailureCallback`
+  // swaps this field live (see `reviseSemanticFailureCallback`, WR-386).
+  private onAssertionFailure?: (info: AssertionFailureInfo) => void;
   /** WR-118: cumulative assertion failures per (tenant, endpoint) — see `getDeliveryStats` / `renderMetrics`. */
   private readonly assertionFailureCounts = new Map<string, Map<string, number>>();
   /** WR-38: global retry budget; undefined when disabled. */
@@ -8470,6 +8478,20 @@ export class RetryQueue {
       this.globalResponseValidator !== undefined ||
       this.endpointResponseValidators.size > 0
     );
+  }
+
+  /**
+   * WR-390: whether any response assertion rule is configured
+   * (queue-level) — the `reviseAssertionFailureCallback` gate.
+   * Assertion failures can only happen with at least one rule in place;
+   * without one there is no failure channel to observe, so enabling
+   * observation needs a restart. NOTE: `responseValidatorConfigured()`
+   * does NOT cover assertion rules — the two hooks are orthogonal
+   * (WR-37 programmatic validators vs WR-118 declarative assertions),
+   * so it must never be reused as this gate.
+   */
+  responseAssertionsConfigured(): boolean {
+    return this.responseAssertionRules.size > 0;
   }
 
   /** Whether the per-endpoint quota subsystem is enabled (queue-level). */
@@ -12840,6 +12862,44 @@ export class RetryQueue {
     const next = cb ?? undefined;
     if (next === this.onUrgentDowngraded) return;
     this.onUrgentDowngraded = next;
+  }
+
+  /**
+   * WR-390: live-redirect the assertion-failure observer — the queue-side
+   * setter behind `RelayServer.reviseAssertionFailureCallback`. The new
+   * callback takes effect from the next assertion failure; failures
+   * already reported are never re-delivered, and the assertion rules,
+   * the retry / backoff / circuit path, and the `assertionFailures`
+   * counters are untouched — only the observation moves. `null` clears
+   * back to no observer (assertion failures keep retrying and are still
+   * audited as `failed` with reason `assertion_failed` and counted —
+   * only the forwarding stops). A non-function value throws `RangeError`
+   * and the live callback is untouched; replacing with the same
+   * reference (or clearing when already unset) is a no-op. Throws
+   * `Error` when no response assertion rule is configured — assertion
+   * failures can only happen with a rule in place, so enabling
+   * observation needs a restart. Under `RelayServer` the field holds
+   * the server's audit closure, so direct calls here would replace the
+   * audit wrapper; server users must go through
+   * `RelayServer.reviseAssertionFailureCallback`, which swaps only the
+   * operator cell behind the audit closure.
+   */
+  reviseAssertionFailureCallback(
+    cb: ((info: AssertionFailureInfo) => void) | null
+  ): void {
+    if (!this.responseAssertionsConfigured()) {
+      throw new Error(
+        "reviseAssertionFailureCallback: no response assertion rule is configured — enabling assertion-failure observation requires a restart"
+      );
+    }
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseAssertionFailureCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === this.onAssertionFailure) return;
+    this.onAssertionFailure = next;
   }
 
   /**

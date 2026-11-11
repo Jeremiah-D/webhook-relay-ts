@@ -5498,6 +5498,13 @@ queue.getDeliveryStats(); // per-endpoint rows incl. `assertionFailures`
   (a 404 is still `non_retryable`, never an assertion failure). Each
   failure fires `onAssertionFailure` and is audited as `failed` with
   `reason: "assertion_failed"`.
+- **Live revision (WR-390)** — `relay.reviseAssertionFailureCallback(cb)` /
+  `queue.reviseAssertionFailureCallback(cb)` swaps the operator callback
+  that receives each assertion failure, without a restart. `null` clears
+  back to audit-only (failures keep retrying, counting, and auditing).
+  Throws `Error` when no response assertion rule is configured — enabling
+  observation needs a restart. Note `responseValidatorConfigured()` does
+  not cover assertion rules; the gate reads the rule table itself.
 - **Observability** — per-endpoint `assertionFailures` via
   `queue.getDeliveryStats()` and the `relay_assertion_failures_total`
   Prometheus counter (activity-gated: absent entirely when the feature

@@ -28,7 +28,7 @@ import {
   selectSignatureAlgorithmVerifier,
   type SignatureAlgorithmRule,
 } from "./signature-alg.ts";
-import { RetryQueue, errorBudgetBurnAuditEvent, type AttemptFailedInfo, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeliveryDeadlineConfig, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type DownstreamResponseSummary, type EndpointPauseCallbacksRevision, type EndpointPauseInfo, type ErrorBudgetConfig, type ErrorBudgetRevision, type EscalationConfig, type EscalationRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type FailureClass, type QuorumRetention, type QuorumRetentionRevision, type ReplayCallbacksRevision, type ReplayForcedInfo, type ReplaySkippedInfo, type RetryItem, type RetryBudgetDepletedInfo, type Sender, type SenderCallOptions, type SemanticFailureInfo, type MaintenanceWindowTransition, type SloMissInfo, type SloRiskConfig, type SloRiskRevision, type UrgentDowngradedEvent, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
+import { RetryQueue, errorBudgetBurnAuditEvent, type AssertionFailureInfo, type AttemptFailedInfo, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeliveryDeadlineConfig, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type DownstreamResponseSummary, type EndpointPauseCallbacksRevision, type EndpointPauseInfo, type ErrorBudgetConfig, type ErrorBudgetRevision, type EscalationConfig, type EscalationRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type FailureClass, type QuorumRetention, type QuorumRetentionRevision, type ReplayCallbacksRevision, type ReplayForcedInfo, type ReplaySkippedInfo, type RetryItem, type RetryBudgetDepletedInfo, type Sender, type SenderCallOptions, type SemanticFailureInfo, type MaintenanceWindowTransition, type SloMissInfo, type SloRiskConfig, type SloRiskRevision, type UrgentDowngradedEvent, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
 import { parseDeliverAtHeader, DELIVER_AT_HEADER } from "./retry.ts";
 import type { ShadowDeliveredInfo, ShadowFailedInfo, ShadowTargetConfig, ShadowTargetsConfig } from "./retry.ts";
 import type {
@@ -7731,6 +7731,30 @@ export interface RelayServer extends Server {
     cb: ((event: UrgentDowngradedEvent) => void) | null
   ) => void;
   /**
+   * WR-390: live-redirect the assertion-failure observer — the operator
+   * callback that fires once per delivery attempt failing a response
+   * assertion (WR-118 declarative rule). `null` clears back to
+   * audit-only (failures keep retrying and are still audited as
+   * `failed` with reason `assertion_failed` and counted in
+   * `assertionFailures`, just no longer forwarded to an operator). A
+   * non-function value throws `RangeError` and the live callback is
+   * untouched; replacing with the same reference (or clearing when
+   * already unset) is a silent no-op. A real replacement is audited as
+   * `assertion_failure_callback_revised` with `previous` / `current`
+   * recording only 'set' / 'cleared' presence, never a function body.
+   * Always set; throws `Error` when no response assertion rule was
+   * configured — enabling it needs a restart. The new callback takes
+   * effect from the next assertion failure; failures already reported
+   * are never re-delivered, and the assertion rules, retry / backoff /
+   * circuit path, and counters are untouched. Direct queue users use
+   * `RetryQueue.reviseAssertionFailureCallback` instead — calling the
+   * queue method on a server-owned queue would replace the audit
+   * wrapper.
+   */
+  reviseAssertionFailureCallback?: (
+    cb: ((info: AssertionFailureInfo) => void) | null
+  ) => void;
+  /**
    * WR-385: live-redirect the delivered observer — the operator
    * callback that fires once per successful delivery, with the attempt
    * count and the WR-54 downstream response summary. `null` clears
@@ -9224,6 +9248,13 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   let operatorUrgentDowngradedCallback:
     | ((event: UrgentDowngradedEvent) => void)
     | undefined = opts.retry?.onUrgentDowngraded;
+  // WR-390: the operator's assertion-failure callback, held in a mutable
+  // cell so `server.reviseAssertionFailureCallback` can replace it at
+  // runtime. The audit wrapper below reads this cell — never the
+  // operator callback directly — so replacing the operator callback
+  // cannot bypass the `failed` (reason `assertion_failed`) audit.
+  let operatorAssertionFailureCallback: ((info: AssertionFailureInfo) => void) | undefined =
+    opts.retry?.onAssertionFailure;
   // WR-385: the operator's delivered / dead-letter callbacks, held in
   // mutable cells so `server.reviseDeliveredCallback` /
   // `server.reviseDeadLetterCallback` can replace them at runtime. The
@@ -9902,7 +9933,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         reason: "assertion_failed",
         assertionReason: info.reason,
       });
-      opts.retry?.onAssertionFailure?.(info);
+      operatorAssertionFailureCallback?.(info);
     },
     // Wrap the caller's onRetryBudgetDepleted so every budget-parked retry
     // is audited, not just observed. The wrapper forwards to the WR-387
@@ -19383,6 +19414,45 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     operatorUrgentDowngradedCallback = next;
     opts.auditLog.append({
       event: "urgent_downgraded_callback_revised",
+      previous: prev,
+      current: nextPresence,
+    });
+  };
+
+  // WR-390: live assertion-failure observer revision. The method is
+  // always set; with no response assertion rule configured the queue
+  // throws the canonical "must restart" Error (delegated below, exactly
+  // like WR-371's queue-depth gate). Only the operator cell moves: the
+  // queue's audit wrapper (which appends `failed` with reason
+  // `assertion_failed` first, then forwards to the cell) is never
+  // touched, so a replacement cannot bypass the audit. A non-function
+  // callback throws `RangeError` and the live cell is untouched; a
+  // same-reference replacement (or clearing when already unset) is a
+  // silent no-op. A real replacement is audited as
+  // `assertion_failure_callback_revised` with `previous` / `current`
+  // recording only 'set' / 'cleared' presence, never a function body.
+  // The new callback takes effect from the next assertion failure;
+  // failures already reported are never re-delivered, and the assertion
+  // rules, retry / backoff / circuit path, and counters are untouched.
+  server.reviseAssertionFailureCallback = (
+    cb: ((info: AssertionFailureInfo) => void) | null
+  ): void => {
+    if (!queue.responseAssertionsConfigured()) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseAssertionFailureCallback(cb);
+    }
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseAssertionFailureCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === operatorAssertionFailureCallback) return;
+    const prev = operatorAssertionFailureCallback === undefined ? "cleared" : "set";
+    const nextPresence = next === undefined ? "cleared" : "set";
+    operatorAssertionFailureCallback = next;
+    opts.auditLog.append({
+      event: "assertion_failure_callback_revised",
       previous: prev,
       current: nextPresence,
     });
