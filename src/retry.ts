@@ -1035,7 +1035,15 @@ export interface SloMissInfo {
 
 /** {@link LatencyTrackerOptions} plus the SLO-miss hook and the SLO-risk predictor. */
 export interface LatencyOptions extends LatencyTrackerOptions {
-  /** Called once per delivery whose accepted→delivered latency exceeds `sloMs`. */
+  /**
+   * Called once per delivery whose accepted→delivered latency exceeds `sloMs`.
+   *
+   * Live-revisable via `RetryQueue.reviseSloMissCallback` (WR-388) —
+   * `null` clears back to no observer. Under `RelayServer` the queue
+   * holds the server's audit closure as the caller callback, so direct
+   * calls there would replace the audit wrapper; server users must go
+   * through `RelayServer.reviseSloMissCallback` instead.
+   */
   onSloMiss?: (info: SloMissInfo) => void;
   /**
    * WR-71: SLO-breach prediction and early warning (see `src/slo-risk.ts`).
@@ -4399,6 +4407,18 @@ export class RetryQueue {
   private readonly latencyOpts?: LatencyOptions;
   /** WR-98: resolved trace-context option; `undefined` = feature off. */
   private readonly traceContextOpts?: ResolvedTraceContextOptions;
+  // WR-388: deliberately *not* readonly — `reviseSloMissCallback`
+  // swaps this field live. It holds the *caller's* callback; the
+  // dispatch field `onSloMiss` below is a stable closure (the OTLP
+  // wrapper when OTLP is configured, a plain forwarder otherwise) that
+  // reads this field live — so a revision can never drop the
+  // `slo_missed` OTLP export (see the constructor).
+  private callerOnSloMiss?: (info: SloMissInfo) => void;
+  /**
+   * WR-388: the SLO-miss dispatch closure. Always a stable closure
+   * reading `callerOnSloMiss` live (never the caller callback itself),
+   * so `reviseSloMissCallback` only ever moves the inner field.
+   */
   private readonly onSloMiss?: (info: SloMissInfo) => void;
   /**
    * WR-143: most recent phase-timeout phase per in-flight delivery
@@ -5335,7 +5355,15 @@ export class RetryQueue {
             onFailed: (info) => opts.onDeadLetterEscalationFailed?.(info),
           });
     this.latencyOpts = opts.latency;
-    this.onSloMiss = opts.latency?.onSloMiss;
+    // WR-388: the caller's callback lives in the mutable inner field;
+    // `onSloMiss` is a stable dispatch closure reading it live (a plain
+    // forwarder here, replaced by the OTLP wrapper below when OTLP is
+    // configured), so `reviseSloMissCallback` can swap the observer
+    // without ever touching — or dropping — the export path.
+    this.callerOnSloMiss = opts.latency?.onSloMiss;
+    this.onSloMiss = (info) => {
+      this.callerOnSloMiss?.(info);
+    };
     // WR-98: opt-in W3C trace-context propagation. Resolved (and
     // validated) eagerly — `RangeError` at construction, never
     // mid-delivery. `undefined` keeps the exact pre-WR-98 behavior.
@@ -5369,9 +5397,11 @@ export class RetryQueue {
           // delivery path must never see an export throw.
         }
       });
-      const callerOnSloMiss = this.onSloMiss;
+      // WR-388: the wrapper reads `callerOnSloMiss` live off `this`,
+      // never a captured snapshot — a revision swaps the caller
+      // callback underneath while the `slo_missed` export keeps firing.
       this.onSloMiss = (info) => {
-        callerOnSloMiss?.(info);
+        this.callerOnSloMiss?.(info);
         try {
           exporter.record({
             eventType: "slo_missed",
@@ -8461,6 +8491,16 @@ export class RetryQueue {
       this.retryBudgetEndpoints.size > 0 ||
       this.tenantRetryBudget !== undefined
     );
+  }
+
+  /**
+   * WR-388: whether latency tracking is configured (queue-level) — the
+   * `reviseSloMissCallback` gate. SLO misses can only be observed when
+   * `opts.latency` is set; without it there is no miss channel to
+   * observe, so enabling observation needs a restart.
+   */
+  latencyConfigured(): boolean {
+    return this.latencyOpts !== undefined;
   }
 
   /**
@@ -12702,6 +12742,44 @@ export class RetryQueue {
     const next = cb ?? undefined;
     if (next === this.onRetryBudgetDepleted) return;
     this.onRetryBudgetDepleted = next;
+  }
+
+  /**
+   * WR-388: live-redirect the SLO-miss observer — the queue-side setter
+   * behind `RelayServer.reviseSloMissCallback`. The new callback takes
+   * effect from the next SLO miss; misses already reported are never
+   * re-delivered, and the SLO thresholds, the sampling windows, and
+   * in-flight delivery timing are untouched — only the observation
+   * moves. `null` clears back to no observer (misses keep being sampled
+   * and audited as `slo_missed` exactly as before — only the forwarding
+   * stops). A non-function value throws `RangeError` and the live
+   * callback is untouched; replacing with the same reference (or
+   * clearing when already unset) is a no-op. Throws `Error` when
+   * latency tracking is not configured — misses can only happen with
+   * `opts.latency` in place, so enabling observation needs a restart.
+   * When OTLP export is configured the swap only moves the inner
+   * caller field (`callerOnSloMiss`); the dispatch closure keeps
+   * exporting every `slo_missed`, so a revision can never drop the
+   * export. Under `RelayServer` the inner field holds the server's
+   * audit closure, so direct calls here would replace the audit
+   * wrapper; server users must go through
+   * `RelayServer.reviseSloMissCallback`, which swaps only the operator
+   * cell behind the audit closure.
+   */
+  reviseSloMissCallback(cb: ((info: SloMissInfo) => void) | null): void {
+    if (!this.latencyConfigured()) {
+      throw new Error(
+        "reviseSloMissCallback: latency tracking is not configured — enabling SLO-miss observation requires a restart"
+      );
+    }
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseSloMissCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === this.callerOnSloMiss) return;
+    this.callerOnSloMiss = next;
   }
 
   /**

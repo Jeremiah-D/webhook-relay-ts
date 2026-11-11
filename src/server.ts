@@ -28,7 +28,7 @@ import {
   selectSignatureAlgorithmVerifier,
   type SignatureAlgorithmRule,
 } from "./signature-alg.ts";
-import { RetryQueue, errorBudgetBurnAuditEvent, type AttemptFailedInfo, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeliveryDeadlineConfig, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type DownstreamResponseSummary, type EndpointPauseCallbacksRevision, type EndpointPauseInfo, type ErrorBudgetConfig, type ErrorBudgetRevision, type EscalationConfig, type EscalationRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type FailureClass, type QuorumRetention, type QuorumRetentionRevision, type ReplayCallbacksRevision, type ReplayForcedInfo, type ReplaySkippedInfo, type RetryItem, type RetryBudgetDepletedInfo, type Sender, type SenderCallOptions, type SemanticFailureInfo, type MaintenanceWindowTransition, type SloRiskConfig, type SloRiskRevision, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
+import { RetryQueue, errorBudgetBurnAuditEvent, type AttemptFailedInfo, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeliveryDeadlineConfig, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type DownstreamResponseSummary, type EndpointPauseCallbacksRevision, type EndpointPauseInfo, type ErrorBudgetConfig, type ErrorBudgetRevision, type EscalationConfig, type EscalationRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type FailureClass, type QuorumRetention, type QuorumRetentionRevision, type ReplayCallbacksRevision, type ReplayForcedInfo, type ReplaySkippedInfo, type RetryItem, type RetryBudgetDepletedInfo, type Sender, type SenderCallOptions, type SemanticFailureInfo, type MaintenanceWindowTransition, type SloMissInfo, type SloRiskConfig, type SloRiskRevision, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
 import { parseDeliverAtHeader, DELIVER_AT_HEADER } from "./retry.ts";
 import type { ShadowDeliveredInfo, ShadowFailedInfo, ShadowTargetConfig, ShadowTargetsConfig } from "./retry.ts";
 import type {
@@ -7685,6 +7685,27 @@ export interface RelayServer extends Server {
     cb: ((info: RetryBudgetDepletedInfo) => void) | null
   ) => void;
   /**
+   * WR-388: live-redirect the SLO-miss observer — the operator callback
+   * that fires once per delivery whose accepted→delivered latency exceeds
+   * `sloMs` (slow-but-delivered, or deadline-budget exhausted). `null`
+   * clears back to audit-only (misses keep being sampled and are still
+   * audited as `slo_missed`, just no longer forwarded to an operator).
+   * A non-function value throws `RangeError` and the live callback is
+   * untouched; replacing with the same reference (or clearing when
+   * already unset) is a silent no-op. A real replacement is audited as
+   * `slo_miss_callback_revised` with `previous` / `current` recording
+   * only 'set' / 'cleared' presence, never a function body. Always set;
+   * throws `Error` when latency tracking was not configured — enabling
+   * it needs a restart. The new callback takes effect from the next SLO
+   * miss; misses already reported are never re-delivered, and the SLO
+   * thresholds, sampling windows, and in-flight delivery timing are
+   * untouched. When OTLP export is configured the `slo_missed` export
+   * survives a revision. Direct queue users use
+   * `RetryQueue.reviseSloMissCallback` instead — calling the queue
+   * method on a server-owned queue would replace the audit wrapper.
+   */
+  reviseSloMissCallback?: (cb: ((info: SloMissInfo) => void) | null) => void;
+  /**
    * WR-385: live-redirect the delivered observer — the operator
    * callback that fires once per successful delivery, with the attempt
    * count and the WR-54 downstream response summary. `null` clears
@@ -9162,6 +9183,14 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   let operatorRetryBudgetDepletedCallback:
     | ((info: RetryBudgetDepletedInfo) => void)
     | undefined = opts.retry?.onRetryBudgetDepleted;
+  // WR-388: the operator's SLO-miss callback, held in a mutable cell
+  // so `server.reviseSloMissCallback` can replace it at runtime. The
+  // audit wrapper below reads this cell — never the operator callback
+  // directly — so replacing the operator callback cannot bypass the
+  // `slo_missed` audit. Initial value is the latency option's callback
+  // (`onSloMiss` lives under `retry.latency`, not on `retry` itself).
+  let operatorSloMissCallback: ((info: SloMissInfo) => void) | undefined =
+    latencyOpts?.onSloMiss;
   // WR-385: the operator's delivered / dead-letter callbacks, held in
   // mutable cells so `server.reviseDeliveredCallback` /
   // `server.reviseDeadLetterCallback` can replace them at runtime. The
@@ -9721,7 +9750,10 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
           ...latencyOpts,
           onSloMiss: (info) => {
             opts.auditLog.append({ event: "slo_missed", ...info });
-            latencyOpts.onSloMiss?.(info);
+            // WR-388: forward to the operator cell, never to the
+            // constructor callback directly, so a live revision cannot
+            // bypass the audit.
+            operatorSloMissCallback?.(info);
           },
           ...(latencyOpts.sloRisk
             ? {
@@ -19241,6 +19273,42 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     operatorRetryBudgetDepletedCallback = next;
     opts.auditLog.append({
       event: "retry_budget_depleted_callback_revised",
+      previous: prev,
+      current: nextPresence,
+    });
+  };
+
+  // WR-388: live SLO-miss observer revision. The method is always set;
+  // with latency tracking unconfigured the queue throws the canonical
+  // "must restart" Error (delegated below, exactly like WR-371's
+  // queue-depth gate). Only the operator cell moves: the queue's audit
+  // wrapper (which appends `slo_missed` first, then forwards to the
+  // cell) is never touched, so a replacement cannot bypass the audit.
+  // A non-function callback throws `RangeError` and the live cell is
+  // untouched; a same-reference replacement (or clearing when already
+  // unset) is a silent no-op. A real replacement is audited as
+  // `slo_miss_callback_revised` with `previous` / `current` recording
+  // only 'set' / 'cleared' presence, never a function body. The new
+  // callback takes effect from the next SLO miss; misses already
+  // reported are never re-delivered, and the SLO thresholds, sampling
+  // windows, and in-flight delivery timing are untouched.
+  server.reviseSloMissCallback = (cb: ((info: SloMissInfo) => void) | null): void => {
+    if (!queue.latencyConfigured()) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseSloMissCallback(cb);
+    }
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseSloMissCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === operatorSloMissCallback) return;
+    const prev = operatorSloMissCallback === undefined ? "cleared" : "set";
+    const nextPresence = next === undefined ? "cleared" : "set";
+    operatorSloMissCallback = next;
+    opts.auditLog.append({
+      event: "slo_miss_callback_revised",
       previous: prev,
       current: nextPresence,
     });

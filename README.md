@@ -511,6 +511,23 @@ reliability primitives that matter for any signed-payload pipeline.
   rate (`withinSlo / count` against `sloMs`, default 5000ms). Deliveries
   slower than the budget fire `onSloMiss` and are audited as `slo_missed`.
   The clock is injectable for deterministic tests.
+  **Live revision (WR-388)** — `relay.reviseSloMissCallback(cb)` /
+  `queue.reviseSloMissCallback(cb)` swaps the operator callback that
+  observes each SLO miss at runtime, no restart: the next miss enters
+  the new callback and the old one goes silent, misses already reported
+  are never re-delivered, and `null` clears back to audit-only (misses
+  keep being sampled and audited as `slo_missed`, just no longer
+  forwarded). A non-function value throws `RangeError` and the live
+  callback is untouched; replacing with the same reference (or clearing
+  when already unset) is a silent no-op. A real revision is audited as
+  `slo_miss_callback_revised` with `previous` / `current` ('set' /
+  'cleared' presence, never a function body) — and the audit can never
+  be bypassed by a replacement. With latency tracking unconfigured,
+  revision throws `Error` — enabling observation needs a restart. When
+  OTLP export is configured the `slo_missed` export survives a revision:
+  the wrapper keeps exporting while the caller callback underneath is
+  swapped. Only the observer moves: SLO thresholds, sampling windows,
+  and in-flight delivery timing are untouched.
 - `src/changepoint.ts` — online changepoint detection for per-endpoint
   accepted→delivered latency (`LatencyChangepointDetector` /
   `LatencyChangepointMonitor`). A Page-Hinkley test watches the latency
