@@ -13317,6 +13317,22 @@ enable it at runtime — that still needs a restart. This revises the
 deadline *configuration*; WR-76 is the deadline mechanism itself and
 WR-99 the budget propagation it tunes.
 
+#### Live revision of the deadline-exceeded observer (WR-391)
+
+The observer that hears each expiry is live-revisable — no restart:
+`RetryQueue.reviseDeliveryDeadlineExceededCallback(cb)` /
+`RelayServer.reviseDeliveryDeadlineExceededCallback(cb)` swaps the
+operator callback that receives each `DeliveryDeadlineExceededInfo`
+(`id` / `endpoint` / `attempts` / `elapsedMs` / `deadlineMs`), audited
+as `delivery_deadline_exceeded_callback_revised` with `previous` /
+`current` presence only. `null` clears back to audit-only (expirations
+keep dead-lettering immediately and counting — only the forwarding
+stops). Throws `Error` when no delivery deadline is configured —
+enabling observation needs a restart. This only moves the observer;
+the deadline value itself still moves via WR-341's
+`reviseDeliveryDeadline` — a callback revised after a WR-341 change
+receives the revised `deadlineMs`.
+
 #### Deadline-budget propagation (WR-99)
 
 The WR-76 deadline above expires a delivery at the next dispatch once

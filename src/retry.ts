@@ -3045,6 +3045,12 @@ export interface RetryQueueOptions {
    * Called once per delivery whose end-to-end deadline expires before
    * delivery. The server audits these as `delivery_deadline_exceeded`;
    * library users get the hook directly.
+   *
+   * Live-revisable via `RetryQueue.reviseDeliveryDeadlineExceededCallback`
+   * (WR-391) — `null` clears back to no observer. Under `RelayServer`
+   * this field holds the server's audit closure, so direct calls there
+   * would replace the audit wrapper; server users must go through
+   * `RelayServer.reviseDeliveryDeadlineExceededCallback` instead.
    */
   onDeliveryDeadlineExceeded?: (info: DeliveryDeadlineExceededInfo) => void;
   /**
@@ -4542,7 +4548,9 @@ export class RetryQueue {
    * WR-341: live-revisable via `reviseDeliveryDeadline`.
    */
   private deadlineMinAttemptBudgetMs: number;
-  private readonly onDeliveryDeadlineExceeded?: (info: DeliveryDeadlineExceededInfo) => void;
+  // WR-391: deliberately *not* readonly — `reviseDeliveryDeadlineExceededCallback`
+  // swaps this field live (see `reviseSemanticFailureCallback`, WR-386).
+  private onDeliveryDeadlineExceeded?: (info: DeliveryDeadlineExceededInfo) => void;
   /** WR-80: cron occurrence audit hook. */
   private readonly onScheduledFired?: (event: ScheduledFiredEvent) => void;
   /** WR-76: cumulative deadline expirations per (tenant, endpoint) — see `src/metrics.ts`. */
@@ -8542,6 +8550,19 @@ export class RetryQueue {
    */
   urgentGuardConfigured(): boolean {
     return this.maxConsecutiveUrgent !== undefined;
+  }
+
+  /**
+   * WR-391: whether any delivery deadline is configured (queue-level) —
+   * the `reviseDeliveryDeadlineExceededCallback` gate. Deadline
+   * expirations can only happen with the per-endpoint deadline table in
+   * place; without it there is no expiry channel to observe, so enabling
+   * observation needs a restart. Same presence test as
+   * `reviseDeliveryDeadline`'s own gate: deleting the last endpoint
+   * leaves an empty map, and the feature stays configured.
+   */
+  deliveryDeadlineConfigured(): boolean {
+    return this.deliveryDeadlines !== undefined;
   }
 
   /**
@@ -12900,6 +12921,46 @@ export class RetryQueue {
     const next = cb ?? undefined;
     if (next === this.onAssertionFailure) return;
     this.onAssertionFailure = next;
+  }
+
+  /**
+   * WR-391: live-redirect the delivery-deadline-exceeded observer — the
+   * queue-side setter behind
+   * `RelayServer.reviseDeliveryDeadlineExceededCallback`. The new
+   * callback takes effect from the next deadline expiry; expirations
+   * already reported are never re-delivered, and the deadline table,
+   * the stamped budgets, the expire-and-dead-letter path, the WR-99
+   * `slo_missed` attribution, and the `deliveryDeadlineExceeded`
+   * counters are untouched — only the observation moves. `null` clears
+   * back to no observer (expirations keep dead-lettering immediately
+   * with their actual attempt count and are still audited as
+   * `delivery_deadline_exceeded` and counted — only the forwarding
+   * stops). A non-function value throws `RangeError` and the live
+   * callback is untouched; replacing with the same reference (or
+   * clearing when already unset) is a no-op. Throws `Error` when no
+   * delivery deadline is configured — expirations can only happen with
+   * the table in place, so enabling observation needs a restart. Under
+   * `RelayServer` the field holds the server's audit closure, so direct
+   * calls here would replace the audit wrapper; server users must go
+   * through `RelayServer.reviseDeliveryDeadlineExceededCallback`, which
+   * swaps only the operator cell behind the audit closure.
+   */
+  reviseDeliveryDeadlineExceededCallback(
+    cb: ((info: DeliveryDeadlineExceededInfo) => void) | null
+  ): void {
+    if (!this.deliveryDeadlineConfigured()) {
+      throw new Error(
+        "reviseDeliveryDeadlineExceededCallback: no delivery deadline is configured — enabling deadline-exceeded observation requires a restart"
+      );
+    }
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseDeliveryDeadlineExceededCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === this.onDeliveryDeadlineExceeded) return;
+    this.onDeliveryDeadlineExceeded = next;
   }
 
   /**

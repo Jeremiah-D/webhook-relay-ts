@@ -28,7 +28,7 @@ import {
   selectSignatureAlgorithmVerifier,
   type SignatureAlgorithmRule,
 } from "./signature-alg.ts";
-import { RetryQueue, errorBudgetBurnAuditEvent, type AssertionFailureInfo, type AttemptFailedInfo, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeliveryDeadlineConfig, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type DownstreamResponseSummary, type EndpointPauseCallbacksRevision, type EndpointPauseInfo, type ErrorBudgetConfig, type ErrorBudgetRevision, type EscalationConfig, type EscalationRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type FailureClass, type QuorumRetention, type QuorumRetentionRevision, type ReplayCallbacksRevision, type ReplayForcedInfo, type ReplaySkippedInfo, type RetryItem, type RetryBudgetDepletedInfo, type Sender, type SenderCallOptions, type SemanticFailureInfo, type MaintenanceWindowTransition, type SloMissInfo, type SloRiskConfig, type SloRiskRevision, type UrgentDowngradedEvent, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
+import { RetryQueue, errorBudgetBurnAuditEvent, type AssertionFailureInfo, type AttemptFailedInfo, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeliveryDeadlineConfig, type DeliveryDeadlineExceededInfo, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type DownstreamResponseSummary, type EndpointPauseCallbacksRevision, type EndpointPauseInfo, type ErrorBudgetConfig, type ErrorBudgetRevision, type EscalationConfig, type EscalationRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type FailureClass, type QuorumRetention, type QuorumRetentionRevision, type ReplayCallbacksRevision, type ReplayForcedInfo, type ReplaySkippedInfo, type RetryItem, type RetryBudgetDepletedInfo, type Sender, type SenderCallOptions, type SemanticFailureInfo, type MaintenanceWindowTransition, type SloMissInfo, type SloRiskConfig, type SloRiskRevision, type UrgentDowngradedEvent, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
 import { parseDeliverAtHeader, DELIVER_AT_HEADER } from "./retry.ts";
 import type { ShadowDeliveredInfo, ShadowFailedInfo, ShadowTargetConfig, ShadowTargetsConfig } from "./retry.ts";
 import type {
@@ -7755,6 +7755,32 @@ export interface RelayServer extends Server {
     cb: ((info: AssertionFailureInfo) => void) | null
   ) => void;
   /**
+   * WR-391: live-redirect the delivery-deadline-exceeded observer — the
+   * operator callback that fires once per delivery whose end-to-end
+   * deadline expires before delivery. `null` clears back to audit-only
+   * (expirations keep dead-lettering immediately and are still audited
+   * as `delivery_deadline_exceeded` and counted in
+   * `relay_delivery_deadline_exceeded_total`, just no longer forwarded
+   * to an operator). A non-function value throws `RangeError` and the
+   * live callback is untouched; replacing with the same reference (or
+   * clearing when already unset) is a silent no-op. A real replacement
+   * is audited as `delivery_deadline_exceeded_callback_revised` with
+   * `previous` / `current` recording only 'set' / 'cleared' presence,
+   * never a function body. Always set; throws `Error` when no delivery
+   * deadline was configured — enabling it needs a restart. The new
+   * callback takes effect from the next expiry; expirations already
+   * reported are never re-delivered, and the deadline values, stamped
+   * budgets, and expire-and-dead-letter path are untouched — this only
+   * moves the observer; the deadline value itself still moves via
+   * WR-341's `reviseDeliveryDeadline`. Direct queue users use
+   * `RetryQueue.reviseDeliveryDeadlineExceededCallback` instead —
+   * calling the queue method on a server-owned queue would replace the
+   * audit wrapper.
+   */
+  reviseDeliveryDeadlineExceededCallback?: (
+    cb: ((info: DeliveryDeadlineExceededInfo) => void) | null
+  ) => void;
+  /**
    * WR-385: live-redirect the delivered observer — the operator
    * callback that fires once per successful delivery, with the attempt
    * count and the WR-54 downstream response summary. `null` clears
@@ -9255,6 +9281,15 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // cannot bypass the `failed` (reason `assertion_failed`) audit.
   let operatorAssertionFailureCallback: ((info: AssertionFailureInfo) => void) | undefined =
     opts.retry?.onAssertionFailure;
+  // WR-391: the operator's delivery-deadline-exceeded callback, held in
+  // a mutable cell so
+  // `server.reviseDeliveryDeadlineExceededCallback` can replace it at
+  // runtime. The audit wrapper below reads this cell — never the
+  // operator callback directly — so replacing the operator callback
+  // cannot bypass the `delivery_deadline_exceeded` audit.
+  let operatorDeliveryDeadlineExceededCallback:
+    | ((info: DeliveryDeadlineExceededInfo) => void)
+    | undefined = opts.retry?.onDeliveryDeadlineExceeded;
   // WR-385: the operator's delivered / dead-letter callbacks, held in
   // mutable cells so `server.reviseDeliveredCallback` /
   // `server.reviseDeadLetterCallback` can replace them at runtime. The
@@ -9516,7 +9551,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         elapsedMs: info.elapsedMs,
         deadlineMs: info.deadlineMs,
       });
-      opts.retry?.onDeliveryDeadlineExceeded?.(info);
+      operatorDeliveryDeadlineExceededCallback?.(info);
     },
     // An explicit server-level `probe` wins over the nested `retry.probe`;
     // either way the queue owns the prober. Wrap the caller's hook so
@@ -19453,6 +19488,45 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     operatorAssertionFailureCallback = next;
     opts.auditLog.append({
       event: "assertion_failure_callback_revised",
+      previous: prev,
+      current: nextPresence,
+    });
+  };
+
+  // WR-391: live delivery-deadline-exceeded observer revision. The
+  // method is always set; with no delivery deadline configured the queue
+  // throws the canonical "must restart" Error (delegated below, exactly
+  // like WR-371's queue-depth gate). Only the operator cell moves: the
+  // queue's audit wrapper (which appends `delivery_deadline_exceeded`
+  // first, then forwards to the cell) is never touched, so a replacement
+  // cannot bypass the audit. A non-function callback throws `RangeError`
+  // and the live cell is untouched; a same-reference replacement (or
+  // clearing when already unset) is a silent no-op. A real replacement
+  // is audited as `delivery_deadline_exceeded_callback_revised` with
+  // `previous` / `current` recording only 'set' / 'cleared' presence,
+  // never a function body. The new callback takes effect from the next
+  // expiry; expirations already reported are never re-delivered, and
+  // the deadline values, stamped budgets, expire-and-dead-letter path,
+  // and WR-99 `slo_missed` attribution are untouched.
+  server.reviseDeliveryDeadlineExceededCallback = (
+    cb: ((info: DeliveryDeadlineExceededInfo) => void) | null
+  ): void => {
+    if (!queue.deliveryDeadlineConfigured()) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseDeliveryDeadlineExceededCallback(cb);
+    }
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseDeliveryDeadlineExceededCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === operatorDeliveryDeadlineExceededCallback) return;
+    const prev = operatorDeliveryDeadlineExceededCallback === undefined ? "cleared" : "set";
+    const nextPresence = next === undefined ? "cleared" : "set";
+    operatorDeliveryDeadlineExceededCallback = next;
+    opts.auditLog.append({
+      event: "delivery_deadline_exceeded_callback_revised",
       previous: prev,
       current: nextPresence,
     });
