@@ -269,6 +269,24 @@ reliability primitives that matter for any signed-payload pipeline.
   sustained urgent flood the normal lane keeps at least
   `1 / (maxConsecutiveUrgent + 1)` of the admission slots. Invalid values
   (non-integer, < 1) throw `RangeError` at construction.
+  **Live revision (WR-389)** — `relay.reviseUrgentDowngradedCallback(cb)` /
+  `queue.reviseUrgentDowngradedCallback(cb)` swaps the operator callback
+  that observes each guard-triggered downgrade at runtime, no restart:
+  the next downgrade enters the new callback and the old one goes
+  silent, downgrades already reported are never re-delivered, and `null`
+  clears back to audit-only (downgrades keep happening and are still
+  audited as `urgent_downgraded` and counted in
+  `getUrgentStats().downgraded`, just no longer forwarded). A non-function
+  value throws `RangeError` and the live callback is untouched; replacing
+  with the same reference (or clearing when already unset) is a silent
+  no-op. A real revision is audited as
+  `urgent_downgraded_callback_revised` with `previous` / `current`
+  ('set' / 'cleared' presence, never a function body) — and the audit can
+  never be bypassed by a replacement. With the guard unconfigured,
+  revision throws `Error` — enabling observation needs a restart.
+  Swapping the callback never resets the consecutive-urgent streak: the
+  next urgent admission is still judged against the streak built so far,
+  and already-downgraded items keep their normal-lane assignment.
 - `src/quota.ts` — per-endpoint delivery quota (`EndpointQuota`): a token
   bucket sized to one minute of budget (`deliveriesPerMinute`), refilled
   lazily. An attempt that finds an empty bucket is rescheduled for the next

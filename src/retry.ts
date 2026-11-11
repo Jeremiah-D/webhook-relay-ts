@@ -2477,6 +2477,12 @@ export interface RetryQueueOptions {
    * and moved one urgent delivery to the normal lane. Per-occurrence —
    * one call per downgraded item, not per episode. The server audits these
    * as `urgent_downgraded`; library users get the hook directly.
+   *
+   * Live-revisable via `RetryQueue.reviseUrgentDowngradedCallback`
+   * (WR-389) — `null` clears back to no observer. Under `RelayServer`
+   * this field holds the server's audit closure, so direct calls there
+   * would replace the audit wrapper; server users must go through
+   * `RelayServer.reviseUrgentDowngradedCallback` instead.
    */
   onUrgentDowngraded?: (event: UrgentDowngradedEvent) => void;
   /**
@@ -4397,7 +4403,9 @@ export class RetryQueue {
    */
   private readonly laneScheduler: LaneScheduler;
   private readonly onStarvationGuardAudit?: (event: StarvationGuardAuditEvent) => void;
-  private readonly onUrgentDowngraded?: (event: UrgentDowngradedEvent) => void;
+  // WR-389: deliberately *not* readonly — `reviseUrgentDowngradedCallback`
+  // swaps this field live (see `reviseAttemptFailedCallback`, WR-384).
+  private onUrgentDowngraded?: (event: UrgentDowngradedEvent) => void;
   /**
    * WR-48: per-tenant latency trackers, keyed by tenant (`""` = default).
    * Accepted→delivered latency is sampled per (tenant, endpoint) so one
@@ -8501,6 +8509,17 @@ export class RetryQueue {
    */
   latencyConfigured(): boolean {
     return this.latencyOpts !== undefined;
+  }
+
+  /**
+   * WR-389: whether the urgent consecutive-occupancy guard is configured
+   * (queue-level) — the `reviseUrgentDowngradedCallback` gate. Downgrade
+   * events can only happen when `urgent.maxConsecutiveUrgent` is set;
+   * without it there is no downgrade channel to observe, so enabling
+   * observation needs a restart.
+   */
+  urgentGuardConfigured(): boolean {
+    return this.maxConsecutiveUrgent !== undefined;
   }
 
   /**
@@ -12780,6 +12799,47 @@ export class RetryQueue {
     const next = cb ?? undefined;
     if (next === this.callerOnSloMiss) return;
     this.callerOnSloMiss = next;
+  }
+
+  /**
+   * WR-389: live-redirect the urgent-downgrade observer — the queue-side
+   * setter behind `RelayServer.reviseUrgentDowngradedCallback`. The new
+   * callback takes effect from the next guard-triggered downgrade;
+   * downgrades already reported are never re-delivered, and the guard
+   * threshold, the consecutive-urgent streak, and the lane assignment of
+   * already-downgraded items are untouched — only the observation moves.
+   * Swapping the callback never resets the streak: the next urgent
+   * admission is still judged against the streak built so far. `null`
+   * clears back to no observer (downgrades keep happening and are still
+   * audited as `urgent_downgraded` and counted in
+   * `getUrgentStats().downgraded` — only the forwarding stops). A
+   * non-function value throws `RangeError` and the live callback is
+   * untouched; replacing with the same reference (or clearing when
+   * already unset) is a no-op. Throws `Error` when the urgent guard is
+   * not configured — downgrades can only happen with
+   * `maxConsecutiveUrgent` in place, so enabling observation needs a
+   * restart. Under `RelayServer` the field holds the server's audit
+   * closure, so direct calls here would replace the audit wrapper;
+   * server users must go through
+   * `RelayServer.reviseUrgentDowngradedCallback`, which swaps only the
+   * operator cell behind the audit closure.
+   */
+  reviseUrgentDowngradedCallback(
+    cb: ((event: UrgentDowngradedEvent) => void) | null
+  ): void {
+    if (!this.urgentGuardConfigured()) {
+      throw new Error(
+        "reviseUrgentDowngradedCallback: urgent starvation guard is not configured — enabling urgent-downgrade observation requires a restart"
+      );
+    }
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseUrgentDowngradedCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === this.onUrgentDowngraded) return;
+    this.onUrgentDowngraded = next;
   }
 
   /**

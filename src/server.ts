@@ -28,7 +28,7 @@ import {
   selectSignatureAlgorithmVerifier,
   type SignatureAlgorithmRule,
 } from "./signature-alg.ts";
-import { RetryQueue, errorBudgetBurnAuditEvent, type AttemptFailedInfo, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeliveryDeadlineConfig, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type DownstreamResponseSummary, type EndpointPauseCallbacksRevision, type EndpointPauseInfo, type ErrorBudgetConfig, type ErrorBudgetRevision, type EscalationConfig, type EscalationRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type FailureClass, type QuorumRetention, type QuorumRetentionRevision, type ReplayCallbacksRevision, type ReplayForcedInfo, type ReplaySkippedInfo, type RetryItem, type RetryBudgetDepletedInfo, type Sender, type SenderCallOptions, type SemanticFailureInfo, type MaintenanceWindowTransition, type SloMissInfo, type SloRiskConfig, type SloRiskRevision, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
+import { RetryQueue, errorBudgetBurnAuditEvent, type AttemptFailedInfo, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeliveryDeadlineConfig, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type DownstreamResponseSummary, type EndpointPauseCallbacksRevision, type EndpointPauseInfo, type ErrorBudgetConfig, type ErrorBudgetRevision, type EscalationConfig, type EscalationRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type FailureClass, type QuorumRetention, type QuorumRetentionRevision, type ReplayCallbacksRevision, type ReplayForcedInfo, type ReplaySkippedInfo, type RetryItem, type RetryBudgetDepletedInfo, type Sender, type SenderCallOptions, type SemanticFailureInfo, type MaintenanceWindowTransition, type SloMissInfo, type SloRiskConfig, type SloRiskRevision, type UrgentDowngradedEvent, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
 import { parseDeliverAtHeader, DELIVER_AT_HEADER } from "./retry.ts";
 import type { ShadowDeliveredInfo, ShadowFailedInfo, ShadowTargetConfig, ShadowTargetsConfig } from "./retry.ts";
 import type {
@@ -7706,6 +7706,31 @@ export interface RelayServer extends Server {
    */
   reviseSloMissCallback?: (cb: ((info: SloMissInfo) => void) | null) => void;
   /**
+   * WR-389: live-redirect the urgent-downgrade observer — the operator
+   * callback that fires once per urgent delivery force-downgraded to the
+   * normal lane by the fast-lane starvation guard (WR-121). `null`
+   * clears back to audit-only (downgrades keep happening and are still
+   * audited as `urgent_downgraded` and counted in
+   * `getUrgentStats().downgraded`, just no longer forwarded to an
+   * operator). A non-function value throws `RangeError` and the live
+   * callback is untouched; replacing with the same reference (or
+   * clearing when already unset) is a silent no-op. A real replacement
+   * is audited as `urgent_downgraded_callback_revised` with `previous`
+   * / `current` recording only 'set' / 'cleared' presence, never a
+   * function body. Always set; throws `Error` when the urgent guard was
+   * not configured — enabling it needs a restart. The new callback
+   * takes effect from the next downgrade; downgrades already reported
+   * are never re-delivered, and the guard threshold, the
+   * consecutive-urgent streak, and already-downgraded items' lane
+   * assignment are untouched. Direct queue users use
+   * `RetryQueue.reviseUrgentDowngradedCallback` instead — calling the
+   * queue method on a server-owned queue would replace the audit
+   * wrapper.
+   */
+  reviseUrgentDowngradedCallback?: (
+    cb: ((event: UrgentDowngradedEvent) => void) | null
+  ) => void;
+  /**
    * WR-385: live-redirect the delivered observer — the operator
    * callback that fires once per successful delivery, with the attempt
    * count and the WR-54 downstream response summary. `null` clears
@@ -9191,6 +9216,14 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // (`onSloMiss` lives under `retry.latency`, not on `retry` itself).
   let operatorSloMissCallback: ((info: SloMissInfo) => void) | undefined =
     latencyOpts?.onSloMiss;
+  // WR-389: the operator's urgent-downgrade callback, held in a mutable
+  // cell so `server.reviseUrgentDowngradedCallback` can replace it at
+  // runtime. The audit wrapper below reads this cell — never the
+  // operator callback directly — so replacing the operator callback
+  // cannot bypass the `urgent_downgraded` audit.
+  let operatorUrgentDowngradedCallback:
+    | ((event: UrgentDowngradedEvent) => void)
+    | undefined = opts.retry?.onUrgentDowngraded;
   // WR-385: the operator's delivered / dead-letter callbacks, held in
   // mutable cells so `server.reviseDeliveredCallback` /
   // `server.reviseDeadLetterCallback` can replace them at runtime. The
@@ -9657,7 +9690,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // downgrade (WR-121) is audited, not just observed.
     onUrgentDowngraded: (event) => {
       opts.auditLog.append(event);
-      opts.retry?.onUrgentDowngraded?.(event);
+      // WR-389: forward to the operator cell, never to the constructor
+      // callback directly, so a live revision cannot bypass the audit.
+      operatorUrgentDowngradedCallback?.(event);
     },
     // Wrap the caller's hook so every failover switch is audited, not
     // just observed.
@@ -19309,6 +19344,45 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     operatorSloMissCallback = next;
     opts.auditLog.append({
       event: "slo_miss_callback_revised",
+      previous: prev,
+      current: nextPresence,
+    });
+  };
+
+  // WR-389: live urgent-downgrade observer revision. The method is
+  // always set; with the urgent guard unconfigured the queue throws the
+  // canonical "must restart" Error (delegated below, exactly like
+  // WR-371's queue-depth gate). Only the operator cell moves: the
+  // queue's audit wrapper (which appends `urgent_downgraded` first, then
+  // forwards to the cell) is never touched, so a replacement cannot
+  // bypass the audit. A non-function callback throws `RangeError` and
+  // the live cell is untouched; a same-reference replacement (or
+  // clearing when already unset) is a silent no-op. A real replacement
+  // is audited as `urgent_downgraded_callback_revised` with `previous`
+  // / `current` recording only 'set' / 'cleared' presence, never a
+  // function body. The new callback takes effect from the next
+  // downgrade; downgrades already reported are never re-delivered, and
+  // the guard threshold, the consecutive-urgent streak, and
+  // already-downgraded items' lane assignment are untouched.
+  server.reviseUrgentDowngradedCallback = (
+    cb: ((event: UrgentDowngradedEvent) => void) | null
+  ): void => {
+    if (!queue.urgentGuardConfigured()) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseUrgentDowngradedCallback(cb);
+    }
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseUrgentDowngradedCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === operatorUrgentDowngradedCallback) return;
+    const prev = operatorUrgentDowngradedCallback === undefined ? "cleared" : "set";
+    const nextPresence = next === undefined ? "cleared" : "set";
+    operatorUrgentDowngradedCallback = next;
+    opts.auditLog.append({
+      event: "urgent_downgraded_callback_revised",
       previous: prev,
       current: nextPresence,
     });
