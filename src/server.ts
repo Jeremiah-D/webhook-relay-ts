@@ -28,7 +28,7 @@ import {
   selectSignatureAlgorithmVerifier,
   type SignatureAlgorithmRule,
 } from "./signature-alg.ts";
-import { RetryQueue, errorBudgetBurnAuditEvent, type AssertionFailureInfo, type AttemptFailedInfo, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeliveryDeadlineConfig, type DeliveryDeadlineExceededInfo, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type DownstreamResponseSummary, type EndpointPauseCallbacksRevision, type EndpointPauseInfo, type ErrorBudgetConfig, type ErrorBudgetRevision, type EscalationConfig, type EscalationRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type FailureClass, type QuorumRetention, type QuorumRetentionRevision, type ReplayCallbacksRevision, type ReplayForcedInfo, type ReplaySkippedInfo, type RetryItem, type RetryBudgetDepletedInfo, type Sender, type SenderCallOptions, type SemanticFailureInfo, type MaintenanceWindowTransition, type SloMissInfo, type SloRiskConfig, type SloRiskRevision, type UrgentDowngradedEvent, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
+import { RetryQueue, errorBudgetBurnAuditEvent, type AssertionFailureInfo, type AttemptFailedInfo, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeliveryDeadlineConfig, type DeliveryDeadlineExceededInfo, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type DownstreamResponseSummary, type EndpointPauseCallbacksRevision, type EndpointPauseInfo, type ErrorBudgetConfig, type ErrorBudgetRevision, type EscalationConfig, type EscalationRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type FailureClass, type QuorumRetention, type QuorumRetentionRevision, type ReplayCallbacksRevision, type ReplayForcedInfo, type ReplaySkippedInfo, type RetryItem, type RetryBudgetDepletedInfo, type Sender, type SenderCallOptions, type SemanticFailureInfo, type MaintenanceWindowTransition, type SloMissInfo, type SloRiskConfig, type SloRiskRevision, type TenantBudgetAuditEvent, type UrgentDowngradedEvent, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
 import { parseDeliverAtHeader, DELIVER_AT_HEADER } from "./retry.ts";
 import type { ShadowDeliveredInfo, ShadowFailedInfo, ShadowTargetConfig, ShadowTargetsConfig } from "./retry.ts";
 import type {
@@ -7781,6 +7781,30 @@ export interface RelayServer extends Server {
     cb: ((info: DeliveryDeadlineExceededInfo) => void) | null
   ) => void;
   /**
+   * WR-392: live-redirect the budget-exceeded observer — the operator
+   * callback that fires on the first over-budget dispatch for a tenant
+   * in a UTC calendar month (WR-137). `null` clears back to audit-only
+   * (over-budget dispatches keep parking until the next month and are
+   * still audited as `budget_exceeded` and counted in
+   * `getTenantBudgetStats()`, just no longer forwarded to an operator).
+   * A non-function value throws `RangeError` and the live callback is
+   * untouched; replacing with the same reference (or clearing when
+   * already unset) is a silent no-op. A real replacement is audited as
+   * `budget_exceeded_callback_revised` with `previous` / `current`
+   * recording only 'set' / 'cleared' presence, never a function body.
+   * Always set; there is no must-restart gate — the budget enforcer is
+   * always constructed (unlimited-by-default). The new callback takes
+   * effect from the next first-over-budget dispatch; exceedances already
+   * reported are never re-delivered, and the budget values, the park
+   * schedule, and the month rollover are untouched. Direct queue users
+   * use `RetryQueue.reviseBudgetExceededCallback` instead — calling the
+   * queue method on a server-owned queue would replace the audit
+   * wrapper.
+   */
+  reviseBudgetExceededCallback?: (
+    cb: ((event: TenantBudgetAuditEvent) => void) | null
+  ) => void;
+  /**
    * WR-385: live-redirect the delivered observer — the operator
    * callback that fires once per successful delivery, with the attempt
    * count and the WR-54 downstream response summary. `null` clears
@@ -9290,6 +9314,13 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   let operatorDeliveryDeadlineExceededCallback:
     | ((info: DeliveryDeadlineExceededInfo) => void)
     | undefined = opts.retry?.onDeliveryDeadlineExceeded;
+  // WR-392: the operator's budget-exceeded callback, held in a mutable
+  // cell so `server.reviseBudgetExceededCallback` can replace it at
+  // runtime. The audit wrapper below reads this cell — never the
+  // operator callback directly — so replacing the operator callback
+  // cannot bypass the `budget_exceeded` audit.
+  let operatorBudgetExceededCallback: ((event: TenantBudgetAuditEvent) => void) | undefined =
+    opts.retry?.onBudgetExceeded;
   // WR-385: the operator's delivered / dead-letter callbacks, held in
   // mutable cells so `server.reviseDeliveredCallback` /
   // `server.reviseDeadLetterCallback` can replace them at runtime. The
@@ -9750,7 +9781,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // is audited as `budget_exceeded`, not just observed.
     onBudgetExceeded: (event) => {
       opts.auditLog.append(event);
-      opts.retry?.onBudgetExceeded?.(event);
+      // WR-392: forward to the operator cell, never to the constructor
+      // callback directly, so a live revision cannot bypass the audit.
+      operatorBudgetExceededCallback?.(event);
     },
     // Wrap the caller's hook so every urgent fast-lane starvation-guard
     // downgrade (WR-121) is audited, not just observed.
@@ -19527,6 +19560,41 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     operatorDeliveryDeadlineExceededCallback = next;
     opts.auditLog.append({
       event: "delivery_deadline_exceeded_callback_revised",
+      previous: prev,
+      current: nextPresence,
+    });
+  };
+
+  // WR-392: live budget-exceeded observer revision. The method is
+  // always set; there is no must-restart gate — the budget enforcer is
+  // always constructed (unlimited-by-default). Only the operator cell
+  // moves: the queue's audit wrapper (which appends `budget_exceeded`
+  // first, then forwards to the cell) is never touched, so a
+  // replacement cannot bypass the audit. A non-function callback
+  // throws `RangeError` and the live cell is untouched; a
+  // same-reference replacement (or clearing when already unset) is a
+  // silent no-op. A real replacement is audited as
+  // `budget_exceeded_callback_revised` with `previous` / `current`
+  // recording only 'set' / 'cleared' presence, never a function body.
+  // The new callback takes effect from the next first-over-budget
+  // dispatch; exceedances already reported are never re-delivered, and
+  // the budget values, the park schedule, and the month rollover are
+  // untouched.
+  server.reviseBudgetExceededCallback = (
+    cb: ((event: TenantBudgetAuditEvent) => void) | null
+  ): void => {
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseBudgetExceededCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === operatorBudgetExceededCallback) return;
+    const prev = operatorBudgetExceededCallback === undefined ? "cleared" : "set";
+    const nextPresence = next === undefined ? "cleared" : "set";
+    operatorBudgetExceededCallback = next;
+    opts.auditLog.append({
+      event: "budget_exceeded_callback_revised",
       previous: prev,
       current: nextPresence,
     });

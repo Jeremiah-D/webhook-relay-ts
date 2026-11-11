@@ -2497,6 +2497,8 @@ export interface RetryQueueOptions {
    * triggered per tenant per month — one call, never an audit flood;
    * the month rollover re-arms it. The server audits these as
    * `budget_exceeded`; library users get the hook directly.
+   * Live-revisable via `RetryQueue.reviseBudgetExceededCallback` —
+   * `null` clears back to no observer.
    */
   onBudgetExceeded?: (event: TenantBudgetAuditEvent) => void;
   /**
@@ -4499,7 +4501,12 @@ export class RetryQueue {
    * cheap no-op until the first budget is set.
    */
   private readonly budget: TenantBudgetEnforcer;
-  private readonly onBudgetExceeded?: (event: TenantBudgetAuditEvent) => void;
+  // WR-392: deliberately *not* readonly — `reviseBudgetExceededCallback`
+  // replaces the live budget-exceeded observer at runtime. The server's
+  // audit closure (which forwards to the operator callback) is held
+  // here when the queue runs under `RelayServer`; direct queue users
+  // hold their own callback in the same field.
+  private onBudgetExceeded?: (event: TenantBudgetAuditEvent) => void;
   /**
    * WR-137: dispatches rescheduled because the tenant was over its
    * monthly delivery budget. Keyed by tenant key (`"default"` for the
@@ -12961,6 +12968,39 @@ export class RetryQueue {
     const next = cb ?? undefined;
     if (next === this.onDeliveryDeadlineExceeded) return;
     this.onDeliveryDeadlineExceeded = next;
+  }
+
+  /**
+   * WR-392: live-redirect the budget-exceeded observer — the queue-side
+   * setter behind `RelayServer.reviseBudgetExceededCallback`. The new
+   * callback takes effect from the next first-over-budget dispatch for
+   * a tenant in a month; exceedances already reported are never
+   * re-delivered, and the budget values, the enforcer, the month
+   * rollover re-arm, `reviseTenantBudget`, and `getTenantBudgetStats()`
+   * are untouched — only the observation moves. `null` clears back to
+   * no observer (over-budget dispatches keep parking until the next
+   * month and are still audited as `budget_exceeded` and counted in
+   * `budgetDelayed` — only the forwarding stops). A non-function value
+   * throws `RangeError` and the live callback is untouched; replacing
+   * with the same reference (or clearing when already unset) is a
+   * no-op. There is no must-restart gate: the budget enforcer is
+   * always constructed — unlimited-by-default — so a revision is
+   * always possible; it only produces an observable event once a
+   * budget is configured and the month's first exceedance fires.
+   * Under `RelayServer` the field holds the server's audit closure, so
+   * direct calls here would replace the audit wrapper; server users
+   * must go through `RelayServer.reviseBudgetExceededCallback`, which
+   * swaps only the operator cell behind the audit closure.
+   */
+  reviseBudgetExceededCallback(cb: ((event: TenantBudgetAuditEvent) => void) | null): void {
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseBudgetExceededCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === this.onBudgetExceeded) return;
+    this.onBudgetExceeded = next;
   }
 
   /**

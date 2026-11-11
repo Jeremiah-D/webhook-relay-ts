@@ -4062,7 +4062,10 @@ queue.setTenantBudget("globex", { deliveriesPerMonth: 500 }); // runtime change,
   gate, so an over-budget tenant consumes no quota tokens either.
 - **One audit event per month** — the first over-budget dispatch per
   tenant per month fires `budget_exceeded` (tenant, allowance, usage,
-  month); the month rollover re-arms it — never an audit flood.
+  month); the month rollover re-arms it — never an audit flood. The
+  observer is live-revisable (WR-392) via `reviseBudgetExceededCallback`
+  on the queue and the server (`null` clears back to audit-only); a
+  revision never re-delivers an exceedance already reported.
 - **Opt-in, unlimited by default** — a tenant without a configured budget
   is unlimited; the default relay behaves byte-identically to the
   pre-WR-137 one.
