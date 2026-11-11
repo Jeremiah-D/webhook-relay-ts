@@ -337,6 +337,22 @@ reliability primitives that matter for any signed-payload pipeline.
   domain or one tenant's override, and this one moves one endpoint's
   override — the gate order endpoint → tenant → global never changes,
   and there is no tenant dimension to an endpoint budget.
+  **Live callback redirection (WR-387)** — `relay.reviseRetryBudgetDepletedCallback(cb)`
+  / `queue.reviseRetryBudgetDepletedCallback(cb)` swaps the operator
+  callback that observes each budget-parked retry at runtime, no restart:
+  the next park enters the new callback and the old one goes silent, parks
+  already reported are never re-delivered, and `null` clears back to
+  audit-only (parks keep happening and are still audited as
+  `retry_budget_depleted` and counted, just no longer forwarded). A
+  non-function value throws `RangeError` and the live callback is
+  untouched; replacing with the same reference (or clearing when already
+  unset) is a silent no-op. A real revision is audited as
+  `retry_budget_depleted_callback_revised` with `previous` / `current`
+  ('set' / 'cleared' presence, never a function body) — and the audit can
+  never be bypassed by a replacement. With no retry budget configured at
+  any layer (global, per-endpoint, per-tenant), revision throws `Error` —
+  enabling observation needs a restart. Only the observer moves: the park
+  schedule, the park counters, and the refill rhythm are untouched.
 - `src/tenant-retry-budget.ts` — *per-tenant* retry budget
   (`TenantRetryBudget`, WR-200): one lazily-created token bucket per
   tenant, each sized to `retriesPerMinute` per minute (default 6000,

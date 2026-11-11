@@ -2409,6 +2409,12 @@ export interface RetryQueueOptions {
   /**
    * Called once per retry parked by the global retry budget. The server
    * audits these as `retry_budget_depleted`.
+   *
+   * Live-revisable via `RetryQueue.reviseRetryBudgetDepletedCallback` (WR-387) —
+   * `null` clears back to no observer. Under `RelayServer` this field
+   * holds the server's audit closure, so direct calls there would
+   * replace the audit wrapper; server users must go through
+   * `RelayServer.reviseRetryBudgetDepletedCallback` instead.
    */
   onRetryBudgetDepleted?: (info: RetryBudgetDepletedInfo) => void;
   /**
@@ -4566,7 +4572,9 @@ export class RetryQueue {
   private latencyPhasesOpts?: LatencyPhaseOptions;
   /** WR-95: per-tenant latency phase trackers (WR-48 scoping). */
   private readonly latencyPhaseTrackers = new Map<string, LatencyPhasesTracker>();
-  private readonly onRetryBudgetDepleted?: (info: RetryBudgetDepletedInfo) => void;
+  // WR-387: deliberately *not* readonly — `reviseRetryBudgetDepletedCallback`
+  // swaps this field live (see `reviseAttemptFailedCallback`, WR-384).
+  private onRetryBudgetDepleted?: (info: RetryBudgetDepletedInfo) => void;
   // WR-384: deliberately *not* readonly — `reviseAttemptFailedCallback`
   // replaces the live failed-attempt observer at runtime. The server's
   // audit closure (which forwards to the operator callback) is held here
@@ -8439,6 +8447,20 @@ export class RetryQueue {
   /** WR-327: whether the global retry budget is enabled (queue-level). */
   retryBudgetConfigured(): boolean {
     return this.retryBudget !== undefined;
+  }
+
+  /**
+   * WR-387: whether any retry budget that can park a retry is configured
+   * (queue-level) — the global budget, at least one per-endpoint
+   * override, or the per-tenant budget. Any one of the three passes the
+   * `reviseRetryBudgetDepletedCallback` gate.
+   */
+  anyRetryBudgetConfigured(): boolean {
+    return (
+      this.retryBudget !== undefined ||
+      this.retryBudgetEndpoints.size > 0 ||
+      this.tenantRetryBudget !== undefined
+    );
   }
 
   /**
@@ -12639,6 +12661,47 @@ export class RetryQueue {
     const next = cb ?? undefined;
     if (next === this.onSemanticFailure) return;
     this.onSemanticFailure = next;
+  }
+
+  /**
+   * WR-387: live-redirect the retry-budget-depleted observer — the
+   * queue-side setter behind
+   * `RelayServer.reviseRetryBudgetDepletedCallback`. The new callback
+   * takes effect from the next parked retry; parks already reported are
+   * never re-delivered, and the park scheduling, the park counters, and
+   * the refill rhythm are untouched — only the observation moves.
+   * `null` clears back to no observer (parked retries keep parking and
+   * resuming exactly as before — only the forwarding stops). A
+   * non-function value throws `RangeError` and the live callback is
+   * untouched; replacing with the same reference (or clearing when
+   * already unset) is a no-op. Throws `Error` when no retry budget is
+   * configured at any of the three layers (global, per-endpoint,
+   * per-tenant) — parks can only happen with a budget in place, so
+   * enabling observation needs a restart. (A per-endpoint override
+   * alone passes the gate — the bucket exists — even though the park
+   * path only consults endpoint buckets when a global or tenant budget
+   * is also present.) Under `RelayServer` the field holds the server's
+   * audit closure, so direct calls here would replace the audit
+   * wrapper; server users must go through
+   * `RelayServer.reviseRetryBudgetDepletedCallback`, which swaps only
+   * the operator cell behind the audit closure.
+   */
+  reviseRetryBudgetDepletedCallback(
+    cb: ((info: RetryBudgetDepletedInfo) => void) | null
+  ): void {
+    if (!this.anyRetryBudgetConfigured()) {
+      throw new Error(
+        "reviseRetryBudgetDepletedCallback: no retry budget is configured — enabling budget-depleted observation requires a restart"
+      );
+    }
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseRetryBudgetDepletedCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === this.onRetryBudgetDepleted) return;
+    this.onRetryBudgetDepleted = next;
   }
 
   /**

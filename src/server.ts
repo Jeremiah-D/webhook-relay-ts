@@ -28,7 +28,7 @@ import {
   selectSignatureAlgorithmVerifier,
   type SignatureAlgorithmRule,
 } from "./signature-alg.ts";
-import { RetryQueue, errorBudgetBurnAuditEvent, type AttemptFailedInfo, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeliveryDeadlineConfig, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type DownstreamResponseSummary, type EndpointPauseCallbacksRevision, type EndpointPauseInfo, type ErrorBudgetConfig, type ErrorBudgetRevision, type EscalationConfig, type EscalationRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type FailureClass, type QuorumRetention, type QuorumRetentionRevision, type ReplayCallbacksRevision, type ReplayForcedInfo, type ReplaySkippedInfo, type RetryItem, type Sender, type SenderCallOptions, type SemanticFailureInfo, type MaintenanceWindowTransition, type SloRiskConfig, type SloRiskRevision, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
+import { RetryQueue, errorBudgetBurnAuditEvent, type AttemptFailedInfo, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeliveryDeadlineConfig, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type DownstreamResponseSummary, type EndpointPauseCallbacksRevision, type EndpointPauseInfo, type ErrorBudgetConfig, type ErrorBudgetRevision, type EscalationConfig, type EscalationRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type FailureClass, type QuorumRetention, type QuorumRetentionRevision, type ReplayCallbacksRevision, type ReplayForcedInfo, type ReplaySkippedInfo, type RetryItem, type RetryBudgetDepletedInfo, type Sender, type SenderCallOptions, type SemanticFailureInfo, type MaintenanceWindowTransition, type SloRiskConfig, type SloRiskRevision, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
 import { parseDeliverAtHeader, DELIVER_AT_HEADER } from "./retry.ts";
 import type { ShadowDeliveredInfo, ShadowFailedInfo, ShadowTargetConfig, ShadowTargetsConfig } from "./retry.ts";
 import type {
@@ -7661,6 +7661,30 @@ export interface RelayServer extends Server {
    */
   reviseSemanticFailureCallback?: (cb: ((info: SemanticFailureInfo) => void) | null) => void;
   /**
+   * WR-387: live-redirect the retry-budget-depleted observer — the
+   * operator callback that fires once per retry parked because a retry
+   * budget (global, per-endpoint, or per-tenant) is exhausted. `null`
+   * clears back to audit-only (parked retries keep parking and resuming
+   * and are still audited as `retry_budget_depleted`, just no longer
+   * forwarded to an operator). A non-function value throws `RangeError`
+   * and the live callback is untouched; replacing with the same
+   * reference (or clearing when already unset) is a silent no-op. A
+   * real replacement is audited as
+   * `retry_budget_depleted_callback_revised` with `previous` / `current`
+   * recording only 'set' / 'cleared' presence, never a function body.
+   * Always set; throws `Error` when no retry budget was configured at
+   * any layer — enabling it needs a restart. The new callback takes
+   * effect from the next parked retry; parks already reported are never
+   * re-delivered, and the park schedule, counters, and refill rhythm
+   * are untouched. Direct queue users use
+   * `RetryQueue.reviseRetryBudgetDepletedCallback` instead — calling the
+   * queue method on a server-owned queue would replace the audit
+   * wrapper.
+   */
+  reviseRetryBudgetDepletedCallback?: (
+    cb: ((info: RetryBudgetDepletedInfo) => void) | null
+  ) => void;
+  /**
    * WR-385: live-redirect the delivered observer — the operator
    * callback that fires once per successful delivery, with the attempt
    * count and the WR-54 downstream response summary. `null` clears
@@ -9130,6 +9154,14 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // cannot bypass the `failed` (reason `semantic_failed`) audit.
   let operatorSemanticFailureCallback: ((info: SemanticFailureInfo) => void) | undefined =
     opts.retry?.onSemanticFailure;
+  // WR-387: the operator's retry-budget-depleted callback, held in a
+  // mutable cell so `server.reviseRetryBudgetDepletedCallback` can
+  // replace it at runtime. The audit wrapper below reads this cell —
+  // never the operator callback directly — so replacing the operator
+  // callback cannot bypass the `retry_budget_depleted` audit.
+  let operatorRetryBudgetDepletedCallback:
+    | ((info: RetryBudgetDepletedInfo) => void)
+    | undefined = opts.retry?.onRetryBudgetDepleted;
   // WR-385: the operator's delivered / dead-letter callbacks, held in
   // mutable cells so `server.reviseDeliveredCallback` /
   // `server.reviseDeadLetterCallback` can replace them at runtime. The
@@ -9806,7 +9838,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       opts.retry?.onAssertionFailure?.(info);
     },
     // Wrap the caller's onRetryBudgetDepleted so every budget-parked retry
-    // is audited, not just observed.
+    // is audited, not just observed. The wrapper forwards to the WR-387
+    // operator cell, never to the constructor callback directly, so a
+    // live revision cannot bypass the audit.
     onRetryBudgetDepleted: (info) => {
       opts.auditLog.append({
         event: "retry_budget_depleted",
@@ -9820,7 +9854,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         // that endpoint's own override bucket was exhausted.
         budgetScope: info.scope,
       });
-      opts.retry?.onRetryBudgetDepleted?.(info);
+      operatorRetryBudgetDepletedCallback?.(info);
     },
     // Wrap the caller's onAttemptFailed so every failed attempt that
     // schedules a retry is audited as `retrying` with its error and the
@@ -19169,6 +19203,44 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     operatorSemanticFailureCallback = next;
     opts.auditLog.append({
       event: "semantic_failure_callback_revised",
+      previous: prev,
+      current: nextPresence,
+    });
+  };
+
+  // WR-387: live retry-budget-depleted observer revision. The method is
+  // always set; with no retry budget configured at any layer the queue
+  // throws the canonical "must restart" Error (delegated below, exactly
+  // like WR-371's queue-depth gate). Only the operator cell moves: the
+  // queue's audit wrapper (which appends `retry_budget_depleted` first,
+  // then forwards to the cell) is never touched, so a replacement cannot
+  // bypass the audit. A non-function callback throws `RangeError` and
+  // the live cell is untouched; a same-reference replacement (or clearing
+  // when already unset) is a silent no-op. A real replacement is audited
+  // as `retry_budget_depleted_callback_revised` with `previous` /
+  // `current` recording only 'set' / 'cleared' presence, never a function
+  // body. The new callback takes effect from the next parked retry;
+  // parks already reported are never re-delivered, and the park
+  // schedule, counters, and refill rhythm are untouched.
+  server.reviseRetryBudgetDepletedCallback = (
+    cb: ((info: RetryBudgetDepletedInfo) => void) | null
+  ): void => {
+    if (!queue.anyRetryBudgetConfigured()) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseRetryBudgetDepletedCallback(cb);
+    }
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseRetryBudgetDepletedCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === operatorRetryBudgetDepletedCallback) return;
+    const prev = operatorRetryBudgetDepletedCallback === undefined ? "cleared" : "set";
+    const nextPresence = next === undefined ? "cleared" : "set";
+    operatorRetryBudgetDepletedCallback = next;
+    opts.auditLog.append({
+      event: "retry_budget_depleted_callback_revised",
       previous: prev,
       current: nextPresence,
     });
