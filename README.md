@@ -12332,6 +12332,25 @@ written to the audit log, so the log is the machine's trace.
   retry mechanism is always on. Server users must use the server method —
   calling the queue method on a server-owned queue would replace the
   audit wrapper.
+- **Live-revisable terminal observers (WR-385)** — the delivered and
+  dead-letter callbacks can be swapped without a restart:
+  `server.reviseDeliveredCallback(cb)` /
+  `server.reviseDeadLetterCallback(cb)` (relay). `null` clears back to
+  audit-only — deliveries keep succeeding and dead letters keep landing,
+  still audited as `delivered` / `dead_letter`, only the operator
+  forwarding stops. The new callback takes effect from the next terminal
+  event; events already reported are never re-delivered, and the
+  delivery / dead-letter decision, retry budget gates, and audit shapes
+  are untouched. A real revision is audited as
+  `delivered_callback_revised` / `dead_letter_callback_revised`
+  (`previous` / `current`: 'set' / 'cleared'); a same-reference revision
+  is a silent no-op, and a non-function value throws `RangeError` with
+  the live callback untouched. There is no must-restart gate: both hooks
+  default to absent. Direct queue users set the constructor
+  `onDelivered` / `onDeadLetter` instead — calling a queue method on a
+  server-owned queue would replace the audit wrapper. WR-384 is the
+  same family for the per-failure-attempt observer; WR-43 owns the
+  `retrying` audit and WR-155 the delivery receipt itself.
 - `delivering` → **`dead_letter`** when `maxAttempts` is exhausted. The
   entry keeps `attempts`, `lastError`, and `deadLetteredAt` — everything an
   operator needs to diagnose it, without the raw payload on the operator

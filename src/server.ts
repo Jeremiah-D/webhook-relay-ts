@@ -28,7 +28,7 @@ import {
   selectSignatureAlgorithmVerifier,
   type SignatureAlgorithmRule,
 } from "./signature-alg.ts";
-import { RetryQueue, errorBudgetBurnAuditEvent, type AttemptFailedInfo, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeliveryDeadlineConfig, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type EndpointPauseCallbacksRevision, type EndpointPauseInfo, type ErrorBudgetConfig, type ErrorBudgetRevision, type EscalationConfig, type EscalationRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type QuorumRetention, type QuorumRetentionRevision, type ReplayCallbacksRevision, type ReplayForcedInfo, type ReplaySkippedInfo, type RetryItem, type Sender, type SenderCallOptions, type MaintenanceWindowTransition, type SloRiskConfig, type SloRiskRevision, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
+import { RetryQueue, errorBudgetBurnAuditEvent, type AttemptFailedInfo, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeliveryDeadlineConfig, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type DownstreamResponseSummary, type EndpointPauseCallbacksRevision, type EndpointPauseInfo, type ErrorBudgetConfig, type ErrorBudgetRevision, type EscalationConfig, type EscalationRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type FailureClass, type QuorumRetention, type QuorumRetentionRevision, type ReplayCallbacksRevision, type ReplayForcedInfo, type ReplaySkippedInfo, type RetryItem, type Sender, type SenderCallOptions, type MaintenanceWindowTransition, type SloRiskConfig, type SloRiskRevision, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
 import { parseDeliverAtHeader, DELIVER_AT_HEADER } from "./retry.ts";
 import type { ShadowDeliveredInfo, ShadowFailedInfo, ShadowTargetConfig, ShadowTargetsConfig } from "./retry.ts";
 import type {
@@ -7639,6 +7639,59 @@ export interface RelayServer extends Server {
    */
   reviseAttemptFailedCallback?: (cb: ((info: AttemptFailedInfo) => void) | null) => void;
   /**
+   * WR-385: live-redirect the delivered observer — the operator
+   * callback that fires once per successful delivery, with the attempt
+   * count and the WR-54 downstream response summary. `null` clears
+   * back to audit-only (deliveries keep succeeding and are still
+   * audited as `delivered`, just no longer forwarded to an operator).
+   * A non-function value throws `RangeError` and the live callback is
+   * untouched; replacing with the same reference (or clearing when
+   * already unset) is a silent no-op. A real replacement is audited
+   * as `delivered_callback_revised` with `previous` / `current`
+   * recording only 'set' / 'cleared' presence, never a function body.
+   * Always set; there is no must-restart gate — the hook defaults to
+   * absent and delivery is always on. The new callback takes effect
+   * from the next successful delivery; deliveries already reported
+   * are never re-delivered. Direct queue users set the constructor
+   * `onDelivered` instead — calling a queue method on a server-owned
+   * queue would replace the audit wrapper.
+   */
+  reviseDeliveredCallback?: (
+    cb: ((item: RetryItem, attempts: number, summary?: DownstreamResponseSummary) => void) | null
+  ) => void;
+  /**
+   * WR-385: live-redirect the dead-letter observer — the operator
+   * callback that fires once per dead-lettered item, with the attempt
+   * count, the last error, its failure class, and the WR-54 response
+   * summary of the last attempt. `null` clears back to audit-only
+   * (items keep dead-lettering and are still audited as
+   * `dead_letter`, just no longer forwarded to an operator). A
+   * non-function value throws `RangeError` and the live callback is
+   * untouched; replacing with the same reference (or clearing when
+   * already unset) is a silent no-op. A real replacement is audited
+   * as `dead_letter_callback_revised` with `previous` / `current`
+   * recording only 'set' / 'cleared' presence, never a function body.
+   * Always set; there is no must-restart gate — the hook defaults to
+   * absent and dead-lettering is always on. The new callback takes
+   * effect from the next dead letter; dead letters already reported
+   * are never re-delivered, and the dead-letter decision, retry budget
+   * gates, and `dead_letter` audit shape are untouched. Direct queue
+   * users set the constructor `onDeadLetter` instead — calling a
+   * queue method on a server-owned queue would replace the audit
+   * wrapper.
+   */
+  reviseDeadLetterCallback?: (
+    cb:
+      | ((
+          item: RetryItem,
+          attempts: number,
+          lastError: unknown,
+          failureClass: FailureClass | undefined,
+          summary?: DownstreamResponseSummary
+        ) => void)
+      | null
+  ) => void;
+  /**
    * WR-331: revise one endpoint's live half-open probe knobs at
    * runtime — no restart. The patch merges over the endpoint's live
    * effective probe values; an illegal patch (or an empty patch)
@@ -9048,6 +9101,24 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // cannot bypass the `retrying` audit.
   let operatorAttemptFailedCallback: ((info: AttemptFailedInfo) => void) | undefined =
     opts.retry?.onAttemptFailed;
+  // WR-385: the operator's delivered / dead-letter callbacks, held in
+  // mutable cells so `server.reviseDeliveredCallback` /
+  // `server.reviseDeadLetterCallback` can replace them at runtime. The
+  // audit wrappers below read these cells — never the operator
+  // callbacks directly — so replacing an operator callback cannot
+  // bypass the `delivered` / `dead_letter` audit.
+  let operatorDeliveredCallback:
+    | ((item: RetryItem, attempts: number, summary?: DownstreamResponseSummary) => void)
+    | undefined = opts.retry?.onDelivered;
+  let operatorDeadLetterCallback:
+    | ((
+        item: RetryItem,
+        attempts: number,
+        lastError: unknown,
+        failureClass: FailureClass | undefined,
+        summary?: DownstreamResponseSummary
+      ) => void)
+    | undefined = opts.retry?.onDeadLetter;
   // WR-372: the operator's endpoint degrade/recover callbacks, held in
   // mutable cells so `server.reviseEndpointDegradedCallbacks` can
   // replace them at runtime. The audit wrappers below read these cells
@@ -9666,6 +9737,10 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         // unmeasured fields are honestly "unavailable".
         response_summary: summary,
       });
+      // WR-385: audit first, then forward to the mutable operator cell
+      // — never the constructor callback directly — so a live revision
+      // cannot bypass the `delivered` audit.
+      operatorDeliveredCallback?.(item, attempts, summary);
     },
     // Wrap the caller's onSemanticFailure so every semantic failure is
     // audited as `failed` with reason `semantic_failed`, not just observed.
@@ -9827,6 +9902,11 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
           error: lastError.message,
         });
       }
+      // WR-385: audit first, then forward to the mutable operator cell
+      // — never the constructor callback directly — so a live revision
+      // cannot bypass the `dead_letter` audit (nor the transform /
+      // schema / integrity / response-too-large lines above it).
+      operatorDeadLetterCallback?.(item, attempts, lastError, failureClass, summary);
     },
     onCircuitStateChange: (endpoint, from, to, tenant) => {
       const event =
@@ -19018,6 +19098,81 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     operatorAttemptFailedCallback = next;
     opts.auditLog.append({
       event: "attempt_failed_callback_revised",
+      previous: prev,
+      current: nextPresence,
+    });
+  };
+
+  // WR-385: live delivered-observer revision. The method is always
+  // set; there is no must-restart gate — the hook defaults to absent
+  // and delivery is always on. Only the operator cell moves: the
+  // queue's audit wrapper (which appends `delivered` first, then
+  // forwards to the cell) is never touched, so a replacement cannot
+  // bypass the audit. A non-function callback throws `RangeError`
+  // and the live cell is untouched; a same-reference replacement (or
+  // clearing when already unset) is a silent no-op. A real
+  // replacement is audited as `delivered_callback_revised` with
+  // `previous` / `current` recording only 'set' / 'cleared' presence,
+  // never a function body. The new callback takes effect from the
+  // next successful delivery; deliveries already reported are never
+  // re-delivered.
+  server.reviseDeliveredCallback = (
+    cb: ((item: RetryItem, attempts: number, summary?: DownstreamResponseSummary) => void) | null
+  ): void => {
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseDeliveredCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === operatorDeliveredCallback) return;
+    const prev = operatorDeliveredCallback === undefined ? "cleared" : "set";
+    const nextPresence = next === undefined ? "cleared" : "set";
+    operatorDeliveredCallback = next;
+    opts.auditLog.append({
+      event: "delivered_callback_revised",
+      previous: prev,
+      current: nextPresence,
+    });
+  };
+
+  // WR-385: live dead-letter-observer revision. The method is always
+  // set; there is no must-restart gate — the hook defaults to absent
+  // and dead-lettering is always on. Only the operator cell moves:
+  // the queue's audit wrapper (which appends `dead_letter` — plus the
+  // transform / schema / integrity / response-too-large lines — first,
+  // then forwards to the cell) is never touched, so a replacement
+  // cannot bypass the audit. A non-function callback throws
+  // `RangeError` and the live cell is untouched; a same-reference
+  // replacement (or clearing when already unset) is a silent no-op.
+  // A real replacement is audited as `dead_letter_callback_revised`
+  // with `previous` / `current` recording only 'set' / 'cleared'
+  // presence, never a function body. The new callback takes effect
+  // from the next dead letter; dead letters already reported are
+  // never re-delivered.
+  server.reviseDeadLetterCallback = (
+    cb:
+      | ((
+          item: RetryItem,
+          attempts: number,
+          lastError: unknown,
+          failureClass: FailureClass | undefined,
+          summary?: DownstreamResponseSummary
+        ) => void)
+      | null
+  ): void => {
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseDeadLetterCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === operatorDeadLetterCallback) return;
+    const prev = operatorDeadLetterCallback === undefined ? "cleared" : "set";
+    const nextPresence = next === undefined ? "cleared" : "set";
+    operatorDeadLetterCallback = next;
+    opts.auditLog.append({
+      event: "dead_letter_callback_revised",
       previous: prev,
       current: nextPresence,
     });
