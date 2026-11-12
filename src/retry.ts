@@ -183,6 +183,7 @@ export {
 };
 export type {
   QuorumAcknowledgedInfo,
+  QuorumCallbacksRevision,
   QuorumConfig,
   QuorumDeadTarget,
   QuorumDispatchedInfo,
@@ -394,6 +395,7 @@ import {
   assertValidQuorumConfig,
   assertValidQuorumRetentionOptions,
   type QuorumAcknowledgedInfo,
+  type QuorumCallbacksRevision,
   type QuorumConfig,
   type QuorumDeadTarget,
   type QuorumDispatchedInfo,
@@ -2989,7 +2991,8 @@ export interface RetryQueueOptions {
   /**
    * Called once per dead-letter entry auto-purged by the retention
    * sweep. The server audits these as `dead_letter_purged`; library
-   * users get the hook directly.
+   * users get the hook directly. Live-revisable via
+   * `RetryQueue.reviseDeadLetterPurgedCallback` (WR-397).
    */
   onDeadLetterPurged?: (event: DeadLetterPurgedEvent) => void;
   /**
@@ -3153,37 +3156,43 @@ export interface RetryQueueOptions {
   /**
    * Called once per quorum fan-out dispatch (one admission -> N member
    * items). The server audits these as `quorum_dispatched`; library
-   * users get the hook directly.
+   * users get the hook directly. Live-revisable via
+   * `RetryQueue.reviseQuorumCallbacks` (WR-396).
    */
   onQuorumDispatched?: (info: QuorumDispatchedInfo) => void;
   /**
    * Called once per member acknowledgement. The server audits these as
    * `quorum_acknowledged`; library users get the hook directly.
+   * Live-revisable via `RetryQueue.reviseQuorumCallbacks` (WR-396).
    */
   onQuorumAcknowledged?: (info: QuorumAcknowledgedInfo) => void;
   /**
    * Called once when a fan-out reaches its quorum. The server audits
    * these as `quorum_satisfied`; library users get the hook directly.
+   * Live-revisable via `RetryQueue.reviseQuorumCallbacks` (WR-396).
    */
   onQuorumSatisfied?: (info: QuorumSatisfiedInfo) => void;
   /**
    * Called once when a fan-out's quorum becomes unreachable. The server
    * audits these as `quorum_failed`; library users get the hook
-   * directly.
+   * directly. Live-revisable via `RetryQueue.reviseQuorumCallbacks`
+   * (WR-396).
    */
   onQuorumFailed?: (info: QuorumFailedInfo) => void;
   /**
    * Called once per member that exhausts its own retry lifecycle, with
    * the WR-30 classification of the final failure. The server audits
    * these as `quorum_target_dead_lettered`; library users get the hook
-   * directly.
+   * directly. Live-revisable via `RetryQueue.reviseQuorumCallbacks`
+   * (WR-396).
    */
   onQuorumTargetDeadLettered?: (info: QuorumTargetDeadLetteredInfo) => void;
   /**
    * Called once per settled quorum fan-out evicted by the retention
    * window (WR-109: `quorumRetentionMs` / `quorumMaxFanouts`). The
    * server audits these as `quorum_evicted`; library users get the hook
-   * directly.
+   * directly. Live-revisable via `RetryQueue.reviseQuorumCallbacks`
+   * (WR-396).
    */
   onQuorumEvicted?: (info: QuorumEvictedInfo) => void;
   /**
@@ -4766,7 +4775,14 @@ export class RetryQueue {
   }
   /** Entries auto-purged by the retention sweep since construction. */
   private deadLetterPurged = 0;
-  private readonly onDeadLetterPurged?: (event: DeadLetterPurgedEvent) => void;
+  // WR-397: deliberately *not* readonly — `reviseDeadLetterPurgedCallback`
+  // replaces the live dead-letter-purged observer at runtime. The
+  // server's audit closure (which forwards to the operator callback) is
+  // held here when the queue runs under `RelayServer`; direct queue
+  // users hold their own callback in the same field. The retention
+  // sweeper's `onPurged` owner closure already reads this field live,
+  // so no extra indirection is needed.
+  private onDeadLetterPurged?: (event: DeadLetterPurgedEvent) => void;
   /** WR-68: shared replay egress gate; undefined when not configured. */
   private readonly replayEgress?: ReplayEgressGate;
   /** WR-135: two-phase replay approval store; undefined when not configured. */
@@ -8533,6 +8549,16 @@ export class RetryQueue {
   /** WR-395: whether the shadow-target mirroring subsystem is enabled (queue-level). */
   shadowConfigured(): boolean {
     return this.shadow !== undefined;
+  }
+
+  /** WR-396: whether the quorum fan-out subsystem is enabled (queue-level). */
+  quorumConfigured(): boolean {
+    return this.quorum !== undefined;
+  }
+
+  /** WR-397: whether the dead-letter retention sweeper is enabled (queue-level). */
+  retentionConfigured(): boolean {
+    return this.retentionSweeper !== undefined;
   }
 
   /** WR-369: whether the auto-disable subsystem is enabled (queue-level). */
@@ -13520,6 +13546,79 @@ export class RetryQueue {
     if (nextBlocked === this.onEndpointDependencyBlocked && nextUnblocked === this.onEndpointDependencyUnblocked) return;
     this.onEndpointDependencyBlocked = nextBlocked;
     this.onEndpointDependencyUnblocked = nextUnblocked;
+  }
+
+  /**
+   * WR-396: live-redirect the quorum fan-out observers — the
+   * queue-side setter behind `RelayServer.reviseQuorumCallbacks`.
+   * The new hooks take effect from the next fan-out event; events
+   * that already fired are never re-delivered. In-progress fan-outs
+   * pick the new hooks up for their subsequent events (a fan-out
+   * dispatched before the revision reports its later acknowledgements
+   * and verdict to the new callbacks). `null` clears a hook back to
+   * no observer (the fan-out keeps dispatching / acknowledging /
+   * settling exactly as before and is still audited and counted —
+   * only the forwarding stops). An omitted field keeps its live
+   * value, so one hook can move without touching the other five. An
+   * empty or non-object patch throws `RangeError`; a non-function
+   * value for a provided field throws `RangeError` and the live
+   * hooks are left completely intact. A patch identical to the live
+   * values is a no-op. Only the observers move: the M/N verdicts,
+   * the member retry / dead-letter lifecycle, the retention sweep,
+   * and the counters are untouched. Throws `Error` when quorum
+   * fan-out was never configured — enabling it needs a restart.
+   * Under `RelayServer` the set's fields hold the server's audit
+   * closures, so direct calls here would replace the audit wrappers;
+   * server users must go through
+   * `RelayServer.reviseQuorumCallbacks`, which swaps only the
+   * operator cells behind the audit closures. The queue itself holds
+   * no audit log — the server audits a real revision as
+   * `quorum_callbacks_revised`.
+   */
+  reviseQuorumCallbacks(patch: QuorumCallbacksRevision): void {
+    if (this.quorum === undefined) {
+      throw new Error(
+        "reviseQuorumCallbacks: quorum fan-out is not configured — enabling it requires a restart"
+      );
+    }
+    this.quorum.reviseCallbacks(patch);
+  }
+
+  /**
+   * WR-397: live-redirect the dead-letter-purged observer — the
+   * queue-side setter behind
+   * `RelayServer.reviseDeadLetterPurgedCallback`. The new callback
+   * takes effect from the next retention purge; purges already
+   * reported are never re-delivered, and the TTL judgement, the
+   * sweep interval, the replay-claim skip, and the WR-49 journal are
+   * untouched — only the observation moves. `null` clears back to no
+   * observer (the sweeper keeps purging and is still audited as
+   * `dead_letter_purged` and counted in `deadLetterPurged` — only
+   * the forwarding stops). A non-function value throws `RangeError`
+   * and the live callback is untouched; replacing with the same
+   * reference (or clearing when already unset) is a no-op. Throws
+   * `Error` when dead-letter retention was never configured — the
+   * sweeper only ever exists with `deadLetterRetention` in place, so
+   * enabling observation needs a restart. Under `RelayServer` the
+   * field holds the server's audit closure, so direct calls here
+   * would replace the audit wrapper; server users must go through
+   * `RelayServer.reviseDeadLetterPurgedCallback`, which swaps only
+   * the operator cell behind the audit closure.
+   */
+  reviseDeadLetterPurgedCallback(cb: ((event: DeadLetterPurgedEvent) => void) | null): void {
+    if (!this.retentionConfigured()) {
+      throw new Error(
+        "reviseDeadLetterPurgedCallback: dead-letter retention is not configured — enabling it requires a restart"
+      );
+    }
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseDeadLetterPurgedCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === this.onDeadLetterPurged) return;
+    this.onDeadLetterPurged = next;
   }
 
   /**

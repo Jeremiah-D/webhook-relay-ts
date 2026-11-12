@@ -28,7 +28,7 @@ import {
   selectSignatureAlgorithmVerifier,
   type SignatureAlgorithmRule,
 } from "./signature-alg.ts";
-import { RetryQueue, errorBudgetBurnAuditEvent, type AssertionFailureInfo, type AttemptFailedInfo, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutEvent, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeadLetterEscalationCallbacksRevision, type DeliveryDeadlineConfig, type DeliveryDeadlineExceededInfo, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type DownstreamResponseSummary, type EndpointPauseCallbacksRevision, type EndpointPauseInfo, type ErrorBudgetConfig, type ErrorBudgetRevision, type EscalationConfig, type EscalationRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type FailureClass, type QuorumRetention, type QuorumRetentionRevision, type ReplayCallbacksRevision, type ReplayForcedInfo, type ReplaySkippedInfo, type RetryItem, type RetryBudgetDepletedInfo, type Sender, type SenderCallOptions, type SemanticFailureInfo, type ShadowCallbacksRevision, type MaintenanceWindowTransition, type SloMissInfo, type SloRiskConfig, type SloRiskRevision, type TenantBudgetAuditEvent, type UrgentDowngradedEvent, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
+import { RetryQueue, errorBudgetBurnAuditEvent, type AssertionFailureInfo, type AttemptFailedInfo, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutEvent, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeadLetterEscalationCallbacksRevision, type DeliveryDeadlineConfig, type DeliveryDeadlineExceededInfo, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type DownstreamResponseSummary, type EndpointPauseCallbacksRevision, type EndpointPauseInfo, type ErrorBudgetConfig, type ErrorBudgetRevision, type EscalationConfig, type EscalationRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type FailureClass, type QuorumCallbacksRevision, type QuorumRetention, type QuorumRetentionRevision, type ReplayCallbacksRevision, type ReplayForcedInfo, type ReplaySkippedInfo, type RetryItem, type RetryBudgetDepletedInfo, type Sender, type SenderCallOptions, type SemanticFailureInfo, type ShadowCallbacksRevision, type MaintenanceWindowTransition, type SloMissInfo, type SloRiskConfig, type SloRiskRevision, type TenantBudgetAuditEvent, type UrgentDowngradedEvent, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
 import { parseDeliverAtHeader, DELIVER_AT_HEADER } from "./retry.ts";
 import type { ShadowDeliveredInfo, ShadowFailedInfo, ShadowTargetConfig, ShadowTargetsConfig } from "./retry.ts";
 import type {
@@ -95,6 +95,7 @@ import type {
   AutoReplayScheduleRevision,
 } from "./autoreplay.ts";
 import type {
+  DeadLetterPurgedEvent,
   DeadLetterRetentionOptions,
   DeadLetterRetentionRevision,
   DeadLetterRetentionSnapshot,
@@ -6913,6 +6914,59 @@ export interface RelayServer extends Server {
    */
   reviseEndpointDependencyCallbacks?: (patch: EndpointDependencyCallbacksRevision) => void;
   /**
+   * WR-396: live-redirect the quorum fan-out observers at runtime —
+   * no restart. Replaces the operator callbacks the server forwards
+   * each fan-out event to, after the event itself is audited as
+   * `quorum_dispatched` / `quorum_acknowledged` / `quorum_satisfied` /
+   * `quorum_failed` / `quorum_target_dead_lettered` / `quorum_evicted`;
+   * the audit can never be bypassed by a replacement. The patch is
+   * partial — an omitted field keeps its live value — and `null`
+   * clears that hook back to audit-only (the fan-out keeps
+   * dispatching / acknowledging / settling and is still audited and
+   * counted, just no longer forwarded to an operator). An empty or
+   * non-object patch throws `RangeError`, as does a non-function value
+   * for a provided field, and the live callbacks are untouched; a
+   * patch identical to the live values is a silent no-op. A real
+   * revision is audited as `quorum_callbacks_revised` with per-hook
+   * `onQuorumDispatched` / `onQuorumAcknowledged` / `onQuorumSatisfied` /
+   * `onQuorumFailed` / `onQuorumTargetDeadLettered` / `onQuorumEvicted`
+   * ('set' / 'cleared' / 'unchanged') and `oldOnQuorumDispatched` /
+   * `oldOnQuorumAcknowledged` / `oldOnQuorumSatisfied` /
+   * `oldOnQuorumFailed` / `oldOnQuorumTargetDeadLettered` /
+   * `oldOnQuorumEvicted` ('set' / 'absent') presence, never a
+   * function body. Always set; throws `Error` when quorum fan-out was
+   * never configured — enabling it needs a restart. The new callbacks
+   * take effect from the next fan-out event; in-progress fan-outs
+   * report their subsequent events to the new callbacks. The M/N
+   * verdicts, the member retry / dead-letter lifecycle, the retention
+   * sweep, and the counters are untouched.
+   */
+  reviseQuorumCallbacks?: (patch: QuorumCallbacksRevision) => void;
+  /**
+   * WR-397: live-redirect the dead-letter-purged observer — the
+   * operator callback that fires once per dead-letter entry
+   * auto-purged by the retention sweep. `null` clears back to
+   * audit-only (the sweeper keeps purging and is still audited as
+   * `dead_letter_purged` and counted, just no longer forwarded to an
+   * operator). A non-function value throws `RangeError` and the live
+   * callback is untouched; replacing with the same reference (or
+   * clearing when already unset) is a silent no-op. A real
+   * replacement is audited as `dead_letter_purged_callback_revised`
+   * with `previous` / `current` recording only 'set' / 'cleared'
+   * presence, never a function body. Always set; throws `Error` when
+   * dead-letter retention was never configured — enabling it needs a
+   * restart. The new callback takes effect from the next purge;
+   * purges already reported are never re-delivered, and the TTL
+   * judgement, the sweep interval, the replay-claim skip, and the
+   * WR-49 journal are untouched. Direct queue users use
+   * `RetryQueue.reviseDeadLetterPurgedCallback` instead — calling the
+   * queue method on a server-owned queue would replace the audit
+   * wrapper.
+   */
+  reviseDeadLetterPurgedCallback?: (
+    cb: ((event: DeadLetterPurgedEvent) => void) | null
+  ) => void;
+  /**
    * WR-350: revise the live quorum retention tuning at runtime
    * (`retentionMs` / `maxFanouts`, partial — omitted fields keep their
    * live values). The new values take effect at the next lazy retention
@@ -9425,6 +9479,37 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     opts.retry?.onShadowDelivered;
   let operatorShadowFailedCallback: ((info: ShadowFailedInfo) => void) | undefined =
     opts.retry?.onShadowFailed;
+  // WR-396: the operator's quorum fan-out callbacks, held in mutable
+  // cells so `server.reviseQuorumCallbacks` can replace them at
+  // runtime. The audit wrappers below read these cells — never the
+  // operator callbacks directly — so replacing an operator callback
+  // cannot bypass the `quorum_dispatched` / `quorum_acknowledged` /
+  // `quorum_satisfied` / `quorum_failed` /
+  // `quorum_target_dead_lettered` / `quorum_evicted` audit.
+  let operatorQuorumDispatchedCallback:
+    | ((info: QuorumDispatchedInfo) => void)
+    | undefined = opts.retry?.onQuorumDispatched;
+  let operatorQuorumAcknowledgedCallback:
+    | ((info: QuorumAcknowledgedInfo) => void)
+    | undefined = opts.retry?.onQuorumAcknowledged;
+  let operatorQuorumSatisfiedCallback:
+    | ((info: QuorumSatisfiedInfo) => void)
+    | undefined = opts.retry?.onQuorumSatisfied;
+  let operatorQuorumFailedCallback: ((info: QuorumFailedInfo) => void) | undefined =
+    opts.retry?.onQuorumFailed;
+  let operatorQuorumTargetDeadLetteredCallback:
+    | ((info: QuorumTargetDeadLetteredInfo) => void)
+    | undefined = opts.retry?.onQuorumTargetDeadLettered;
+  let operatorQuorumEvictedCallback: ((info: QuorumEvictedInfo) => void) | undefined =
+    opts.retry?.onQuorumEvicted;
+  // WR-397: the operator's dead-letter-purged callback, held in a
+  // mutable cell so `server.reviseDeadLetterPurgedCallback` can replace
+  // it at runtime. The audit wrapper below reads this cell — never the
+  // operator callback directly — so replacing the operator callback
+  // cannot bypass the `dead_letter_purged` audit.
+  let operatorDeadLetterPurgedCallback:
+    | ((event: DeadLetterPurgedEvent) => void)
+    | undefined = opts.retry?.onDeadLetterPurged;
   // WR-385: the operator's delivered / dead-letter callbacks, held in
   // mutable cells so `server.reviseDeliveredCallback` /
   // `server.reviseDeadLetterCallback` can replace them at runtime. The
@@ -9662,7 +9747,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // `dead_letter_purged`, not just observed.
     onDeadLetterPurged: (event) => {
       opts.auditLog.append(event);
-      opts.retry?.onDeadLetterPurged?.(event);
+      // WR-397: forward to the operator cell, never to the constructor
+      // callback directly, so a live revision cannot bypass the audit.
+      operatorDeadLetterPurgedCallback?.(event);
     },
     // WR-100: wrap the caller's hook so every stale-endpoint auto-pause
     // is audited as `endpoint_auto_paused` (the full event carries
@@ -9786,7 +9873,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         targets: info.targets,
         quorum: info.quorum,
       });
-      opts.retry?.onQuorumDispatched?.(info);
+      operatorQuorumDispatchedCallback?.(info);
     },
     onQuorumAcknowledged: (info: QuorumAcknowledgedInfo) => {
       opts.auditLog.append({
@@ -9799,7 +9886,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         acked: info.acked,
         targets: info.targets,
       });
-      opts.retry?.onQuorumAcknowledged?.(info);
+      operatorQuorumAcknowledgedCallback?.(info);
     },
     onQuorumSatisfied: (info: QuorumSatisfiedInfo) => {
       opts.auditLog.append({
@@ -9811,7 +9898,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         acked: info.acked,
         targets: info.targets,
       });
-      opts.retry?.onQuorumSatisfied?.(info);
+      operatorQuorumSatisfiedCallback?.(info);
     },
     onQuorumFailed: (info: QuorumFailedInfo) => {
       opts.auditLog.append({
@@ -9824,7 +9911,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         targets: info.targets,
         reason: info.reason,
       });
-      opts.retry?.onQuorumFailed?.(info);
+      operatorQuorumFailedCallback?.(info);
     },
     onQuorumTargetDeadLettered: (info: QuorumTargetDeadLetteredInfo) => {
       opts.auditLog.append({
@@ -9839,7 +9926,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         acked: info.acked,
         targets: info.targets,
       });
-      opts.retry?.onQuorumTargetDeadLettered?.(info);
+      operatorQuorumTargetDeadLetteredCallback?.(info);
     },
     // WR-109: wrap the caller's hook so every retention eviction is
     // archived in the audit trail as `quorum_evicted` (operator
@@ -9862,7 +9949,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         evictedAt: info.evictedAt,
         reason: info.reason,
       });
-      opts.retry?.onQuorumEvicted?.(info);
+      operatorQuorumEvictedCallback?.(info);
     },
     onProbeAudit: (event) => {
       opts.auditLog.append(event);
@@ -18401,6 +18488,226 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     operatorEndpointDependencyBlockedCallback = nextBlocked;
     operatorEndpointDependencyUnblockedCallback = nextUnblocked;
     opts.auditLog.append({ event: "endpoint_dependency_callbacks_revised", ...payload });
+  };
+
+  // WR-396: live quorum fan-out observer replacement. Only the
+  // server-side operator-callback cells move — the queue's own
+  // callbacks (the `quorum_dispatched` / `quorum_acknowledged` /
+  // `quorum_satisfied` / `quorum_failed` /
+  // `quorum_target_dead_lettered` / `quorum_evicted` audit wrappers)
+  // are never touched, so a replacement cannot bypass the audit. The
+  // patch is partial: an omitted field keeps its live value; `null`
+  // clears that hook back to audit-only. An empty or non-object patch
+  // throws `RangeError`, as does a non-function value for a provided
+  // field, and the live cells are untouched; a patch identical to the
+  // live values is a silent no-op. A real revision is audited as
+  // `quorum_callbacks_revised` with per-hook presence
+  // (`onQuorumDispatched` / `onQuorumAcknowledged` /
+  // `onQuorumSatisfied` / `onQuorumFailed` /
+  // `onQuorumTargetDeadLettered` / `onQuorumEvicted`: 'set' /
+  // 'cleared' / 'unchanged'; `oldOnQuorumDispatched` /
+  // `oldOnQuorumAcknowledged` / `oldOnQuorumSatisfied` /
+  // `oldOnQuorumFailed` / `oldOnQuorumTargetDeadLettered` /
+  // `oldOnQuorumEvicted`: 'set' / 'absent'), never a function body.
+  // With quorum fan-out unconfigured the queue throws the canonical
+  // "must restart" Error.
+  server.reviseQuorumCallbacks = (patch: QuorumCallbacksRevision): void => {
+    if (!queue.quorumConfigured()) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseQuorumCallbacks(patch);
+    }
+    if (patch === null || typeof patch !== "object") {
+      throw new RangeError(
+        "reviseQuorumCallbacks: patch must be an object with at least one of onQuorumDispatched / onQuorumAcknowledged / onQuorumSatisfied / onQuorumFailed / onQuorumTargetDeadLettered / onQuorumEvicted"
+      );
+    }
+    const hasDispatched = patch.onQuorumDispatched !== undefined;
+    const hasAcknowledged = patch.onQuorumAcknowledged !== undefined;
+    const hasSatisfied = patch.onQuorumSatisfied !== undefined;
+    const hasFailed = patch.onQuorumFailed !== undefined;
+    const hasTargetDeadLettered = patch.onQuorumTargetDeadLettered !== undefined;
+    const hasEvicted = patch.onQuorumEvicted !== undefined;
+    if (
+      !hasDispatched &&
+      !hasAcknowledged &&
+      !hasSatisfied &&
+      !hasFailed &&
+      !hasTargetDeadLettered &&
+      !hasEvicted
+    ) {
+      throw new RangeError(
+        "reviseQuorumCallbacks: patch must set at least one of onQuorumDispatched / onQuorumAcknowledged / onQuorumSatisfied / onQuorumFailed / onQuorumTargetDeadLettered / onQuorumEvicted"
+      );
+    }
+    if (
+      hasDispatched &&
+      patch.onQuorumDispatched !== null &&
+      typeof patch.onQuorumDispatched !== "function"
+    ) {
+      throw new RangeError(
+        "reviseQuorumCallbacks: onQuorumDispatched must be a function or null"
+      );
+    }
+    if (
+      hasAcknowledged &&
+      patch.onQuorumAcknowledged !== null &&
+      typeof patch.onQuorumAcknowledged !== "function"
+    ) {
+      throw new RangeError(
+        "reviseQuorumCallbacks: onQuorumAcknowledged must be a function or null"
+      );
+    }
+    if (
+      hasSatisfied &&
+      patch.onQuorumSatisfied !== null &&
+      typeof patch.onQuorumSatisfied !== "function"
+    ) {
+      throw new RangeError(
+        "reviseQuorumCallbacks: onQuorumSatisfied must be a function or null"
+      );
+    }
+    if (
+      hasFailed &&
+      patch.onQuorumFailed !== null &&
+      typeof patch.onQuorumFailed !== "function"
+    ) {
+      throw new RangeError("reviseQuorumCallbacks: onQuorumFailed must be a function or null");
+    }
+    if (
+      hasTargetDeadLettered &&
+      patch.onQuorumTargetDeadLettered !== null &&
+      typeof patch.onQuorumTargetDeadLettered !== "function"
+    ) {
+      throw new RangeError(
+        "reviseQuorumCallbacks: onQuorumTargetDeadLettered must be a function or null"
+      );
+    }
+    if (
+      hasEvicted &&
+      patch.onQuorumEvicted !== null &&
+      typeof patch.onQuorumEvicted !== "function"
+    ) {
+      throw new RangeError("reviseQuorumCallbacks: onQuorumEvicted must be a function or null");
+    }
+    const nextDispatched = hasDispatched
+      ? patch.onQuorumDispatched ?? undefined
+      : operatorQuorumDispatchedCallback;
+    const nextAcknowledged = hasAcknowledged
+      ? patch.onQuorumAcknowledged ?? undefined
+      : operatorQuorumAcknowledgedCallback;
+    const nextSatisfied = hasSatisfied
+      ? patch.onQuorumSatisfied ?? undefined
+      : operatorQuorumSatisfiedCallback;
+    const nextFailed = hasFailed
+      ? patch.onQuorumFailed ?? undefined
+      : operatorQuorumFailedCallback;
+    const nextTargetDeadLettered = hasTargetDeadLettered
+      ? patch.onQuorumTargetDeadLettered ?? undefined
+      : operatorQuorumTargetDeadLetteredCallback;
+    const nextEvicted = hasEvicted
+      ? patch.onQuorumEvicted ?? undefined
+      : operatorQuorumEvictedCallback;
+    if (
+      nextDispatched === operatorQuorumDispatchedCallback &&
+      nextAcknowledged === operatorQuorumAcknowledgedCallback &&
+      nextSatisfied === operatorQuorumSatisfiedCallback &&
+      nextFailed === operatorQuorumFailedCallback &&
+      nextTargetDeadLettered === operatorQuorumTargetDeadLetteredCallback &&
+      nextEvicted === operatorQuorumEvictedCallback
+    ) {
+      return;
+    }
+    const payload = {
+      onQuorumDispatched: hasDispatched
+        ? nextDispatched === undefined
+          ? "cleared"
+          : "set"
+        : "unchanged",
+      oldOnQuorumDispatched:
+        operatorQuorumDispatchedCallback === undefined ? "absent" : "set",
+      onQuorumAcknowledged: hasAcknowledged
+        ? nextAcknowledged === undefined
+          ? "cleared"
+          : "set"
+        : "unchanged",
+      oldOnQuorumAcknowledged:
+        operatorQuorumAcknowledgedCallback === undefined ? "absent" : "set",
+      onQuorumSatisfied: hasSatisfied
+        ? nextSatisfied === undefined
+          ? "cleared"
+          : "set"
+        : "unchanged",
+      oldOnQuorumSatisfied:
+        operatorQuorumSatisfiedCallback === undefined ? "absent" : "set",
+      onQuorumFailed: hasFailed
+        ? nextFailed === undefined
+          ? "cleared"
+          : "set"
+        : "unchanged",
+      oldOnQuorumFailed:
+        operatorQuorumFailedCallback === undefined ? "absent" : "set",
+      onQuorumTargetDeadLettered: hasTargetDeadLettered
+        ? nextTargetDeadLettered === undefined
+          ? "cleared"
+          : "set"
+        : "unchanged",
+      oldOnQuorumTargetDeadLettered:
+        operatorQuorumTargetDeadLetteredCallback === undefined ? "absent" : "set",
+      onQuorumEvicted: hasEvicted
+        ? nextEvicted === undefined
+          ? "cleared"
+          : "set"
+        : "unchanged",
+      oldOnQuorumEvicted:
+        operatorQuorumEvictedCallback === undefined ? "absent" : "set",
+    };
+    operatorQuorumDispatchedCallback = nextDispatched;
+    operatorQuorumAcknowledgedCallback = nextAcknowledged;
+    operatorQuorumSatisfiedCallback = nextSatisfied;
+    operatorQuorumFailedCallback = nextFailed;
+    operatorQuorumTargetDeadLetteredCallback = nextTargetDeadLettered;
+    operatorQuorumEvictedCallback = nextEvicted;
+    opts.auditLog.append({ event: "quorum_callbacks_revised", ...payload });
+  };
+
+  // WR-397: live dead-letter-purged observer revision. The method is
+  // always set; with dead-letter retention unconfigured the queue
+  // throws the canonical "must restart" Error (delegated below,
+  // exactly like WR-393's canary gate). Only the operator cell moves:
+  // the queue's audit wrapper (which appends `dead_letter_purged`
+  // first, then forwards to the cell) is never touched, so a
+  // replacement cannot bypass the audit. A non-function callback
+  // throws `RangeError` and the live cell is untouched; a
+  // same-reference replacement (or clearing when already unset) is a
+  // silent no-op. A real replacement is audited as
+  // `dead_letter_purged_callback_revised` with `previous` / `current`
+  // recording only 'set' / 'cleared' presence, never a function body.
+  // The new callback takes effect from the next purge; purges already
+  // reported are never re-delivered, and the TTL judgement, the sweep
+  // interval, the replay-claim skip, and the WR-49 journal are
+  // untouched.
+  server.reviseDeadLetterPurgedCallback = (
+    cb: ((event: DeadLetterPurgedEvent) => void) | null
+  ): void => {
+    if (!queue.retentionConfigured()) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseDeadLetterPurgedCallback(cb);
+    }
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseDeadLetterPurgedCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === operatorDeadLetterPurgedCallback) return;
+    const prev = operatorDeadLetterPurgedCallback === undefined ? "cleared" : "set";
+    const nextPresence = next === undefined ? "cleared" : "set";
+    operatorDeadLetterPurgedCallback = next;
+    opts.auditLog.append({
+      event: "dead_letter_purged_callback_revised",
+      previous: prev,
+      current: nextPresence,
+    });
   };
 
   // WR-350: live quorum retention tuning revision. The method is always

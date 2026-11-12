@@ -4632,6 +4632,24 @@ const server = createRelayServer({
   empty patch is a `RangeError`, and a same-value revision is a silent
   no-op. Revising when quorum fan-out was never configured throws
   `Error` — enabling it needs a restart.
+  The six fan-out observers are live-revisable too (WR-396):
+  `reviseQuorumCallbacks({ onQuorumDispatched?, onQuorumAcknowledged?,
+  onQuorumSatisfied?, onQuorumFailed?, onQuorumTargetDeadLettered?,
+  onQuorumEvicted? })` on the queue and the server — partial, so an
+  omitted field keeps its live value and `null` clears that hook back
+  to audit-only. The new callbacks take effect from the next fan-out
+  event (an in-progress fan-out reports its later events to the new
+  callbacks); events already reported are never re-delivered. A real
+  revision is audited as `quorum_callbacks_revised` with per-hook
+  presence (`'set'` / `'cleared'` / `'unchanged'` plus the old
+  presence), never a function body; an empty or non-object patch, or a
+  non-function value for a provided field, throws `RangeError` and
+  leaves the live hooks untouched, and a same-value patch is a silent
+  no-op. Revising when quorum fan-out was never configured throws
+  `Error` — enabling it needs a restart. This only moves the
+  observers; the retention values still go through `reviseQuorumRetention`
+  (WR-350), and the M/N verdicts, the member lifecycle, the sweep,
+  and the counters are untouched.
 - **Invalid configs throw `RangeError` at startup** — empty/duplicate/
   non-`http(s)` targets, fanning out to the logical endpoint itself
   (double-delivery), or a quorum outside `[1, targets.length]`. Absent =
@@ -13170,6 +13188,21 @@ untouched; an empty or same-value patch is a silent no-op; a real revision
 is audited as `dead_letter_retention_revised` with `previous` / `current`.
 Revising when retention was never configured throws `Error` (enabling it
 needs a restart), and entries already purged never come back.
+
+WR-397: the purge observer is revisable live via
+`server.reviseDeadLetterPurgedCallback(cb)` (and
+`RetryQueue.reviseDeadLetterPurgedCallback(cb)` for direct queue users) —
+`null` clears back to audit-only (the sweeper keeps purging and is still
+audited as `dead_letter_purged` and counted, just no longer forwarded to
+an operator). The new callback takes effect from the next purge; purges
+already reported are never re-delivered. A non-function value throws
+`RangeError` and leaves the live callback untouched; replacing with the
+same reference (or clearing when already unset) is a silent no-op. A real
+revision is audited as `dead_letter_purged_callback_revised` with
+`previous` / `current` recording only 'set' / 'cleared' presence, never a
+function body. Revising when retention was never configured throws `Error`
+(enabling it needs a restart). This only moves the observer; the TTL and
+sweep interval still go through `setDeadLetterRetention` (WR-315).
 
 **Operator surface** (same Bearer <redacted>, fail closed to 404 without
 `operatorToken`):

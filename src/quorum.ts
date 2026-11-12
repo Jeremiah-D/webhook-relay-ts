@@ -258,6 +258,27 @@ export interface QuorumFanoutSetOptions {
   now?: () => number;
 }
 
+/**
+ * WR-396: patch for `RetryQueue.reviseQuorumCallbacks` /
+ * `RelayServer.reviseQuorumCallbacks`. Each field is optional —
+ * an omitted field keeps its live value; `null` clears that hook back
+ * to no observer (the fan-out keeps dispatching / acknowledging /
+ * settling exactly as before and is still audited and counted — only
+ * the forwarding stops). At least one field must be present, else the
+ * patch throws `RangeError` and the live hooks are untouched. The
+ * field names match the `RetryQueueOptions` observer options
+ * (`onQuorumDispatched` …); the set's internal hook names drop the
+ * `Quorum` infix (`onDispatched` …).
+ */
+export interface QuorumCallbacksRevision {
+  onQuorumDispatched?: ((info: QuorumDispatchedInfo) => void) | null;
+  onQuorumAcknowledged?: ((info: QuorumAcknowledgedInfo) => void) | null;
+  onQuorumSatisfied?: ((info: QuorumSatisfiedInfo) => void) | null;
+  onQuorumFailed?: ((info: QuorumFailedInfo) => void) | null;
+  onQuorumTargetDeadLettered?: ((info: QuorumTargetDeadLetteredInfo) => void) | null;
+  onQuorumEvicted?: ((info: QuorumEvictedInfo) => void) | null;
+}
+
 /** Default `retentionMs`: settled fan-outs stay in memory for 1h. */
 export const DEFAULT_QUORUM_RETENTION_MS = 3_600_000;
 /** Default `maxFanouts`: 10k settled fan-outs retained, oldest evicted first. */
@@ -746,6 +767,124 @@ export class QuorumFanoutSet {
    */
   currentRetention(): QuorumRetention {
     return { retentionMs: this.retentionMs, maxFanouts: this.maxFanouts };
+  }
+
+  /**
+   * WR-396: live-redirect the quorum fan-out observers — the set-side
+   * setter behind `RetryQueue.reviseQuorumCallbacks`. The new hooks
+   * take effect from the next fan-out event; events that already fired
+   * are never re-delivered. `null` clears a hook back to no observer
+   * (the fan-out keeps dispatching / acknowledging / settling exactly
+   * as before — only the forwarding stops). An omitted field keeps its
+   * live value, so one hook can move without touching the other five.
+   * An empty or non-object patch throws `RangeError`; a non-function
+   * value for a provided field throws `RangeError` and the live hooks
+   * are left completely intact. A patch identical to the live values
+   * is a no-op. Only the observers move: the M/N verdicts, the member
+   * retry / dead-letter lifecycle, the retention sweep, and the
+   * counters are untouched. `private readonly opts` only locks the
+   * reference, not the fields, so the hooks are replaced in place.
+   */
+  reviseCallbacks(patch: QuorumCallbacksRevision): void {
+    if (patch === null || typeof patch !== "object") {
+      throw new RangeError(
+        "reviseCallbacks: patch must be an object with at least one of onQuorumDispatched / onQuorumAcknowledged / onQuorumSatisfied / onQuorumFailed / onQuorumTargetDeadLettered / onQuorumEvicted"
+      );
+    }
+    const hasDispatched = patch.onQuorumDispatched !== undefined;
+    const hasAcknowledged = patch.onQuorumAcknowledged !== undefined;
+    const hasSatisfied = patch.onQuorumSatisfied !== undefined;
+    const hasFailed = patch.onQuorumFailed !== undefined;
+    const hasTargetDeadLettered = patch.onQuorumTargetDeadLettered !== undefined;
+    const hasEvicted = patch.onQuorumEvicted !== undefined;
+    if (
+      !hasDispatched &&
+      !hasAcknowledged &&
+      !hasSatisfied &&
+      !hasFailed &&
+      !hasTargetDeadLettered &&
+      !hasEvicted
+    ) {
+      throw new RangeError(
+        "reviseCallbacks: patch must set at least one of onQuorumDispatched / onQuorumAcknowledged / onQuorumSatisfied / onQuorumFailed / onQuorumTargetDeadLettered / onQuorumEvicted"
+      );
+    }
+    if (
+      hasDispatched &&
+      patch.onQuorumDispatched !== null &&
+      typeof patch.onQuorumDispatched !== "function"
+    ) {
+      throw new RangeError("reviseCallbacks: onQuorumDispatched must be a function or null");
+    }
+    if (
+      hasAcknowledged &&
+      patch.onQuorumAcknowledged !== null &&
+      typeof patch.onQuorumAcknowledged !== "function"
+    ) {
+      throw new RangeError(
+        "reviseCallbacks: onQuorumAcknowledged must be a function or null"
+      );
+    }
+    if (
+      hasSatisfied &&
+      patch.onQuorumSatisfied !== null &&
+      typeof patch.onQuorumSatisfied !== "function"
+    ) {
+      throw new RangeError("reviseCallbacks: onQuorumSatisfied must be a function or null");
+    }
+    if (
+      hasFailed &&
+      patch.onQuorumFailed !== null &&
+      typeof patch.onQuorumFailed !== "function"
+    ) {
+      throw new RangeError("reviseCallbacks: onQuorumFailed must be a function or null");
+    }
+    if (
+      hasTargetDeadLettered &&
+      patch.onQuorumTargetDeadLettered !== null &&
+      typeof patch.onQuorumTargetDeadLettered !== "function"
+    ) {
+      throw new RangeError(
+        "reviseCallbacks: onQuorumTargetDeadLettered must be a function or null"
+      );
+    }
+    if (
+      hasEvicted &&
+      patch.onQuorumEvicted !== null &&
+      typeof patch.onQuorumEvicted !== "function"
+    ) {
+      throw new RangeError("reviseCallbacks: onQuorumEvicted must be a function or null");
+    }
+    const nextDispatched = hasDispatched
+      ? patch.onQuorumDispatched ?? undefined
+      : this.opts.onDispatched;
+    const nextAcknowledged = hasAcknowledged
+      ? patch.onQuorumAcknowledged ?? undefined
+      : this.opts.onAcknowledged;
+    const nextSatisfied = hasSatisfied
+      ? patch.onQuorumSatisfied ?? undefined
+      : this.opts.onSatisfied;
+    const nextFailed = hasFailed ? patch.onQuorumFailed ?? undefined : this.opts.onFailed;
+    const nextTargetDeadLettered = hasTargetDeadLettered
+      ? patch.onQuorumTargetDeadLettered ?? undefined
+      : this.opts.onTargetDeadLettered;
+    const nextEvicted = hasEvicted ? patch.onQuorumEvicted ?? undefined : this.opts.onEvicted;
+    if (
+      nextDispatched === this.opts.onDispatched &&
+      nextAcknowledged === this.opts.onAcknowledged &&
+      nextSatisfied === this.opts.onSatisfied &&
+      nextFailed === this.opts.onFailed &&
+      nextTargetDeadLettered === this.opts.onTargetDeadLettered &&
+      nextEvicted === this.opts.onEvicted
+    ) {
+      return;
+    }
+    this.opts.onDispatched = nextDispatched;
+    this.opts.onAcknowledged = nextAcknowledged;
+    this.opts.onSatisfied = nextSatisfied;
+    this.opts.onFailed = nextFailed;
+    this.opts.onTargetDeadLettered = nextTargetDeadLettered;
+    this.opts.onEvicted = nextEvicted;
   }
 
   /**
