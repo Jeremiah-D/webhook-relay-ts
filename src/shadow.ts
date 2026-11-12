@@ -183,6 +183,20 @@ export interface ShadowDispatcherOptions {
 }
 
 /**
+ * WR-395: patch for `RetryQueue.reviseShadowCallbacks` /
+ * `RelayServer.reviseShadowCallbacks`. Each field is optional —
+ * an omitted field keeps its live value; `null` clears that hook back
+ * to no observer (the mirror keeps running, the outcome is still
+ * audited as `shadow_delivered` / `shadow_failed` and still counted,
+ * only the forwarding stops). At least one field must be present,
+ * else the patch throws `RangeError` and the live hooks are untouched.
+ */
+export interface ShadowCallbacksRevision {
+  onShadowDelivered?: ((info: ShadowDeliveredInfo) => void) | null;
+  onShadowFailed?: ((info: ShadowFailedInfo) => void) | null;
+}
+
+/**
  * Owns the per-endpoint shadow target lists and performs the
  * fire-and-forget mirroring. The queue calls `mirror()` once per main
  * attempt, right after the attempt's sender promise settles (success or
@@ -191,8 +205,10 @@ export interface ShadowDispatcherOptions {
 export class ShadowDispatcher {
   private readonly targets = new Map<string, ShadowTargetConfig[]>();
   private readonly sender: Sender;
-  private readonly onDelivered?: (info: ShadowDeliveredInfo) => void;
-  private readonly onFailed?: (info: ShadowFailedInfo) => void;
+  // WR-395: deliberately *not* readonly — `reviseCallbacks` swaps
+  // these fields live.
+  private onDelivered?: (info: ShadowDeliveredInfo) => void;
+  private onFailed?: (info: ShadowFailedInfo) => void;
   /**
    * Mirror counters, keyed by JSON of [tenant, endpoint, shadowTarget]
    * (`""` tenant = the default tenant). Rows are created on the first recorded
@@ -219,6 +235,57 @@ export class ShadowDispatcher {
   /** Whether `endpoint` has any shadow targets configured. */
   hasTargets(endpoint: string): boolean {
     return this.targets.has(endpoint);
+  }
+
+  /**
+   * WR-395: live-redirect the shadow outcome observers — the
+   * dispatcher-side setter behind `RetryQueue.reviseShadowCallbacks`.
+   * The new hooks take effect from the next mirrored copy's outcome;
+   * outcomes that already fired are never re-delivered. `null` clears
+   * a hook back to no observer (the mirror keeps running and its
+   * outcomes are still counted in `stats()` / `relay_shadow_total` —
+   * only the forwarding stops). An omitted field keeps its live value,
+   * so one hook can move without touching the other. An empty or
+   * non-object patch throws `RangeError`; a non-function value for a
+   * provided field throws `RangeError` and the live hooks are left
+   * completely intact. A patch identical to the live values is a
+   * no-op. Only the observers move: the shadow target lists, the
+   * sender copies, and the counters are untouched.
+   */
+  reviseCallbacks(patch: ShadowCallbacksRevision): void {
+    if (patch === null || typeof patch !== "object") {
+      throw new RangeError(
+        "reviseCallbacks: patch must be an object with at least one of onShadowDelivered / onShadowFailed"
+      );
+    }
+    const hasDelivered = patch.onShadowDelivered !== undefined;
+    const hasFailed = patch.onShadowFailed !== undefined;
+    if (!hasDelivered && !hasFailed) {
+      throw new RangeError(
+        "reviseCallbacks: patch must set at least one of onShadowDelivered / onShadowFailed"
+      );
+    }
+    if (
+      hasDelivered &&
+      patch.onShadowDelivered !== null &&
+      typeof patch.onShadowDelivered !== "function"
+    ) {
+      throw new RangeError("reviseCallbacks: onShadowDelivered must be a function or null");
+    }
+    if (
+      hasFailed &&
+      patch.onShadowFailed !== null &&
+      typeof patch.onShadowFailed !== "function"
+    ) {
+      throw new RangeError("reviseCallbacks: onShadowFailed must be a function or null");
+    }
+    const nextDelivered = hasDelivered
+      ? patch.onShadowDelivered ?? undefined
+      : this.onDelivered;
+    const nextFailed = hasFailed ? patch.onShadowFailed ?? undefined : this.onFailed;
+    if (nextDelivered === this.onDelivered && nextFailed === this.onFailed) return;
+    this.onDelivered = nextDelivered;
+    this.onFailed = nextFailed;
   }
 
   /**

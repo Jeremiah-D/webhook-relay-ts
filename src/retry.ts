@@ -161,6 +161,7 @@ export { CRON_HEADER, parseCronExpression, nextCronOccurrence } from "./cron.ts"
 export type { CronExpression } from "./cron.ts";
 import {
   ShadowDispatcher,
+  type ShadowCallbacksRevision,
   type ShadowDeliveredInfo,
   type ShadowFailedInfo,
   type ShadowTargetConfig,
@@ -168,6 +169,7 @@ import {
   type ShadowTargetsConfig,
 } from "./shadow.ts";
 export type {
+  ShadowCallbacksRevision,
   ShadowDeliveredInfo,
   ShadowFailedInfo,
   ShadowTargetConfig,
@@ -3113,7 +3115,8 @@ export interface RetryQueueOptions {
   /**
    * Called once per mirrored copy a shadow target answers (transport
    * success). The server audits these as `shadow_delivered`; library
-   * users get the hook directly.
+   * users get the hook directly. Live-revisable via
+   * `RetryQueue.reviseShadowCallbacks` (WR-395).
    */
   onShadowDelivered?: (info: ShadowDeliveredInfo) => void;
   /**
@@ -3121,6 +3124,7 @@ export interface RetryQueueOptions {
    * Silent by design: the failure is recorded (audit + metrics) and
    * never retried, never escalated. The server audits these as
    * `shadow_failed`; library users get the hook directly.
+   * Live-revisable via `RetryQueue.reviseShadowCallbacks` (WR-395).
    */
   onShadowFailed?: (info: ShadowFailedInfo) => void;
   /**
@@ -8526,6 +8530,11 @@ export class RetryQueue {
     return this.escalation !== undefined;
   }
 
+  /** WR-395: whether the shadow-target mirroring subsystem is enabled (queue-level). */
+  shadowConfigured(): boolean {
+    return this.shadow !== undefined;
+  }
+
   /** WR-369: whether the auto-disable subsystem is enabled (queue-level). */
   autoDisableConfigured(): boolean {
     return this.autoDisable !== undefined;
@@ -13336,6 +13345,40 @@ export class RetryQueue {
     }
     this.callerOnDeadLetterEscalated = nextEscalated;
     this.callerOnDeadLetterEscalationFailed = nextFailed;
+  }
+
+  /**
+   * WR-395: live-redirect the shadow-target mirror observers — the
+   * queue-side setter behind `RelayServer.reviseShadowCallbacks`.
+   * The new hooks take effect from the next mirrored copy's outcome;
+   * outcomes that already fired are never re-delivered. `null` clears
+   * a hook back to no observer (the mirror keeps running, the outcome
+   * is still audited as `shadow_delivered` / `shadow_failed` by the
+   * server and still counted in `getShadowStats()` /
+   * `relay_shadow_total` — only the forwarding stops). An omitted
+   * field keeps its live value, so one hook can move without touching
+   * the other. An empty or non-object patch throws `RangeError`; a
+   * non-function value for a provided field throws `RangeError` and
+   * the live hooks are left completely intact. A patch identical to
+   * the live values is a no-op. Only the observers move: the shadow
+   * target lists, the sender copies, and the counters are untouched.
+   * Throws `Error` when shadow targets were never configured — the
+   * mirror only ever runs with `shadowTargets` in place, so enabling
+   * observation needs a restart. Under `RelayServer` the dispatcher
+   * fields hold the server's audit closures, so direct calls here
+   * would replace the audit wrappers; server users must go through
+   * `RelayServer.reviseShadowCallbacks`, which swaps only the
+   * operator cells behind the audit closures. The queue itself holds
+   * no audit log — the server audits a real revision as
+   * `shadow_callbacks_revised`.
+   */
+  reviseShadowCallbacks(patch: ShadowCallbacksRevision): void {
+    if (this.shadow === undefined) {
+      throw new Error(
+        "reviseShadowCallbacks: shadow targets are not configured — enabling shadow observation requires a restart"
+      );
+    }
+    this.shadow.reviseCallbacks(patch);
   }
 
   /**

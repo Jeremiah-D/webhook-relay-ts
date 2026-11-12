@@ -13604,6 +13604,26 @@ breaker, never consumes a quota token, and never pollutes the main
 delivery counters — a failing shadow is silent (recorded, never
 retried). Off by default; invalid values throw `RangeError` at startup.
 
+**Live callback redirection (WR-395).** `relay.reviseShadowCallbacks({ onShadowDelivered, onShadowFailed })`
+/ `queue.reviseShadowCallbacks(patch)` swaps the operator callbacks
+that observe each mirrored outcome at runtime, no restart: the next
+mirrored copy enters the new callback and the old one goes silent. The
+patch is partial — an omitted field keeps its live value — and `null`
+clears that hook back to audit-only (the mirror keeps running and its
+outcomes are still audited and counted, just no longer forwarded). An
+empty or non-object patch throws `RangeError`, as does a non-function
+value for a provided field, and the live hooks are untouched; a patch
+identical to the live values is a silent no-op. A real revision is
+audited as `shadow_callbacks_revised` with per-hook
+`onShadowDelivered` / `onShadowFailed` ('set' / 'cleared' /
+'unchanged') and `oldOnShadowDelivered` / `oldOnShadowFailed` ('set' /
+'absent') presence, never a function body — and the audit can never be
+bypassed by a replacement. Revising when shadow targets were never
+configured throws `Error` (enabling mirroring needs a restart): the
+mirror only ever runs with `shadowTargets` in place. Only the
+observers move: the shadow target lists, the sender copies, and the
+counters are untouched.
+
 ### Delivery event archive
 
 Opt-in persistent history for the delivery lifecycle events

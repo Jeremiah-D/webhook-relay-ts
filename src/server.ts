@@ -28,7 +28,7 @@ import {
   selectSignatureAlgorithmVerifier,
   type SignatureAlgorithmRule,
 } from "./signature-alg.ts";
-import { RetryQueue, errorBudgetBurnAuditEvent, type AssertionFailureInfo, type AttemptFailedInfo, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutEvent, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeadLetterEscalationCallbacksRevision, type DeliveryDeadlineConfig, type DeliveryDeadlineExceededInfo, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type DownstreamResponseSummary, type EndpointPauseCallbacksRevision, type EndpointPauseInfo, type ErrorBudgetConfig, type ErrorBudgetRevision, type EscalationConfig, type EscalationRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type FailureClass, type QuorumRetention, type QuorumRetentionRevision, type ReplayCallbacksRevision, type ReplayForcedInfo, type ReplaySkippedInfo, type RetryItem, type RetryBudgetDepletedInfo, type Sender, type SenderCallOptions, type SemanticFailureInfo, type MaintenanceWindowTransition, type SloMissInfo, type SloRiskConfig, type SloRiskRevision, type TenantBudgetAuditEvent, type UrgentDowngradedEvent, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
+import { RetryQueue, errorBudgetBurnAuditEvent, type AssertionFailureInfo, type AttemptFailedInfo, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutEvent, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeadLetterEscalationCallbacksRevision, type DeliveryDeadlineConfig, type DeliveryDeadlineExceededInfo, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type DownstreamResponseSummary, type EndpointPauseCallbacksRevision, type EndpointPauseInfo, type ErrorBudgetConfig, type ErrorBudgetRevision, type EscalationConfig, type EscalationRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type FailureClass, type QuorumRetention, type QuorumRetentionRevision, type ReplayCallbacksRevision, type ReplayForcedInfo, type ReplaySkippedInfo, type RetryItem, type RetryBudgetDepletedInfo, type Sender, type SenderCallOptions, type SemanticFailureInfo, type ShadowCallbacksRevision, type MaintenanceWindowTransition, type SloMissInfo, type SloRiskConfig, type SloRiskRevision, type TenantBudgetAuditEvent, type UrgentDowngradedEvent, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
 import { parseDeliverAtHeader, DELIVER_AT_HEADER } from "./retry.ts";
 import type { ShadowDeliveredInfo, ShadowFailedInfo, ShadowTargetConfig, ShadowTargetsConfig } from "./retry.ts";
 import type {
@@ -6842,6 +6842,29 @@ export interface RelayServer extends Server {
    */
   reviseDeadLetterEscalationCallbacks?: (patch: DeadLetterEscalationCallbacksRevision) => void;
   /**
+   * WR-395: live-redirect the shadow-target mirror observers at
+   * runtime — no restart. Replaces the operator callbacks the server
+   * forwards each mirrored outcome to, after the outcome itself is
+   * audited as `shadow_delivered` / `shadow_failed`; the audit can
+   * never be bypassed by a replacement. The patch is partial — an
+   * omitted field keeps its live value — and `null` clears that hook
+   * back to audit-only (the mirror keeps running and its outcomes are
+   * still audited and counted, just no longer forwarded to an
+   * operator). An empty or non-object patch throws `RangeError`, as
+   * does a non-function value for a provided field, and the live
+   * callbacks are untouched; a patch identical to the live values is
+   * a silent no-op. A real revision is audited as
+   * `shadow_callbacks_revised` with per-hook
+   * `onShadowDelivered` / `onShadowFailed` ('set' / 'cleared' /
+   * 'unchanged') and `oldOnShadowDelivered` / `oldOnShadowFailed`
+   * ('set' / 'absent') presence, never a function body. Always set;
+   * throws `Error` when shadow targets were never configured —
+   * enabling mirroring needs a restart. The new callbacks take effect
+   * from the next mirrored outcome; the shadow target lists, the
+   * sender copies, and the counters are untouched.
+   */
+  reviseShadowCallbacks?: (patch: ShadowCallbacksRevision) => void;
+  /**
    * WR-369: live-redirect the endpoint auto-disable/enable observers at
    * runtime — no restart. Replaces the operator callbacks the server
    * forwards each transition to, after the transition itself is
@@ -9393,6 +9416,15 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   let operatorDeadLetterEscalationFailedCallback:
     | ((info: DeadLetterEscalationFailedInfo) => void)
     | undefined = opts.retry?.onDeadLetterEscalationFailed;
+  // WR-395: the operator's shadow mirror outcome callbacks, held in
+  // mutable cells so `server.reviseShadowCallbacks` can replace them
+  // at runtime. The audit wrappers below read these cells — never the
+  // operator callbacks directly — so replacing an operator callback
+  // cannot bypass the `shadow_delivered` / `shadow_failed` audit.
+  let operatorShadowDeliveredCallback: ((info: ShadowDeliveredInfo) => void) | undefined =
+    opts.retry?.onShadowDelivered;
+  let operatorShadowFailedCallback: ((info: ShadowFailedInfo) => void) | undefined =
+    opts.retry?.onShadowFailed;
   // WR-385: the operator's delivered / dead-letter callbacks, held in
   // mutable cells so `server.reviseDeliveredCallback` /
   // `server.reviseDeadLetterCallback` can replace them at runtime. The
@@ -9719,7 +9751,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         shadowTarget: info.shadowTarget,
         attempts: info.attempts,
       });
-      opts.retry?.onShadowDelivered?.(info);
+      operatorShadowDeliveredCallback?.(info);
     },
     onShadowFailed: (info) => {
       opts.auditLog.append({
@@ -9732,7 +9764,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         attempts: info.attempts,
         error: info.error,
       });
-      opts.retry?.onShadowFailed?.(info);
+      operatorShadowFailedCallback?.(info);
     },
     // WR-106: quorum fan-out (M-of-N downstream acknowledgement). An
     // explicit server-level `quorum` wins over the nested `retry.quorum`;
@@ -18136,6 +18168,84 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     operatorDeadLetterEscalatedCallback = nextEscalated;
     operatorDeadLetterEscalationFailedCallback = nextFailed;
     opts.auditLog.append({ event: "dead_letter_escalation_callbacks_revised", ...payload });
+  };
+
+  // WR-395: live shadow mirror outcome callback replacement. Only
+  // the server-side operator-callback cells move — the queue's own
+  // callbacks (the `shadow_delivered` / `shadow_failed` audit
+  // wrappers) are never touched, so a replacement cannot bypass the
+  // audit. The patch is partial: an omitted field keeps its live
+  // value; `null` clears that hook back to audit-only. An empty or
+  // non-object patch throws `RangeError`, as does a non-function value
+  // for a provided field, and the live cells are untouched; a patch
+  // identical to the live values is a silent no-op. A real revision
+  // is audited as `shadow_callbacks_revised` with per-hook presence
+  // (`onShadowDelivered` / `onShadowFailed`: 'set' / 'cleared' /
+  // 'unchanged'; `oldOnShadowDelivered` / `oldOnShadowFailed`: 'set' /
+  // 'absent'), never a function body. With shadow targets
+  // unconfigured the queue throws the canonical "must restart" Error.
+  server.reviseShadowCallbacks = (patch: ShadowCallbacksRevision): void => {
+    if (!queue.shadowConfigured()) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseShadowCallbacks(patch);
+    }
+    if (patch === null || typeof patch !== "object") {
+      throw new RangeError(
+        "reviseShadowCallbacks: patch must be an object with at least one of onShadowDelivered / onShadowFailed"
+      );
+    }
+    const hasDelivered = patch.onShadowDelivered !== undefined;
+    const hasFailed = patch.onShadowFailed !== undefined;
+    if (!hasDelivered && !hasFailed) {
+      throw new RangeError(
+        "reviseShadowCallbacks: patch must set at least one of onShadowDelivered / onShadowFailed"
+      );
+    }
+    if (
+      hasDelivered &&
+      patch.onShadowDelivered !== null &&
+      typeof patch.onShadowDelivered !== "function"
+    ) {
+      throw new RangeError(
+        "reviseShadowCallbacks: onShadowDelivered must be a function or null"
+      );
+    }
+    if (
+      hasFailed &&
+      patch.onShadowFailed !== null &&
+      typeof patch.onShadowFailed !== "function"
+    ) {
+      throw new RangeError(
+        "reviseShadowCallbacks: onShadowFailed must be a function or null"
+      );
+    }
+    const nextDelivered = hasDelivered
+      ? patch.onShadowDelivered ?? undefined
+      : operatorShadowDeliveredCallback;
+    const nextFailed = hasFailed
+      ? patch.onShadowFailed ?? undefined
+      : operatorShadowFailedCallback;
+    if (
+      nextDelivered === operatorShadowDeliveredCallback &&
+      nextFailed === operatorShadowFailedCallback
+    ) {
+      return;
+    }
+    const payload = {
+      onShadowDelivered: hasDelivered
+        ? nextDelivered === undefined
+          ? "cleared"
+          : "set"
+        : "unchanged",
+      oldOnShadowDelivered:
+        operatorShadowDeliveredCallback === undefined ? "absent" : "set",
+      onShadowFailed: hasFailed ? (nextFailed === undefined ? "cleared" : "set") : "unchanged",
+      oldOnShadowFailed:
+        operatorShadowFailedCallback === undefined ? "absent" : "set",
+    };
+    operatorShadowDeliveredCallback = nextDelivered;
+    operatorShadowFailedCallback = nextFailed;
+    opts.auditLog.append({ event: "shadow_callbacks_revised", ...payload });
   };
 
   // WR-369: live endpoint auto-disable/enable callback replacement.
