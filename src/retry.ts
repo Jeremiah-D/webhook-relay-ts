@@ -973,7 +973,9 @@ export interface MetricsOptions {
    * WR-80: called with the `scheduled_fired` audit event every time a
    * cron-recurring schedule generates an occurrence. The server wires this
    * to its audit log; a raw queue without it simply loses the event
-   * (nothing else is affected).
+   * (nothing else is affected). Live-revisable via
+   * `RetryQueue.reviseScheduledFiredCallback` (WR-399) — the new observer
+   * takes effect from the next occurrence.
    */
   onScheduledFired?: (event: ScheduledFiredEvent) => void;
 }
@@ -4595,8 +4597,15 @@ export class RetryQueue {
   // WR-391: deliberately *not* readonly — `reviseDeliveryDeadlineExceededCallback`
   // swaps this field live (see `reviseSemanticFailureCallback`, WR-386).
   private onDeliveryDeadlineExceeded?: (info: DeliveryDeadlineExceededInfo) => void;
-  /** WR-80: cron occurrence audit hook. */
-  private readonly onScheduledFired?: (event: ScheduledFiredEvent) => void;
+  // WR-399: deliberately *not* readonly — `reviseScheduledFiredCallback`
+  // swaps this field live (see `reviseDeadLetterPurgedCallback`, WR-397).
+  // It holds the *caller's* callback; `releaseScheduled` reads this field
+  // live, so a revision can never drop the occurrence generation, the
+  // `scheduled_fired` audit, or the fired count. The server's audit
+  // closure (which forwards to the operator callback) is held here when
+  // the queue runs under `RelayServer`; direct queue users hold their own
+  // callback in the same field.
+  private onScheduledFired?: (event: ScheduledFiredEvent) => void;
   /** WR-76: cumulative deadline expirations per (tenant, endpoint) — see `src/metrics.ts`. */
   private readonly deliveryDeadlineExceeded = new Map<string, Map<string, number>>();
   /**
@@ -13684,6 +13693,38 @@ export class RetryQueue {
     const next = cb ?? undefined;
     if (next === this.onDeadLetterPurged) return;
     this.onDeadLetterPurged = next;
+  }
+
+  /**
+   * WR-399: live-redirect the scheduled-fired observer — the
+   * queue-side setter behind
+   * `RelayServer.reviseScheduledFiredCallback`. The new callback
+   * takes effect from the next cron occurrence; occurrences already
+   * reported are never re-delivered, and the cron parsing, the
+   * firing rhythm, pause/resume, and `nextAt` computation are
+   * untouched — only the observation moves. `null` clears back to no
+   * observer (occurrences are still generated and still audited as
+   * `scheduled_fired` and counted in `getScheduledStats().fired` —
+   * only the forwarding stops). A non-function value throws
+   * `RangeError` and the live callback is untouched; replacing with
+   * the same reference (or clearing when already unset) is a no-op.
+   * There is no must-restart gate: the scheduler is always built and
+   * schedules are created, paused, and resumed at runtime, so a
+   * revision succeeds even with zero schedules registered. Under
+   * `RelayServer` the field holds the server's audit closure, so
+   * direct calls here would replace the audit wrapper; server users
+   * must go through `RelayServer.reviseScheduledFiredCallback`,
+   * which swaps only the operator cell behind the audit closure.
+   */
+  reviseScheduledFiredCallback(cb: ((event: ScheduledFiredEvent) => void) | null): void {
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseScheduledFiredCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === this.onScheduledFired) return;
+    this.onScheduledFired = next;
   }
 
   /**

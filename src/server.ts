@@ -28,7 +28,7 @@ import {
   selectSignatureAlgorithmVerifier,
   type SignatureAlgorithmRule,
 } from "./signature-alg.ts";
-import { RetryQueue, errorBudgetBurnAuditEvent, type AssertionFailureInfo, type AttemptFailedInfo, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutEvent, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeadLetterEscalationCallbacksRevision, type DeliveryDeadlineConfig, type DeliveryDeadlineExceededInfo, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type DownstreamResponseSummary, type EndpointPauseCallbacksRevision, type EndpointPauseInfo, type ErrorBudgetConfig, type ErrorBudgetRevision, type EscalationConfig, type EscalationRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type FailureClass, type QuorumCallbacksRevision, type QuorumRetention, type QuorumRetentionRevision, type ReplayCallbacksRevision, type ReplayForcedInfo, type ReplaySkippedInfo, type RetryItem, type RetryBudgetDepletedInfo, type Sender, type SenderCallOptions, type SemanticFailureInfo, type ShadowCallbacksRevision, type MaintenanceWindowTransition, type SloMissInfo, type SloRiskConfig, type SloRiskRevision, type TenantBudgetAuditEvent, type UrgentDowngradedEvent, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
+import { RetryQueue, errorBudgetBurnAuditEvent, type AssertionFailureInfo, type AttemptFailedInfo, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutEvent, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeadLetterEscalationCallbacksRevision, type DeliveryDeadlineConfig, type DeliveryDeadlineExceededInfo, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type DownstreamResponseSummary, type EndpointPauseCallbacksRevision, type EndpointPauseInfo, type ErrorBudgetConfig, type ErrorBudgetRevision, type EscalationConfig, type EscalationRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type FailureClass, type QuorumCallbacksRevision, type QuorumRetention, type QuorumRetentionRevision, type ReplayCallbacksRevision, type ReplayForcedInfo, type ReplaySkippedInfo, type RetryItem, type RetryBudgetDepletedInfo, type ScheduledFiredEvent, type Sender, type SenderCallOptions, type SemanticFailureInfo, type ShadowCallbacksRevision, type MaintenanceWindowTransition, type SloMissInfo, type SloRiskConfig, type SloRiskRevision, type TenantBudgetAuditEvent, type UrgentDowngradedEvent, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
 import { parseDeliverAtHeader, DELIVER_AT_HEADER } from "./retry.ts";
 import type { ShadowDeliveredInfo, ShadowFailedInfo, ShadowTargetConfig, ShadowTargetsConfig } from "./retry.ts";
 import type {
@@ -6991,6 +6991,29 @@ export interface RelayServer extends Server {
     cb: ((event: DeadLetterPurgedEvent) => void) | null
   ) => void;
   /**
+   * WR-399: live-redirect the scheduled-fired observer — the
+   * operator callback that fires once per cron occurrence generated.
+   * `null` clears back to audit-only (occurrences are still generated
+   * and still audited as `scheduled_fired` and counted, just no longer
+   * forwarded to an operator). A non-function value throws `RangeError`
+   * and the live callback is untouched; replacing with the same
+   * reference (or clearing when already unset) is a silent no-op. A
+   * real replacement is audited as `scheduled_fired_callback_revised`
+   * with `previous` / `current` recording only 'set' / 'cleared'
+   * presence, never a function body. Always set — there is no
+   * must-restart gate: the scheduler is always built and schedules are
+   * created at runtime. The new callback takes effect from the next
+   * occurrence; occurrences already reported are never re-delivered,
+   * and the cron parsing, the firing rhythm, pause/resume, and
+   * `nextAt` computation are untouched. Direct queue users use
+   * `RetryQueue.reviseScheduledFiredCallback` instead — calling the
+   * queue method on a server-owned queue would replace the audit
+   * wrapper.
+   */
+  reviseScheduledFiredCallback?: (
+    cb: ((event: ScheduledFiredEvent) => void) | null
+  ) => void;
+  /**
    * WR-350: revise the live quorum retention tuning at runtime
    * (`retentionMs` / `maxFanouts`, partial — omitted fields keep their
    * live values). The new values take effect at the next lazy retention
@@ -9543,6 +9566,14 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   let operatorCompletionCallbackFailedCallback:
     | ((info: CompletionCallbackFailedInfo) => void)
     | undefined = opts.retry?.onCompletionCallbackFailed;
+  // WR-399: the operator's scheduled-fired callback, held in a
+  // mutable cell so `server.reviseScheduledFiredCallback` can replace
+  // it at runtime. The audit wrapper below reads this cell — never the
+  // operator callback directly — so replacing the operator callback
+  // cannot bypass the `scheduled_fired` audit.
+  let operatorScheduledFiredCallback:
+    | ((event: ScheduledFiredEvent) => void)
+    | undefined = opts.retry?.onScheduledFired;
   // WR-385: the operator's delivered / dead-letter callbacks, held in
   // mutable cells so `server.reviseDeliveredCallback` /
   // `server.reviseDeadLetterCallback` can replace them at runtime. The
@@ -9756,7 +9787,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // `scheduled_fired`, not just observed.
     onScheduledFired: (event) => {
       opts.auditLog.append(event);
-      opts.retry?.onScheduledFired?.(event);
+      // WR-399: forward to the operator cell, never to the constructor
+      // callback directly, so a live revision cannot bypass the audit.
+      operatorScheduledFiredCallback?.(event);
     },
     // Wrap the caller's hook so rounds-exhaustion is always audited, not
     // just observed.
@@ -18780,6 +18813,40 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     operatorDeadLetterPurgedCallback = next;
     opts.auditLog.append({
       event: "dead_letter_purged_callback_revised",
+      previous: prev,
+      current: nextPresence,
+    });
+  };
+
+  // WR-399: live scheduled-fired observer replacement. Only the
+  // server-side operator-callback cell moves — the queue's audit
+  // wrapper (which appends `scheduled_fired` first, then forwards to
+  // the cell) is never touched, so a replacement cannot bypass the
+  // audit. A non-function callback throws `RangeError` and the live
+  // cell is untouched; a same-reference replacement (or clearing when
+  // already unset) is a silent no-op. A real replacement is audited as
+  // `scheduled_fired_callback_revised` with `previous` / `current`
+  // recording only 'set' / 'cleared' presence, never a function body.
+  // No must-restart gate: the scheduler is always built. The new
+  // callback takes effect from the next occurrence; occurrences
+  // already reported are never re-delivered, and the cron parsing,
+  // the firing rhythm, pause/resume, and `nextAt` computation are
+  // untouched.
+  server.reviseScheduledFiredCallback = (
+    cb: ((event: ScheduledFiredEvent) => void) | null
+  ): void => {
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseScheduledFiredCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === operatorScheduledFiredCallback) return;
+    const prev = operatorScheduledFiredCallback === undefined ? "cleared" : "set";
+    const nextPresence = next === undefined ? "cleared" : "set";
+    operatorScheduledFiredCallback = next;
+    opts.auditLog.append({
+      event: "scheduled_fired_callback_revised",
       previous: prev,
       current: nextPresence,
     });

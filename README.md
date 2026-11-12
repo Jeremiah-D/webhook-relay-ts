@@ -3460,6 +3460,19 @@ curl -X POST http://127.0.0.1:PORT/ \
   schedules are in-memory only, like the one-shot delay queue —
   a restart does not resurrect them (documented limitation, not a
   bug).
+- **Live observer revision (WR-399)** — the firing observer is
+  revisable live via `server.reviseScheduledFiredCallback(cb)` (and
+  `RetryQueue.reviseScheduledFiredCallback(cb)` for direct queue
+  users): `null` clears back to audit-only (occurrences are still
+  generated and still audited as `scheduled_fired` and counted, just
+  no longer forwarded to an operator). The new observer takes effect
+  from the next occurrence; occurrences already reported are never
+  re-delivered. A real revision is audited as
+  `scheduled_fired_callback_revised` with `previous` / `current`
+  ('set' / 'cleared' only). This only swaps the observation receiver
+  — the schedules themselves stay in-memory only, and there is no
+  must-restart gate: the scheduler is always built, so a revision
+  succeeds even with zero schedules registered.
 - **The clock is injectable** — the recurring scheduler takes its time
   from the same injectable clock as the delay queue, so tests drive
   cycles deterministically without wall-clock waits.
