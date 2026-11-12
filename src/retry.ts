@@ -2347,6 +2347,12 @@ export interface RetryQueueOptions {
    * semantics win), and `head_of_line_parked` when a stuck head is
    * parked into the dead-letter list. The server writes both into the
    * audit log; library users get the hook directly.
+   *
+   * Live-revisable via `RetryQueue.reviseOrderedAuditCallback` (WR-401) —
+   * `null` clears back to no observer. Under `RelayServer` this field
+   * holds the server's audit closure, so direct calls there would
+   * replace the audit wrapper; server users must go through
+   * `RelayServer.reviseOrderedAuditCallback` instead.
    */
   onOrderedAudit?: (event: OrderedAuditEvent) => void;
   /**
@@ -4725,7 +4731,16 @@ export class RetryQueue {
   private readonly orderedTracker?: OrderedTracker;
   /** WR-113: normalized ordered config (global scope + exact-targetUrl records). */
   private readonly orderedConfig?: ResolvedOrderedConfig;
-  private readonly onOrderedAudit?: (event: OrderedAuditEvent) => void;
+  // WR-401: deliberately *not* readonly — `reviseOrderedAuditCallback`
+  // swaps this field live (see `reviseDeadLetterPurgedCallback`,
+  // WR-397). It holds the *caller's* callback; the ordered gate and
+  // `parkOrderedHead` read this field live, so a revision can never
+  // drop the gate, the park, the `ordered_bypassed` /
+  // `head_of_line_parked` audits, or the `relay_ordered_*` counters.
+  // The server's audit closure (which forwards to the operator
+  // callback) is held here when the queue runs under `RelayServer`;
+  // direct queue users hold their own callback in the same field.
+  private onOrderedAudit?: (event: OrderedAuditEvent) => void;
   /** WR-113: cumulative per-endpoint ordered counters (stats + metrics source). */
   private readonly orderedHeadBlockedTotal = new Map<string, number>();
   private readonly orderedHeadOfLineParkedTotal = new Map<string, number>();
@@ -8607,6 +8622,11 @@ export class RetryQueue {
   /** WR-400: whether batch merging is enabled (queue-level). */
   batchConfigured(): boolean {
     return this.batcher !== undefined;
+  }
+
+  /** WR-401: whether per-endpoint ordered delivery is enabled (queue-level). */
+  orderedConfigured(): boolean {
+    return this.orderedTracker !== undefined;
   }
 
   /** WR-369: whether the auto-disable subsystem is enabled (queue-level). */
@@ -13775,6 +13795,44 @@ export class RetryQueue {
     const next = cb ?? undefined;
     if (next === this.onBatch) return;
     this.onBatch = next;
+  }
+
+  /**
+   * WR-401: live-redirect the ordered-delivery audit observer — the
+   * queue-side setter behind
+   * `RelayServer.reviseOrderedAuditCallback`. The new callback takes
+   * effect from the next urgent bypass or head park; transitions
+   * already reported are never re-delivered, and the ordered gate,
+   * the head hold bound, the `maxHeadOfLineHoldMs` judgement, the
+   * park behavior, the line positions, and `getOrderedStats` are
+   * untouched — only the observation moves. `null` clears back to no
+   * observer (the gate and the park carry on and are still audited as
+   * `ordered_bypassed` / `head_of_line_parked` and counted in
+   * `relay_ordered_*` — only the forwarding stops). A non-function
+   * value throws `RangeError` and the live callback is untouched;
+   * replacing with the same reference (or clearing when already
+   * unset) is a no-op. Throws `Error` when ordered delivery was never
+   * configured — the tracker only ever exists with `ordered` in
+   * place, so enabling observation needs a restart. Under
+   * `RelayServer` the field holds the server's audit closure, so
+   * direct calls here would replace the audit wrapper; server users
+   * must go through `RelayServer.reviseOrderedAuditCallback`, which
+   * swaps only the operator cell behind the audit closure.
+   */
+  reviseOrderedAuditCallback(cb: ((event: OrderedAuditEvent) => void) | null): void {
+    if (!this.orderedConfigured()) {
+      throw new Error(
+        "reviseOrderedAuditCallback: ordered delivery is not configured — enabling it requires a restart"
+      );
+    }
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseOrderedAuditCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === this.onOrderedAudit) return;
+    this.onOrderedAudit = next;
   }
 
   /**

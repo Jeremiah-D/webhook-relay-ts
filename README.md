@@ -11626,6 +11626,20 @@ relay with the feature off exposes no `relay_ordered_*` series at all.
 `head_of_line_parked`) is the per-event channel; `getOrderedStats` is
 the per-endpoint channel.
 
+WR-401: the audit observer is revisable live via
+`server.reviseOrderedAuditCallback(cb)` (and
+`RetryQueue.reviseOrderedAuditCallback(cb)` for direct queue users) —
+`null` clears back to audit-only (the gate and the park carry on and
+are still audited as `ordered_bypassed` / `head_of_line_parked` and
+counted in `relay_ordered_*`, just no longer forwarded to an operator).
+The new observer takes effect from the next bypass or park; transitions
+already reported are never re-delivered. A real revision is audited as
+`ordered_audit_callback_revised` with `previous` / `current` ('set' /
+'cleared' only). Revising when ordered delivery was never configured
+throws `Error` (enabling it needs a restart). This only swaps the
+observation receiver — the ordered gate, the head hold bound, and the
+park behavior are untouched.
+
 **Fail-fast** — an illegal `ordered` value (bad shape, non-positive
 `maxHeadOfLineHoldMs`, …) throws `RangeError` at construction.
 

@@ -7035,6 +7035,32 @@ export interface RelayServer extends Server {
     cb: ((info: BatchInfo) => void) | null
   ) => void;
   /**
+   * WR-401: live-redirect the ordered-delivery audit observer — the
+   * operator callback that fires once per urgent bypass
+   * (`ordered_bypassed`) and once per poison-parked head
+   * (`head_of_line_parked`). `null` clears back to audit-only (the
+   * gate and the park carry on and are still audited as
+   * `ordered_bypassed` / `head_of_line_parked` and counted in
+   * `relay_ordered_*`, just no longer forwarded to an operator). A
+   * non-function value throws `RangeError` and the live callback is
+   * untouched; replacing with the same reference (or clearing when
+   * already unset) is a silent no-op. A real replacement is audited
+   * as `ordered_audit_callback_revised` with `previous` / `current`
+   * recording only 'set' / 'cleared' presence, never a function body.
+   * Always set; throws `Error` when ordered delivery was never
+   * configured — enabling it needs a restart. The new callback takes
+   * effect from the next bypass or park; transitions already reported
+   * are never re-delivered, and the ordered gate, the head hold
+   * bound, the park behavior, the line positions, and
+   * `getOrderedStats` are untouched. Direct queue users use
+   * `RetryQueue.reviseOrderedAuditCallback` instead — calling the
+   * queue method on a server-owned queue would replace the audit
+   * wrapper.
+   */
+  reviseOrderedAuditCallback?: (
+    cb: ((event: OrderedAuditEvent) => void) | null
+  ) => void;
+  /**
    * WR-350: revise the live quorum retention tuning at runtime
    * (`retentionMs` / `maxFanouts`, partial — omitted fields keep their
    * live values). The new values take effect at the next lazy retention
@@ -9603,6 +9629,14 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   let operatorBatchCallback:
     | ((info: BatchInfo) => void)
     | undefined = opts.retry?.onBatch;
+  // WR-401: the operator's ordered-delivery audit callback, held in a
+  // mutable cell so `server.reviseOrderedAuditCallback` can replace it
+  // at runtime. The audit wrapper below reads this cell — never the
+  // operator callback directly — so replacing the operator callback
+  // cannot bypass the `ordered_bypassed` / `head_of_line_parked` audit.
+  let operatorOrderedAuditCallback:
+    | ((event: OrderedAuditEvent) => void)
+    | undefined = opts.retry?.onOrderedAudit;
   // WR-385: the operator's delivered / dead-letter callbacks, held in
   // mutable cells so `server.reviseDeliveredCallback` /
   // `server.reviseDeadLetterCallback` can replace them at runtime. The
@@ -9898,7 +9932,10 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     ordered: registryOrdered ?? opts.ordered ?? opts.retry?.ordered,
     // Wrap the caller's hook so every urgent bypass and every
     // poison-parked head is audited as `ordered_bypassed` /
-    // `head_of_line_parked`, not just observed.
+    // `head_of_line_parked`, not just observed. WR-401: the wrapper
+    // reads the mutable `operatorOrderedAuditCallback` cell — the
+    // queue's callback is never swapped, so a runtime callback
+    // replacement cannot bypass this audit.
     onOrderedAudit: (event: OrderedAuditEvent) => {
       opts.auditLog.append({
         event: event.kind,
@@ -9911,7 +9948,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
           ? { maxHeadOfLineHoldMs: event.maxHeadOfLineHoldMs }
           : {}),
       });
-      opts.retry?.onOrderedAudit?.(event);
+      operatorOrderedAuditCallback?.(event);
     },
     // WR-98: an explicit server-level `traceContext` wins over the nested
     // `retry.traceContext`; either way the queue owns span-reference
@@ -18916,6 +18953,46 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     operatorBatchCallback = next;
     opts.auditLog.append({
       event: "batch_callback_revised",
+      previous: prev,
+      current: nextPresence,
+    });
+  };
+
+  // WR-401: live ordered-delivery audit observer replacement. Only
+  // the server-side operator-callback cell moves — the queue's audit
+  // wrapper (which appends `ordered_bypassed` / `head_of_line_parked`
+  // first, then forwards to the cell) is never touched, so a
+  // replacement cannot bypass the audit. With ordered delivery
+  // unconfigured the queue throws the canonical "must restart" Error
+  // (delegated below, exactly like WR-397's purged gate). A
+  // non-function callback throws `RangeError` and the live cell is
+  // untouched; a same-reference replacement (or clearing when already
+  // unset) is a silent no-op. A real replacement is audited as
+  // `ordered_audit_callback_revised` with `previous` / `current`
+  // recording only 'set' / 'cleared' presence, never a function body.
+  // The new callback takes effect from the next bypass or park;
+  // transitions already reported are never re-delivered, and the
+  // ordered gate, the head hold bound, the park behavior, the line
+  // positions, and `getOrderedStats` are untouched.
+  server.reviseOrderedAuditCallback = (
+    cb: ((event: OrderedAuditEvent) => void) | null
+  ): void => {
+    if (!queue.orderedConfigured()) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseOrderedAuditCallback(cb);
+    }
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseOrderedAuditCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === operatorOrderedAuditCallback) return;
+    const prev = operatorOrderedAuditCallback === undefined ? "cleared" : "set";
+    const nextPresence = next === undefined ? "cleared" : "set";
+    operatorOrderedAuditCallback = next;
+    opts.auditLog.append({
+      event: "ordered_audit_callback_revised",
       previous: prev,
       current: nextPresence,
     });
