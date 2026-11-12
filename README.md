@@ -12838,6 +12838,18 @@ leaves the live values untouched; an empty or same-value patch is a silent
 no-op, and a real revision is audited as `batch_config_revised` with
 `previous` / `current`.
 
+WR-400: the flush observer is revisable live via
+`server.reviseBatchCallback(cb)` (and `RetryQueue.reviseBatchCallback(cb)`
+for direct queue users) — `null` clears back to audit-only (merging and
+flushing continue and are still audited as `batch_flushed` and counted in
+batch stats, just no longer forwarded to an operator). The new observer
+takes effect from the next flush; batches already reported are never
+re-delivered. A real revision is audited as `batch_callback_revised` with
+`previous` / `current` ('set' / 'cleared' only). Revising when batching
+was never configured throws `Error` (enabling it needs a restart). This
+only swaps the observation receiver — the merge rhythm still follows
+WR-333 (`setBatchConfig`).
+
 **Live event stream:** with an `operatorToken` set, `GET /events` opens a
 Server-Sent Events stream pushing `delivered` / `retrying` / `dead_letter`
 frames as JSON in real time (`event: delivery`), so an operator can watch

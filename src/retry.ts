@@ -2471,7 +2471,9 @@ export interface RetryQueueOptions {
   /**
    * Called every time a batch is flushed — i.e. a group of buffered events
    * became one merged delivery item. The server audits this as
-   * `batch_flushed`.
+   * `batch_flushed`. Live-revisable via
+   * `RetryQueue.reviseBatchCallback` (WR-400) — the new observer takes
+   * effect from the next flush.
    */
   onBatch?: (info: BatchInfo) => void;
   /**
@@ -4704,7 +4706,15 @@ export class RetryQueue {
   private readonly tenantRetryBudgetDepletedByTenant = new Map<string, number>();
   private readonly batcher?: BatchCollector;
   private readonly batchResolved?: ResolvedBatchOptions;
-  private readonly onBatch?: (info: BatchInfo) => void;
+  // WR-400: deliberately *not* readonly — `reviseBatchCallback` swaps
+  // this field live (see `reviseDeadLetterPurgedCallback`, WR-397).
+  // It holds the *caller's* callback; `flushBatch` reads this field
+  // live, so a revision can never drop the merge, the flush, the
+  // `batch_flushed` audit, or the batch stats. The server's audit
+  // closure (which forwards to the operator callback) is held here when
+  // the queue runs under `RelayServer`; direct queue users hold their own
+  // callback in the same field.
+  private onBatch?: (info: BatchInfo) => void;
   /** Per-endpoint flushed-batch counters. */
   private readonly batchStats = new Map<string, { batches: number; events: number }>();
   /**
@@ -8592,6 +8602,11 @@ export class RetryQueue {
   /** WR-397: whether the dead-letter retention sweeper is enabled (queue-level). */
   retentionConfigured(): boolean {
     return this.retentionSweeper !== undefined;
+  }
+
+  /** WR-400: whether batch merging is enabled (queue-level). */
+  batchConfigured(): boolean {
+    return this.batcher !== undefined;
   }
 
   /** WR-369: whether the auto-disable subsystem is enabled (queue-level). */
@@ -13725,6 +13740,41 @@ export class RetryQueue {
     const next = cb ?? undefined;
     if (next === this.onScheduledFired) return;
     this.onScheduledFired = next;
+  }
+
+  /**
+   * WR-400: live-redirect the batch-flush observer — the queue-side
+   * setter behind `RelayServer.reviseBatchCallback`. The new callback
+   * takes effect from the next flush; batches already reported are
+   * never re-delivered, and the window timer, `maxBatchSize`, retune,
+   * and the merge envelope are untouched — only the observation moves.
+   * `null` clears back to no observer (merging and flushing continue
+   * and are still audited as `batch_flushed` and counted in
+   * `getBatchStats()` — only the forwarding stops). A non-function
+   * value throws `RangeError` and the live callback is untouched;
+   * replacing with the same reference (or clearing when already
+   * unset) is a no-op. Throws `Error` when batching was never
+   * configured — the collector only ever exists with `batch` in
+   * place, so enabling observation needs a restart. Under
+   * `RelayServer` the field holds the server's audit closure, so
+   * direct calls here would replace the audit wrapper; server users
+   * must go through `RelayServer.reviseBatchCallback`, which swaps
+   * only the operator cell behind the audit closure.
+   */
+  reviseBatchCallback(cb: ((info: BatchInfo) => void) | null): void {
+    if (!this.batchConfigured()) {
+      throw new Error(
+        "reviseBatchCallback: batching is not configured — enabling it requires a restart"
+      );
+    }
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseBatchCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === this.onBatch) return;
+    this.onBatch = next;
   }
 
   /**

@@ -28,7 +28,7 @@ import {
   selectSignatureAlgorithmVerifier,
   type SignatureAlgorithmRule,
 } from "./signature-alg.ts";
-import { RetryQueue, errorBudgetBurnAuditEvent, type AssertionFailureInfo, type AttemptFailedInfo, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutEvent, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeadLetterEscalationCallbacksRevision, type DeliveryDeadlineConfig, type DeliveryDeadlineExceededInfo, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type DownstreamResponseSummary, type EndpointPauseCallbacksRevision, type EndpointPauseInfo, type ErrorBudgetConfig, type ErrorBudgetRevision, type EscalationConfig, type EscalationRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type FailureClass, type QuorumCallbacksRevision, type QuorumRetention, type QuorumRetentionRevision, type ReplayCallbacksRevision, type ReplayForcedInfo, type ReplaySkippedInfo, type RetryItem, type RetryBudgetDepletedInfo, type ScheduledFiredEvent, type Sender, type SenderCallOptions, type SemanticFailureInfo, type ShadowCallbacksRevision, type MaintenanceWindowTransition, type SloMissInfo, type SloRiskConfig, type SloRiskRevision, type TenantBudgetAuditEvent, type UrgentDowngradedEvent, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
+import { RetryQueue, errorBudgetBurnAuditEvent, type AssertionFailureInfo, type AttemptFailedInfo, type BatchInfo, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutEvent, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeadLetterEscalationCallbacksRevision, type DeliveryDeadlineConfig, type DeliveryDeadlineExceededInfo, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type DownstreamResponseSummary, type EndpointPauseCallbacksRevision, type EndpointPauseInfo, type ErrorBudgetConfig, type ErrorBudgetRevision, type EscalationConfig, type EscalationRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type FailureClass, type QuorumCallbacksRevision, type QuorumRetention, type QuorumRetentionRevision, type ReplayCallbacksRevision, type ReplayForcedInfo, type ReplaySkippedInfo, type RetryItem, type RetryBudgetDepletedInfo, type ScheduledFiredEvent, type Sender, type SenderCallOptions, type SemanticFailureInfo, type ShadowCallbacksRevision, type MaintenanceWindowTransition, type SloMissInfo, type SloRiskConfig, type SloRiskRevision, type TenantBudgetAuditEvent, type UrgentDowngradedEvent, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
 import { parseDeliverAtHeader, DELIVER_AT_HEADER } from "./retry.ts";
 import type { ShadowDeliveredInfo, ShadowFailedInfo, ShadowTargetConfig, ShadowTargetsConfig } from "./retry.ts";
 import type {
@@ -7014,6 +7014,27 @@ export interface RelayServer extends Server {
     cb: ((event: ScheduledFiredEvent) => void) | null
   ) => void;
   /**
+   * WR-400: live-redirect the batch-flush observer — the operator
+   * callback that fires once per flushed batch. `null` clears back to
+   * audit-only (merging and flushing continue and are still audited as
+   * `batch_flushed` and counted in batch stats, just no longer
+   * forwarded to an operator). A non-function value throws `RangeError`
+   * and the live callback is untouched; replacing with the same
+   * reference (or clearing when already unset) is a silent no-op. A
+   * real replacement is audited as `batch_callback_revised` with
+   * `previous` / `current` recording only 'set' / 'cleared' presence,
+   * never a function body. Always set; throws `Error` when batching was
+   * never configured — enabling it needs a restart. The new callback
+   * takes effect from the next flush; batches already reported are
+   * never re-delivered, and the window timer, `maxBatchSize`, retune,
+   * and the merge envelope are untouched. Direct queue users use
+   * `RetryQueue.reviseBatchCallback` instead — calling the queue
+   * method on a server-owned queue would replace the audit wrapper.
+   */
+  reviseBatchCallback?: (
+    cb: ((info: BatchInfo) => void) | null
+  ) => void;
+  /**
    * WR-350: revise the live quorum retention tuning at runtime
    * (`retentionMs` / `maxFanouts`, partial — omitted fields keep their
    * live values). The new values take effect at the next lazy retention
@@ -9574,6 +9595,14 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   let operatorScheduledFiredCallback:
     | ((event: ScheduledFiredEvent) => void)
     | undefined = opts.retry?.onScheduledFired;
+  // WR-400: the operator's batch-flush callback, held in a mutable
+  // cell so `server.reviseBatchCallback` can replace it at runtime.
+  // The audit wrapper below reads this cell — never the operator
+  // callback directly — so replacing the operator callback cannot
+  // bypass the `batch_flushed` audit.
+  let operatorBatchCallback:
+    | ((info: BatchInfo) => void)
+    | undefined = opts.retry?.onBatch;
   // WR-385: the operator's delivered / dead-letter callbacks, held in
   // mutable cells so `server.reviseDeliveredCallback` /
   // `server.reviseDeadLetterCallback` can replace them at runtime. The
@@ -10547,7 +10576,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         targetUrl: info.endpoint,
         size: info.size,
       });
-      opts.retry?.onBatch?.(info);
+      // WR-400: forward to the operator cell, never to the constructor
+      // callback directly, so a live revision cannot bypass the audit.
+      operatorBatchCallback?.(info);
     },
   });
   queue.start();
@@ -18847,6 +18878,44 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     operatorScheduledFiredCallback = next;
     opts.auditLog.append({
       event: "scheduled_fired_callback_revised",
+      previous: prev,
+      current: nextPresence,
+    });
+  };
+
+  // WR-400: live batch-flush observer replacement. Only the
+  // server-side operator-callback cell moves — the queue's audit
+  // wrapper (which appends `batch_flushed` first, then forwards to
+  // the cell) is never touched, so a replacement cannot bypass the
+  // audit. With batching unconfigured the queue throws the canonical
+  // "must restart" Error (delegated below, exactly like WR-397's
+  // purged gate). A non-function callback throws `RangeError` and the
+  // live cell is untouched; a same-reference replacement (or clearing
+  // when already unset) is a silent no-op. A real replacement is
+  // audited as `batch_callback_revised` with `previous` / `current`
+  // recording only 'set' / 'cleared' presence, never a function body.
+  // The new callback takes effect from the next flush; batches
+  // already reported are never re-delivered, and the window timer,
+  // `maxBatchSize`, retune, and the merge envelope are untouched.
+  server.reviseBatchCallback = (
+    cb: ((info: BatchInfo) => void) | null
+  ): void => {
+    if (!queue.batchConfigured()) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseBatchCallback(cb);
+    }
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseBatchCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === operatorBatchCallback) return;
+    const prev = operatorBatchCallback === undefined ? "cleared" : "set";
+    const nextPresence = next === undefined ? "cleared" : "set";
+    operatorBatchCallback = next;
+    opts.auditLog.append({
+      event: "batch_callback_revised",
       previous: prev,
       current: nextPresence,
     });
