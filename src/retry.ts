@@ -2653,6 +2653,9 @@ export interface RetryQueueOptions {
    * (`maxAttempts`, at most 3). The server audits these as
    * `callback_failed`. Receipts never enter the retry queue or the
    * dead-letter list — a failing callback cannot recurse.
+   * Live-revisable via
+   * `RetryQueue.reviseCompletionCallbackFailedCallback` (WR-398) — the
+   * new observer takes effect from the next exhausted receipt.
    */
   onCompletionCallbackFailed?: (info: CompletionCallbackFailedInfo) => void;
   /**
@@ -4844,6 +4847,16 @@ export class RetryQueue {
   // queue users hold their own callbacks in the same fields.
   private callerOnDeadLetterEscalated?: (info: DeadLetterEscalatedInfo) => void;
   private callerOnDeadLetterEscalationFailed?: (info: DeadLetterEscalationFailedInfo) => void;
+  // WR-398: deliberately *not* readonly —
+  // `reviseCompletionCallbackFailedCallback` swaps this field live.
+  // It holds the *caller's* callback; the callbacker's `onFailed` hook
+  // below is a stable closure reading this field live (along WR-394's
+  // `callerOnDeadLetterEscalationFailed`), so a revision can never drop
+  // the receipt POST, the receipt retry, or the receipt statistics.
+  // The server's audit closure (which forwards to the operator
+  // callback) is held here when the queue runs under `RelayServer`;
+  // direct queue users hold their own callback in the same field.
+  private callerOnCompletionCallbackFailed?: (info: CompletionCallbackFailedInfo) => void;
 
   private readonly queue = new Map<string, RetryItem & { attempt: number }>();
   private readonly timers = new Map<string, Scheduled>();
@@ -5422,11 +5435,17 @@ export class RetryQueue {
     // address) is installed later via `setCompletionCallbackSelfCheck`,
     // because the server does not know its listen port yet at this point.
     const callbackConfig = resolveCompletionCallbackConfig(opts.completionCallback);
+    // WR-398: the caller's callback lives in the mutable inner field;
+    // the callbacker's `onFailed` hook is a stable closure reading it
+    // live (along WR-394's `callerOnDeadLetterEscalationFailed`), so
+    // `reviseCompletionCallbackFailedCallback` can swap the observer
+    // without ever touching — or dropping — the callbacker itself.
+    this.callerOnCompletionCallbackFailed = opts.onCompletionCallbackFailed;
     this.callbacker =
       callbackConfig === undefined
         ? undefined
         : new CompletionCallbacker(callbackConfig, {
-            onFailed: (info) => opts.onCompletionCallbackFailed?.(info),
+            onFailed: (info) => this.callerOnCompletionCallbackFailed?.(info),
           });
     // WR-93: invalid escalation configs throw here, at construction —
     // never mid-delivery. The runtime loop check (against the actually
@@ -8544,6 +8563,11 @@ export class RetryQueue {
   /** WR-394: whether the dead-letter storm escalation subsystem is enabled (queue-level). */
   escalationConfigured(): boolean {
     return this.escalation !== undefined;
+  }
+
+  /** WR-398: whether the completion-callback subsystem is enabled (queue-level). */
+  completionCallbackConfigured(): boolean {
+    return this.callbacker !== undefined;
   }
 
   /** WR-395: whether the shadow-target mirroring subsystem is enabled (queue-level). */
@@ -13546,6 +13570,47 @@ export class RetryQueue {
     if (nextBlocked === this.onEndpointDependencyBlocked && nextUnblocked === this.onEndpointDependencyUnblocked) return;
     this.onEndpointDependencyBlocked = nextBlocked;
     this.onEndpointDependencyUnblocked = nextUnblocked;
+  }
+
+  /**
+   * WR-398: live-redirect the completion-callback-failed observer — the
+   * queue-side setter behind
+   * `RelayServer.reviseCompletionCallbackFailedCallback`. The new
+   * callback takes effect from the next exhausted receipt; failures
+   * already reported are never re-delivered, and the receipt POST,
+   * the receipt retry/backoff, the self-check, and the receipt
+   * statistics are untouched — only the observation moves. `null`
+   * clears back to no observer (receipts still POST / retry / exhaust
+   * and are still audited as `callback_failed` and counted — only the
+   * forwarding stops). A non-function value throws `RangeError` and
+   * the live callback is untouched; replacing with the same reference
+   * (or clearing when already unset) is a no-op. Throws `Error` when
+   * completion callbacks were never configured — the receipts only
+   * ever fire with `completionCallback` in place, so enabling
+   * observation needs a restart. Under `RelayServer` the field holds
+   * the server's audit closure, so direct calls here would replace
+   * the audit wrapper; server users must go through
+   * `RelayServer.reviseCompletionCallbackFailedCallback`, which swaps
+   * only the operator cell behind the audit closure. The queue itself
+   * holds no audit log — the server audits a real revision as
+   * `completion_callback_failed_callback_revised`.
+   */
+  reviseCompletionCallbackFailedCallback(
+    cb: ((info: CompletionCallbackFailedInfo) => void) | null
+  ): void {
+    if (!this.completionCallbackConfigured()) {
+      throw new Error(
+        "reviseCompletionCallbackFailedCallback: completion callback is not configured — enabling completion callback observation requires a restart"
+      );
+    }
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseCompletionCallbackFailedCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === this.callerOnCompletionCallbackFailed) return;
+    this.callerOnCompletionCallbackFailed = next;
   }
 
   /**

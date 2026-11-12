@@ -12535,6 +12535,23 @@ and again before every POST against the actually bound address (so even an
 undeclared self-target is refused). A refused target fails fast and is
 audited as `callback_failed` — it is never POSTed.
 
+WR-398: the failure observer is revisable live via
+`server.reviseCompletionCallbackFailedCallback(cb)` (and
+`RetryQueue.reviseCompletionCallbackFailedCallback(cb)` for direct queue
+users) — `null` clears back to audit-only (receipts still POST / retry /
+exhaust and are still audited as `callback_failed` and counted, just no
+longer forwarded to an operator). The new callback takes effect from the
+next exhausted receipt; failures already reported are never re-delivered.
+A non-function value throws `RangeError` and leaves the live callback
+untouched; replacing with the same reference (or clearing when already
+unset) is a silent no-op. A real revision is audited as
+`completion_callback_failed_callback_revised` with `previous` / `current`
+recording only 'set' / 'cleared' presence, never a function body.
+Revising when completion callbacks were never configured throws `Error`
+(enabling them needs a restart). This only moves the failure observer;
+the receipt configuration itself still goes through `completionCallback`
+at construction.
+
 ### Dead-letter storm escalation
 
 Completion callbacks (above) are *per-delivery* receipts to the *caller's*

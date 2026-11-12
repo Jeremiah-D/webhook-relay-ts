@@ -75,7 +75,7 @@ import {
   assertValidStatusRetryPolicy,
 } from "./status-retry.ts";
 import { parseCronExpression, CRON_HEADER } from "./cron.ts";
-import type { CompletionCallbackOptions } from "./callback.ts";
+import type { CompletionCallbackFailedInfo, CompletionCallbackOptions } from "./callback.ts";
 import { createBoundAddressSelfCheck } from "./callback.ts";
 import type {
   DeadLetterEscalatedInfo,
@@ -6914,6 +6914,30 @@ export interface RelayServer extends Server {
    */
   reviseEndpointDependencyCallbacks?: (patch: EndpointDependencyCallbacksRevision) => void;
   /**
+   * WR-398: live-redirect the completion-callback-failed observer — the
+   * operator callback that fires once per completion receipt that
+   * exhausts its attempts. `null` clears back to audit-only (receipts
+   * still POST / retry / exhaust and are still audited as
+   * `callback_failed` and counted, just no longer forwarded to an
+   * operator). A non-function value throws `RangeError` and the live
+   * callback is untouched; replacing with the same reference (or
+   * clearing when already unset) is a silent no-op. A real replacement
+   * is audited as `completion_callback_failed_callback_revised` with
+   * `previous` / `current` recording only 'set' / 'cleared' presence,
+   * never a function body. Always set; throws `Error` when completion
+   * callbacks were never configured — enabling them needs a restart.
+   * The new callback takes effect from the next exhausted receipt;
+   * failures already reported are never re-delivered, and the receipt
+   * POST, retry/backoff, self-check, and receipt statistics are
+   * untouched. Direct queue users use
+   * `RetryQueue.reviseCompletionCallbackFailedCallback` instead —
+   * calling the queue method on a server-owned queue would replace
+   * the audit wrapper.
+   */
+  reviseCompletionCallbackFailedCallback?: (
+    cb: ((info: CompletionCallbackFailedInfo) => void) | null
+  ) => void;
+  /**
    * WR-396: live-redirect the quorum fan-out observers at runtime —
    * no restart. Replaces the operator callbacks the server forwards
    * each fan-out event to, after the event itself is audited as
@@ -9510,6 +9534,15 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   let operatorDeadLetterPurgedCallback:
     | ((event: DeadLetterPurgedEvent) => void)
     | undefined = opts.retry?.onDeadLetterPurged;
+  // WR-398: the operator's completion-callback-failed callback, held
+  // in a mutable cell so
+  // `server.reviseCompletionCallbackFailedCallback` can replace it at
+  // runtime. The audit wrapper below reads this cell — never the
+  // operator callback directly — so replacing the operator callback
+  // cannot bypass the `callback_failed` audit.
+  let operatorCompletionCallbackFailedCallback:
+    | ((info: CompletionCallbackFailedInfo) => void)
+    | undefined = opts.retry?.onCompletionCallbackFailed;
   // WR-385: the operator's delivered / dead-letter callbacks, held in
   // mutable cells so `server.reviseDeliveredCallback` /
   // `server.reviseDeadLetterCallback` can replace them at runtime. The
@@ -10036,7 +10069,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         attempts: info.attempts,
         error: info.error,
       });
-      opts.retry?.onCompletionCallbackFailed?.(info);
+      // WR-398: forward to the operator cell, never to the constructor
+      // callback directly, so a live revision cannot bypass the audit.
+      operatorCompletionCallbackFailedCallback?.(info);
     },
     // WR-93: an explicit server-level `deadLetterEscalation` wins over
     // the nested `retry.escalation`; either way the queue owns the
@@ -18488,6 +18523,46 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     operatorEndpointDependencyBlockedCallback = nextBlocked;
     operatorEndpointDependencyUnblockedCallback = nextUnblocked;
     opts.auditLog.append({ event: "endpoint_dependency_callbacks_revised", ...payload });
+  };
+
+  // WR-398: live completion-callback-failed observer revision. The
+  // method is always set; with completion callbacks unconfigured the
+  // queue throws the canonical "must restart" Error (delegated below,
+  // exactly like WR-393's canary gate). Only the operator cell moves:
+  // the queue's audit wrapper (which appends `callback_failed` first,
+  // then forwards to the cell) is never touched, so a replacement
+  // cannot bypass the audit. A non-function callback throws
+  // `RangeError` and the live cell is untouched; a same-reference
+  // replacement (or clearing when already unset) is a silent no-op. A
+  // real replacement is audited as
+  // `completion_callback_failed_callback_revised` with `previous` /
+  // `current` recording only 'set' / 'cleared' presence, never a
+  // function body. The new callback takes effect from the next
+  // exhausted receipt; failures already reported are never
+  // re-delivered, and the receipt POST, retry/backoff, self-check, and
+  // receipt statistics are untouched.
+  server.reviseCompletionCallbackFailedCallback = (
+    cb: ((info: CompletionCallbackFailedInfo) => void) | null
+  ): void => {
+    if (!queue.completionCallbackConfigured()) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseCompletionCallbackFailedCallback(cb);
+    }
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseCompletionCallbackFailedCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === operatorCompletionCallbackFailedCallback) return;
+    const prev = operatorCompletionCallbackFailedCallback === undefined ? "cleared" : "set";
+    const nextPresence = next === undefined ? "cleared" : "set";
+    operatorCompletionCallbackFailedCallback = next;
+    opts.auditLog.append({
+      event: "completion_callback_failed_callback_revised",
+      previous: prev,
+      current: nextPresence,
+    });
   };
 
   // WR-396: live quorum fan-out observer replacement. Only the
