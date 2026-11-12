@@ -2678,7 +2678,9 @@ export interface RetryQueueOptions {
   escalation?: DeadLetterEscalationOptions;
   /**
    * Called once when a storm alert is dispatched for a scope. The server
-   * audits these as `dead_letter_escalated`.
+   * audits these as `dead_letter_escalated`. Live-revisable via
+   * `RetryQueue.reviseDeadLetterEscalationCallbacks` (WR-394) — the new
+   * observer takes effect from the next dispatched alert.
    */
   onDeadLetterEscalated?: (info: DeadLetterEscalatedInfo) => void;
   /**
@@ -2686,7 +2688,9 @@ export interface RetryQueueOptions {
    * (`maxAttempts`, at most 3). The server audits these as
    * `dead_letter_escalation_failed`. A failing alert never enters the
    * retry queue or the dead-letter list — alert delivery must not
-   * recurse into the machinery it observes.
+   * recurse into the machinery it observes. Live-revisable via
+   * `RetryQueue.reviseDeadLetterEscalationCallbacks` (WR-394) — the new
+   * observer takes effect from the next exhausted alert.
    */
   onDeadLetterEscalationFailed?: (info: DeadLetterEscalationFailedInfo) => void;
   /**
@@ -3317,6 +3321,21 @@ export interface EndpointPauseCallbacksRevision {
 export interface ReplayCallbacksRevision {
   onReplaySkipped?: ((info: ReplaySkippedInfo) => void) | null;
   onReplayForced?: ((info: ReplayForcedInfo) => void) | null;
+}
+
+/**
+ * WR-394: patch for `RetryQueue.reviseDeadLetterEscalationCallbacks` /
+ * `RelayServer.reviseDeadLetterEscalationCallbacks`. Each field is optional —
+ * an omitted field keeps its live value; `null` clears that hook back
+ * to no observer (the storm is still evaluated, the alert is still
+ * POSTed and audited, only the forwarding stops). At least one field
+ * must be present, else the patch throws `RangeError` and the live
+ * hooks are untouched. Throws `Error` when dead-letter escalation was
+ * never configured — enabling it needs a restart.
+ */
+export interface DeadLetterEscalationCallbacksRevision {
+  onDeadLetterEscalated?: ((info: DeadLetterEscalatedInfo) => void) | null;
+  onDeadLetterEscalationFailed?: ((info: DeadLetterEscalationFailedInfo) => void) | null;
 }
 
 /**
@@ -4794,6 +4813,17 @@ export class RetryQueue {
   private readonly callbacker?: CompletionCallbacker;
   /** WR-93: dead-letter storm escalator; undefined when the feature is off. */
   private readonly escalation?: DeadLetterStormEscalator;
+  // WR-394: deliberately *not* readonly —
+  // `reviseDeadLetterEscalationCallbacks` swaps these fields live.
+  // They hold the *caller's* callbacks; the escalator's hooks below
+  // are stable closures reading these fields live (along WR-388's
+  // `callerOnSloMiss`), so a revision can never drop the escalation
+  // evaluation, the alert POST, or the escalation statistics. The
+  // server's audit closures (which forward to the operator callbacks)
+  // are held here when the queue runs under `RelayServer`; direct
+  // queue users hold their own callbacks in the same fields.
+  private callerOnDeadLetterEscalated?: (info: DeadLetterEscalatedInfo) => void;
+  private callerOnDeadLetterEscalationFailed?: (info: DeadLetterEscalationFailedInfo) => void;
 
   private readonly queue = new Map<string, RetryItem & { attempt: number }>();
   private readonly timers = new Map<string, Scheduled>();
@@ -5385,12 +5415,19 @@ export class RetryQueue {
     // point. Off by default — no alert POSTs unless the operator opts
     // in explicitly.
     const escalationConfig = resolveDeadLetterEscalationConfig(opts.escalation);
+    // WR-394: the caller's callbacks live in the mutable inner fields;
+    // the escalator's hooks are stable dispatch closures reading them
+    // live (along WR-388's `callerOnSloMiss`), so
+    // `reviseDeadLetterEscalationCallbacks` can swap the observers
+    // without ever touching — or dropping — the escalator itself.
+    this.callerOnDeadLetterEscalated = opts.onDeadLetterEscalated;
+    this.callerOnDeadLetterEscalationFailed = opts.onDeadLetterEscalationFailed;
     this.escalation =
       escalationConfig === undefined
         ? undefined
         : new DeadLetterStormEscalator(escalationConfig, {
-            onEscalated: (info) => opts.onDeadLetterEscalated?.(info),
-            onFailed: (info) => opts.onDeadLetterEscalationFailed?.(info),
+            onEscalated: (info) => this.callerOnDeadLetterEscalated?.(info),
+            onFailed: (info) => this.callerOnDeadLetterEscalationFailed?.(info),
           });
     this.latencyOpts = opts.latency;
     // WR-388: the caller's callback lives in the mutable inner field;
@@ -8482,6 +8519,11 @@ export class RetryQueue {
   /** WR-368: whether the replay-idempotency subsystem is enabled (queue-level). */
   replayIdempotencyConfigured(): boolean {
     return this.replayIdempotencyOpts !== undefined;
+  }
+
+  /** WR-394: whether the dead-letter storm escalation subsystem is enabled (queue-level). */
+  escalationConfigured(): boolean {
+    return this.escalation !== undefined;
   }
 
   /** WR-369: whether the auto-disable subsystem is enabled (queue-level). */
@@ -13215,6 +13257,85 @@ export class RetryQueue {
     if (nextSkipped === this.onReplaySkipped && nextForced === this.onReplayForced) return;
     this.onReplaySkipped = nextSkipped;
     this.onReplayForced = nextForced;
+  }
+
+  /**
+   * WR-394: live-redirect the dead-letter storm escalation observers —
+   * the queue-side setter behind
+   * `RelayServer.reviseDeadLetterEscalationCallbacks`. The new hooks
+   * take effect from the next alert dispatch / exhaustion; alerts that
+   * already fired are never re-delivered. `null` clears a hook back to
+   * no observer (the storm is still evaluated, the alert is still
+   * POSTed and still audited as `dead_letter_escalated` /
+   * `dead_letter_escalation_failed` and still counted in the
+   * escalation statistics — only the forwarding stops). An omitted
+   * field keeps its live value, so one hook can move without touching
+   * the other. An empty or non-object patch throws `RangeError`; a
+   * non-function value for a provided field throws `RangeError` and
+   * the live hooks are left completely intact. A patch identical to
+   * the live values is a no-op. Only the observers move: the storm
+   * thresholds, the cooldown, the alert retry/backoff, and the
+   * counters are untouched. Throws `Error` when dead-letter escalation
+   * was never configured — the alerts only ever fire when the
+   * escalator is set, so enabling it needs a restart. Under
+   * `RelayServer` the fields hold the server's audit closures, so
+   * direct calls here would replace the audit wrappers; server users
+   * must go through
+   * `RelayServer.reviseDeadLetterEscalationCallbacks`, which swaps
+   * only the operator cells behind the audit closures. The queue
+   * itself holds no audit log — the server audits a real revision as
+   * `dead_letter_escalation_callbacks_revised`.
+   */
+  reviseDeadLetterEscalationCallbacks(patch: DeadLetterEscalationCallbacksRevision): void {
+    if (this.escalation === undefined) {
+      throw new Error(
+        "reviseDeadLetterEscalationCallbacks: dead-letter escalation is not configured — enabling it requires a restart"
+      );
+    }
+    if (patch === null || typeof patch !== "object") {
+      throw new RangeError(
+        "reviseDeadLetterEscalationCallbacks: patch must be an object with at least one of onDeadLetterEscalated / onDeadLetterEscalationFailed"
+      );
+    }
+    const hasEscalated = patch.onDeadLetterEscalated !== undefined;
+    const hasFailed = patch.onDeadLetterEscalationFailed !== undefined;
+    if (!hasEscalated && !hasFailed) {
+      throw new RangeError(
+        "reviseDeadLetterEscalationCallbacks: patch must set at least one of onDeadLetterEscalated / onDeadLetterEscalationFailed"
+      );
+    }
+    if (
+      hasEscalated &&
+      patch.onDeadLetterEscalated !== null &&
+      typeof patch.onDeadLetterEscalated !== "function"
+    ) {
+      throw new RangeError(
+        "reviseDeadLetterEscalationCallbacks: onDeadLetterEscalated must be a function or null"
+      );
+    }
+    if (
+      hasFailed &&
+      patch.onDeadLetterEscalationFailed !== null &&
+      typeof patch.onDeadLetterEscalationFailed !== "function"
+    ) {
+      throw new RangeError(
+        "reviseDeadLetterEscalationCallbacks: onDeadLetterEscalationFailed must be a function or null"
+      );
+    }
+    const nextEscalated = hasEscalated
+      ? patch.onDeadLetterEscalated ?? undefined
+      : this.callerOnDeadLetterEscalated;
+    const nextFailed = hasFailed
+      ? patch.onDeadLetterEscalationFailed ?? undefined
+      : this.callerOnDeadLetterEscalationFailed;
+    if (
+      nextEscalated === this.callerOnDeadLetterEscalated &&
+      nextFailed === this.callerOnDeadLetterEscalationFailed
+    ) {
+      return;
+    }
+    this.callerOnDeadLetterEscalated = nextEscalated;
+    this.callerOnDeadLetterEscalationFailed = nextFailed;
   }
 
   /**

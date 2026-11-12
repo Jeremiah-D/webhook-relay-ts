@@ -12589,6 +12589,27 @@ without `deadLetterEscalation`, `reviseEscalation` throws `Error`
 (enabling it needs a restart). `url`, `signingSecret`, `keyId`, the
 transport, the clock, and the timers are never revisable.
 
+**Live callback redirection (WR-394).** `relay.reviseDeadLetterEscalationCallbacks({ onDeadLetterEscalated, onDeadLetterEscalationFailed })`
+/ `queue.reviseDeadLetterEscalationCallbacks(patch)` swaps the operator
+callbacks that observe each dispatched / exhausted alert at runtime, no
+restart: the next alert enters the new callback and the old one goes
+silent. The patch is partial — an omitted field keeps its live
+value — and `null` clears that hook back to audit-only (the storm is
+still evaluated, the alert is still POSTed and still audited and
+counted, just no longer forwarded). An empty or non-object patch throws
+`RangeError`, as does a non-function value for a provided field,
+and the live hooks are untouched; a patch identical to the live
+values is a silent no-op. A real revision is audited as
+`dead_letter_escalation_callbacks_revised` with per-hook
+`onDeadLetterEscalated` / `onDeadLetterEscalationFailed` ('set' /
+'cleared' / 'unchanged') and `oldOnDeadLetterEscalated` /
+`oldOnDeadLetterEscalationFailed` ('set' / 'absent') presence, never a
+function body — and the audit can never be bypassed by a replacement.
+Revising when dead-letter escalation was never configured throws `Error`
+(enabling it needs a restart): the alerts only ever fire when the
+escalator is set. Only the observers move: the storm thresholds, the
+cooldown, the alert retry/backoff, and the counters are untouched.
+
 ### Multi-tenant isolation
 
 One relay can serve many tenants without them stepping on each other. An

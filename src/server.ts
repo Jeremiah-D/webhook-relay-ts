@@ -28,7 +28,7 @@ import {
   selectSignatureAlgorithmVerifier,
   type SignatureAlgorithmRule,
 } from "./signature-alg.ts";
-import { RetryQueue, errorBudgetBurnAuditEvent, type AssertionFailureInfo, type AttemptFailedInfo, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutEvent, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeliveryDeadlineConfig, type DeliveryDeadlineExceededInfo, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type DownstreamResponseSummary, type EndpointPauseCallbacksRevision, type EndpointPauseInfo, type ErrorBudgetConfig, type ErrorBudgetRevision, type EscalationConfig, type EscalationRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type FailureClass, type QuorumRetention, type QuorumRetentionRevision, type ReplayCallbacksRevision, type ReplayForcedInfo, type ReplaySkippedInfo, type RetryItem, type RetryBudgetDepletedInfo, type Sender, type SenderCallOptions, type SemanticFailureInfo, type MaintenanceWindowTransition, type SloMissInfo, type SloRiskConfig, type SloRiskRevision, type TenantBudgetAuditEvent, type UrgentDowngradedEvent, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
+import { RetryQueue, errorBudgetBurnAuditEvent, type AssertionFailureInfo, type AttemptFailedInfo, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutEvent, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeadLetterEscalationCallbacksRevision, type DeliveryDeadlineConfig, type DeliveryDeadlineExceededInfo, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type DownstreamResponseSummary, type EndpointPauseCallbacksRevision, type EndpointPauseInfo, type ErrorBudgetConfig, type ErrorBudgetRevision, type EscalationConfig, type EscalationRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type FailureClass, type QuorumRetention, type QuorumRetentionRevision, type ReplayCallbacksRevision, type ReplayForcedInfo, type ReplaySkippedInfo, type RetryItem, type RetryBudgetDepletedInfo, type Sender, type SenderCallOptions, type SemanticFailureInfo, type MaintenanceWindowTransition, type SloMissInfo, type SloRiskConfig, type SloRiskRevision, type TenantBudgetAuditEvent, type UrgentDowngradedEvent, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
 import { parseDeliverAtHeader, DELIVER_AT_HEADER } from "./retry.ts";
 import type { ShadowDeliveredInfo, ShadowFailedInfo, ShadowTargetConfig, ShadowTargetsConfig } from "./retry.ts";
 import type {
@@ -6817,6 +6817,31 @@ export interface RelayServer extends Server {
    */
   reviseReplayCallbacks?: (patch: ReplayCallbacksRevision) => void;
   /**
+   * WR-394: live-redirect the dead-letter storm escalation observers at
+   * runtime — no restart. Replaces the operator callbacks the server
+   * forwards each dispatched / exhausted alert to, after the alert
+   * itself is audited as `dead_letter_escalated` /
+   * `dead_letter_escalation_failed`; the audit can never be bypassed
+   * by a replacement. The patch is partial — an omitted field keeps
+   * its live value — and `null` clears that hook back to audit-only
+   * (the storm is still evaluated, the alert is still POSTed and
+   * still audited and counted, just no longer forwarded to an
+   * operator). An empty or non-object patch throws `RangeError`, as
+   * does a non-function value for a provided field, and the live
+   * callbacks are untouched; a patch identical to the live values is
+   * a silent no-op. A real revision is audited as
+   * `dead_letter_escalation_callbacks_revised` with per-hook
+   * `onDeadLetterEscalated` / `onDeadLetterEscalationFailed` ('set' /
+   * 'cleared' / 'unchanged') and `oldOnDeadLetterEscalated` /
+   * `oldOnDeadLetterEscalationFailed` ('set' / 'absent') presence,
+   * never a function body. Always set; throws `Error` when
+   * dead-letter escalation was never configured — enabling it needs
+   * a restart. The new callbacks take effect from the next alert
+   * dispatch / exhaustion; the storm thresholds, the cooldown, the
+   * alert retry/backoff, and the counters are untouched.
+   */
+  reviseDeadLetterEscalationCallbacks?: (patch: DeadLetterEscalationCallbacksRevision) => void;
+  /**
    * WR-369: live-redirect the endpoint auto-disable/enable observers at
    * runtime — no restart. Replaces the operator callbacks the server
    * forwards each transition to, after the transition itself is
@@ -9355,6 +9380,19 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   let operatorCanaryRolloutEventCallback:
     | ((event: CanaryRolloutEvent) => void)
     | undefined = opts.retry?.onCanaryRolloutEvent;
+  // WR-394: the operator's dead-letter storm escalation callbacks,
+  // held in mutable cells so
+  // `server.reviseDeadLetterEscalationCallbacks` can replace them at
+  // runtime. The audit wrappers below read these cells — never the
+  // operator callbacks directly — so replacing an operator callback
+  // cannot bypass the `dead_letter_escalated` /
+  // `dead_letter_escalation_failed` audit.
+  let operatorDeadLetterEscalatedCallback:
+    | ((info: DeadLetterEscalatedInfo) => void)
+    | undefined = opts.retry?.onDeadLetterEscalated;
+  let operatorDeadLetterEscalationFailedCallback:
+    | ((info: DeadLetterEscalationFailedInfo) => void)
+    | undefined = opts.retry?.onDeadLetterEscalationFailed;
   // WR-385: the operator's delivered / dead-letter callbacks, held in
   // mutable cells so `server.reviseDeliveredCallback` /
   // `server.reviseDeadLetterCallback` can replace them at runtime. The
@@ -9899,7 +9937,10 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         windowMs: info.windowMs,
         alertedAt: info.alertedAt,
       });
-      opts.retry?.onDeadLetterEscalated?.(info);
+      // WR-394: forward to the operator cell, never to the
+      // constructor callback directly, so a live revision cannot
+      // bypass the audit.
+      operatorDeadLetterEscalatedCallback?.(info);
     },
     onDeadLetterEscalationFailed: (info: DeadLetterEscalationFailedInfo) => {
       opts.auditLog.append({
@@ -9909,7 +9950,10 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         attempts: info.attempts,
         error: info.error,
       });
-      opts.retry?.onDeadLetterEscalationFailed?.(info);
+      // WR-394: forward to the operator cell, never to the
+      // constructor callback directly, so a live revision cannot
+      // bypass the audit.
+      operatorDeadLetterEscalationFailedCallback?.(info);
     },
     // Wrap the caller's onSloMiss so every SLO miss is audited, not just observed.
     // WR-71: same treatment for onSloRisk — every early-warning
@@ -18006,6 +18050,92 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     operatorReplaySkippedCallback = nextSkipped;
     operatorReplayForcedCallback = nextForced;
     opts.auditLog.append({ event: "replay_callbacks_revised", ...payload });
+  };
+
+  // WR-394: live dead-letter storm escalation callback replacement.
+  // Only the server-side operator-callback cells move — the queue's
+  // own callbacks (the `dead_letter_escalated` /
+  // `dead_letter_escalation_failed` audit wrappers) are never touched,
+  // so a replacement cannot bypass the audit. The patch is partial:
+  // an omitted field keeps its live value; `null` clears that hook
+  // back to audit-only. An empty or non-object patch throws
+  // `RangeError`, as does a non-function value for a provided field,
+  // and the live cells are untouched; a patch identical to the live
+  // values is a silent no-op. A real revision is audited as
+  // `dead_letter_escalation_callbacks_revised` with per-hook presence
+  // (`onDeadLetterEscalated` / `onDeadLetterEscalationFailed`: 'set' /
+  // 'cleared' / 'unchanged'; `oldOnDeadLetterEscalated` /
+  // `oldOnDeadLetterEscalationFailed`: 'set' / 'absent'), never a
+  // function body. With dead-letter escalation unconfigured the queue
+  // throws the canonical "must restart" Error.
+  server.reviseDeadLetterEscalationCallbacks = (
+    patch: DeadLetterEscalationCallbacksRevision
+  ): void => {
+    if (!queue.escalationConfigured()) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseDeadLetterEscalationCallbacks(patch);
+    }
+    if (patch === null || typeof patch !== "object") {
+      throw new RangeError(
+        "reviseDeadLetterEscalationCallbacks: patch must be an object with at least one of onDeadLetterEscalated / onDeadLetterEscalationFailed"
+      );
+    }
+    const hasEscalated = patch.onDeadLetterEscalated !== undefined;
+    const hasFailed = patch.onDeadLetterEscalationFailed !== undefined;
+    if (!hasEscalated && !hasFailed) {
+      throw new RangeError(
+        "reviseDeadLetterEscalationCallbacks: patch must set at least one of onDeadLetterEscalated / onDeadLetterEscalationFailed"
+      );
+    }
+    if (
+      hasEscalated &&
+      patch.onDeadLetterEscalated !== null &&
+      typeof patch.onDeadLetterEscalated !== "function"
+    ) {
+      throw new RangeError(
+        "reviseDeadLetterEscalationCallbacks: onDeadLetterEscalated must be a function or null"
+      );
+    }
+    if (
+      hasFailed &&
+      patch.onDeadLetterEscalationFailed !== null &&
+      typeof patch.onDeadLetterEscalationFailed !== "function"
+    ) {
+      throw new RangeError(
+        "reviseDeadLetterEscalationCallbacks: onDeadLetterEscalationFailed must be a function or null"
+      );
+    }
+    const nextEscalated = hasEscalated
+      ? patch.onDeadLetterEscalated ?? undefined
+      : operatorDeadLetterEscalatedCallback;
+    const nextFailed = hasFailed
+      ? patch.onDeadLetterEscalationFailed ?? undefined
+      : operatorDeadLetterEscalationFailedCallback;
+    if (
+      nextEscalated === operatorDeadLetterEscalatedCallback &&
+      nextFailed === operatorDeadLetterEscalationFailedCallback
+    ) {
+      return;
+    }
+    const payload = {
+      onDeadLetterEscalated: hasEscalated
+        ? nextEscalated === undefined
+          ? "cleared"
+          : "set"
+        : "unchanged",
+      oldOnDeadLetterEscalated:
+        operatorDeadLetterEscalatedCallback === undefined ? "absent" : "set",
+      onDeadLetterEscalationFailed: hasFailed
+        ? nextFailed === undefined
+          ? "cleared"
+          : "set"
+        : "unchanged",
+      oldOnDeadLetterEscalationFailed:
+        operatorDeadLetterEscalationFailedCallback === undefined ? "absent" : "set",
+    };
+    operatorDeadLetterEscalatedCallback = nextEscalated;
+    operatorDeadLetterEscalationFailedCallback = nextFailed;
+    opts.auditLog.append({ event: "dead_letter_escalation_callbacks_revised", ...payload });
   };
 
   // WR-369: live endpoint auto-disable/enable callback replacement.
