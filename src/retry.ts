@@ -12225,7 +12225,9 @@ export class RetryQueue {
     );
     // WR-57: the scheduled-delivery counters appear once a delivery has
     // actually been parked — activity-gated, like the starvation-guard
-    // series, so an untouched relay's exposition is unchanged.
+    // series, so an untouched relay's exposition is unchanged. WR-405
+    // widens the gate: a pure-cron relay never parks a deliver_at, so the
+    // block also appears once a cron schedule has fired.
     const scheduledStats = this.scheduler.stats();
     // WR-71: one gauge series per currently elevated (tenant, endpoint) —
     // activity-gated the same way, so a relay that never predicted risk
@@ -12461,13 +12463,16 @@ export class RetryQueue {
               .map((s) => ({ tenant: s.tenant, waits: s.waitsTotal })),
           }
         : {}),
-      // WR-57: activity-gated (see above).
-      ...(scheduledStats.scheduled > 0
+      // WR-57: activity-gated (see above). WR-405: the gate also opens on
+      // a cron firing, so a relay that only runs recurring schedules still
+      // exposes the block (and `relay_scheduled_fired_total`).
+      ...(scheduledStats.scheduled > 0 || scheduledStats.fired > 0
         ? {
             scheduled: {
               scheduled: scheduledStats.scheduled,
               due: scheduledStats.due,
               canceled: scheduledStats.canceled,
+              fired: scheduledStats.fired,
             },
           }
         : {}),

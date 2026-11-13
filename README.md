@@ -3496,7 +3496,8 @@ curl -X POST http://127.0.0.1:PORT/ \
   and `paused`.
 - **Observability** — every firing is audited as `scheduled_fired`
   (wrapped through the caller's `onScheduledFired`, so custom hooks
-  keep working); `relay_scheduled_fired_total` counts cycles. The
+  keep working); `relay_scheduled_fired_total` counts cycles — since
+  WR-405 this counter is actually exported by `/metrics`. The
   schedules are in-memory only, like the one-shot delay queue —
   a restart does not resurrect them (documented limitation, not a
   bug).
@@ -3504,7 +3505,8 @@ curl -X POST http://127.0.0.1:PORT/ \
   revisable live via `server.reviseScheduledFiredCallback(cb)` (and
   `RetryQueue.reviseScheduledFiredCallback(cb)` for direct queue
   users): `null` clears back to audit-only (occurrences are still
-  generated and still audited as `scheduled_fired` and counted, just
+  generated and still audited as `scheduled_fired` and counted in
+  `relay_scheduled_fired_total`, just
   no longer forwarded to an operator). The new observer takes effect
   from the next occurrence; occurrences already reported are never
   re-delivered. A real revision is audited as

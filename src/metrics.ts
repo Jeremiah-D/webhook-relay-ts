@@ -68,11 +68,12 @@
  *   tenant. Present only when the per-tenant cap is configured (finite),
  *   and only for tenants that actually waited (activity-gated).
  * - `relay_scheduled_total` / `relay_scheduled_due_total` /
- *   `relay_scheduled_canceled_total`: counters of deliveries parked for a
- *   future `deliver_at` (WR-57), of parked deliveries whose instant
- *   arrived, and of parked deliveries canceled before it. Present only
- *   once a delivery has actually been parked. No endpoint label — the
- *   delay queue is relay-wide.
+ *   `relay_scheduled_canceled_total` / `relay_scheduled_fired_total`:
+ *   counters of deliveries parked for a future `deliver_at` (WR-57), of
+ *   parked deliveries whose instant arrived, of parked deliveries canceled
+ *   before it, and of recurring (cron) schedule firings (WR-405). Present
+ *   only once a delivery has actually been parked or a cron schedule has
+ *   fired. No endpoint label — the delay queue is relay-wide.
  * - `relay_slo_risk_seconds{endpoint}`: gauge of predicted SLO headroom
  *   remaining before breach, in seconds (WR-71 early warning). Present
  *   only for endpoints currently elevated by the SLO-risk predictor —
@@ -632,6 +633,8 @@ export interface ScheduledMetricsInput {
   due: number;
   /** Cumulative parked deliveries canceled before their deliver_at. */
   canceled: number;
+  /** Cumulative recurring (cron) schedule firings (WR-405). */
+  fired: number;
 }
 
 /** One endpoint's predicted SLO headroom (WR-71), in Prometheus label order. */
@@ -1321,6 +1324,11 @@ export function renderPrometheus(input: MetricsInput): string {
     );
     lines.push("# TYPE relay_scheduled_canceled_total counter");
     lines.push(`relay_scheduled_canceled_total ${input.scheduled.canceled}`);
+    lines.push(
+      "# HELP relay_scheduled_fired_total Recurring (cron) schedule firings (WR-405)."
+    );
+    lines.push("# TYPE relay_scheduled_fired_total counter");
+    lines.push(`relay_scheduled_fired_total ${input.scheduled.fired}`);
   }
   if (input.sloRisk !== undefined && input.sloRisk.length > 0) {
     lines.push(
