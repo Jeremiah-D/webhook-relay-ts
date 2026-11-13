@@ -28,7 +28,7 @@ import {
   selectSignatureAlgorithmVerifier,
   type SignatureAlgorithmRule,
 } from "./signature-alg.ts";
-import { RetryQueue, errorBudgetBurnAuditEvent, type AssertionFailureInfo, type AttemptFailedInfo, type BatchInfo, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutEvent, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeadLetterEscalationCallbacksRevision, type DeliveryDeadlineConfig, type DeliveryDeadlineExceededInfo, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type DownstreamResponseSummary, type EndpointPauseCallbacksRevision, type EndpointPauseInfo, type ErrorBudgetConfig, type ErrorBudgetRevision, type EscalationConfig, type EscalationRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type FailureClass, type QuorumCallbacksRevision, type QuorumRetention, type QuorumRetentionRevision, type ReplayCallbacksRevision, type ReplayForcedInfo, type ReplaySkippedInfo, type RetryItem, type RetryBudgetDepletedInfo, type ScheduledFiredEvent, type Sender, type SenderCallOptions, type SemanticFailureInfo, type ShadowCallbacksRevision, type MaintenanceWindowTransition, type SloMissInfo, type SloRiskConfig, type SloRiskRevision, type TenantBudgetAuditEvent, type UrgentDowngradedEvent, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
+import { RetryQueue, errorBudgetBurnAuditEvent, type AssertionFailureInfo, type AttemptFailedInfo, type BatchInfo, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutEvent, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeadLetterEscalationCallbacksRevision, type DeliveryDeadlineConfig, type DeliveryDeadlineExceededInfo, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type DownstreamResponseSummary, type EndpointPauseCallbacksRevision, type EndpointPauseInfo, type ErrorBudgetConfig, type ErrorBudgetRevision, type EscalationConfig, type EscalationRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type FailureClass, type QuorumCallbacksRevision, type QuorumRetention, type QuorumRetentionRevision, type ReplayCallbacksRevision, type ReplayForcedInfo, type ReplaySkippedInfo, type RetryItem, type RetryBudgetDepletedInfo, type ScheduledFiredEvent, type Sender, type SenderCallOptions, type SemanticFailureInfo, type ShadowCallbacksRevision, type MaintenanceWindowTransition, type SloMissInfo, type SloRiskConfig, type SloRiskRevision, type StarvationGuardAuditEvent, type TenantBudgetAuditEvent, type UrgentDowngradedEvent, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
 import { parseDeliverAtHeader, DELIVER_AT_HEADER } from "./retry.ts";
 import type { ShadowDeliveredInfo, ShadowFailedInfo, ShadowTargetConfig, ShadowTargetsConfig } from "./retry.ts";
 import type {
@@ -7088,6 +7088,33 @@ export interface RelayServer extends Server {
     cb: ((event: ProbeAuditEvent) => void) | null
   ) => void;
   /**
+   * WR-406: live-redirect the starvation-guard activation observer —
+   * the operator callback that fires once per guard activation episode
+   * (urgent dispatches deferred while normal deliveries were
+   * backlogged, edge-triggered). `null` clears back to audit-only (the
+   * guard keeps pacing and is still audited as
+   * `starvation_guard_activated` and counted in
+   * `relay_starvation_guard_activations{endpoint}`, just no longer
+   * forwarded to an operator). A non-function value throws `RangeError`
+   * and the live callback is untouched; replacing with the same
+   * reference (or clearing when already unset) is a silent no-op. A
+   * real replacement is audited as
+   * `starvation_guard_audit_callback_revised` with `previous` /
+   * `current` recording only 'set' / 'cleared' presence, never a
+   * function body. Always set; no must-restart gate — the lane
+   * scheduler is built unconditionally (minNormalShare defaults to
+   * 0.2). The new callback takes effect from the next activation
+   * episode; activations already reported are never re-delivered, and
+   * the minNormalShare, the turn allocation, and the `guardActive`
+   * flip logic are untouched. Direct queue users use
+   * `RetryQueue.reviseStarvationGuardAuditCallback` instead — calling
+   * the queue method on a server-owned queue would replace the audit
+   * wrapper.
+   */
+  reviseStarvationGuardAuditCallback?: (
+    cb: ((event: StarvationGuardAuditEvent) => void) | null
+  ) => void;
+  /**
    * WR-402: live-redirect the stale-endpoint auto-pause audit observer —
    * the operator callback that fires once per auto-paused endpoint
    * (`endpoint_auto_paused`, edge-triggered: one per transition).
@@ -9741,6 +9768,15 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   let operatorDryRunDeliveryCallback:
     | ((event: DryRunDeliveryEvent) => void)
     | undefined = opts.retry?.onDryRunDelivery;
+  // WR-406: the operator's starvation-guard activation audit callback,
+  // held in a mutable cell so
+  // `server.reviseStarvationGuardAuditCallback` can replace it at
+  // runtime. The audit wrapper below reads this cell — never the
+  // operator callback directly — so replacing the operator callback
+  // cannot bypass the `starvation_guard_activated` audit.
+  let operatorStarvationGuardAuditCallback:
+    | ((event: StarvationGuardAuditEvent) => void)
+    | undefined = opts.retry?.onStarvationGuardAudit;
   // WR-385: the operator's delivered / dead-letter callbacks, held in
   // mutable cells so `server.reviseDeliveredCallback` /
   // `server.reviseDeadLetterCallback` can replace them at runtime. The
@@ -10208,7 +10244,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // audited, not just observed.
     onStarvationGuardAudit: (event) => {
       opts.auditLog.append(event);
-      opts.retry?.onStarvationGuardAudit?.(event);
+      // WR-406: forward to the operator cell, never to the constructor
+      // callback directly, so a live revision cannot bypass the audit.
+      operatorStarvationGuardAuditCallback?.(event);
     },
     // WR-137: wrap the caller's hook so every tenant budget exceedance
     // is audited as `budget_exceeded`, not just observed.
@@ -19143,6 +19181,41 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     operatorProbeAuditCallback = next;
     opts.auditLog.append({
       event: "probe_audit_callback_revised",
+      previous: prev,
+      current: nextPresence,
+    });
+  };
+
+  // WR-406: live starvation-guard activation audit observer replacement.
+  // Only the server-side operator-callback cell moves — the queue's
+  // audit wrapper (which appends `starvation_guard_activated` first,
+  // then forwards to the cell) is never touched, so a replacement
+  // cannot bypass the audit. A non-function callback throws
+  // `RangeError` and the live cell is untouched; a same-reference
+  // replacement (or clearing when already unset) is a silent no-op. A
+  // real replacement is audited as
+  // `starvation_guard_audit_callback_revised` with `previous` /
+  // `current` recording only 'set' / 'cleared' presence, never a
+  // function body. No must-restart gate: the LaneScheduler is built
+  // unconditionally (minNormalShare defaults to 0.2). The new callback
+  // takes effect from the next activation episode; activations already
+  // reported are never re-delivered, and the minNormalShare, the turn
+  // allocation, and the `guardActive` flip logic are untouched.
+  server.reviseStarvationGuardAuditCallback = (
+    cb: ((event: StarvationGuardAuditEvent) => void) | null
+  ): void => {
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseStarvationGuardAuditCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === operatorStarvationGuardAuditCallback) return;
+    const prev = operatorStarvationGuardAuditCallback === undefined ? "cleared" : "set";
+    const nextPresence = next === undefined ? "cleared" : "set";
+    operatorStarvationGuardAuditCallback = next;
+    opts.auditLog.append({
+      event: "starvation_guard_audit_callback_revised",
       previous: prev,
       current: nextPresence,
     });

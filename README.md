@@ -242,7 +242,12 @@ reliability primitives that matter for any signed-payload pipeline.
   double rate-limiting. Guard activations are counted in
   `relay_starvation_guard_activations{endpoint}` and audited as
   `starvation_guard_activated`; `getLaneStats()` reports per-endpoint
-  turns granted per lane. The share is also live-revisable from the
+  turns granted per lane. The activation observer is also
+  live-revisable (WR-406, no restart): `reviseStarvationGuardAuditCallback`
+  swaps only who receives the activation episode — the lane scheduling
+  itself still runs WR-35/WR-323 — and a real revision is audited as
+  `starvation_guard_audit_callback_revised` with `previous` / `current`
+  recording only 'set' / 'cleared'. The share is also live-revisable from the
   server (WR-323, no restart, no tenant sharding — one shared scheduler
   per queue, so one endpoint's share governs all tenants):
   `reviseEndpointMinNormalShare(endpoint, share)` (illegal values throw
@@ -13073,7 +13078,8 @@ endpoints (404 when disabled):
   `TLSv1.2`), only once a rejection has happened,
 - `relay_starvation_guard_activations{endpoint}` — starvation-guard
   activation episodes (urgent dispatches deferred while normal demand was
-  backlogged), only for endpoints where the guard engaged,
+  backlogged), only for endpoints where the guard engaged (the activation
+  observer itself is live-revisable, WR-406, without touching the count),
 - `relay_retry_budget_depleted_total` — retries parked because the global
   retry budget was exhausted (no endpoint label — the budget is global),
   only when `retry.retryBudget` is enabled,

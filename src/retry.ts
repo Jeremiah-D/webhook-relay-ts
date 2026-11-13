@@ -2493,6 +2493,12 @@ export interface RetryQueueOptions {
    * were backlogged. Edge-triggered — one call when the guard engages,
    * not one per deferred dispatch. The server audits these as
    * `starvation_guard_activated`; library users get the hook directly.
+   *
+   * Live-revisable via `RetryQueue.reviseStarvationGuardAuditCallback`
+   * (WR-406) — `null` clears back to no observer. Under `RelayServer`
+   * this field holds the server's audit closure, so direct calls there
+   * would replace the audit wrapper; server users must go through
+   * `RelayServer.reviseStarvationGuardAuditCallback` instead.
    */
   onStarvationGuardAudit?: (event: StarvationGuardAuditEvent) => void;
   /**
@@ -4468,7 +4474,9 @@ export class RetryQueue {
    * rate limit on top of the urgent token bucket.
    */
   private readonly laneScheduler: LaneScheduler;
-  private readonly onStarvationGuardAudit?: (event: StarvationGuardAuditEvent) => void;
+  // WR-406: deliberately *not* readonly — `reviseStarvationGuardAuditCallback`
+  // swaps this field live (see `reviseUrgentDowngradedCallback`, WR-389).
+  private onStarvationGuardAudit?: (event: StarvationGuardAuditEvent) => void;
   // WR-389: deliberately *not* readonly — `reviseUrgentDowngradedCallback`
   // swaps this field live (see `reviseAttemptFailedCallback`, WR-384).
   private onUrgentDowngraded?: (event: UrgentDowngradedEvent) => void;
@@ -13973,6 +13981,40 @@ export class RetryQueue {
       );
     }
     prober.reviseAuditCallback(cb);
+  }
+
+  /**
+   * WR-406: live-redirect the starvation-guard activation observer — the
+   * queue-side setter behind
+   * `RelayServer.reviseStarvationGuardAuditCallback`. The new callback
+   * takes effect from the next activation episode; activations already
+   * reported are never re-delivered, and the minNormalShare, the turn
+   * allocation, and the `guardActive` flip logic are untouched — only
+   * the observation moves. `null` clears back to no observer (the guard
+   * keeps pacing and is still audited as `starvation_guard_activated`
+   * and counted in `relay_starvation_guard_activations` — only the
+   * forwarding stops). A non-function value throws `RangeError` and the
+   * live callback is untouched; replacing with the same reference (or
+   * clearing when already unset) is a no-op. There is no must-restart
+   * gate: the LaneScheduler is built unconditionally (minNormalShare
+   * defaults to 0.2), so a revision succeeds even with zero callbacks
+   * configured. Under `RelayServer` the field holds the server's audit
+   * closure, so direct calls here would replace the audit wrapper;
+   * server users must go through
+   * `RelayServer.reviseStarvationGuardAuditCallback`, which swaps only
+   * the operator cell behind the audit closure.
+   */
+  reviseStarvationGuardAuditCallback(
+    cb: ((event: StarvationGuardAuditEvent) => void) | null
+  ): void {
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseStarvationGuardAuditCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === this.onStarvationGuardAudit) return;
+    this.onStarvationGuardAudit = next;
   }
 
   /**
