@@ -1058,6 +1058,12 @@ export interface LatencyOptions extends LatencyTrackerOptions {
    * actually breached. Disabled by default (`undefined`) — the relay then
    * behaves exactly as before, with no predictor instances and no
    * `relay_slo_risk_seconds` series.
+   *
+   * Live-revisable via `RetryQueue.reviseSloRiskCallback` (WR-407) —
+   * `null` clears back to no observer. Under `RelayServer` the queue
+   * holds the server's audit closure as the caller callback, so direct
+   * calls there would replace the audit wrapper; server users must go
+   * through `RelayServer.reviseSloRiskCallback` instead.
    */
   sloRisk?: SloRiskOptions;
 }
@@ -4538,7 +4544,13 @@ export class RetryQueue {
   private onEndpointRecovered?: (info: EndpointRecoveredInfo) => void;
   /** WR-359: receives the single `endpoint_health_revised` audit event per real revision. */
   private readonly onEndpointHealthAudit?: (event: EndpointHealthRevisedAuditEvent) => void;
-  private readonly onSloRisk?: (info: SloRiskInfo) => void;
+  // WR-407: deliberately *not* readonly — `reviseSloRiskCallback`
+  // swaps this field live. It holds the *caller's* callback (the
+  // server's audit closure when the queue runs under `RelayServer`);
+  // each live per-tenant predictor holds a tenant-attaching closure
+  // built around this field at construction, so a revision swaps
+  // every live predictor in place (see `reviseSloRiskCallback`).
+  private onSloRisk?: (info: SloRiskInfo) => void;
   /**
    * WR-71: per-(tenant, endpoint) pending deliveries (queued + in-flight
    * + backoff-waiting), keyed by tenant instance key then logical
@@ -12067,6 +12079,57 @@ export class RetryQueue {
     // Tenants born later start from the revised values.
     this.sloRiskOpts = { ...this.sloRiskOpts, ...patch };
     return next;
+  }
+
+  /**
+   * WR-407: live-redirect the SLO-risk observer — the queue-side setter
+   * behind `RelayServer.reviseSloRiskCallback`. The new callback takes
+   * effect from the next `observe` that flips a risk state; transitions
+   * already reported are never re-delivered, and the five knobs, the
+   * EWMA state, the `atRisk` latch, the score, and the prediction are
+   * untouched — only the observation moves. `null` clears back to no
+   * observer (risk is still predicted and audited as `slo_risk`
+   * exactly as before, and the `relay_slo_risk_seconds` gauge still
+   * tracks elevated endpoints — only the forwarding stops). A
+   * non-function value throws `RangeError` and the live callback is
+   * untouched; replacing with the same reference (or clearing when
+   * already unset) is a no-op. Throws `Error` when SLO-risk
+   * prediction was never configured — enabling it needs a restart.
+   * Every live per-tenant predictor is swapped in place (each holds
+   * a tenant-attaching closure built at construction), and
+   * `sloRiskOpts` is updated so tenants born later start from the
+   * new callback. Under `RelayServer` the field holds the server's
+   * audit closure, so direct calls here would replace the audit
+   * wrapper; server users must go through
+   * `RelayServer.reviseSloRiskCallback`, which swaps only the
+   * operator cell behind the audit closure.
+   */
+  reviseSloRiskCallback(cb: ((info: SloRiskInfo) => void) | null): void {
+    if (this.sloRiskOpts === undefined) {
+      throw new Error(
+        "reviseSloRiskCallback: SLO risk prediction is not configured — enabling it requires a restart"
+      );
+    }
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseSloRiskCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === this.onSloRisk) return;
+    this.onSloRisk = next;
+    // Every live predictor holds a tenant-attaching closure built at
+    // construction around the old callback — swap each one in place.
+    for (const [key, predictor] of this.sloRisks) {
+      const tenant = key === "" ? undefined : key;
+      predictor.reviseCallback(
+        next === undefined
+          ? null
+          : (info) => next({ ...info, ...(tenant === undefined ? {} : { tenant }) })
+      );
+    }
+    // Tenants born later start from the revised callback.
+    this.sloRiskOpts = { ...this.sloRiskOpts, onSloRisk: next };
   }
 
   /**

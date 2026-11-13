@@ -628,6 +628,22 @@ reliability primitives that matter for any signed-payload pipeline.
   *prediction* thresholds: it only changes when the relay warns
   early, never whether a delivery proceeds, and never the latency
   SLO budget itself (`sloMs` comes from the `observe` caller).
+- **Live callback revision (WR-407)** — `server.reviseSloRiskCallback(cb)`
+  swaps the SLO-risk observer at runtime, no restart (`null` clears
+  back to audit-only: risk is still predicted and audited as
+  `slo_risk`, and the `relay_slo_risk_seconds` gauge still tracks
+  elevated endpoints — only the forwarding stops). The new callback
+  takes effect from the next risk-state transition; transitions
+  already reported are never re-delivered, and the five knobs, the
+  EWMA state, the `atRisk` latch, the score, and the prediction are
+  untouched — only the observer moves. A non-function value throws
+  `RangeError` and the live callback is untouched; a same-reference
+  replace (or clearing when already unset) is a silent no-op. A real
+  replacement is audited as `slo_risk_callback_revised` with
+  `previous` / `current` ('set' / 'cleared' presence only, never a
+  function body). The five knobs themselves still move only through
+  `reviseSloRisk` (WR-347); a predictor that was never configured
+  cannot be switched on at runtime — enabling it requires a restart.
 - `src/endpoint-health.ts` — outbound endpoint health scoring
   (`EndpointHealthTracker`), opt-in under `retry.endpointHealth`
   (disabled by default; an explicit server-level `endpointHealth` wins

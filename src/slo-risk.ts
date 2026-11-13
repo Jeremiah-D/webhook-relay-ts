@@ -64,10 +64,12 @@ export interface SloRiskOptions {
 
 /**
  * WR-347: a partial live revision of the five SLO-risk knobs —
- * omitted fields keep their live values. `onSloRisk` is never
- * revisable: a retune carries the construction callback forward
- * untouched. (There is no clock to carry: the predictor reads time
- * from the `observe` caller.)
+ * omitted fields keep their live values. `onSloRisk` is not part of
+ * the patch: a retune carries the construction callback forward
+ * untouched. The callback itself is revisable separately, with
+ * `reviseCallback()` (WR-407) — the two revisions are independent.
+ * (There is no clock to carry: the predictor reads time from the
+ * `observe` caller.)
  */
 export type SloRiskRevision = {
   warnRatio?: number;
@@ -184,17 +186,21 @@ function resolveSloRiskOptions(opts: SloRiskOptions): {
  * WR-347: the five knobs are live-revisable with `retune()` — no
  * restart. A retune takes effect on the next `observe`; the
  * accumulated EWMA state, the `atRisk` latch, the score, and the
- * prediction are never reset or recomputed by a retune.
+ * prediction are never reset or recomputed by a retune. WR-407: the
+ * observer is live-revisable with `reviseCallback()` — likewise no
+ * restart, and likewise without touching the knobs or the state.
  */
 export class SloRiskPredictor {
   // WR-347: not readonly — `retune()` replaces the five knobs in
-  // place so they are live-revisable. `onSloRisk` is never revised.
+  // place so they are live-revisable. WR-407: `onSloRisk` is not
+  // readonly either — `reviseCallback()` replaces the observer live;
+  // `retune()` still never touches it.
   private warnRatio: number;
   private alpha: number;
   private minSamples: number;
   private clearRatio: number;
   private trendHorizon: number;
-  private readonly onSloRisk?: (info: SloRiskInfo) => void;
+  private onSloRisk?: (info: SloRiskInfo) => void;
   private readonly endpoints = new Map<string, EndpointState>();
 
   constructor(opts: SloRiskOptions = {}) {
@@ -247,6 +253,28 @@ export class SloRiskPredictor {
     this.clearRatio = resolved.clearRatio;
     this.trendHorizon = resolved.trendHorizon;
     return this.config();
+  }
+
+  /**
+   * WR-407: replace the risk-transition observer at runtime — no
+   * restart. `null` clears back to no observer (transitions are still
+   * computed and returned by `observe`, just no longer forwarded). A
+   * non-function value throws `RangeError` and the live callback is
+   * untouched; replacing with the same reference (or clearing when
+   * already unset) is a silent no-op. Takes effect from the next
+   * `observe` that flips the risk state; transitions already reported
+   * are never re-delivered, and the five knobs, the EWMA state, the
+   * `atRisk` latch, the score, and the prediction are untouched —
+   * only the observer moves. `retune()` still never touches this
+   * callback; the two revisions are independent.
+   */
+  reviseCallback(cb: ((info: SloRiskInfo) => void) | null): void {
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError("reviseCallback: handler must be a function or null");
+    }
+    const next = cb ?? undefined;
+    if (next === this.onSloRisk) return;
+    this.onSloRisk = next;
   }
 
   /**

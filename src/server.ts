@@ -28,7 +28,7 @@ import {
   selectSignatureAlgorithmVerifier,
   type SignatureAlgorithmRule,
 } from "./signature-alg.ts";
-import { RetryQueue, errorBudgetBurnAuditEvent, type AssertionFailureInfo, type AttemptFailedInfo, type BatchInfo, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutEvent, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeadLetterEscalationCallbacksRevision, type DeliveryDeadlineConfig, type DeliveryDeadlineExceededInfo, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type DownstreamResponseSummary, type EndpointPauseCallbacksRevision, type EndpointPauseInfo, type ErrorBudgetConfig, type ErrorBudgetRevision, type EscalationConfig, type EscalationRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type FailureClass, type QuorumCallbacksRevision, type QuorumRetention, type QuorumRetentionRevision, type ReplayCallbacksRevision, type ReplayForcedInfo, type ReplaySkippedInfo, type RetryItem, type RetryBudgetDepletedInfo, type ScheduledFiredEvent, type Sender, type SenderCallOptions, type SemanticFailureInfo, type ShadowCallbacksRevision, type MaintenanceWindowTransition, type SloMissInfo, type SloRiskConfig, type SloRiskRevision, type StarvationGuardAuditEvent, type TenantBudgetAuditEvent, type UrgentDowngradedEvent, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
+import { RetryQueue, errorBudgetBurnAuditEvent, type AssertionFailureInfo, type AttemptFailedInfo, type BatchInfo, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutEvent, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeadLetterEscalationCallbacksRevision, type DeliveryDeadlineConfig, type DeliveryDeadlineExceededInfo, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type DownstreamResponseSummary, type EndpointPauseCallbacksRevision, type EndpointPauseInfo, type ErrorBudgetConfig, type ErrorBudgetRevision, type EscalationConfig, type EscalationRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type FailureClass, type QuorumCallbacksRevision, type QuorumRetention, type QuorumRetentionRevision, type ReplayCallbacksRevision, type ReplayForcedInfo, type ReplaySkippedInfo, type RetryItem, type RetryBudgetDepletedInfo, type ScheduledFiredEvent, type Sender, type SenderCallOptions, type SemanticFailureInfo, type ShadowCallbacksRevision, type MaintenanceWindowTransition, type SloMissInfo, type SloRiskConfig, type SloRiskInfo, type SloRiskRevision, type StarvationGuardAuditEvent, type TenantBudgetAuditEvent, type UrgentDowngradedEvent, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
 import { parseDeliverAtHeader, DELIVER_AT_HEADER } from "./retry.ts";
 import type { ShadowDeliveredInfo, ShadowFailedInfo, ShadowTargetConfig, ShadowTargetsConfig } from "./retry.ts";
 import type {
@@ -6688,6 +6688,29 @@ export interface RelayServer extends Server {
    */
   reviseSloRisk?: (patch: SloRiskRevision) => SloRiskConfig;
   /**
+   * WR-407: live-redirect the SLO-risk observer — the operator callback
+   * that fires once per SLO-breach prediction state transition
+   * (`elevated` / `cleared`). `null` clears back to audit-only (risk
+   * is still predicted and still audited as `slo_risk`, and the
+   * `relay_slo_risk_seconds` gauge still tracks elevated endpoints,
+   * just no longer forwarded to an operator). A non-function value
+   * throws `RangeError` and the live callback is untouched; replacing
+   * with the same reference (or clearing when already unset) is a
+   * silent no-op. A real replacement is audited as
+   * `slo_risk_callback_revised` with `previous` / `current` recording
+   * only 'set' / 'cleared' presence, never a function body. Always
+   * set; throws `Error` when SLO-risk prediction was never configured
+   * — enabling it needs a restart. The new callback takes effect from
+   * the next risk-state transition; transitions already reported are
+   * never re-delivered, and the five knobs, the EWMA state, the
+   * `atRisk` latch, the score, and the prediction are untouched. The
+   * five knobs themselves still move only through `reviseSloRisk`
+   * (WR-347). Direct queue users use
+   * `RetryQueue.reviseSloRiskCallback` instead — calling the queue
+   * method on a server-owned queue would replace the audit wrapper.
+   */
+  reviseSloRiskCallback?: (cb: ((info: SloRiskInfo) => void) | null) => void;
+  /**
    * WR-347: live SLO-breach prediction config — the five knobs.
    * Only set when `sloRisk` was configured; `undefined` otherwise.
    */
@@ -9616,6 +9639,15 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // (`onSloMiss` lives under `retry.latency`, not on `retry` itself).
   let operatorSloMissCallback: ((info: SloMissInfo) => void) | undefined =
     latencyOpts?.onSloMiss;
+  // WR-407: the operator's SLO-risk callback, held in a mutable cell
+  // so `server.reviseSloRiskCallback` can replace it at runtime. The
+  // audit wrapper below reads this cell — never the operator callback
+  // directly — so replacing the operator callback cannot bypass the
+  // `slo_risk` audit. Initial value is the latency option's callback
+  // (`onSloRisk` lives under `retry.latency.sloRisk`, not on `retry`
+  // itself).
+  let operatorSloRiskCallback: ((info: SloRiskInfo) => void) | undefined =
+    latencyOpts?.sloRisk?.onSloRisk;
   // WR-389: the operator's urgent-downgrade callback, held in a mutable
   // cell so `server.reviseUrgentDowngradedCallback` can replace it at
   // runtime. The audit wrapper below reads this cell — never the
@@ -10376,7 +10408,10 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
                   ...latencyOpts.sloRisk,
                   onSloRisk: (info) => {
                     opts.auditLog.append({ event: "slo_risk", ...info });
-                    latencyOpts.sloRisk?.onSloRisk?.(info);
+                    // WR-407: forward to the operator cell, never to the
+                    // constructor callback directly, so a live revision cannot
+                    // bypass the audit.
+                    operatorSloRiskCallback?.(info);
                   },
                 },
               }
@@ -18177,6 +18212,43 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       current: next,
     });
     return next;
+  };
+
+  // WR-407: live SLO-risk observer revision. The method is always set;
+  // with the predictor unconfigured the queue throws the canonical
+  // "must restart" Error (delegated below, exactly like WR-347's
+  // reviseSloRisk gate). Only the operator cell moves: the queue's audit
+  // wrapper (which appends `slo_risk` first, then forwards to the
+  // cell) is never touched, so a replacement cannot bypass the audit.
+  // A non-function callback throws `RangeError` and the live cell is
+  // untouched; a same-reference replacement (or clearing when already
+  // unset) is a silent no-op. A real replacement is audited as
+  // `slo_risk_callback_revised` with `previous` / `current` recording
+  // only 'set' / 'cleared' presence, never a function body. The new
+  // callback takes effect from the next risk-state transition;
+  // transitions already reported are never re-delivered, and the five
+  // knobs, the EWMA state, the `atRisk` latch, the score, and the
+  // prediction are untouched.
+  server.reviseSloRiskCallback = (cb: ((info: SloRiskInfo) => void) | null): void => {
+    if (queue.getSloRiskConfig() === undefined) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseSloRiskCallback(cb);
+    }
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseSloRiskCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === operatorSloRiskCallback) return;
+    const prev = operatorSloRiskCallback === undefined ? "cleared" : "set";
+    const nextPresence = next === undefined ? "cleared" : "set";
+    operatorSloRiskCallback = next;
+    opts.auditLog.append({
+      event: "slo_risk_callback_revised",
+      previous: prev,
+      current: nextPresence,
+    });
   };
 
   // WR-347: live SLO-breach prediction config. Only set when
