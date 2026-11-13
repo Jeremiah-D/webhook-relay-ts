@@ -1270,6 +1270,16 @@ reliability primitives that matter for any signed-payload pipeline.
   live list untouched; an empty patch is a `RangeError`; a patch with no
   net change is a silent no-op. A real revision is audited as
   `probe_endpoints_revised` with `previous` / `current` endpoint lists.
+  Live revision (WR-404): `server.reviseProbeAuditCallback(cb | null)`
+  swaps the probe audit observer live — only the observation moves (the
+  probe itself still runs on WR-34/WR-355/WR-356: same cadence, same
+  endpoint list, same counters, same circuit-breaker feed). The new
+  callback takes effect from the next probe round; results already
+  reported are never re-delivered. `null` clears back to audit-only
+  (rounds carry on and are still audited and counted). A real revision
+  is audited as `probe_audit_callback_revised` with `previous` /
+  `current` recording only 'set' / 'cleared' presence, never a
+  function body.
   Enabling probing when it was never configured still requires a
   restart.
   (Not to be confused with the keep-alive pool's *connection* health

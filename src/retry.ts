@@ -2188,6 +2188,9 @@ export interface RetryQueueOptions {
    * failed probe (with the current consecutive-failure streak) and
    * `probe_recovered` when a failing endpoint answers again. The server
    * routes these into the audit log; library users get the hook directly.
+   * Live-revisable at runtime via `reviseProbeAuditCallback()` (WR-404) —
+   * the replacement takes effect from the next probe round, and
+   * `probe_endpoints_revised` (WR-356) flows through the same channel.
    */
   onProbeAudit?: (event: ProbeAuditEvent) => void;
   /**
@@ -8654,6 +8657,11 @@ export class RetryQueue {
     return this.orderedTracker !== undefined;
   }
 
+  /** WR-404: whether downstream probing is enabled (queue-level). */
+  probeConfigured(): boolean {
+    return this.prober !== undefined;
+  }
+
   /** WR-369: whether the auto-disable subsystem is enabled (queue-level). */
   autoDisableConfigured(): boolean {
     return this.autoDisable !== undefined;
@@ -13927,6 +13935,39 @@ export class RetryQueue {
     const next = cb ?? undefined;
     if (next === this.onDryRunDelivery) return;
     this.onDryRunDelivery = next;
+  }
+
+  /**
+   * WR-404: live-redirect the probe audit observer — the queue-side
+   * setter behind `RelayServer.reviseProbeAuditCallback`. The new
+   * callback takes effect from the next probe round; results already
+   * reported are never re-delivered, and the probe cadence, the
+   * endpoint list, the counters, and the circuit-breaker feed are
+   * untouched — only the observation moves. `null` clears back to no
+   * observer (rounds carry on and are still audited as `probe_failed`
+   * / `probe_recovered` and counted in `relay_probe_total` /
+   * `relay_probe_consecutive_failures` — only the forwarding stops).
+   * A non-function value throws `RangeError` and the live callback is
+   * untouched; replacing with the same reference (or clearing when
+   * already unset) is a no-op. Throws `Error` when probing was never
+   * configured — the prober only ever exists with `probe` in place,
+   * so enabling observation needs a restart. The same channel also
+   * carries `probe_endpoints_revised` (WR-356), so a list revision
+   * after this one reports to the new callback too. Under
+   * `RelayServer` the prober holds the server's audit closure, so
+   * direct calls here would replace the audit wrapper; server users
+   * must go through `RelayServer.reviseProbeAuditCallback`, which
+   * swaps only the operator cell behind the audit closure.
+   */
+  reviseProbeAuditCallback(cb: ((event: ProbeAuditEvent) => void) | null): void {
+    const prober = this.prober;
+    if (prober === undefined) {
+      throw new Error(
+        "reviseProbeAuditCallback: downstream probing is not configured — enabling it requires a restart: " +
+          "the prober is created at startup and a running relay cannot start probing new endpoints without one"
+      );
+    }
+    prober.reviseAuditCallback(cb);
   }
 
   /**

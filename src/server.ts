@@ -531,7 +531,7 @@ import {
   OutboundSchemaViolationError,
   type OutboundSchemaMetrics,
 } from "./outbound-schema.ts";
-import type { ProbeConfig, ProbeEndpointsRevision, ProbeOptions, ProbeRevision } from "./downstream-probe.ts";
+import type { ProbeAuditEvent, ProbeConfig, ProbeEndpointsRevision, ProbeOptions, ProbeRevision } from "./downstream-probe.ts";
 import {
   ProxyHealthMonitor,
   type ProxyHealthConfig,
@@ -7061,6 +7061,33 @@ export interface RelayServer extends Server {
     cb: ((event: OrderedAuditEvent) => void) | null
   ) => void;
   /**
+   * WR-404: live-redirect the probe audit observer — the operator
+   * callback that fires once per probe outcome worth auditing
+   * (`probe_failed` on each failure, with the consecutive-failure
+   * streak; `probe_recovered` when a failing endpoint answers again;
+   * `probe_endpoints_revised` when the probed list changes). `null`
+   * clears back to audit-only (rounds carry on and are still audited
+   * as `probe_failed` / `probe_recovered` and counted in
+   * `relay_probe_total` / `relay_probe_consecutive_failures`, just no
+   * longer forwarded to an operator). A non-function value throws
+   * `RangeError` and the live callback is untouched; replacing with
+   * the same reference (or clearing when already unset) is a silent
+   * no-op. A real replacement is audited as
+   * `probe_audit_callback_revised` with `previous` / `current`
+   * recording only 'set' / 'cleared' presence, never a function body.
+   * Always set; throws `Error` when downstream probing was never
+   * configured — enabling it needs a restart. The new callback takes
+   * effect from the next probe round; results already reported are
+   * never re-delivered, and the probe cadence, the endpoint list, the
+   * counters, and the circuit-breaker feed are untouched. Direct queue
+   * users use `RetryQueue.reviseProbeAuditCallback` instead — calling
+   * the queue method on a server-owned queue would replace the audit
+   * wrapper.
+   */
+  reviseProbeAuditCallback?: (
+    cb: ((event: ProbeAuditEvent) => void) | null
+  ) => void;
+  /**
    * WR-402: live-redirect the stale-endpoint auto-pause audit observer —
    * the operator callback that fires once per auto-paused endpoint
    * (`endpoint_auto_paused`, edge-triggered: one per transition).
@@ -9688,6 +9715,15 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   let operatorOrderedAuditCallback:
     | ((event: OrderedAuditEvent) => void)
     | undefined = opts.retry?.onOrderedAudit;
+  // WR-404: the operator's probe audit callback, held in a mutable
+  // cell so `server.reviseProbeAuditCallback` can replace it at
+  // runtime. The audit wrapper below reads this cell — never the
+  // operator callback directly — so replacing the operator callback
+  // cannot bypass the `probe_failed` / `probe_recovered` /
+  // `probe_endpoints_revised` audit.
+  let operatorProbeAuditCallback:
+    | ((event: ProbeAuditEvent) => void)
+    | undefined = opts.retry?.onProbeAudit;
   // WR-402: the operator's stale-endpoint auto-pause audit callback,
   // held in a mutable cell so
   // `server.reviseStalePauseAuditCallback` can replace it at runtime.
@@ -10157,7 +10193,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     },
     onProbeAudit: (event) => {
       opts.auditLog.append(event);
-      opts.retry?.onProbeAudit?.(event);
+      // WR-404: forward to the operator cell, never to the constructor
+      // callback directly, so a live revision cannot bypass the audit.
+      operatorProbeAuditCallback?.(event);
     },
     // WR-359: route the single `endpoint_health_revised` audit event
     // per real revision into the audit log (and on to the caller's
@@ -19065,6 +19103,46 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     operatorOrderedAuditCallback = next;
     opts.auditLog.append({
       event: "ordered_audit_callback_revised",
+      previous: prev,
+      current: nextPresence,
+    });
+  };
+
+  // WR-404: live probe audit observer replacement. Only the
+  // server-side operator-callback cell moves — the queue's audit
+  // wrapper (which appends `probe_failed` / `probe_recovered` /
+  // `probe_endpoints_revised` first, then forwards to the cell) is
+  // never touched, so a replacement cannot bypass the audit. With
+  // probing unconfigured the queue throws the canonical "must restart"
+  // Error (delegated below, exactly like WR-397's purged gate). A
+  // non-function callback throws `RangeError` and the live cell is
+  // untouched; a same-reference replacement (or clearing when already
+  // unset) is a silent no-op. A real replacement is audited as
+  // `probe_audit_callback_revised` with `previous` / `current`
+  // recording only 'set' / 'cleared' presence, never a function body.
+  // The new callback takes effect from the next probe round; results
+  // already reported are never re-delivered, and the probe cadence,
+  // the endpoint list, the counters, and the circuit-breaker feed are
+  // untouched.
+  server.reviseProbeAuditCallback = (
+    cb: ((event: ProbeAuditEvent) => void) | null
+  ): void => {
+    if (!queue.probeConfigured()) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseProbeAuditCallback(cb);
+    }
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseProbeAuditCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === operatorProbeAuditCallback) return;
+    const prev = operatorProbeAuditCallback === undefined ? "cleared" : "set";
+    const nextPresence = next === undefined ? "cleared" : "set";
+    operatorProbeAuditCallback = next;
+    opts.auditLog.append({
+      event: "probe_audit_callback_revised",
       previous: prev,
       current: nextPresence,
     });

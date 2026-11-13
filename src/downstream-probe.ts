@@ -274,7 +274,11 @@ export class DownstreamProber {
   private readonly clearTimer: (handle: ProbeTimerHandle) => void;
   private readonly probeRequest: (endpoint: string, method: "HEAD" | "GET") => Promise<boolean>;
   private readonly recordOutcome: (endpoint: string, ok: boolean) => void;
-  private readonly onAudit?: (event: ProbeAuditEvent) => void;
+  // WR-404: live-revisable via `reviseAuditCallback()` (the queue's
+  // `reviseProbeAuditCallback` delegates here), so this is deliberately
+  // not `readonly` — swapping the observer never touches the probe
+  // schedule, the endpoint list, or the counters.
+  private onAudit?: (event: ProbeAuditEvent) => void;
   private readonly records = new Map<string, ProbeRecord>();
   private running = false;
 
@@ -520,6 +524,30 @@ export class DownstreamProber {
   /** WR-356: live probed endpoint list snapshot (a copy). */
   snapshotEndpoints(): string[] {
     return [...this.endpoints];
+  }
+
+  /**
+   * WR-404: live-redirect the probe audit observer — the prober-side
+   * setter behind `RetryQueue.reviseProbeAuditCallback`. The new
+   * callback takes effect from the next probe round; results already
+   * reported are never re-delivered, and the probe cadence, the
+   * endpoint list, the counters, and the circuit-breaker feed are
+   * untouched — only the observation moves. `null` clears back to no
+   * observer (rounds carry on and are still counted in
+   * `relay_probe_total` / `relay_probe_consecutive_failures` — only
+   * the forwarding stops). A non-function value throws `RangeError`
+   * and the live callback is untouched; replacing with the same
+   * reference (or clearing when already unset) is a silent no-op.
+   * Every audited event — `probe_failed`, `probe_recovered`, and
+   * `probe_endpoints_revised` — flows through this one channel.
+   */
+  reviseAuditCallback(cb: ((event: ProbeAuditEvent) => void) | null): void {
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError("reviseAuditCallback: handler must be a function or null");
+    }
+    const next = cb ?? undefined;
+    if (next === this.onAudit) return;
+    this.onAudit = next;
   }
 
   /** WR-355: live probe config snapshot (the three cadence knobs). */
