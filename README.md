@@ -3336,6 +3336,21 @@ throws `Error` — enabling the feature needs a restart.
   counter. Manual pauses keep auditing as `endpoint_paused` — one
   transition, one event, the cause in the name.
 
+WR-402: the audit observer is revisable live via
+`server.reviseStalePauseAuditCallback(cb)` (and
+`RetryQueue.reviseStalePauseAuditCallback(cb)` for direct queue users) —
+`null` clears back to audit-only (the sweep and the auto-pause carry on
+and are still audited as `endpoint_auto_paused` and counted in
+`relay_endpoint_auto_pauses_total`, just no longer forwarded to an
+operator). The new observer takes effect from the next auto-pause;
+pauses already reported are never re-delivered. A real revision is
+audited as `stale_pause_audit_callback_revised` with `previous` /
+`current` ('set' / 'cleared' only). Revising when `stalePause` was never
+configured throws `Error` (enabling it needs a restart). This only
+swaps the observation receiver — the sweep interval, the
+`staleAfterDays` judgement, the idle baseline, and the manual
+pause/resume semantics are untouched.
+
 ## Scheduled delivery (deliver_at)
 
 Timed delivery: an inbound event may declare a future delivery time via

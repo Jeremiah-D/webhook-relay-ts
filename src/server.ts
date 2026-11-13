@@ -53,7 +53,7 @@ import type {
   EndpointHealthRevision,
   EndpointRecoveredInfo,
 } from "./retry.ts";
-import type { StalePauseConfig, StalePauseOptions, StalePauseRevision } from "./retry.ts";
+import type { StaleEndpointPausedEvent, StalePauseConfig, StalePauseOptions, StalePauseRevision } from "./retry.ts";
 import {
   assertValidCorsPolicy,
   answerCorsPreflight,
@@ -7061,6 +7061,32 @@ export interface RelayServer extends Server {
     cb: ((event: OrderedAuditEvent) => void) | null
   ) => void;
   /**
+   * WR-402: live-redirect the stale-endpoint auto-pause audit observer —
+   * the operator callback that fires once per auto-paused endpoint
+   * (`endpoint_auto_paused`, edge-triggered: one per transition).
+   * `null` clears back to audit-only (the sweep and the auto-pause
+   * carry on and are still audited as `endpoint_auto_paused` and
+   * counted in `relay_endpoint_auto_pauses_total`, just no longer
+   * forwarded to an operator). A non-function value throws `RangeError`
+   * and the live callback is untouched; replacing with the same
+   * reference (or clearing when already unset) is a silent no-op. A
+   * real replacement is audited as
+   * `stale_pause_audit_callback_revised` with `previous` / `current`
+   * recording only 'set' / 'cleared' presence, never a function body.
+   * Always set; throws `Error` when stale-endpoint auto-pause was never
+   * configured — enabling it needs a restart. The new callback takes
+   * effect from the next auto-pause; pauses already reported are never
+   * re-delivered, and the sweep interval, the `staleAfterDays`
+   * judgement, the idle baseline, and the manual pause/resume semantics
+   * are untouched. Direct queue users use
+   * `RetryQueue.reviseStalePauseAuditCallback` instead — calling the
+   * queue method on a server-owned queue would replace the audit
+   * wrapper.
+   */
+  reviseStalePauseAuditCallback?: (
+    cb: ((event: StaleEndpointPausedEvent) => void) | null
+  ) => void;
+  /**
    * WR-350: revise the live quorum retention tuning at runtime
    * (`retentionMs` / `maxFanouts`, partial — omitted fields keep their
    * live values). The new values take effect at the next lazy retention
@@ -9637,6 +9663,15 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   let operatorOrderedAuditCallback:
     | ((event: OrderedAuditEvent) => void)
     | undefined = opts.retry?.onOrderedAudit;
+  // WR-402: the operator's stale-endpoint auto-pause audit callback,
+  // held in a mutable cell so
+  // `server.reviseStalePauseAuditCallback` can replace it at runtime.
+  // The audit wrapper below reads this cell — never the operator
+  // callback directly — so replacing the operator callback cannot
+  // bypass the `endpoint_auto_paused` audit.
+  let operatorStalePauseAuditCallback:
+    | ((event: StaleEndpointPausedEvent) => void)
+    | undefined = opts.retry?.onStalePauseAudit;
   // WR-385: the operator's delivered / dead-letter callbacks, held in
   // mutable cells so `server.reviseDeliveredCallback` /
   // `server.reviseDeadLetterCallback` can replace them at runtime. The
@@ -9887,7 +9922,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // the feature — edge-triggered, one per transition.
     onStalePauseAudit: (event) => {
       opts.auditLog.append(event);
-      opts.retry?.onStalePauseAudit?.(event);
+      // WR-402: forward to the operator cell, never to the constructor
+      // callback directly, so a live revision cannot bypass the audit.
+      operatorStalePauseAuditCallback?.(event);
     },
     // Wrap the caller's hook so every deadline expiry is audited as
     // `delivery_deadline_exceeded`, not just observed.
@@ -18993,6 +19030,46 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     operatorOrderedAuditCallback = next;
     opts.auditLog.append({
       event: "ordered_audit_callback_revised",
+      previous: prev,
+      current: nextPresence,
+    });
+  };
+
+  // WR-402: live stale-endpoint auto-pause audit observer replacement.
+  // Only the server-side operator-callback cell moves — the queue's
+  // audit wrapper (which appends `endpoint_auto_paused` first, then
+  // forwards to the cell) is never touched, so a replacement cannot
+  // bypass the audit. With stale-endpoint auto-pause unconfigured the
+  // queue throws the canonical "must restart" Error (delegated below,
+  // exactly like WR-397's purged gate). A non-function callback throws
+  // `RangeError` and the live cell is untouched; a same-reference
+  // replacement (or clearing when already unset) is a silent no-op. A
+  // real replacement is audited as `stale_pause_audit_callback_revised`
+  // with `previous` / `current` recording only 'set' / 'cleared'
+  // presence, never a function body. The new callback takes effect from
+  // the next auto-pause; pauses already reported are never
+  // re-delivered, and the sweep interval, the `staleAfterDays`
+  // judgement, the idle baseline, and the manual pause/resume semantics
+  // are untouched.
+  server.reviseStalePauseAuditCallback = (
+    cb: ((event: StaleEndpointPausedEvent) => void) | null
+  ): void => {
+    if (!queue.stalePauseConfigured()) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseStalePauseAuditCallback(cb);
+    }
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseStalePauseAuditCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === operatorStalePauseAuditCallback) return;
+    const prev = operatorStalePauseAuditCallback === undefined ? "cleared" : "set";
+    const nextPresence = next === undefined ? "cleared" : "set";
+    operatorStalePauseAuditCallback = next;
+    opts.auditLog.append({
+      event: "stale_pause_audit_callback_revised",
       previous: prev,
       current: nextPresence,
     });

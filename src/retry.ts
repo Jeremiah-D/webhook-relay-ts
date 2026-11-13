@@ -3015,7 +3015,8 @@ export interface RetryQueueOptions {
    * the operator alert channel for this feature (edge-triggered: one
    * event per transition), alongside the
    * `relay_endpoint_auto_pauses_total` Prometheus counter. Library
-   * users get the hook directly.
+   * users get the hook directly. Live-revisable via
+   * `RetryQueue.reviseStalePauseAuditCallback` (WR-402).
    */
   onStalePauseAudit?: (event: StaleEndpointPausedEvent) => void;
   /**
@@ -4781,7 +4782,16 @@ export class RetryQueue {
   private readonly stalePauseEnabled: boolean;
   /** WR-100: cumulative auto-pauses per logical endpoint (metric source). */
   private readonly autoPauseCounts = new Map<string, number>();
-  private readonly onStalePauseAudit?: (event: StaleEndpointPausedEvent) => void;
+  // WR-402: deliberately *not* readonly — `reviseStalePauseAuditCallback`
+  // swaps this field live (see `reviseDeadLetterPurgedCallback`,
+  // WR-397). It holds the *caller's* callback; the sweeper reads this
+  // field live, so a revision can never drop the sweep, the pause, the
+  // `endpoint_auto_paused` audit, or the
+  // `relay_endpoint_auto_pauses_total` counter. The server's audit
+  // closure (which forwards to the operator callback) is held here when
+  // the queue runs under `RelayServer`; direct queue users hold their
+  // own callback in the same field.
+  private onStalePauseAudit?: (event: StaleEndpointPausedEvent) => void;
   /**
    * Dead-letter ids currently claimed by a replay operation (WR-23
    * batch replay, including the WR-31 auto-replay, which runs through
@@ -8622,6 +8632,11 @@ export class RetryQueue {
   /** WR-400: whether batch merging is enabled (queue-level). */
   batchConfigured(): boolean {
     return this.batcher !== undefined;
+  }
+
+  /** WR-402: whether stale-endpoint auto-pause is enabled (queue-level). */
+  stalePauseConfigured(): boolean {
+    return this.stalePauser !== undefined;
   }
 
   /** WR-401: whether per-endpoint ordered delivery is enabled (queue-level). */
@@ -13833,6 +13848,43 @@ export class RetryQueue {
     const next = cb ?? undefined;
     if (next === this.onOrderedAudit) return;
     this.onOrderedAudit = next;
+  }
+
+  /**
+   * WR-402: live-redirect the stale-endpoint auto-pause audit observer — the
+   * queue-side setter behind
+   * `RelayServer.reviseStalePauseAuditCallback`. The new callback takes
+   * effect from the next auto-pause; pauses already reported are never
+   * re-delivered, and the sweep interval, the `staleAfterDays`
+   * judgement, the idle baseline, and the manual pause/resume semantics
+   * are untouched — only the observation moves. `null` clears back to no
+   * observer (the sweep and the auto-pause carry on and are still audited
+   * as `endpoint_auto_paused` and counted in
+   * `relay_endpoint_auto_pauses_total` — only the forwarding stops). A
+   * non-function value throws `RangeError` and the live callback is
+   * untouched; replacing with the same reference (or clearing when
+   * already unset) is a no-op. Throws `Error` when stale-endpoint
+   * auto-pause was never configured — the sweeper only ever exists with
+   * `stalePause` in place, so enabling observation needs a restart.
+   * Under `RelayServer` the field holds the server's audit closure, so
+   * direct calls here would replace the audit wrapper; server users must
+   * go through `RelayServer.reviseStalePauseAuditCallback`, which swaps
+   * only the operator cell behind the audit closure.
+   */
+  reviseStalePauseAuditCallback(cb: ((event: StaleEndpointPausedEvent) => void) | null): void {
+    if (!this.stalePauseConfigured()) {
+      throw new Error(
+        "reviseStalePauseAuditCallback: stalePause is not configured — enabling it requires a restart"
+      );
+    }
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseStalePauseAuditCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === this.onStalePauseAudit) return;
+    this.onStalePauseAudit = next;
   }
 
   /**
