@@ -3040,6 +3040,21 @@ curl -X POST http://127.0.0.1:PORT/endpoints/dry-run \
   `endpoint_dry_run_disabled` with the operator's `keyId`.
   `queue.setEndpointDryRun` / `getEndpointDryRun` /
   `dryRunEndpoints` / `getDryRunStats` are the library-level API.
+
+WR-403: the drill observer is revisable live via
+`server.reviseDryRunDeliveryCallback(cb)` (and
+`RetryQueue.reviseDryRunDeliveryCallback(cb)` for direct queue users) —
+`null` clears back to audit-only (drills keep running and are still
+audited with `dry_run: true` and counted in
+`relay_dry_run_deliveries_total`, just no longer forwarded to an
+operator). The new observer takes effect from the next drill result;
+results already reported are never re-delivered. A real revision is
+audited as `dry_run_delivery_callback_revised` with `previous` /
+`current` ('set' / 'cleared' only). There is no must-restart gate:
+drill configs are installed at runtime, so a revision succeeds even
+with zero drills configured. This only swaps the observation receiver —
+the canned status classification, the canned delay, and the retry
+rhythm are untouched.
 - **Honest drill semantics** — the canned delay holds the delivery
   in-flight (keep it small); a drill never emits completion receipts
   (WR-47), never feeds the fan-out quorum (WR-106), and never samples

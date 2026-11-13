@@ -7087,6 +7087,31 @@ export interface RelayServer extends Server {
     cb: ((event: StaleEndpointPausedEvent) => void) | null
   ) => void;
   /**
+   * WR-403: live-redirect the dry-run delivery observer — the operator
+   * callback that fires once per drill attempt outcome (`delivered` /
+   * `retrying` / `dry_run_exhausted` / `failed`, all audited with
+   * `dry_run: true`). `null` clears back to audit-only (drills keep
+   * running and are still audited with `dry_run: true` and counted in
+   * `relay_dry_run_deliveries_total`, just no longer forwarded to an
+   * operator). A non-function value throws `RangeError` and the live
+   * callback is untouched; replacing with the same reference (or
+   * clearing when already unset) is a silent no-op. A real replacement
+   * is audited as `dry_run_delivery_callback_revised` with `previous` /
+   * `current` recording only 'set' / 'cleared' presence, never a
+   * function body. Always set — there is no must-restart gate: drill
+   * configs are installed at runtime (`setEndpointDryRun` /
+   * `POST /endpoints/dry-run`). The new callback takes effect from the
+   * next drill result; results already reported are never re-delivered,
+   * and the canned status classification, the canned delay, and the
+   * retry rhythm are untouched. Direct queue users use
+   * `RetryQueue.reviseDryRunDeliveryCallback` instead — calling the
+   * queue method on a server-owned queue would replace the audit
+   * wrapper.
+   */
+  reviseDryRunDeliveryCallback?: (
+    cb: ((event: DryRunDeliveryEvent) => void) | null
+  ) => void;
+  /**
    * WR-350: revise the live quorum retention tuning at runtime
    * (`retentionMs` / `maxFanouts`, partial — omitted fields keep their
    * live values). The new values take effect at the next lazy retention
@@ -9672,6 +9697,14 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   let operatorStalePauseAuditCallback:
     | ((event: StaleEndpointPausedEvent) => void)
     | undefined = opts.retry?.onStalePauseAudit;
+  // WR-403: the operator's dry-run delivery callback, held in a
+  // mutable cell so `server.reviseDryRunDeliveryCallback` can replace
+  // it at runtime. The audit wrapper below reads this cell — never the
+  // operator callback directly — so replacing the operator callback
+  // cannot bypass the `dry_run: true` audit.
+  let operatorDryRunDeliveryCallback:
+    | ((event: DryRunDeliveryEvent) => void)
+    | undefined = opts.retry?.onDryRunDelivery;
   // WR-385: the operator's delivered / dead-letter callbacks, held in
   // mutable cells so `server.reviseDeliveredCallback` /
   // `server.reviseDeadLetterCallback` can replace them at runtime. The
@@ -9879,7 +9912,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
           ...dryRunLabel,
         });
       }
-      opts.retry?.onDryRunDelivery?.(event);
+      // WR-403: forward to the operator cell, never to the constructor
+      // callback directly, so a live revision cannot bypass the audit.
+      operatorDryRunDeliveryCallback?.(event);
     },
     // Wrap the caller's hook so every cron occurrence is audited as
     // `scheduled_fired`, not just observed.
@@ -19070,6 +19105,41 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     operatorStalePauseAuditCallback = next;
     opts.auditLog.append({
       event: "stale_pause_audit_callback_revised",
+      previous: prev,
+      current: nextPresence,
+    });
+  };
+
+  // WR-403: live dry-run delivery observer replacement. Only the
+  // server-side operator-callback cell moves — the queue's audit
+  // wrapper (which appends `delivered` / `retrying` /
+  // `dry_run_exhausted` / `failed`, all with `dry_run: true`, first,
+  // then forwards to the cell) is never touched, so a replacement
+  // cannot bypass the audit. A non-function callback throws
+  // `RangeError` and the live cell is untouched; a same-reference
+  // replacement (or clearing when already unset) is a silent no-op. A
+  // real replacement is audited as `dry_run_delivery_callback_revised`
+  // with `previous` / `current` recording only 'set' / 'cleared'
+  // presence, never a function body. No must-restart gate: drill
+  // configs are installed at runtime. The new callback takes effect
+  // from the next drill result; results already reported are never
+  // re-delivered, and the canned status classification, the canned
+  // delay, and the retry rhythm are untouched.
+  server.reviseDryRunDeliveryCallback = (
+    cb: ((event: DryRunDeliveryEvent) => void) | null
+  ): void => {
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseDryRunDeliveryCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === operatorDryRunDeliveryCallback) return;
+    const prev = operatorDryRunDeliveryCallback === undefined ? "cleared" : "set";
+    const nextPresence = next === undefined ? "cleared" : "set";
+    operatorDryRunDeliveryCallback = next;
+    opts.auditLog.append({
+      event: "dry_run_delivery_callback_revised",
       previous: prev,
       current: nextPresence,
     });

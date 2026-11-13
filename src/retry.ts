@@ -2471,7 +2471,8 @@ export interface RetryQueueOptions {
    * Called once per drill attempt outcome (WR-145). The server audits
    * these with `dry_run: true` (`delivered` / `retrying` /
    * `dry_run_exhausted` / `failed`), keeping drill traffic isolated
-   * from real-traffic audit queries.
+   * from real-traffic audit queries. Live-revisable via
+   * `RetryQueue.reviseDryRunDeliveryCallback` (WR-403).
    */
   onDryRunDelivery?: (event: DryRunDeliveryEvent) => void;
   /**
@@ -4694,7 +4695,16 @@ export class RetryQueue {
    * behavior.
    */
   private readonly dryRunConfigs = new Map<string, NormalizedDryRunConfig>();
-  private readonly onDryRunDelivery?: (event: DryRunDeliveryEvent) => void;
+  // WR-403: deliberately *not* readonly — `reviseDryRunDeliveryCallback`
+  // swaps this field live (see `reviseDeadLetterPurgedCallback`,
+  // WR-397). It holds the *caller's* callback; the drill `report`
+  // closure reads this field live, so a revision can never drop the
+  // drill, the canned classification, or the
+  // `relay_dry_run_deliveries_total` counter. The server's audit
+  // closure (which forwards to the operator callback) is held here when
+  // the queue runs under `RelayServer`; direct queue users hold their
+  // own callback in the same field.
+  private onDryRunDelivery?: (event: DryRunDeliveryEvent) => void;
   /**
    * WR-145: drill outcome counters — tenant key ("" = default) →
    * endpoint → outcome → count. Only endpoints that actually drilled
@@ -13885,6 +13895,38 @@ export class RetryQueue {
     const next = cb ?? undefined;
     if (next === this.onStalePauseAudit) return;
     this.onStalePauseAudit = next;
+  }
+
+  /**
+   * WR-403: live-redirect the dry-run delivery observer — the
+   * queue-side setter behind
+   * `RelayServer.reviseDryRunDeliveryCallback`. The new callback takes
+   * effect from the next drill result; results already reported are
+   * never re-delivered, and the canned status classification, the canned
+   * delay, and the retry rhythm are untouched — only the observation
+   * moves. `null` clears back to no observer (drills keep running and
+   * are still audited with `dry_run: true` and counted in
+   * `relay_dry_run_deliveries_total` — only the forwarding stops). A
+   * non-function value throws `RangeError` and the live callback is
+   * untouched; replacing with the same reference (or clearing when
+   * already unset) is a no-op. There is no must-restart gate: drill
+   * configs are installed and removed at runtime
+   * (`setEndpointDryRun` / `POST /endpoints/dry-run`), so a revision
+   * succeeds even with zero drills configured. Under `RelayServer` the
+   * field holds the server's audit closure, so direct calls here would
+   * replace the audit wrapper; server users must go through
+   * `RelayServer.reviseDryRunDeliveryCallback`, which swaps only the
+   * operator cell behind the audit closure.
+   */
+  reviseDryRunDeliveryCallback(cb: ((event: DryRunDeliveryEvent) => void) | null): void {
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseDryRunDeliveryCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === this.onDryRunDelivery) return;
+    this.onDryRunDelivery = next;
   }
 
   /**
