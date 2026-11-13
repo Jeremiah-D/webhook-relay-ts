@@ -699,7 +699,17 @@ reliability primitives that matter for any signed-payload pipeline.
   late-born tenants, no-op and must-restart cases, server audit), plus
   `test/endpoint-degraded-callbacks-revision.test.ts` (12 tests: live
   swaps on built and late-born trackers, clearing, partial patches,
-  no-op and must-restart cases, server audit).
+  no-op and must-restart cases, server audit). Live audit-channel
+  callback revision (WR-408): `server.reviseEndpointHealthAuditCallback(cb)`
+  swaps only the receiver of the `endpoint_health_revised` audit event —
+  the eight knobs still move only through `reviseEndpointHealth`, and a
+  revision already reported is never re-delivered; `null` clears back to
+  audit-only (revisions carry on and are still audited, just no longer
+  forwarded). A real replacement is audited as
+  `endpoint_health_audit_callback_revised` with `previous` / `current`
+  recording only 'set' / 'cleared' presence. Covered by
+  `test/endpoint-health-audit-callback-revision.test.ts` (10 tests: live
+  swaps, clearing, no-op and must-restart cases, server audit).
 - `src/audit.ts` — append-only JSONL audit log (`append` / `readAll`) plus an
   indexed query (`query({ event, endpoint, since, until, limit })`): a lazily
   maintained line-offset index maps each complete line to its `ts`/`event`/

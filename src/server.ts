@@ -50,6 +50,7 @@ import type {
   EndpointDegradedInfo,
   EndpointHealthConfig,
   EndpointHealthOptions,
+  EndpointHealthRevisedAuditEvent,
   EndpointHealthRevision,
   EndpointRecoveredInfo,
 } from "./retry.ts";
@@ -6182,6 +6183,31 @@ export interface RelayServer extends Server {
    */
   reviseEndpointHealth?: (patch: EndpointHealthRevision) => EndpointHealthConfig;
   /**
+   * WR-408: live-redirect the endpoint-health revision audit observer —
+   * the operator callback that fires once per real `reviseEndpointHealth`
+   * revision with the `endpoint_health_revised` event (previous /
+   * current config, all eight knobs). `null` clears back to audit-only
+   * (revisions carry on and are still audited as
+   * `endpoint_health_revised` and visible via `getEndpointHealthConfig`,
+   * just no longer forwarded to an operator). A non-function value
+   * throws `RangeError` and the live callback is untouched; replacing
+   * with the same reference (or clearing when already unset) is a
+   * silent no-op. A real replacement is audited as
+   * `endpoint_health_audit_callback_revised` with `previous` /
+   * `current` recording only 'set' / 'cleared' presence, never a
+   * function body. Always set; throws `Error` when `endpointHealth`
+   * was never configured — enabling it needs a restart. The new
+   * callback takes effect from the next real revision; revisions
+   * already reported are never re-delivered, and the eight knobs, the
+   * thresholds, the hysteresis, and the scoring logic are untouched.
+   * Direct queue users use `RetryQueue.reviseEndpointHealthAuditCallback`
+   * instead — calling the queue method on a server-owned queue would
+   * replace the audit wrapper.
+   */
+  reviseEndpointHealthAuditCallback?: (
+    cb: ((event: EndpointHealthRevisedAuditEvent) => void) | null
+  ) => void;
+  /**
    * WR-359: live outbound endpoint health config — the eight scoring
    * knobs. Only set when `endpointHealth` was configured; `undefined`
    * otherwise.
@@ -9809,6 +9835,15 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   let operatorStarvationGuardAuditCallback:
     | ((event: StarvationGuardAuditEvent) => void)
     | undefined = opts.retry?.onStarvationGuardAudit;
+  // WR-408: the operator's endpoint-health revision audit callback,
+  // held in a mutable cell so
+  // `server.reviseEndpointHealthAuditCallback` can replace it at
+  // runtime. The audit wrapper below reads this cell — never the
+  // operator callback directly — so replacing the operator callback
+  // cannot bypass the `endpoint_health_revised` audit.
+  let operatorEndpointHealthAuditCallback:
+    | ((event: EndpointHealthRevisedAuditEvent) => void)
+    | undefined = opts.retry?.onEndpointHealthAudit;
   // WR-385: the operator's delivered / dead-letter callbacks, held in
   // mutable cells so `server.reviseDeliveredCallback` /
   // `server.reviseDeadLetterCallback` can replace them at runtime. The
@@ -10270,7 +10305,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // hook, like onProbeAudit above).
     onEndpointHealthAudit: (event) => {
       opts.auditLog.append(event);
-      opts.retry?.onEndpointHealthAudit?.(event);
+      // WR-408: forward to the operator cell, never to the constructor
+      // callback directly, so a live revision cannot bypass the audit.
+      operatorEndpointHealthAuditCallback?.(event);
     },
     // Wrap the caller's hook so every starvation-guard activation is
     // audited, not just observed.
@@ -17374,6 +17411,46 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // no-op.
   server.reviseEndpointHealth = (patch: EndpointHealthRevision): EndpointHealthConfig =>
     queue.reviseEndpointHealth(patch);
+
+  // WR-408: live endpoint-health revision audit observer replacement.
+  // Only the server-side operator-callback cell moves — the queue's
+  // audit wrapper (which appends `endpoint_health_revised` first, then
+  // forwards to the cell) is never touched, so a replacement cannot
+  // bypass the audit. With endpoint health unconfigured the queue
+  // throws the canonical "must restart" Error (delegated below,
+  // exactly like WR-404's probe gate). A non-function callback throws
+  // `RangeError` and the live cell is untouched; a same-reference
+  // replacement (or clearing when already unset) is a silent no-op. A
+  // real replacement is audited as
+  // `endpoint_health_audit_callback_revised` with `previous` /
+  // `current` recording only 'set' / 'cleared' presence, never a
+  // function body. The new callback takes effect from the next real
+  // revision; revisions already reported are never re-delivered, and
+  // the eight knobs, the thresholds, the hysteresis, and the scoring
+  // logic are untouched.
+  server.reviseEndpointHealthAuditCallback = (
+    cb: ((event: EndpointHealthRevisedAuditEvent) => void) | null
+  ): void => {
+    if (queue.getEndpointHealthConfig() === undefined) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseEndpointHealthAuditCallback(cb);
+    }
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseEndpointHealthAuditCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === operatorEndpointHealthAuditCallback) return;
+    const prev = operatorEndpointHealthAuditCallback === undefined ? "cleared" : "set";
+    const nextPresence = next === undefined ? "cleared" : "set";
+    operatorEndpointHealthAuditCallback = next;
+    opts.auditLog.append({
+      event: "endpoint_health_audit_callback_revised",
+      previous: prev,
+      current: nextPresence,
+    });
+  };
 
   // WR-359: live outbound endpoint health config. Only set when
   // `endpointHealth` was configured.

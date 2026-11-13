@@ -2206,6 +2206,8 @@ export interface RetryQueueOptions {
    * audit log; library users get the hook directly. Not called for a
    * same-value or empty patch (those never reach this hook — the
    * former is a silent no-op, the latter throws `RangeError`).
+   * Live-revisable at runtime via `reviseEndpointHealthAuditCallback()`
+   * (WR-408) — the replacement takes effect from the next real revision.
    */
   onEndpointHealthAudit?: (event: EndpointHealthRevisedAuditEvent) => void;
   /**
@@ -4543,7 +4545,13 @@ export class RetryQueue {
   private onEndpointDegraded?: (info: EndpointDegradedInfo) => void;
   private onEndpointRecovered?: (info: EndpointRecoveredInfo) => void;
   /** WR-359: receives the single `endpoint_health_revised` audit event per real revision. */
-  private readonly onEndpointHealthAudit?: (event: EndpointHealthRevisedAuditEvent) => void;
+  // WR-408: deliberately *not* readonly — `reviseEndpointHealthAuditCallback`
+  // swaps the live audit observer at runtime. It holds the *caller's*
+  // callback (the server's audit closure when the queue runs under
+  // `RelayServer`); `reviseEndpointHealth` reads this field live at
+  // fire time, so a revision swaps the observer in place (see
+  // `reviseEndpointHealthAuditCallback`).
+  private onEndpointHealthAudit?: (event: EndpointHealthRevisedAuditEvent) => void;
   // WR-407: deliberately *not* readonly — `reviseSloRiskCallback`
   // swaps this field live. It holds the *caller's* callback (the
   // server's audit closure when the queue runs under `RelayServer`);
@@ -7153,6 +7161,45 @@ export class RetryQueue {
       current: { ...next },
     });
     return { ...next };
+  }
+
+  /**
+   * WR-408: live-redirect the endpoint-health revision audit observer —
+   * the queue-side setter behind
+   * `RelayServer.reviseEndpointHealthAuditCallback`. The new callback
+   * takes effect from the next real `reviseEndpointHealth` revision;
+   * revisions already reported are never re-delivered, and the eight
+   * knobs, the thresholds, the hysteresis, and the scoring logic are
+   * untouched — only the observation moves. `null` clears back to no
+   * observer (revisions carry on and are still audited as
+   * `endpoint_health_revised` and visible via `getEndpointHealthConfig`
+   * — only the forwarding stops). A non-function value throws
+   * `RangeError` and the live callback is untouched; replacing with
+   * the same reference (or clearing when already unset) is a silent
+   * no-op. Throws `Error` when health scoring was never configured —
+   * enabling it needs a restart. Under `RelayServer` the field holds
+   * the server's audit closure, so direct calls here would replace the
+   * audit wrapper; server users must go through
+   * `RelayServer.reviseEndpointHealthAuditCallback`, which swaps only
+   * the operator cell behind the audit closure.
+   */
+  reviseEndpointHealthAuditCallback(
+    cb: ((event: EndpointHealthRevisedAuditEvent) => void) | null
+  ): void {
+    if (this.endpointHealthOpts === undefined) {
+      throw new Error(
+        "reviseEndpointHealthAuditCallback: endpoint health scoring is not configured — enabling it requires a restart: " +
+          "the trackers are created at startup and a running relay cannot start scoring endpoints without one"
+      );
+    }
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseEndpointHealthAuditCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === this.onEndpointHealthAudit) return;
+    this.onEndpointHealthAudit = next;
   }
 
   /**
