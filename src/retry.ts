@@ -2215,6 +2215,9 @@ export interface RetryQueueOptions {
    * the endpoint and the before/after diff of every patched field. The
    * server routes this into the audit log as `endpoint_config_updated`;
    * library users get the same observability hook directly.
+   * Live-revisable at runtime via `reviseConfigChangeCallback()`
+   * (WR-409) — the replacement takes effect from the next
+   * `updateEndpointConfig` patch.
    */
   onConfigChange?: (endpoint: string, changes: ConfigChange[]) => void;
   /**
@@ -4360,7 +4363,13 @@ export class RetryQueue {
   // here when the queue runs under `RelayServer`; direct queue users
   // hold their own callback in the same field.
   private circuitBreakerOnStateChange?: CircuitStateChangeCallback;
-  private readonly onConfigChange?: (endpoint: string, changes: ConfigChange[]) => void;
+  // WR-409: deliberately *not* readonly — `reviseConfigChangeCallback`
+  // swaps the live config-change observer at runtime. It holds the
+  // *caller's* callback (the server's audit closure when the queue runs
+  // under `RelayServer`); `updateEndpointConfig` reads this field live
+  // at fire time, so a revision swaps the observer in place (see
+  // `reviseConfigChangeCallback`).
+  private onConfigChange?: (endpoint: string, changes: ConfigChange[]) => void;
   /** WR-50: operator pause/resume transition hooks (audited by the server). */
   // WR-367: deliberately *not* readonly — `reviseEndpointPauseCallbacks`
   // replaces the live pause/resume observers at runtime. The server's
@@ -9126,6 +9135,38 @@ export class RetryQueue {
 
     this.onConfigChange?.(endpoint, changes);
     return changes;
+  }
+
+  /**
+   * WR-409: live-redirect the endpoint-config-change observer — the
+   * queue-side setter behind `RelayServer.reviseConfigChangeCallback`.
+   * The new callback takes effect from the next `updateEndpointConfig`
+   * patch; changes already reported are never re-delivered, and the
+   * patch validation gate, atomicity, and in-flight timer semantics
+   * are untouched — only the observation moves. `null` clears back to
+   * no observer (patches carry on; under `RelayServer` they are still
+   * audited as `endpoint_config_updated` — only the forwarding stops).
+   * A non-function value throws `RangeError` and the live callback is
+   * untouched; replacing with the same reference (or clearing when
+   * already unset) is a silent no-op. There is no must-restart gate
+   * here: `onConfigChange` is a pure optional hook with no
+   * configuration object behind it. Under `RelayServer` the field
+   * holds the server's audit closure, so direct calls here would
+   * replace the audit wrapper; server users must go through
+   * `RelayServer.reviseConfigChangeCallback`, which swaps only the
+   * operator cell behind the audit closure.
+   */
+  reviseConfigChangeCallback(
+    cb: ((endpoint: string, changes: ConfigChange[]) => void) | null
+  ): void {
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseConfigChangeCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === this.onConfigChange) return;
+    this.onConfigChange = next;
   }
 
   private schedule(id: string, delayMs: number): void {

@@ -6208,6 +6208,29 @@ export interface RelayServer extends Server {
     cb: ((event: EndpointHealthRevisedAuditEvent) => void) | null
   ) => void;
   /**
+   * WR-409: live-redirect the endpoint-config-change observer — the
+   * operator callback that fires once per applied `updateEndpointConfig`
+   * patch with the endpoint and the before/after diff of every patched
+   * field. `null` clears back to audit-only (patches carry on and are
+   * still audited as `endpoint_config_updated`, just no longer
+   * forwarded to an operator). A non-function value throws `RangeError`
+   * and the live callback is untouched; replacing with the same
+   * reference (or clearing when already unset) is a silent no-op. A
+   * real replacement is audited as `config_change_callback_revised`
+   * with `previous` / `current` recording only 'set' / 'cleared'
+   * presence, never a function body. Always set — there is no
+   * must-restart gate: `onConfigChange` is a pure optional hook. The
+   * new callback takes effect from the next applied patch; changes
+   * already reported are never re-delivered, and the patch validation
+   * gate, atomicity, and in-flight timer semantics are untouched.
+   * Direct queue users use `RetryQueue.reviseConfigChangeCallback`
+   * instead — calling the queue method on a server-owned queue would
+   * replace the audit wrapper.
+   */
+  reviseConfigChangeCallback?: (
+    cb: ((endpoint: string, changes: ConfigChange[]) => void) | null
+  ) => void;
+  /**
    * WR-359: live outbound endpoint health config — the eight scoring
    * knobs. Only set when `endpointHealth` was configured; `undefined`
    * otherwise.
@@ -9844,6 +9867,14 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   let operatorEndpointHealthAuditCallback:
     | ((event: EndpointHealthRevisedAuditEvent) => void)
     | undefined = opts.retry?.onEndpointHealthAudit;
+  // WR-409: the operator's endpoint-config-change callback, held in a
+  // mutable cell so `server.reviseConfigChangeCallback` can replace it
+  // at runtime. The audit wrapper below reads this cell — never the
+  // operator callback directly — so replacing the operator callback
+  // cannot bypass the `endpoint_config_updated` audit.
+  let operatorConfigChangeCallback:
+    | ((endpoint: string, changes: ConfigChange[]) => void)
+    | undefined = opts.retry?.onConfigChange;
   // WR-385: the operator's delivered / dead-letter callbacks, held in
   // mutable cells so `server.reviseDeliveredCallback` /
   // `server.reviseDeadLetterCallback` can replace them at runtime. The
@@ -10754,7 +10785,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         changes,
         ...(activeOperatorKeyId !== undefined ? { keyId: activeOperatorKeyId } : {}),
       });
-      opts.retry?.onConfigChange?.(endpoint, changes);
+      // WR-409: forward to the operator cell, never to the constructor
+      // callback directly, so a live revision cannot bypass the audit.
+      operatorConfigChangeCallback?.(endpoint, changes);
     },
     // Wrap the caller's pause hooks so every pause/resume transition is
     // audited as `endpoint_paused` / `endpoint_resumed`, not just
@@ -17447,6 +17480,40 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     operatorEndpointHealthAuditCallback = next;
     opts.auditLog.append({
       event: "endpoint_health_audit_callback_revised",
+      previous: prev,
+      current: nextPresence,
+    });
+  };
+
+  // WR-409: live endpoint-config-change observer replacement. Only the
+  // server-side operator-callback cell moves — the queue's audit
+  // wrapper (which appends `endpoint_config_updated` first, then
+  // forwards to the cell) is never touched, so a replacement cannot
+  // bypass the audit. There is no must-restart gate: `onConfigChange`
+  // is a pure optional hook, so the method is always set. A
+  // non-function callback throws `RangeError` and the live cell is
+  // untouched; a same-reference replacement (or clearing when already
+  // unset) is a silent no-op. A real replacement is audited as
+  // `config_change_callback_revised` with `previous` / `current`
+  // recording only 'set' / 'cleared' presence, never a function body.
+  // The new callback takes effect from the next applied patch; changes
+  // already reported are never re-delivered, and the patch validation
+  // gate, atomicity, and in-flight timer semantics are untouched.
+  server.reviseConfigChangeCallback = (
+    cb: ((endpoint: string, changes: ConfigChange[]) => void) | null
+  ): void => {
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseConfigChangeCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === operatorConfigChangeCallback) return;
+    const prev = operatorConfigChangeCallback === undefined ? "cleared" : "set";
+    const nextPresence = next === undefined ? "cleared" : "set";
+    operatorConfigChangeCallback = next;
+    opts.auditLog.append({
+      event: "config_change_callback_revised",
       previous: prev,
       current: nextPresence,
     });

@@ -2382,6 +2382,14 @@ curl -X POST http://127.0.0.1:PORT/config/endpoint \
 # token · 404 when operator endpoints are disabled (fail closed)
 ```
 
+Live callback revision (WR-409): `server.reviseConfigChangeCallback(cb)`
+swaps only the receiver of the config-change observation — the patch knob
+still moves only through `updateEndpointConfig` / HTTP `POST /config/endpoint`;
+`null` clears back to audit-only and a change already reported is never
+re-delivered. Covered by `test/config-change-callback-revision.test.ts`
+(10 tests: live swaps, clearing, no-op and invalid-value cases, server
+audit, and unchanged patch validation / atomicity / in-flight timers).
+
 ## Named retry policies
 
 Different downstreams deserve different backoff schedules: a payment
