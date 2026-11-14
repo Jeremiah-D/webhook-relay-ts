@@ -764,6 +764,10 @@ reliability primitives that matter for any signed-payload pipeline.
   scanner instance backs the `AuditLog` scan (via `setSecretScanner()`), so
   masked (WR-72) and encrypted (WR-11) persisted payloads are inspected before
   sealing. Enabled by default; `{ enabled: false }` disables both scans.
+  `server.reviseSecretLeakCallback(cb)` swaps the leak-alert recipient at
+  runtime (`null` clears back to audit-only); detection, the pattern table,
+  and `blockMode` still come from construction-time `secretScan`, and
+  revising throws when scanning was disabled.
 - `src/masking.ts` — field-level masking for audit payloads (`FieldMask`):
   opt-in per-endpoint rules like `{ path: "card_number", strategy: "last4" }`
   (`"4111111111111111"` → `"****1111"`, irreversible; `"full"` → `"****"`).

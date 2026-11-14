@@ -7500,6 +7500,28 @@ export interface RelayServer extends Server {
     cb: ((event: DeadLetterAutoReplayAuditEvent) => void) | null
   ) => void;
   /**
+   * WR-418: live-revise the inbound secret-leak observation callback —
+   * the operator hook called once per inbound hit (`SecretLeakInfo`,
+   * pattern names and field paths only, never secret values). `null`
+   * clears back to audit-only (the leak is still scanned, blockMode
+   * still answers 400, and `secret_leak_suspected` is still audited,
+   * just no longer forwarded to an operator). A non-function value
+   * throws `RangeError` and the live callback is untouched; replacing
+   * with the same reference (or clearing when already unset) is a
+   * silent no-op. A real replacement is audited as
+   * `secret_leak_callback_revised` with `previous` / `current`
+   * recording only 'set' / 'cleared' presence, never a function body.
+   * Always set; throws `Error` when secret scanning was disabled —
+   * enabling it needs a restart. The new callback takes effect from
+   * the next inbound hit; hits already reported are never re-emitted,
+   * and the pattern table, blockMode, and the MAX_SECRET_HITS cap are
+   * untouched. This swaps only the leak-alert recipient; detection
+   * and blockMode still come from construction-time `secretScan`.
+   */
+  reviseSecretLeakCallback?: (
+    cb: ((info: SecretLeakInfo) => void) | null
+  ) => void;
+  /**
    * WR-344: live dead-letter auto-replay schedule cadence — the three
    * round-rhythm inputs. Only set when `autoReplay` was configured;
    * `undefined` otherwise.
@@ -11313,6 +11335,14 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // intake scan in `admitOneEvent` and the audit log's scan of persisted
   // payloads (installed via `setSecretScanner`, the WR-72 pattern).
   const secretScanOpts = opts.secretScan;
+  // WR-418: the operator's inbound secret-leak observation callback,
+  // held in a mutable cell so `server.reviseSecretLeakCallback` can
+  // replace it at runtime. The intake call site below reads this cell
+  // — never the construction option directly — so replacing the
+  // operator callback cannot bypass the `secret_leak_suspected` audit.
+  let operatorSecretLeakCallback:
+    | ((info: SecretLeakInfo) => void)
+    | undefined = secretScanOpts?.onSecretLeak;
   if (secretScanOpts?.blockMode === true && secretScanOpts?.enabled === false) {
     throw new RangeError("secretScan: blockMode requires the scanner to be enabled");
   }
@@ -15111,7 +15141,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       const secretHits = secretScanner.scanBuffer(body);
       if (secretHits.length > 0) {
         try {
-          secretScanOpts?.onSecretLeak?.({
+          operatorSecretLeakCallback?.({
             id,
             traceId,
             targetUrl,
@@ -20161,6 +20191,45 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     operatorAutoReplayAuditCallback = next;
     opts.auditLog.append({
       event: "auto_replay_audit_callback_revised",
+      previous: prev,
+      current: nextPresence,
+    });
+  };
+
+  // WR-418: live inbound secret-leak observation callback revision.
+  // Only the operator-callback cell moves — the intake scan and the
+  // `secret_leak_suspected` audit in `admitOneEvent` are never
+  // touched, so a replacement cannot bypass the audit. With secret
+  // scanning disabled the revision throws the canonical "must
+  // restart" Error. A non-function callback throws `RangeError` and
+  // the live cell is untouched; a same-reference replacement (or
+  // clearing when already unset) is a silent no-op. A real
+  // replacement is audited as `secret_leak_callback_revised` with
+  // `previous` / `current` recording only 'set' / 'cleared' presence,
+  // never a function body. The new callback takes effect from the
+  // next inbound hit; hits already reported are never re-emitted,
+  // and the pattern table, blockMode, and the MAX_SECRET_HITS cap
+  // are untouched.
+  server.reviseSecretLeakCallback = (
+    cb: ((info: SecretLeakInfo) => void) | null
+  ): void => {
+    if (secretScanner === undefined) {
+      throw new Error(
+        "secret scanning is not enabled — enabling it requires a restart"
+      );
+    }
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseSecretLeakCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === operatorSecretLeakCallback) return;
+    const prev = operatorSecretLeakCallback === undefined ? "cleared" : "set";
+    const nextPresence = next === undefined ? "cleared" : "set";
+    operatorSecretLeakCallback = next;
+    opts.auditLog.append({
+      event: "secret_leak_callback_revised",
       previous: prev,
       current: nextPresence,
     });
