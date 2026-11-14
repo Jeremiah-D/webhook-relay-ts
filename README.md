@@ -12660,6 +12660,26 @@ Revising when completion callbacks were never configured throws `Error`
 the receipt configuration itself still goes through `completionCallback`
 at construction.
 
+WR-412: the receipt configuration itself is revisable live via
+`server.reviseCompletionCallback(patch)` (and
+`RetryQueue.reviseCompletionCallback(patch)` for direct queue users) —
+the receipt target `url`, the `signingSecret` / `keyId` /
+`idempotencySecret` (a `null` clears back to unsigned / unset, so a
+secret rotation needs no restart), and the `maxAttempts` / `backoffMs` /
+`timeoutMs` / `keyPrefix` / `selfOrigins` knobs. The whole patch is
+validated first (an illegal value throws `RangeError` and the live
+config is untouched), and a new `url` re-runs both loop guards. The new
+config applies from the next terminal event; receipts already sent are
+never re-sent, and an in-flight receipt retry chain finishes on the
+config it started with. A patch identical to the live values is a
+silent no-op. A real revision is audited as
+`completion_callback_revised` with `previous` / `current` recording
+only the target origin and the changed knob names, never secret
+material. Revising when completion callbacks were never configured
+throws `Error` (enabling them needs a restart). This only swaps the
+receipt target / secret / knobs — the failure observer stays with
+WR-398.
+
 ### Dead-letter storm escalation
 
 Completion callbacks (above) are *per-delivery* receipts to the *caller's*

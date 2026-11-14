@@ -344,6 +344,7 @@ import {
   resolveCompletionCallbackConfig,
   type CompletionCallbackFailedInfo,
   type CompletionCallbackOptions,
+  type CompletionCallbackRevision,
   type CompletionReceipt,
   type TerminalDeliveryState,
 } from "./callback.ts";
@@ -2680,6 +2681,10 @@ export interface RetryQueueOptions {
    * WR-44-style idempotency key, WR-26-style `x-relay-signature`) to the
    * caller's URL — the active counterpart to the passive
    * `GET /deliveries/:traceId` query. Disabled by default.
+   * Live-revisable via `RetryQueue.reviseCompletionCallback` (WR-412) —
+   * the receipt target, secrets, and knobs move at runtime; the
+   * failure observer stays with
+   * `reviseCompletionCallbackFailedCallback` (WR-398).
    */
   completionCallback?: CompletionCallbackOptions;
   /**
@@ -3454,6 +3459,45 @@ export interface EndpointConfigState {
   weighted?: { targets: Array<{ targetUrl: string; weight: number }> };
   /** Consistent-hash target list; present only when consistent-hash routing is on. */
   consistentHash?: { targets: Array<{ targetUrl: string }> };
+}
+
+/**
+ * WR-412: live snapshot of the completion-callback config, as returned
+ * by `RetryQueue.getCompletionCallbackConfig`. A snapshot — mutating
+ * the returned object never moves the callbacker. Secret values are
+ * never exposed: only presence flags (`signingSecretSet` / `keyIdSet` /
+ * `idempotencySecretSet`), so a secret rotation shows up as a
+ * `version` bump and a `lastChanged` entry, never as secret material.
+ * `selfOrigins` is present only when declared at construction (or
+ * revised in since).
+ */
+export interface CompletionCallbackConfigSnapshot {
+  /** The caller's receipt endpoint. */
+  url: string;
+  /** Declared self origins for the configuration-time loop check. */
+  selfOrigins?: string[];
+  /** Whether a signing secret is currently set. */
+  signingSecretSet: boolean;
+  /** Whether a key id is currently set. */
+  keyIdSet: boolean;
+  /** Whether an idempotency secret is currently set. */
+  idempotencySecretSet: boolean;
+  /** Prefix prepended to the derived idempotency key. */
+  keyPrefix: string;
+  /** Receipt POST attempts per terminal event, including the first. */
+  maxAttempts: number;
+  /** Backoff between receipt retries in ms (`backoffMs * attempt`). */
+  backoffMs: number;
+  /** Per-attempt socket timeout in ms. */
+  timeoutMs: number;
+  /**
+   * Monotonic revision counter; bumps only when a real revision
+   * lands, so the server can tell a same-value no-op from a change
+   * without ever comparing secret values.
+   */
+  version: number;
+  /** Knob names changed by the most recent real revision (empty before any revision). */
+  lastChanged: string[];
 }
 
 interface Scheduled {
@@ -4264,6 +4308,17 @@ export interface ResolvedEndpointRetryPolicy {
 }
 
 /**
+ * WR-412: origin-list equality for completion-callback `selfOrigins`
+ * (order-sensitive; `undefined` and an empty list mean the same thing
+ * — no declared origins — so a revision between them is a no-op).
+ */
+function completionCallbackOriginsEqual(a?: string[], b?: string[]): boolean {
+  const x = a ?? [];
+  const y = b ?? [];
+  return x.length === y.length && x.every((v, i) => v === y[i]);
+}
+
+/**
  * RetryQueue holds outbound deliveries and retries them with exponential
  * backoff + jitter. Items that exhaust `maxAttempts` are moved to an
  * in-memory dead-letter list for later inspection.
@@ -4931,6 +4986,16 @@ export class RetryQueue {
   private readonly consistentHash?: ConsistentHashDispatcher;
   /** WR-47: completion-receipt sender; undefined when the feature is off. */
   private readonly callbacker?: CompletionCallbacker;
+  // WR-412: the construction-time completion-callback options, kept so
+  // `reviseCompletionCallback` can merge a patch over the live values
+  // (notably `selfOrigins`, which the resolved config drops, and the
+  // injected transport / clock / timers). Replaced wholesale on each
+  // real revision; undefined when the feature is off.
+  private completionCallbackOpts?: CompletionCallbackOptions;
+  /** WR-412: revision counter for the completion-callback config; bumps only on a real change. */
+  private completionCallbackVersion = 0;
+  /** WR-412: knob names changed by the most recent real completion-callback revision. */
+  private completionCallbackLastChanged: string[] = [];
   /** WR-93: dead-letter storm escalator; undefined when the feature is off. */
   private readonly escalation?: DeadLetterStormEscalator;
   // WR-394: deliberately *not* readonly —
@@ -5538,6 +5603,8 @@ export class RetryQueue {
     // `reviseCompletionCallbackFailedCallback` can swap the observer
     // without ever touching — or dropping — the callbacker itself.
     this.callerOnCompletionCallbackFailed = opts.onCompletionCallbackFailed;
+    this.completionCallbackOpts =
+      opts.completionCallback === undefined ? undefined : { ...opts.completionCallback };
     this.callbacker =
       callbackConfig === undefined
         ? undefined
@@ -8731,6 +8798,33 @@ export class RetryQueue {
   /** WR-398: whether the completion-callback subsystem is enabled (queue-level). */
   completionCallbackConfigured(): boolean {
     return this.callbacker !== undefined;
+  }
+
+  /**
+   * WR-412: the live completion-callback config, or `undefined` when
+   * the feature is off. A snapshot — mutating the returned object
+   * never moves the callbacker — and secret values are never exposed
+   * (only presence flags), so the server can audit a revision with
+   * the target origin and the changed knob names and nothing else.
+   */
+  getCompletionCallbackConfig(): CompletionCallbackConfigSnapshot | undefined {
+    if (this.callbacker === undefined) return undefined;
+    const config = this.callbacker.currentConfig();
+    return {
+      url: config.url,
+      ...(this.completionCallbackOpts?.selfOrigins !== undefined
+        ? { selfOrigins: [...this.completionCallbackOpts.selfOrigins] }
+        : {}),
+      signingSecretSet: config.signingSecret !== undefined,
+      keyIdSet: config.keyId !== undefined,
+      idempotencySecretSet: config.idempotencySecret !== undefined,
+      keyPrefix: config.keyPrefix,
+      maxAttempts: config.maxAttempts,
+      backoffMs: config.backoffMs,
+      timeoutMs: config.timeoutMs,
+      version: this.completionCallbackVersion,
+      lastChanged: [...this.completionCallbackLastChanged],
+    };
   }
 
   /** WR-395: whether the shadow-target mirroring subsystem is enabled (queue-level). */
@@ -13882,6 +13976,132 @@ export class RetryQueue {
     const next = cb ?? undefined;
     if (next === this.callerOnCompletionCallbackFailed) return;
     this.callerOnCompletionCallbackFailed = next;
+  }
+
+  /**
+   * WR-412: live-revise the completion-callback target config — the
+   * queue-side setter behind `RelayServer.reviseCompletionCallback`.
+   * The patch is partial: an omitted field keeps its live value; a
+   * `null` secret (`signingSecret` / `keyId` / `idempotencySecret`)
+   * clears that field back to unsigned / unset, so a secret rotation
+   * (or an unsigned fallback) needs no restart. The whole patch is
+   * validated first by re-resolving the merged options with
+   * `resolveCompletionCallbackConfig` — an illegal value throws
+   * `RangeError` and the live config stays completely unchanged — and
+   * a new `url` re-runs both loop guards: the construction-declared
+   * `selfOrigins` (inside the resolver) and the runtime `selfCheck`
+   * the server installs from the actually bound address; either hit
+   * throws `RangeError` and the live config is untouched. The new
+   * config applies from the next terminal event; receipts already
+   * sent are never re-sent, and an in-flight receipt retry chain
+   * finishes on the config it started with (the callbacker captures
+   * the config at `send` time, so one receipt never splits across
+   * two endpoints). A patch identical to the live values — including
+   * an empty patch — is a silent no-op. Throws `Error` when
+   * completion callbacks were never configured — enabling them needs
+   * a restart. The queue itself holds no audit log — the server
+   * audits a real revision as `completion_callback_revised` (target
+   * origin and changed knob names only, never secret material).
+   */
+  reviseCompletionCallback(patch: CompletionCallbackRevision): void {
+    if (!this.completionCallbackConfigured()) {
+      throw new Error(
+        "reviseCompletionCallback: completion callback is not configured — enabling it requires a restart"
+      );
+    }
+    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new RangeError(
+        `reviseCompletionCallback: patch must be an object, got ${JSON.stringify(patch)}`
+      );
+    }
+    // The shared resolver only range-checks, so mistyped patch fields
+    // are rejected here first — before the merge — with RangeError.
+    if (patch.url !== undefined && typeof patch.url !== "string") {
+      throw new RangeError("reviseCompletionCallback: `url` must be a string when set");
+    }
+    if (
+      patch.selfOrigins !== undefined &&
+      (!Array.isArray(patch.selfOrigins) ||
+        patch.selfOrigins.some((s) => typeof s !== "string"))
+    ) {
+      throw new RangeError(
+        "reviseCompletionCallback: `selfOrigins` must be an array of strings when set"
+      );
+    }
+    for (const field of ["signingSecret", "keyId", "idempotencySecret"] as const) {
+      const value = patch[field];
+      if (value !== undefined && value !== null && typeof value !== "string") {
+        throw new RangeError(
+          `reviseCompletionCallback: \`${field}\` must be a string or null when set`
+        );
+      }
+    }
+    if (patch.keyPrefix !== undefined && typeof patch.keyPrefix !== "string") {
+      throw new RangeError("reviseCompletionCallback: `keyPrefix` must be a string when set");
+    }
+    for (const field of ["maxAttempts", "backoffMs", "timeoutMs"] as const) {
+      if (patch[field] !== undefined && typeof patch[field] !== "number") {
+        throw new RangeError(
+          `reviseCompletionCallback: \`${field}\` must be a number when set`
+        );
+      }
+    }
+    const current = this.completionCallbackOpts;
+    const merged: CompletionCallbackOptions = {
+      ...current,
+      ...(patch.url !== undefined ? { url: patch.url } : {}),
+      ...(patch.selfOrigins !== undefined ? { selfOrigins: patch.selfOrigins } : {}),
+      ...(patch.signingSecret !== undefined
+        ? { signingSecret: patch.signingSecret ?? undefined }
+        : {}),
+      ...(patch.keyId !== undefined ? { keyId: patch.keyId ?? undefined } : {}),
+      ...(patch.idempotencySecret !== undefined
+        ? { idempotencySecret: patch.idempotencySecret ?? undefined }
+        : {}),
+      ...(patch.keyPrefix !== undefined ? { keyPrefix: patch.keyPrefix } : {}),
+      ...(patch.maxAttempts !== undefined ? { maxAttempts: patch.maxAttempts } : {}),
+      ...(patch.backoffMs !== undefined ? { backoffMs: patch.backoffMs } : {}),
+      ...(patch.timeoutMs !== undefined ? { timeoutMs: patch.timeoutMs } : {}),
+    };
+    // Validate-then-apply: the merged config must pass the construction
+    // gates (including the declared-`selfOrigins` loop check) before
+    // the live config moves.
+    const next = resolveCompletionCallbackConfig(merged);
+    if (next === undefined) {
+      // Unreachable: `merged` is always defined when configured, but
+      // the resolver's `undefined`-when-off return keeps the guard
+      // explicit instead of a non-null assertion.
+      throw new Error(
+        "reviseCompletionCallback: completion callback is not configured — enabling it requires a restart"
+      );
+    }
+    // Runtime loop check on a new url, against the server-installed
+    // selfCheck from the actually bound address. A patch that leaves
+    // the url untouched skips it — the unchanged url is already
+    // re-checked before every receipt POST.
+    const prev = this.callbacker!.currentConfig();
+    if (next.url !== prev.url && this.callbacker!.isSelfTarget(next.url)) {
+      throw new RangeError(
+        "reviseCompletionCallback: `url` targets this relay's own inbound origin — the receipt would re-enter intake and loop forever"
+      );
+    }
+    const changed: string[] = [];
+    if (next.url !== prev.url) changed.push("url");
+    if (!completionCallbackOriginsEqual(merged.selfOrigins, current?.selfOrigins)) {
+      changed.push("selfOrigins");
+    }
+    if (next.signingSecret !== prev.signingSecret) changed.push("signingSecret");
+    if (next.keyId !== prev.keyId) changed.push("keyId");
+    if (next.idempotencySecret !== prev.idempotencySecret) changed.push("idempotencySecret");
+    if (next.keyPrefix !== prev.keyPrefix) changed.push("keyPrefix");
+    if (next.maxAttempts !== prev.maxAttempts) changed.push("maxAttempts");
+    if (next.backoffMs !== prev.backoffMs) changed.push("backoffMs");
+    if (next.timeoutMs !== prev.timeoutMs) changed.push("timeoutMs");
+    if (changed.length === 0) return; // Same-value revision: silent no-op.
+    this.callbacker!.reviseConfig(next);
+    this.completionCallbackOpts = { ...merged };
+    this.completionCallbackVersion += 1;
+    this.completionCallbackLastChanged = changed;
   }
 
   /**

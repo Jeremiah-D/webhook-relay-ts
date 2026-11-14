@@ -144,6 +144,27 @@ export interface ResolvedCompletionCallbackConfig {
   clearTimer: (handle: { clear(): void }) => void;
 }
 
+/**
+ * WR-412: a partial live revision of the completion-callback target
+ * config — omitted fields keep their live values. The secret fields
+ * (`signingSecret`, `keyId`, `idempotencySecret`) accept `string |
+ * null`; `null` clears the field back to unsigned / unset, so a
+ * secret rotation (or an unsigned fallback) needs no restart. `url`
+ * and `selfOrigins` re-run both loop guards on the merged config;
+ * `maxAttempts` stays capped at 3 by the shared resolver.
+ */
+export interface CompletionCallbackRevision {
+  url?: string;
+  selfOrigins?: string[];
+  signingSecret?: string | null;
+  keyId?: string | null;
+  idempotencySecret?: string | null;
+  keyPrefix?: string;
+  maxAttempts?: number;
+  backoffMs?: number;
+  timeoutMs?: number;
+}
+
 /** Info passed to the failure hook when a receipt gives up. */
 export interface CompletionCallbackFailedInfo {
   id: string;
@@ -343,9 +364,19 @@ export interface CompletionCallbackerHooks {
  * validated config; the server installs a runtime self-target check via
  * {@link setSelfCheck}. Receipt sends never touch the retry queue, so a
  * failing callback cannot recurse into the delivery machinery.
+ *
+ * WR-412: the config is revisable live via {@link reviseConfig} — the
+ * new config applies from the next terminal event. A receipt chain
+ * captures the config it started with (see `send`), so an in-flight
+ * retry chain always finishes on its original endpoint, secret, and
+ * knobs; one receipt never splits across two endpoints.
  */
 export class CompletionCallbacker {
-  private readonly config: ResolvedCompletionCallbackConfig;
+  // WR-412: deliberately *not* readonly — `reviseConfig` swaps the
+  // live config at runtime. In-flight receipt chains hold the config
+  // object they started with, so a swap can never redirect a retry
+  // mid-chain.
+  private config: ResolvedCompletionCallbackConfig;
   private readonly hooks: CompletionCallbackerHooks;
   private selfCheck?: (url: string) => boolean;
   private readonly timers = new Set<{ clear(): void }>();
@@ -354,6 +385,27 @@ export class CompletionCallbacker {
   constructor(config: ResolvedCompletionCallbackConfig, hooks: CompletionCallbackerHooks) {
     this.config = config;
     this.hooks = hooks;
+  }
+
+  /** The live config. A copy — mutating it never moves the callbacker. */
+  currentConfig(): ResolvedCompletionCallbackConfig {
+    return { ...this.config };
+  }
+
+  /**
+   * WR-412: swap the live config. The caller must have validated the
+   * new config first (the queue re-validates the merged options via
+   * `resolveCompletionCallbackConfig` and re-runs both loop guards);
+   * this method only swaps. Receipts already in flight keep the
+   * config object they captured at `send` time.
+   */
+  reviseConfig(next: ResolvedCompletionCallbackConfig): void {
+    this.config = next;
+  }
+
+  /** True when the installed runtime loop check refuses `url`. */
+  isSelfTarget(url: string): boolean {
+    return this.selfCheck?.(url) ?? false;
   }
 
   /**
@@ -415,9 +467,12 @@ export class CompletionCallbacker {
 
   private send(receipt: CompletionReceipt): void {
     if (this.stopped) return;
+    // WR-412: capture the live config for the whole chain — a revision
+    // landing mid-chain must not redirect the retries that follow.
+    const config = this.config;
     // Runtime loop check (the configuration-time check ran at startup):
     // refuse to POST a receipt back into this relay's own intake.
-    if (this.selfCheck?.(this.config.url)) {
+    if (this.selfCheck?.(config.url)) {
       this.hooks.onFailed({
         id: receipt.id,
         traceId: receipt.traceId,
@@ -429,34 +484,38 @@ export class CompletionCallbacker {
       });
       return;
     }
-    void this.attempt(receipt, 1);
+    void this.attempt(receipt, 1, config);
   }
 
-  private async attempt(receipt: CompletionReceipt, attempt: number): Promise<void> {
+  private async attempt(
+    receipt: CompletionReceipt,
+    attempt: number,
+    config: ResolvedCompletionCallbackConfig
+  ): Promise<void> {
     if (this.stopped) return;
     const body = Buffer.from(JSON.stringify(receipt), "utf8");
     const headers: Record<string, string> = {
       "content-type": "application/json",
       [TRACE_ID_HEADER]: receipt.traceId,
     };
-    if (this.config.signingSecret !== undefined) {
-      headers["x-relay-signature"] = signSha256(body, this.config.signingSecret);
+    if (config.signingSecret !== undefined) {
+      headers["x-relay-signature"] = signSha256(body, config.signingSecret);
     }
-    if (this.config.keyId !== undefined) {
-      headers["x-relay-key-id"] = this.config.keyId;
+    if (config.keyId !== undefined) {
+      headers["x-relay-key-id"] = config.keyId;
     }
-    if (this.config.idempotencySecret !== undefined) {
+    if (config.idempotencySecret !== undefined) {
       headers[IDEMPOTENCY_KEY_HEADER] = deriveIdempotencyKey(
-        this.config.idempotencySecret,
+        config.idempotencySecret,
         receipt.id,
         attempt,
-        this.config.keyPrefix
+        config.keyPrefix
       );
     }
     let statusCode: number | undefined;
     let failure: string | undefined;
     try {
-      const result = await this.raceTimeout(this.config.post(this.config.url, body, headers));
+      const result = await this.raceTimeout(config.post(config.url, body, headers), config);
       statusCode = result.statusCode;
       if (statusCode < 200 || statusCode >= 300) {
         failure = `unexpected status ${statusCode}`;
@@ -465,11 +524,11 @@ export class CompletionCallbacker {
       failure = err instanceof Error ? err.message : String(err);
     }
     if (failure === undefined) return; // Receipt landed.
-    if (attempt < this.config.maxAttempts && !this.stopped) {
-      const waitMs = this.config.backoffMs * attempt;
-      const timer = this.config.setTimer(() => {
+    if (attempt < config.maxAttempts && !this.stopped) {
+      const waitMs = config.backoffMs * attempt;
+      const timer = config.setTimer(() => {
         this.timers.delete(timer);
-        void this.attempt(receipt, attempt + 1);
+        void this.attempt(receipt, attempt + 1, config);
       }, waitMs);
       this.timers.add(timer);
       return;
@@ -486,10 +545,13 @@ export class CompletionCallbacker {
   }
 
   /** The transport gets its own timeout even when a custom `post` hangs. */
-  private raceTimeout(p: Promise<CallbackPostResult>): Promise<CallbackPostResult> {
-    const timeoutMs = this.config.timeoutMs;
+  private raceTimeout(
+    p: Promise<CallbackPostResult>,
+    config: ResolvedCompletionCallbackConfig
+  ): Promise<CallbackPostResult> {
+    const timeoutMs = config.timeoutMs;
     return new Promise((resolve, reject) => {
-      const timer = this.config.setTimer(
+      const timer = config.setTimer(
         () => reject(new Error(`completion callback timed out after ${timeoutMs}ms`)),
         timeoutMs
       );

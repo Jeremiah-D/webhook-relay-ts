@@ -76,7 +76,11 @@ import {
   assertValidStatusRetryPolicy,
 } from "./status-retry.ts";
 import { parseCronExpression, CRON_HEADER } from "./cron.ts";
-import type { CompletionCallbackFailedInfo, CompletionCallbackOptions } from "./callback.ts";
+import type {
+  CompletionCallbackFailedInfo,
+  CompletionCallbackOptions,
+  CompletionCallbackRevision,
+} from "./callback.ts";
 import { createBoundAddressSelfCheck } from "./callback.ts";
 import type {
   DeadLetterEscalatedInfo,
@@ -2047,6 +2051,10 @@ export interface RelayServerOptions {
    * the active counterpart to the passive `GET /deliveries/:traceId`
    * query. Exhausted receipts are audited as `callback_failed` and never
    * enter the retry queue or the dead-letter list. Off by default.
+   * Live-revisable via `server.reviseCompletionCallback` (WR-412) — the
+   * receipt target, secrets, and knobs move at runtime; the failure
+   * observer stays with `reviseCompletionCallbackFailedCallback`
+   * (WR-398).
    */
   completionCallback?: CompletionCallbackOptions;
   /**
@@ -7010,6 +7018,31 @@ export interface RelayServer extends Server {
   reviseCompletionCallbackFailedCallback?: (
     cb: ((info: CompletionCallbackFailedInfo) => void) | null
   ) => void;
+  /**
+   * WR-412: live-revise the completion-callback target config — the
+   * receipt endpoint, secrets, and knobs — at runtime, no restart.
+   * The patch is partial: an omitted field keeps its live value; a
+   * `null` secret (`signingSecret` / `keyId` / `idempotencySecret`)
+   * clears that field back to unsigned / unset. The whole patch is
+   * validated first (an illegal value throws `RangeError` and the live
+   * config is untouched), and a new `url` re-runs both loop guards
+   * (declared `selfOrigins` and the runtime check from the actually
+   * bound address). The new config applies from the next terminal
+   * event; receipts already sent are never re-sent, and an in-flight
+   * receipt retry chain finishes on the config it started with. A
+   * patch identical to the live values is a silent no-op. A real
+   * revision is audited as `completion_callback_revised` with
+   * `previous` / `current` recording only the target origin and
+   * `changed` listing the changed knob names, never secret material.
+   * Always set; throws `Error` when completion callbacks were never
+   * configured — enabling them needs a restart. This only swaps the
+   * receipt target / secret / knobs; the failure observer stays with
+   * `reviseCompletionCallbackFailedCallback` (WR-398). Direct queue
+   * users use `RetryQueue.reviseCompletionCallback` instead —
+   * calling the queue method on a server-owned queue would skip the
+   * `completion_callback_revised` audit.
+   */
+  reviseCompletionCallback?: (patch: CompletionCallbackRevision) => void;
   /**
    * WR-396: live-redirect the quorum fan-out observers at runtime —
    * no restart. Replaces the operator callbacks the server forwards
@@ -19065,6 +19098,36 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       event: "completion_callback_failed_callback_revised",
       previous: prev,
       current: nextPresence,
+    });
+  };
+
+  // WR-412: live completion-callback target-config revision. The
+  // queue owns the config and validates the whole patch first (an
+  // illegal value throws `RangeError` and the live config is left
+  // completely intact); the server only snapshots before/after. A
+  // same-value revision is a silent no-op — the queue's revision
+  // counter does not move, so nothing is audited. A real revision is
+  // audited as `completion_callback_revised` with `previous` /
+  // `current` recording only the target origin and `changed` listing
+  // the changed knob names, never secret material (the queue's
+  // snapshot carries only presence flags for the secrets, so even a
+  // pure secret rotation is visible as a version bump, not as a
+  // value). The failure observer (`callback_failed` audit + operator
+  // cell) is untouched by this method — it stays with WR-398.
+  server.reviseCompletionCallback = (patch: CompletionCallbackRevision): void => {
+    const prev = queue.getCompletionCallbackConfig();
+    if (prev === undefined) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseCompletionCallback(patch);
+    }
+    queue.reviseCompletionCallback(patch);
+    const next = queue.getCompletionCallbackConfig()!;
+    if (next.version === prev.version) return; // Same-value: silent no-op.
+    opts.auditLog.append({
+      event: "completion_callback_revised",
+      previous: new URL(prev.url).origin,
+      current: new URL(next.url).origin,
+      changed: next.lastChanged,
     });
   };
 
