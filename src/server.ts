@@ -432,6 +432,7 @@ import {
   OutboundSsrfGuard,
   type OutboundSsrfAllowlistedInfo,
   type OutboundSsrfBlockedInfo,
+  type OutboundSsrfCallbacksRevision,
   type OutboundSsrfGuardOptions,
   type OutboundSsrfProxySkippedInfo,
   type SsrfAllowlistRevision,
@@ -6562,6 +6563,29 @@ export interface RelayServer extends Server {
    */
   reviseOutboundSsrfAllowlist?: (patch: SsrfAllowlistRevision) => Record<string, boolean>;
   /**
+   * WR-417: live-redirect the three outbound-SSRF observation
+   * callbacks — the operator hooks that fire on a blocked lookup, an
+   * allowlisted serve, and a proxied skip. The patch is partial: an
+   * omitted field keeps its live value; `null` clears that hook back
+   * to audit-only (the guard decision is unchanged — only the
+   * observation stops, and the `outbound_ssrf_blocked` /
+   * `outbound_ssrf_allowlisted` / `outbound_ssrf_proxy_skipped`
+   * audit event is still appended). An empty or non-object patch
+   * throws `RangeError`, as does a non-function value for a provided
+   * field, and the live callbacks are untouched; a patch identical to
+   * the live values is a silent no-op. A real revision is audited as
+   * `outbound_ssrf_callbacks_revised` with `previous` / `current`
+   * recording only 'set' / 'cleared' presence per field, never a
+   * function body. Always set; throws `Error` when the SSRF guard was
+   * never configured — enabling it needs a restart. The new callbacks
+   * take effect from the next guard decision; already-emitted
+   * decision events are never re-emitted. This only swaps the
+   * observation recipients — the allowlist content still goes through
+   * `reviseOutboundSsrfAllowlist`, and the decision classification,
+   * the stats, and the guard construction are untouched.
+   */
+  reviseOutboundSsrfCallbacks?: (patch: OutboundSsrfCallbacksRevision) => void;
+  /**
    * WR-375: live outbound SSRF guard allowlist — the endpoints
    * currently opted into intentional private targets. Always set;
    * `{}` when the guard was never configured. Returns a fresh
@@ -9339,6 +9363,37 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       at: info.at,
     });
   };
+  // WR-417: the operator's outbound-SSRF observation callbacks, held
+  // in mutable cells so `server.reviseOutboundSsrfCallbacks` can
+  // replace them at runtime. The composite closures below read these
+  // cells — never the operator callbacks directly — so replacing an
+  // operator callback cannot bypass the `outbound_ssrf_blocked` /
+  // `outbound_ssrf_allowlisted` / `outbound_ssrf_proxy_skipped`
+  // audit: the audit is appended first, then the cell is called.
+  // The guard's `readonly` callback fields and construction semantics
+  // are untouched — the composite reference is passed once at
+  // construction and the cell lives in this closure.
+  let operatorOutboundSsrfBlockedCallback:
+    | ((info: OutboundSsrfBlockedInfo) => void)
+    | undefined;
+  let operatorOutboundSsrfAllowlistedCallback:
+    | ((info: OutboundSsrfAllowlistedInfo) => void)
+    | undefined;
+  let operatorOutboundSsrfProxySkippedCallback:
+    | ((info: OutboundSsrfProxySkippedInfo) => void)
+    | undefined;
+  const onOutboundSsrfBlocked = (info: OutboundSsrfBlockedInfo) => {
+    onOutboundSsrfBlockedAudit(info);
+    operatorOutboundSsrfBlockedCallback?.(info);
+  };
+  const onOutboundSsrfAllowlisted = (info: OutboundSsrfAllowlistedInfo) => {
+    onOutboundSsrfAllowlistedAudit(info);
+    operatorOutboundSsrfAllowlistedCallback?.(info);
+  };
+  const onOutboundSsrfProxySkipped = (info: OutboundSsrfProxySkippedInfo) => {
+    onOutboundSsrfProxySkippedAudit(info);
+    operatorOutboundSsrfProxySkippedCallback?.(info);
+  };
   // WR-374: an egress residency refusal — one audit line per blocked
   // delivery naming the tenant, the endpoint, and the offending country
   // (audit-only: the resolved addresses ride along but never appear in
@@ -9532,7 +9587,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     opts.responseGuard ?? {};
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, opts.awsSigV4, opts.awsSecretResolver, opts.outboundSchemas, opts.oauth2, undefined, opts.compressBrotli, opts.phaseTimeouts, opts.tlsCa, opts.chaos, onChaosInjectedAudit, liveResponseGuard, opts.doh, onDohFallbackAudit, proxyHealthMonitor, opts.outboundCredentials, opts.dnsPin, onDnsPinMismatchAudit, opts.cloudEvents, opts.outboundSsrfGuard, onOutboundSsrfBlockedAudit, onOutboundSsrfAllowlistedAudit, onOutboundSsrfProxySkippedAudit, opts.egressResidency, onEgressResidencyBlockedAudit)
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, opts.awsSigV4, opts.awsSecretResolver, opts.outboundSchemas, opts.oauth2, undefined, opts.compressBrotli, opts.phaseTimeouts, opts.tlsCa, opts.chaos, onChaosInjectedAudit, liveResponseGuard, opts.doh, onDohFallbackAudit, proxyHealthMonitor, opts.outboundCredentials, opts.dnsPin, onDnsPinMismatchAudit, opts.cloudEvents, opts.outboundSsrfGuard, onOutboundSsrfBlocked, onOutboundSsrfAllowlisted, onOutboundSsrfProxySkipped, opts.egressResidency, onEgressResidencyBlockedAudit)
       : undefined;
   // WR-146: tail-latency hedging for outbound attempts (opt-in). The
   // wrapper sits around whichever sender the queue uses — the default
@@ -18248,6 +18303,111 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // the guard was never configured.
   server.getOutboundSsrfAllowlist = (): Record<string, boolean> =>
     defaultSender?.outboundSsrfGuard?.allowPrivateTargets() ?? {};
+
+  // WR-417: live outbound-SSRF observation-callback revision. The
+  // method is always set (like reviseOutboundSsrfAllowlist above);
+  // with the guard unconfigured the revision throws Error — enabling
+  // it needs a restart. Only the server-side operator-callback cells
+  // move — the composite closures passed into the guard at
+  // construction (which append the `outbound_ssrf_*` audit first,
+  // then forward to the cell) are never touched, so a replacement
+  // cannot bypass the audit. The patch is partial: an omitted field
+  // keeps its live value; `null` clears that hook back to audit-only.
+  // An empty or non-object patch throws `RangeError`, as does a
+  // non-function value for a provided field, and the live cells are
+  // untouched; a patch identical to the live values is a silent
+  // no-op. A real revision is audited as
+  // `outbound_ssrf_callbacks_revised` with `previous` / `current`
+  // recording only 'set' / 'cleared' presence per field, never a
+  // function body. The new callbacks take effect from the next guard
+  // decision; already-emitted decision events are never re-emitted,
+  // and the allowlist content, the decision classification, the
+  // stats, and the guard construction are untouched.
+  server.reviseOutboundSsrfCallbacks = (patch: OutboundSsrfCallbacksRevision): void => {
+    const guard = defaultSender?.outboundSsrfGuard;
+    if (guard === undefined) {
+      throw new Error(
+        "reviseOutboundSsrfCallbacks: outbound SSRF guard is not configured — enabling it requires a restart: " +
+          "the guard is created at startup and a running relay cannot start guarding resolutions without one"
+      );
+    }
+    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new RangeError(
+        "reviseOutboundSsrfCallbacks: patch must be an object with at least one of onOutboundSsrfBlocked / onOutboundSsrfAllowlisted / onOutboundSsrfProxySkipped"
+      );
+    }
+    const hasBlocked = patch.onOutboundSsrfBlocked !== undefined;
+    const hasAllowlisted = patch.onOutboundSsrfAllowlisted !== undefined;
+    const hasProxySkipped = patch.onOutboundSsrfProxySkipped !== undefined;
+    if (!hasBlocked && !hasAllowlisted && !hasProxySkipped) {
+      throw new RangeError(
+        "reviseOutboundSsrfCallbacks: patch must set at least one of onOutboundSsrfBlocked / onOutboundSsrfAllowlisted / onOutboundSsrfProxySkipped"
+      );
+    }
+    if (
+      hasBlocked &&
+      patch.onOutboundSsrfBlocked !== null &&
+      typeof patch.onOutboundSsrfBlocked !== "function"
+    ) {
+      throw new RangeError(
+        "reviseOutboundSsrfCallbacks: onOutboundSsrfBlocked must be a function or null"
+      );
+    }
+    if (
+      hasAllowlisted &&
+      patch.onOutboundSsrfAllowlisted !== null &&
+      typeof patch.onOutboundSsrfAllowlisted !== "function"
+    ) {
+      throw new RangeError(
+        "reviseOutboundSsrfCallbacks: onOutboundSsrfAllowlisted must be a function or null"
+      );
+    }
+    if (
+      hasProxySkipped &&
+      patch.onOutboundSsrfProxySkipped !== null &&
+      typeof patch.onOutboundSsrfProxySkipped !== "function"
+    ) {
+      throw new RangeError(
+        "reviseOutboundSsrfCallbacks: onOutboundSsrfProxySkipped must be a function or null"
+      );
+    }
+    const nextBlocked = hasBlocked
+      ? patch.onOutboundSsrfBlocked ?? undefined
+      : operatorOutboundSsrfBlockedCallback;
+    const nextAllowlisted = hasAllowlisted
+      ? patch.onOutboundSsrfAllowlisted ?? undefined
+      : operatorOutboundSsrfAllowlistedCallback;
+    const nextProxySkipped = hasProxySkipped
+      ? patch.onOutboundSsrfProxySkipped ?? undefined
+      : operatorOutboundSsrfProxySkippedCallback;
+    if (
+      nextBlocked === operatorOutboundSsrfBlockedCallback &&
+      nextAllowlisted === operatorOutboundSsrfAllowlistedCallback &&
+      nextProxySkipped === operatorOutboundSsrfProxySkippedCallback
+    ) {
+      return;
+    }
+    const presence = (cb: unknown): "set" | "cleared" =>
+      cb === undefined ? "cleared" : "set";
+    const previous = {
+      onOutboundSsrfBlocked: presence(operatorOutboundSsrfBlockedCallback),
+      onOutboundSsrfAllowlisted: presence(operatorOutboundSsrfAllowlistedCallback),
+      onOutboundSsrfProxySkipped: presence(operatorOutboundSsrfProxySkippedCallback),
+    };
+    const current = {
+      onOutboundSsrfBlocked: presence(nextBlocked),
+      onOutboundSsrfAllowlisted: presence(nextAllowlisted),
+      onOutboundSsrfProxySkipped: presence(nextProxySkipped),
+    };
+    operatorOutboundSsrfBlockedCallback = nextBlocked;
+    operatorOutboundSsrfAllowlistedCallback = nextAllowlisted;
+    operatorOutboundSsrfProxySkippedCallback = nextProxySkipped;
+    opts.auditLog.append({
+      event: "outbound_ssrf_callbacks_revised",
+      previous,
+      current,
+    });
+  };
 
   // WR-376: audited egress data-residency revision. The method is
   // always set (like reviseOutboundSsrfAllowlist above); with the gate

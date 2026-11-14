@@ -11992,6 +11992,22 @@ const server = createRelayServer({
   The HTTP/2 session pool and the WebSocket pool manage their own
   connections and keep the OS resolver — like the WR-194 pin, the
   guard covers the HTTP/1.1 path only.
+- **Live observation-callback revision** —
+  `server.reviseOutboundSsrfCallbacks(patch)` swaps the observation
+  recipients of the three decision events at runtime (`onOutboundSsrfBlocked` /
+  `onOutboundSsrfAllowlisted` / `onOutboundSsrfProxySkipped`, partial —
+  an omitted field keeps its live value, `null` clears that hook back
+  to audit-only). It only swaps who observes the decisions: the audit
+  event is still appended first, the guard decision itself is
+  unchanged, and allowlist content still goes through
+  `reviseOutboundSsrfAllowlist`. An empty or non-object patch, or a
+  non-function / non-`null` value, throws `RangeError` and leaves the
+  live callbacks untouched; a same-reference patch (or clearing an
+  already-cleared hook) is a silent no-op. A real revision is audited
+  as `outbound_ssrf_callbacks_revised` with `previous` / `current`
+  recording only 'set' / 'cleared' presence per field, never a
+  function body. With the guard unconfigured the method throws
+  `Error`: enabling the guard needs a restart.
 
 ## Egress data-residency gate (opt-in)
 

@@ -105,6 +105,21 @@ export type SsrfGuardMode = "guarded" | "allowlisted" | "proxied";
 export type SsrfAllowlistRevision = Record<string, boolean | null>;
 
 /**
+ * WR-417: partial patch for
+ * {@link RelayServer.reviseOutboundSsrfCallbacks} — live revision of
+ * the three outbound-SSRF observation callbacks. Each field is a
+ * callback or `null` (clears that hook back to audit-only); an
+ * omitted field keeps its live value. The patch never carries a
+ * function body into the audit — a revision is audited with
+ * 'set' / 'cleared' presence only.
+ */
+export type OutboundSsrfCallbacksRevision = {
+  onOutboundSsrfBlocked?: ((info: OutboundSsrfBlockedInfo) => void) | null;
+  onOutboundSsrfAllowlisted?: ((info: OutboundSsrfAllowlistedInfo) => void) | null;
+  onOutboundSsrfProxySkipped?: ((info: OutboundSsrfProxySkippedInfo) => void) | null;
+};
+
+/**
  * The per-endpoint binding the sender hands to the pool / one-off
  * request path: the `dns.lookup`-compatible resolver the agent dials
  * through, plus the mode the pool key binds (see `src/keepalive.ts`).
