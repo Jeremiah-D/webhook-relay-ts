@@ -485,7 +485,13 @@ import {
   assertValidDeadlineBudgetOptions,
   resolveDeadlineBudget,
 } from "./deadline-budget.ts";
-import { OtlpExporter, type OtlpExporterOptions, type OtlpStats } from "./otlp.ts";
+import {
+  OtlpExporter,
+  type OtlpExportConfig,
+  type OtlpExporterOptions,
+  type OtlpRevision,
+  type OtlpStats,
+} from "./otlp.ts";
 import {
   resolveOutboundTraceContext,
   resolveTraceContextOptions,
@@ -760,7 +766,7 @@ export type {
 };
 export { OtelTracer };
 export type { OtelTracingOptions, OtelTracingStats, OtelTerminalOutcome };
-export type { OtlpExporterOptions, OtlpStats } from "./otlp.ts";
+export type { OtlpExportConfig, OtlpExporterOptions, OtlpRevision, OtlpStats } from "./otlp.ts";
 export { OutboundCoalescer, coalesceKey } from "./coalesce.ts";
 export type { CoalesceStats, CoalescingOptions } from "./coalesce.ts";
 
@@ -7441,6 +7447,49 @@ export class RetryQueue {
     return (
       this.otlpExporter?.stats() ?? { enabled: false, buffered: 0, dropped: 0, exported: 0 }
     );
+  }
+
+  /**
+   * WR-414: the live OTLP export parameters, or `undefined` when the
+   * feature is off. A snapshot — mutating the returned object never
+   * moves the exporter — so the server can audit a revision with the
+   * previous and current values and nothing else (the endpoint is
+   * never exposed here).
+   */
+  getOtlpConfig(): OtlpExportConfig | undefined {
+    return this.otlpExporter?.current();
+  }
+
+  /**
+   * WR-414: live-revise the OTLP export parameters — the queue-side
+   * setter behind `RelayServer.reviseOtlp`. The patch is partial: an
+   * omitted field keeps its live value. The exporter validates the
+   * merged values with the construction rules first — an illegal
+   * value throws `RangeError` and the live parameters stay completely
+   * unchanged. A patch identical to the live values — including an
+   * empty patch — is a silent no-op. Returns the resolved live
+   * parameters after the revision. The new `sampleRate` applies from
+   * the next `record()` admission, the new `maxBuffered` from the
+   * next overflow check (tightening below the current buffer size
+   * drops the oldest records down to the new cap on the next enqueue,
+   * never retroactively), and the new `serviceName` from the next
+   * payload build; the in-flight buffer is kept (nothing is cleared,
+   * re-sent, or dropped by the revision itself), the flush timer is
+   * untouched, and `getOtlpStats()` counting is unchanged. Throws
+   * `Error` when OTLP export was never configured — enabling it
+   * needs a restart. The queue itself holds no audit log — the
+   * server audits a real revision as `otlp_export_revised`
+   * (`previous` / `current`, the three values only, never the
+   * endpoint). Direct queue users call this method; server users
+   * must go through `RelayServer.reviseOtlp`, which adds the audit.
+   */
+  reviseOtlp(patch: OtlpRevision): OtlpRevision {
+    if (this.otlpExporter === undefined) {
+      throw new Error(
+        "reviseOtlp: otlp export is not configured — enabling it requires a restart"
+      );
+    }
+    return this.otlpExporter.revise(patch);
   }
 
   /**

@@ -118,6 +118,58 @@ export interface OtlpExporterOptions {
   now?: () => number;
 }
 
+/**
+ * WR-414: partial live revision of the OTLP export parameters.
+ * An omitted field keeps its live value. The collector endpoint is
+ * not revisable — it is fixed at construction.
+ */
+export interface OtlpRevision {
+  sampleRate?: number;
+  maxBuffered?: number;
+  serviceName?: string;
+}
+
+/** Live OTLP export parameter snapshot (`OtlpExporter.current()`). */
+export interface OtlpExportConfig {
+  sampleRate: number;
+  maxBuffered: number;
+  serviceName: string;
+}
+
+/**
+ * Shared construction / live-revision gate for the three revisable
+ * export parameters. `where` is `"otlp"` at construction and
+ * `"reviseOtlp"` for a live revision, so the message names the call
+ * that rejected the value. Throws `RangeError`; never mutates.
+ */
+function validateOtlpExportValues(
+  sampleRate: unknown,
+  maxBuffered: unknown,
+  serviceName: unknown,
+  where: "otlp" | "reviseOtlp"
+): void {
+  if (
+    typeof sampleRate !== "number" ||
+    !Number.isFinite(sampleRate) ||
+    sampleRate < 0 ||
+    sampleRate > 1
+  ) {
+    throw new RangeError(
+      `${where}.sampleRate must be a finite number in [0, 1], got ${sampleRate}`
+    );
+  }
+  if (typeof maxBuffered !== "number" || !Number.isInteger(maxBuffered) || maxBuffered < 1) {
+    throw new RangeError(`${where}.maxBuffered must be an integer >= 1, got ${maxBuffered}`);
+  }
+  if (typeof serviceName !== "string" || serviceName.length === 0) {
+    throw new RangeError(
+      where === "otlp"
+        ? `otlp.serviceName must be a non-empty string when set`
+        : `reviseOtlp.serviceName must be a non-empty string, got ${JSON.stringify(serviceName)}`
+    );
+  }
+}
+
 /** Snapshot returned by `OtlpExporter.stats()` / `RetryQueue.getOtlpStats()`. */
 export interface OtlpStats {
   /** Always true for a constructed exporter; false when unset. */
@@ -270,9 +322,16 @@ const EXPORT_COUNTER_ORDER: Array<[OtlpEventType, OtlpExportStatus]> = [
 export class OtlpExporter {
   private readonly endpoint: URL;
   private readonly endpointString: string;
-  private readonly sampleRate: number;
-  private readonly maxBuffered: number;
-  private readonly serviceName: string;
+  /**
+   * WR-414: the three export parameters are live — `revise()` swaps
+   * them in place and every use point reads the field, so a revision
+   * takes effect from the next `record()` / overflow check / payload
+   * build. The endpoint stays `readonly`: the collector destination
+   * is fixed at construction.
+   */
+  private sampleRate: number;
+  private maxBuffered: number;
+  private serviceName: string;
   private readonly random: () => number;
   private readonly now: () => number;
 
@@ -303,28 +362,72 @@ export class OtlpExporter {
       );
     }
     const sampleRate = opts.sampleRate ?? 1.0;
-    if (
-      typeof sampleRate !== "number" ||
-      !Number.isFinite(sampleRate) ||
-      sampleRate < 0 ||
-      sampleRate > 1
-    ) {
-      throw new RangeError(`otlp.sampleRate must be a finite number in [0, 1], got ${sampleRate}`);
-    }
     const maxBuffered = opts.maxBuffered ?? 1000;
-    if (typeof maxBuffered !== "number" || !Number.isInteger(maxBuffered) || maxBuffered < 1) {
-      throw new RangeError(`otlp.maxBuffered must be an integer >= 1, got ${maxBuffered}`);
-    }
-    if (opts.serviceName !== undefined && (typeof opts.serviceName !== "string" || opts.serviceName.length === 0)) {
-      throw new RangeError(`otlp.serviceName must be a non-empty string when set`);
-    }
+    const serviceName = opts.serviceName ?? "webhook-relay-ts";
+    validateOtlpExportValues(sampleRate, maxBuffered, serviceName, "otlp");
     this.endpoint = parsed;
     this.endpointString = opts.endpoint;
     this.sampleRate = sampleRate;
     this.maxBuffered = maxBuffered;
-    this.serviceName = opts.serviceName ?? "webhook-relay-ts";
+    this.serviceName = serviceName;
     this.random = opts.random ?? Math.random;
     this.now = opts.now ?? Date.now;
+  }
+
+  /**
+   * WR-414: live snapshot of the three revisable export parameters.
+   * A fresh object every call — mutating it never moves the exporter.
+   */
+  current(): OtlpExportConfig {
+    return {
+      sampleRate: this.sampleRate,
+      maxBuffered: this.maxBuffered,
+      serviceName: this.serviceName,
+    };
+  }
+
+  /**
+   * WR-414: live-revise the export parameters — `sampleRate` /
+   * `maxBuffered` / `serviceName` — without a restart and without
+   * touching the in-flight buffer. The patch is partial: an omitted
+   * field keeps its live value. The merged values are validated with
+   * the construction rules before anything moves, so an illegal value
+   * throws `RangeError` and the live parameters are left completely
+   * intact. A patch identical to the live values — including an empty
+   * patch — is a silent no-op that returns the current snapshot. The
+   * endpoint is not revisable here (fixed at construction). Returns
+   * the resolved live parameters after the revision. The new values
+   * take effect from the next `record()` admission (sampleRate), the
+   * next overflow check (maxBuffered — tightening below the current
+   * buffer size drops the oldest records down to the new cap on the
+   * next enqueue, it never retroactively clears the buffer), and the
+   * next payload build (serviceName); the flush timer is untouched.
+   */
+  revise(patch: OtlpRevision): OtlpExportConfig {
+    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new RangeError(
+        `reviseOtlp: patch must be an object, got ${JSON.stringify(patch)}`
+      );
+    }
+    const next: OtlpExportConfig = {
+      sampleRate: patch.sampleRate ?? this.sampleRate,
+      maxBuffered: patch.maxBuffered ?? this.maxBuffered,
+      serviceName: patch.serviceName ?? this.serviceName,
+    };
+    // Validate-then-apply: the merged values must pass the
+    // construction gates before the live parameters move.
+    validateOtlpExportValues(next.sampleRate, next.maxBuffered, next.serviceName, "reviseOtlp");
+    if (
+      next.sampleRate === this.sampleRate &&
+      next.maxBuffered === this.maxBuffered &&
+      next.serviceName === this.serviceName
+    ) {
+      return this.current(); // Same-value revision: silent no-op.
+    }
+    this.sampleRate = next.sampleRate;
+    this.maxBuffered = next.maxBuffered;
+    this.serviceName = next.serviceName;
+    return this.current();
   }
 
   /**

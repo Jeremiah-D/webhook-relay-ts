@@ -545,7 +545,7 @@ import {
   type ProxyHealthRevision,
   type ProxyHealthStats,
 } from "./proxy-health.ts";
-import type { OtlpExporterOptions } from "./otlp.ts";
+import type { OtlpExporterOptions, OtlpRevision } from "./otlp.ts";
 import {
   assertValidBrotliCompressConfig,
   maybeCompressBrotliOutbound,
@@ -7068,6 +7068,29 @@ export interface RelayServer extends Server {
    * `completion_callback_revised` audit.
    */
   reviseCompletionCallback?: (patch: CompletionCallbackRevision) => void;
+  /**
+   * WR-414: live-revise the OTLP event-export parameters at runtime —
+   * no restart. `sampleRate` / `maxBuffered` / `serviceName` move;
+   * the collector endpoint is fixed at construction and cannot be
+   * re-pointed here. The patch is partial: an omitted field keeps its
+   * live value. An illegal value throws `RangeError` and the live
+   * values are left completely intact; a patch identical to the live
+   * values — including an empty patch — is a silent no-op with no
+   * audit event. A real revision is audited as `otlp_export_revised`
+   * with `previous` / `current` recording only the three values,
+   * never the endpoint. The in-flight buffer is kept across the
+   * revision (nothing cleared, re-sent, or dropped by the revision
+   * itself); the new `sampleRate` applies from the next `record()`
+   * admission, the new `maxBuffered` from the next overflow check,
+   * and the new `serviceName` from the next payload build; the flush
+   * timer and `getOtlpStats()` counting are untouched. Always set;
+   * throws `Error` when OTLP export was never configured — enabling
+   * it needs a restart. Returns the resolved live parameters after
+   * the revision. Direct queue users use
+   * `RetryQueue.reviseOtlp` instead — calling the queue method on a
+   * server-owned queue would skip the `otlp_export_revised` audit.
+   */
+  reviseOtlp?: (patch: OtlpRevision) => OtlpRevision;
   /**
    * WR-396: live-redirect the quorum fan-out observers at runtime —
    * no restart. Replaces the operator callbacks the server forwards
@@ -19183,6 +19206,43 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       current: new URL(next.url).origin,
       changed: next.lastChanged,
     });
+  };
+
+  // WR-414: live OTLP export-parameter revision. The queue owns the
+  // parameters and validates the whole patch first (an illegal value
+  // throws `RangeError` and the live parameters are left completely
+  // intact); the server only snapshots before/after. A same-value
+  // revision is a silent no-op — nothing is audited. A real revision
+  // is audited as `otlp_export_revised` with `previous` / `current`
+  // recording only the three values (`sampleRate` / `maxBuffered` /
+  // `serviceName`), never the endpoint. The in-flight buffer, the
+  // flush timer, and the export counters are untouched by this
+  // method — only the three knobs move.
+  server.reviseOtlp = (patch: OtlpRevision): OtlpRevision => {
+    const prev = queue.getOtlpConfig();
+    if (prev === undefined) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseOtlp(patch);
+    }
+    const next = queue.reviseOtlp(patch);
+    const current = {
+      sampleRate: next.sampleRate ?? prev.sampleRate,
+      maxBuffered: next.maxBuffered ?? prev.maxBuffered,
+      serviceName: next.serviceName ?? prev.serviceName,
+    };
+    if (
+      current.sampleRate === prev.sampleRate &&
+      current.maxBuffered === prev.maxBuffered &&
+      current.serviceName === prev.serviceName
+    ) {
+      return next; // Same-value: silent no-op.
+    }
+    opts.auditLog.append({
+      event: "otlp_export_revised",
+      previous: prev,
+      current,
+    });
+    return next;
   };
 
   // WR-396: live quorum fan-out observer replacement. Only the

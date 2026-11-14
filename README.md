@@ -6252,6 +6252,21 @@ const server = createRelayServer({
   exponential backoff.
 - **Fail-fast** — a bad endpoint URL, a `sampleRate` outside [0, 1], or a
   `maxBuffered` below 1 throws `RangeError` at construction.
+- **Live revision (WR-414)** — `server.reviseOtlp({ sampleRate,
+  maxBuffered, serviceName })` (or `queue.reviseOtlp(...)`) revises the
+  three parameters without a restart; the endpoint is fixed at
+  construction and cannot be re-pointed here. The patch is partial
+  (omitted fields keep their live values); an illegal value throws
+  `RangeError` and leaves the live values untouched, and an empty or
+  same-value patch is a silent no-op. Records already buffered stay
+  buffered (nothing is cleared, re-sent, or dropped by the revision
+  itself); the new `sampleRate` applies from the next `record()`
+  admission, the new `maxBuffered` from the next overflow check
+  (tightening below the current buffer size drops the oldest records
+  down to the new cap on the next enqueue), and the new `serviceName`
+  from the next payload build. Server revisions are audited as
+  `otlp_export_revised` with `previous` / `current` (the three values
+  only, never the endpoint).
 - **Observability** — `queue.getOtlpStats()` returns
   `{ enabled, buffered, dropped, exported, lastError? }`; `GET /metrics`
   adds `relay_otlp_exports_total{event_type,status}` and
