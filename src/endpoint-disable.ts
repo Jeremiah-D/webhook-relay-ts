@@ -55,6 +55,23 @@ export interface EndpointAutoDisableOptions {
   nowMs?: () => number;
 }
 
+/**
+ * WR-415: patch for `EndpointAutoDisable.revise` /
+ * `RetryQueue.reviseEndpointAutoDisable` /
+ * `RelayServer.reviseEndpointAutoDisable`. Each field is optional — an
+ * omitted field keeps its live value. Merged values are validated with
+ * the construction rules before anything moves, so an illegal value
+ * throws `RangeError` and the live configuration is left completely
+ * intact. An empty patch — or one identical to the live values — is a
+ * silent no-op.
+ */
+export interface EndpointAutoDisableRevision {
+  /** New consecutive-failure threshold (integer >= 1). */
+  failureThreshold?: number;
+  /** New rolling failure window (finite number > 0, or `Infinity`). */
+  windowMs?: number;
+}
+
 /** Observable snapshot of one endpoint's auto-disable state. */
 export interface EndpointDisableStatsRow {
   /** The endpoint (physical `targetUrl` that earned the verdicts). */
@@ -134,8 +151,12 @@ interface FailureStreak {
  * on a retryable failure. Query `isDisabled` on the dispatch path.
  */
 export class EndpointAutoDisable {
-  private readonly failureThreshold: number;
-  private readonly windowMs: number;
+  // WR-415: deliberately *not* readonly — `revise()` swaps the live
+  // threshold / window at runtime. `recordFailure` / `prune` already
+  // read these fields on every call, so a revision takes effect from
+  // the next recorded failure with no other change.
+  private failureThreshold: number;
+  private windowMs: number;
   private readonly nowMs: () => number;
   private readonly streaks = new Map<string, FailureStreak>();
   private readonly disabledAt = new Map<string, number>();
@@ -160,6 +181,53 @@ export class EndpointAutoDisable {
   /** Effective failure threshold (constructor default or override). */
   get threshold(): number {
     return this.failureThreshold;
+  }
+
+  /**
+   * WR-415: live snapshot of the two revisable knobs. A fresh object
+   * every call — mutating it never moves the tracker.
+   */
+  config(): EndpointAutoDisableRevision {
+    return { failureThreshold: this.failureThreshold, windowMs: this.windowMs };
+  }
+
+  /**
+   * WR-415: live-revise the failure threshold and/or the failure
+   * window — no restart, no streak reset. The patch is partial: an
+   * omitted field keeps its live value. The merged values are
+   * validated with the construction rules (`assertValidThreshold` /
+   * `assertValidWindowMs`) before anything moves, so an illegal value
+   * throws `RangeError` and the live configuration is left completely
+   * intact. A patch identical to the live values — including an empty
+   * patch — is a silent no-op that returns the current snapshot. The
+   * recorded streaks are untouched: a threshold lowered below a live
+   * streak count does not retroactively disable that endpoint (it
+   * disables on its next recorded failure), a raised threshold never
+   * re-enables an already-disabled endpoint (re-enable still only
+   * goes through `enable()`), and a tightened window only prunes on
+   * the next `recordFailure` / `getStats` read. Returns the resolved
+   * live configuration after the revision.
+   */
+  revise(patch: EndpointAutoDisableRevision): EndpointAutoDisableRevision {
+    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new RangeError(
+        `reviseEndpointAutoDisable: patch must be an object, got ${describeValue(patch)}`
+      );
+    }
+    const next: EndpointAutoDisableRevision = {
+      failureThreshold: patch.failureThreshold ?? this.failureThreshold,
+      windowMs: patch.windowMs ?? this.windowMs,
+    };
+    // Validate-then-apply: the merged values must pass the
+    // construction gates before the live knobs move.
+    assertValidThreshold(next.failureThreshold);
+    assertValidWindowMs(next.windowMs);
+    if (next.failureThreshold === this.failureThreshold && next.windowMs === this.windowMs) {
+      return this.config(); // Same-value revision: silent no-op.
+    }
+    this.failureThreshold = next.failureThreshold!;
+    this.windowMs = next.windowMs!;
+    return this.config();
   }
 
   private streakFor(endpoint: string): FailureStreak {

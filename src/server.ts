@@ -28,7 +28,7 @@ import {
   selectSignatureAlgorithmVerifier,
   type SignatureAlgorithmRule,
 } from "./signature-alg.ts";
-import { RetryQueue, errorBudgetBurnAuditEvent, type AssertionFailureInfo, type AttemptFailedInfo, type BatchInfo, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutEvent, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeadLetterEscalationCallbacksRevision, type DeliveryDeadlineConfig, type DeliveryDeadlineExceededInfo, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type DownstreamResponseSummary, type EndpointPauseCallbacksRevision, type EndpointPauseInfo, type ErrorBudgetConfig, type ErrorBudgetRevision, type EscalationConfig, type EscalationRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type FailureClass, type QuorumCallbacksRevision, type QuorumRetention, type QuorumRetentionRevision, type ReplayCallbacksRevision, type ReplayForcedInfo, type ReplaySkippedInfo, type RetryItem, type RetryBudgetDepletedInfo, type ScheduledFiredEvent, type Sender, type SenderCallOptions, type SemanticFailureInfo, type ShadowCallbacksRevision, type MaintenanceWindowTransition, type SloMissInfo, type SloRiskConfig, type SloRiskInfo, type SloRiskRevision, type StarvationGuardAuditEvent, type TenantBudgetAuditEvent, type UrgentDowngradedEvent, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
+import { RetryQueue, errorBudgetBurnAuditEvent, type AssertionFailureInfo, type AttemptFailedInfo, type BatchInfo, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutEvent, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeadLetterEscalationCallbacksRevision, type DeliveryDeadlineConfig, type DeliveryDeadlineExceededInfo, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type DownstreamResponseSummary, type EndpointAutoDisableRevision, type EndpointPauseCallbacksRevision, type EndpointPauseInfo, type ErrorBudgetConfig, type ErrorBudgetRevision, type EscalationConfig, type EscalationRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type FailureClass, type QuorumCallbacksRevision, type QuorumRetention, type QuorumRetentionRevision, type ReplayCallbacksRevision, type ReplayForcedInfo, type ReplaySkippedInfo, type RetryItem, type RetryBudgetDepletedInfo, type ScheduledFiredEvent, type Sender, type SenderCallOptions, type SemanticFailureInfo, type ShadowCallbacksRevision, type MaintenanceWindowTransition, type SloMissInfo, type SloRiskConfig, type SloRiskInfo, type SloRiskRevision, type StarvationGuardAuditEvent, type TenantBudgetAuditEvent, type UrgentDowngradedEvent, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
 import { parseDeliverAtHeader, DELIVER_AT_HEADER } from "./retry.ts";
 import type { ShadowDeliveredInfo, ShadowFailedInfo, ShadowTargetConfig, ShadowTargetsConfig } from "./retry.ts";
 import type {
@@ -6994,6 +6994,30 @@ export interface RelayServer extends Server {
    * failure streaks, and the disabled set are untouched.
    */
   reviseEndpointAutoDisableCallbacks?: (patch: EndpointAutoDisableCallbacksRevision) => void;
+  /**
+   * WR-415: live-revise the endpoint auto-disable threshold and/or
+   * failure window at runtime — no restart. The patch is partial: an
+   * omitted field keeps its live value. An illegal value throws
+   * `RangeError` and the live values are left completely intact; a
+   * patch identical to the live values — including an empty patch —
+   * is a silent no-op with no audit event. A real revision is audited
+   * as `endpoint_auto_disable_revised` with `previous` / `current`
+   * recording `{ failureThreshold, windowMs }` (`windowMs` is the
+   * string `"Infinity"` when the window is unbounded, so the audit
+   * row stays JSON-safe). The live streaks are untouched: a threshold
+   * lowered below a live streak count does not retroactively disable
+   * that endpoint (it disables on its next recorded failure), a
+   * raised threshold never re-enables an already-disabled endpoint
+   * (re-enable still only goes through `enableEndpoint`), and a
+   * tightened window only prunes on the next recorded failure. Always
+   * set; throws `Error` when auto-disable was never configured —
+   * enabling it needs a restart. Returns the resolved live
+   * configuration after the revision. Direct queue users use
+   * `RetryQueue.reviseEndpointAutoDisable` instead — calling the
+   * queue method on a server-owned queue would skip the
+   * `endpoint_auto_disable_revised` audit.
+   */
+  reviseEndpointAutoDisable?: (patch: EndpointAutoDisableRevision) => EndpointAutoDisableRevision;
   /**
    * WR-370: live-redirect the endpoint dependency-block/unblock
    * observers at runtime — no restart. Replaces the operator callbacks
@@ -19056,6 +19080,42 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     operatorEndpointAutoDisabledCallback = nextDisabled;
     operatorEndpointEnabledCallback = nextEnabled;
     opts.auditLog.append({ event: "endpoint_auto_disable_callbacks_revised", ...payload });
+  };
+
+  // WR-415: live endpoint auto-disable threshold / window revision.
+  // The queue owns the knobs and validates the whole patch first (an
+  // illegal value throws `RangeError` and the live configuration is
+  // left completely intact); the server only snapshots before/after.
+  // A same-value revision — including an empty patch — is a silent
+  // no-op: nothing is audited. A real revision is audited as
+  // `endpoint_auto_disable_revised` with `previous` / `current`
+  // recording `{ failureThreshold, windowMs }`; an unbounded window
+  // is written as the string `"Infinity"` so the audit row stays
+  // JSON-safe (JSON.stringify would otherwise turn it into `null`).
+  // The live streaks, the disabled set, and `getEndpointDisableStats`
+  // are untouched by this method — only the two knobs move.
+  server.reviseEndpointAutoDisable = (
+    patch: EndpointAutoDisableRevision
+  ): EndpointAutoDisableRevision => {
+    const prev = queue.getEndpointAutoDisableConfig();
+    if (prev === undefined) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseEndpointAutoDisable(patch);
+    }
+    const next = queue.reviseEndpointAutoDisable(patch);
+    if (next.failureThreshold === prev.failureThreshold && next.windowMs === prev.windowMs) {
+      return next; // Same-value: silent no-op.
+    }
+    const forAudit = (c: EndpointAutoDisableRevision): { failureThreshold: number; windowMs: number | "Infinity" } => ({
+      failureThreshold: c.failureThreshold!,
+      windowMs: c.windowMs === Infinity ? "Infinity" : c.windowMs!,
+    });
+    opts.auditLog.append({
+      event: "endpoint_auto_disable_revised",
+      previous: forAudit(prev),
+      current: forAudit(next),
+    });
+    return next;
   };
 
   // WR-370: live endpoint dependency-block/unblock callback replacement.

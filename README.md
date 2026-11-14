@@ -2862,6 +2862,27 @@ curl -X POST http://127.0.0.1:PORT/endpoints/enable \
   gate, the failure streaks, and the disabled set are untouched.
   WR-367 is the same family for the pause/resume hooks; WR-368 for
   the replay skip/force hooks.
+- **Live threshold/window revision (WR-415)** —
+  `relay.reviseEndpointAutoDisable({ failureThreshold, windowMs })` /
+  `queue.reviseEndpointAutoDisable(patch)` retunes the gate's
+  sensitivity at runtime, no restart: the new threshold/window apply
+  from the next recorded failure, so a failure storm can be answered
+  by tightening the threshold without dropping in-flight deliveries,
+  retry timers, or streak state. The patch is partial — an omitted
+  field keeps its live value — and an illegal value throws
+  `RangeError` with the live configuration untouched; an empty patch,
+  or one identical to the live values, is a silent no-op. A real
+  revision is audited as `endpoint_auto_disable_revised` with
+  `previous` / `current` (`{ failureThreshold, windowMs }`; an
+  unbounded window is written as the string `"Infinity"`). Only the
+  two knobs move: the live streaks are kept (a threshold lowered
+  below a live streak count does not retroactively disable that
+  endpoint — it disables on its next recorded failure), a raised
+  threshold never re-enables an already-disabled endpoint (re-enable
+  still only goes through `enableEndpoint`), and
+  `getEndpointDisableStats()` / `isEndpointDisabled()` are unchanged.
+  Throws `Error` when auto-disable was never configured — enabling
+  it needs a restart.
 - **Off by default** — without the option the tracker is never
   constructed: zero behavior change, zero hot-path cost.
 

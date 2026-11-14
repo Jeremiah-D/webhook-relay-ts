@@ -41,6 +41,7 @@ import {
   EndpointAutoDisable,
   type DisableFailureOutcome,
   type EndpointAutoDisableOptions,
+  type EndpointAutoDisableRevision,
   type EndpointDisableStatsRow,
 } from "./endpoint-disable.ts";
 import {
@@ -761,6 +762,7 @@ export type {
 export { EndpointAutoDisable };
 export type {
   EndpointAutoDisableOptions,
+  EndpointAutoDisableRevision,
   EndpointDisableStatsRow,
   DisableFailureOutcome,
 };
@@ -13916,6 +13918,40 @@ export class RetryQueue {
   }
 
   /**
+   * WR-415: live-revise the endpoint auto-disable threshold and/or
+   * failure window — the queue-side setter behind
+   * `RelayServer.reviseEndpointAutoDisable`. The patch is partial: an
+   * omitted field keeps its live value. The merged values are
+   * validated with the construction rules first — an illegal value
+   * throws `RangeError` and the live configuration stays completely
+   * unchanged. A patch identical to the live values — including an
+   * empty patch — is a silent no-op. Returns the resolved live
+   * configuration after the revision. The new threshold / window apply
+   * from the next `recordFailure` evaluation (`prune` reads the live
+   * window, the threshold comparison reads the live threshold); the
+   * live streaks are untouched — a threshold lowered below a live
+   * streak count does not retroactively disable that endpoint (it
+   * disables on its next recorded failure), a raised threshold never
+   * re-enables an already-disabled endpoint (re-enable still only
+   * goes through `enableEndpoint`), and `getEndpointDisableStats()` /
+   * `isEndpointDisabled()` semantics are unchanged. Throws `Error`
+   * when auto-disable was never configured — enabling it needs a
+   * restart. The queue itself holds no audit log — the server audits a
+   * real revision as `endpoint_auto_disable_revised` (`previous` /
+   * `current`, both `{ failureThreshold, windowMs }`). Direct queue
+   * users call this method; server users must go through
+   * `RelayServer.reviseEndpointAutoDisable`, which adds the audit.
+   */
+  reviseEndpointAutoDisable(patch: EndpointAutoDisableRevision): EndpointAutoDisableRevision {
+    if (this.autoDisable === undefined) {
+      throw new Error(
+        "reviseEndpointAutoDisable: endpoint auto-disable is not configured — enabling it requires a restart"
+      );
+    }
+    return this.autoDisable.revise(patch);
+  }
+
+  /**
    * WR-370: live-redirect the endpoint dependency-block/unblock
    * observers — the queue-side setter behind
    * `RelayServer.reviseEndpointDependencyCallbacks`. The new hooks take
@@ -15077,6 +15113,17 @@ export class RetryQueue {
    */
   getEndpointDisableStats(): EndpointDisableStatsRow[] {
     return this.autoDisable?.getStats() ?? [];
+  }
+
+  /**
+   * WR-415: the live auto-disable configuration (`failureThreshold` /
+   * `windowMs`), or `undefined` when the `endpointAutoDisable` option
+   * was never configured. A snapshot — mutating the returned object
+   * never moves the tracker — so the server can audit a revision with
+   * the previous and current values.
+   */
+  getEndpointAutoDisableConfig(): EndpointAutoDisableRevision | undefined {
+    return this.autoDisable?.config();
   }
 
   /**
