@@ -222,12 +222,14 @@ import {
 import { DEFAULT_TENANT } from "./usage.ts";
 import {
   OrderedTracker,
+  assertValidMaxHeadOfLineHoldMs,
   assertValidOrderedConfig,
   resolveOrderedClock,
   resolveOrderedConfig,
   type OrderedAuditEvent,
   type OrderedEndpointStats,
   type OrderedModeOptions,
+  type OrderedRevision,
   type ResolvedOrderedConfig,
 } from "./ordered.ts";
 import { ReplayEgressGate, type ReplayEgressConfig, type ReplayEgressOptions, type ReplayEgressRevision, DEFAULT_REPLAY_EGRESS_RPS } from "./replay-egress.ts";
@@ -521,6 +523,7 @@ export type {
   OrderedAuditEvent,
   OrderedEndpointStats,
   OrderedModeOptions,
+  OrderedRevision,
   ResolvedOrderedConfig,
   ResolvedOrderedEndpointConfig,
 } from "./ordered.ts";
@@ -7016,6 +7019,29 @@ export class RetryQueue {
         urgentBypassed: this.orderedUrgentBypassedTotal.get(endpoint) ?? 0,
       };
     });
+  }
+
+  /**
+   * WR-416: the live ordered-delivery configuration — the global bound
+   * and the per-endpoint bounds — or `undefined` when the `ordered`
+   * option was never configured. A snapshot — mutating the returned
+   * object never moves the queue — so the server can audit a revision
+   * with the previous and current values.
+   */
+  getOrderedConfig(): OrderedRevision | undefined {
+    const cfg = this.orderedConfig;
+    if (cfg === undefined) return undefined;
+    const snapshot: OrderedRevision = {};
+    if (cfg.global !== undefined) {
+      snapshot.global = { maxHeadOfLineHoldMs: cfg.global.maxHeadOfLineHoldMs };
+    }
+    if (cfg.endpoints.size > 0) {
+      snapshot.endpoints = {};
+      for (const [endpoint, epCfg] of cfg.endpoints) {
+        snapshot.endpoints[endpoint] = { maxHeadOfLineHoldMs: epCfg.maxHeadOfLineHoldMs };
+      }
+    }
+    return snapshot;
   }
 
   /** Merge a flushed batch window into one delivery item and queue it. */
@@ -14365,6 +14391,110 @@ export class RetryQueue {
     const next = cb ?? undefined;
     if (next === this.onOrderedAudit) return;
     this.onOrderedAudit = next;
+  }
+
+  /**
+   * WR-416: live-revise the ordered-delivery head-of-line hold bound(s)
+   * — the queue-side setter behind `RelayServer.reviseOrdered`. The
+   * patch is partial per scope: an omitted scope, or an omitted
+   * `maxHeadOfLineHoldMs` inside a scope, keeps its live value. The
+   * whole patch is validated first — an illegal bound, an unconfigured
+   * scope (a global revision on a record-only config, or an endpoint
+   * with no ordered config), or a patch that sets no bound at all
+   * throws `RangeError` and the live configuration stays completely
+   * unchanged. The resolved config objects are mutated in place, so
+   * the new bound applies from the next park evaluation
+   * (`orderedConfigFor` reads the live config on every dispatch): a
+   * head already past a lowered bound parks on its next dispatch
+   * evaluation, a head inside a raised bound keeps holding until the
+   * new bound, and an already-parked head stays dead-lettered. The
+   * hold clocks (`headSinceMs`), the line order, the urgent bypass,
+   * and `getOrderedStats()` are untouched. A patch identical to the
+   * live values is a silent no-op. Returns the resolved live
+   * configuration after the revision. Throws `Error` when ordered
+   * delivery was never configured — enabling it needs a restart. The
+   * queue itself holds no audit log — the server audits a real
+   * revision as one `ordered_revised` event per moved scope (`scope` /
+   * `previous` / `current`). Direct queue users call this method;
+   * server users must go through `RelayServer.reviseOrdered`, which
+   * adds the audit.
+   */
+  reviseOrdered(patch: OrderedRevision): OrderedRevision {
+    if (this.orderedConfig === undefined) {
+      throw new Error(
+        "reviseOrdered: ordered delivery is not configured — enabling it requires a restart"
+      );
+    }
+    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new RangeError(
+        `reviseOrdered: patch must be an object, got ${JSON.stringify(patch)}`
+      );
+    }
+    // Validate-then-apply: every scope and bound is checked before
+    // any live value moves, so a bad patch leaves the config intact.
+    const globalPatch = patch.global;
+    let globalBound: number | undefined;
+    if (globalPatch !== undefined) {
+      if (globalPatch === null || typeof globalPatch !== "object" || Array.isArray(globalPatch)) {
+        throw new RangeError(
+          `reviseOrdered: global must be an object, got ${JSON.stringify(globalPatch)}`
+        );
+      }
+      if (globalPatch.maxHeadOfLineHoldMs !== undefined) {
+        if (this.orderedConfig.global === undefined) {
+          throw new RangeError(
+            "reviseOrdered: global ordered scope is not configured — enabling it requires a restart"
+          );
+        }
+        assertValidMaxHeadOfLineHoldMs(globalPatch.maxHeadOfLineHoldMs, "reviseOrdered.global");
+        globalBound = globalPatch.maxHeadOfLineHoldMs;
+      }
+    }
+    const endpointPatches = patch.endpoints;
+    const endpointBounds = new Map<string, number>();
+    if (endpointPatches !== undefined) {
+      if (
+        endpointPatches === null ||
+        typeof endpointPatches !== "object" ||
+        Array.isArray(endpointPatches)
+      ) {
+        throw new RangeError(
+          `reviseOrdered: endpoints must be an object, got ${JSON.stringify(endpointPatches)}`
+        );
+      }
+      for (const [endpoint, epPatch] of Object.entries(endpointPatches)) {
+        if (epPatch === null || typeof epPatch !== "object" || Array.isArray(epPatch)) {
+          throw new RangeError(
+            `reviseOrdered: endpoints[${JSON.stringify(endpoint)}] must be an object, got ${JSON.stringify(epPatch)}`
+          );
+        }
+        if (epPatch.maxHeadOfLineHoldMs === undefined) continue;
+        if (!this.orderedConfig.endpoints.has(endpoint)) {
+          throw new RangeError(
+            `reviseOrdered: endpoint ${JSON.stringify(endpoint)} is not configured for ordered delivery — enabling it requires a restart`
+          );
+        }
+        assertValidMaxHeadOfLineHoldMs(
+          epPatch.maxHeadOfLineHoldMs,
+          `reviseOrdered.endpoints[${JSON.stringify(endpoint)}]`
+        );
+        endpointBounds.set(endpoint, epPatch.maxHeadOfLineHoldMs);
+      }
+    }
+    if (globalBound === undefined && endpointBounds.size === 0) {
+      throw new RangeError(
+        "reviseOrdered: patch must set at least one maxHeadOfLineHoldMs"
+      );
+    }
+    // The resolved config objects are plain and unfrozen: mutate the
+    // bound in place so the next dispatch reads the new value.
+    if (globalBound !== undefined) {
+      this.orderedConfig.global!.maxHeadOfLineHoldMs = globalBound;
+    }
+    for (const [endpoint, bound] of endpointBounds) {
+      this.orderedConfig.endpoints.get(endpoint)!.maxHeadOfLineHoldMs = bound;
+    }
+    return this.getOrderedConfig()!;
   }
 
   /**

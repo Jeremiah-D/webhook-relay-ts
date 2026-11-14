@@ -49,6 +49,36 @@ export interface OrderedModeOptions {
   now?: () => number;
 }
 
+/**
+ * WR-416: patch for `RetryQueue.reviseOrdered` /
+ * `RelayServer.reviseOrdered`. Each scope is optional — an omitted
+ * scope keeps its live bound; within a scope, an omitted
+ * `maxHeadOfLineHoldMs` keeps its live value. At least one bound must
+ * be present, else the patch throws `RangeError`. A scope that was
+ * never configured cannot be revised (global scope on a record-only
+ * config, or an endpoint with no ordered config) — enabling ordering
+ * for a new scope needs a restart.
+ */
+export interface OrderedRevision {
+  /** New bound for the global scope (all endpoints), when configured. */
+  global?: { maxHeadOfLineHoldMs?: number };
+  /** New bound per exact `targetUrl`, for configured endpoints only. */
+  endpoints?: Record<string, { maxHeadOfLineHoldMs?: number }>;
+}
+
+/** Validate one `maxHeadOfLineHoldMs` value; throws `RangeError` on anything illegal. */
+export function assertValidMaxHeadOfLineHoldMs(value: unknown, where: string): asserts value is number {
+  const ok =
+    typeof value === "number" &&
+    !Number.isNaN(value) &&
+    (value === Infinity || (Number.isFinite(value) && value > 0));
+  if (!ok) {
+    throw new RangeError(
+      `${where}.maxHeadOfLineHoldMs must be a finite number > 0 or Infinity, got ${describeValue(value)}`
+    );
+  }
+}
+
 /** An ordered-delivery scope after validation and defaulting. */
 export interface ResolvedOrderedEndpointConfig {
   /** Always `true` here — a resolved config is an enabled one. */
@@ -115,16 +145,7 @@ function assertValidOrderedModeOptions(obj: Record<string, unknown>, where: stri
     throw new RangeError(`${where}.enabled must be a boolean, got ${describeValue(enabled)}`);
   }
   if (maxHeadOfLineHoldMs !== undefined) {
-    const v = maxHeadOfLineHoldMs as number;
-    const ok =
-      typeof v === "number" &&
-      !Number.isNaN(v) &&
-      (v === Infinity || (Number.isFinite(v) && v > 0));
-    if (!ok) {
-      throw new RangeError(
-        `${where}.maxHeadOfLineHoldMs must be a finite number > 0 or Infinity, got ${describeValue(maxHeadOfLineHoldMs)}`
-      );
-    }
+    assertValidMaxHeadOfLineHoldMs(maxHeadOfLineHoldMs, where);
   }
   if (now !== undefined && typeof now !== "function") {
     throw new RangeError(`${where}.now must be a function, got ${describeValue(now)}`);

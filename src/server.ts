@@ -68,7 +68,7 @@ import {
   type HttpHardeningOptions,
   type ResolvedHttpHardening,
 } from "./http-hardening.ts";
-import type { LatencyPhaseOptions, OrderedAuditEvent, OrderedModeOptions } from "./retry.ts";
+import type { LatencyPhaseOptions, OrderedAuditEvent, OrderedModeOptions, OrderedRevision } from "./retry.ts";
 import type { BulkheadRevision, BulkheadRevisionSnapshot, CircuitProbeRevision, CircuitThresholdPatch, DeliveryWindowListEntry, DeliveryWindowSnapshot, EndpointConcurrencySnapshot, EndpointDegradedCallbacksRevision, EndpointDependencyCallbacksRevision, EndpointDependencyTransitionInfo, EndpointQuotaSnapshot, EndpointRetryBudgetSnapshot, EndpointRetryPolicyRevision, GlobalConcurrencyStats, GlobalRateLimitRevision, GlobalRateLimitStats, HolidayCalendarConfig, HolidayCalendarSnapshot, MinNormalShareSnapshot, ResolvedCircuitProbe, ResolvedCircuitThresholds, ResolvedEndpointRetryPolicy, StatusRetryPolicyConfig, TenantBudgetSnapshot, TenantConcurrencySnapshot, TenantRetryBudgetRevision } from "./retry.ts";
 import type { QueueDepthBreachInfo } from "./queue-depth.ts";
 import {
@@ -7238,6 +7238,32 @@ export interface RelayServer extends Server {
   reviseOrderedAuditCallback?: (
     cb: ((event: OrderedAuditEvent) => void) | null
   ) => void;
+  /**
+   * WR-416: live-revise the ordered-delivery head-of-line hold
+   * bound(s) at runtime — no restart. The patch is partial per scope:
+   * an omitted scope, or an omitted `maxHeadOfLineHoldMs` inside a
+   * scope, keeps its live value. An illegal bound, an unconfigured
+   * scope (a global revision on a record-only config, or an endpoint
+   * with no ordered config), or a patch that sets no bound at all
+   * throws `RangeError` and the live configuration is left completely
+   * intact; a patch identical to the live values is a silent no-op
+   * with no audit event. A real revision is audited as one
+   * `ordered_revised` event per moved scope (`scope`: `"global"` or
+   * the endpoint URL; `previous` / `current`: `{
+   * maxHeadOfLineHoldMs }`, an unbounded bound written as the string
+   * `"Infinity"` so the audit row stays JSON-safe). The new bound
+   * applies from the next park evaluation: a head already past a
+   * lowered bound parks on its next dispatch, a head inside a raised
+   * bound keeps holding until the new bound, and an already-parked
+   * head stays dead-lettered; the hold clocks, the line order, the
+   * urgent bypass, and `getOrderedStats()` are untouched. Always set;
+   * throws `Error` when ordered delivery was never configured —
+   * enabling it needs a restart. Returns the resolved live
+   * configuration after the revision. Direct queue users use
+   * `RetryQueue.reviseOrdered` instead — calling the queue method on
+   * a server-owned queue would skip the `ordered_revised` audit.
+   */
+  reviseOrdered?: (patch: OrderedRevision) => OrderedRevision;
   /**
    * WR-404: live-redirect the probe audit observer — the operator
    * callback that fires once per probe outcome worth auditing
@@ -19635,6 +19661,49 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       previous: prev,
       current: nextPresence,
     });
+  };
+
+  // WR-416: live ordered-delivery head-of-line hold bound revision.
+  // The queue owns the bounds and validates the whole patch first (an
+  // illegal bound or an unconfigured scope throws `RangeError` and the
+  // live configuration is left completely intact); the server only
+  // snapshots before/after. A same-value revision is a silent no-op:
+  // nothing is audited. A real revision is audited as one
+  // `ordered_revised` event per moved scope (`scope`: `"global"` or
+  // the endpoint URL; `previous` / `current`: `{
+  // maxHeadOfLineHoldMs }`); an unbounded bound is written as the
+  // string `"Infinity"` so the audit row stays JSON-safe
+  // (JSON.stringify would otherwise turn it into `null`). The hold
+  // clocks, the line order, the urgent bypass, and
+  // `getOrderedStats` are untouched by this method — only the bound(s)
+  // move.
+  server.reviseOrdered = (patch: OrderedRevision): OrderedRevision => {
+    const prev = queue.getOrderedConfig();
+    if (prev === undefined) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseOrdered(patch);
+    }
+    const next = queue.reviseOrdered(patch);
+    const forAudit = (bound: number): number | "Infinity" =>
+      bound === Infinity ? "Infinity" : bound;
+    const maybeAudit = (scope: string, prevBound: number | undefined, nextBound: number | undefined): void => {
+      if (prevBound === undefined || nextBound === undefined) return;
+      if (prevBound === nextBound) return;
+      opts.auditLog.append({
+        event: "ordered_revised",
+        scope,
+        previous: { maxHeadOfLineHoldMs: forAudit(prevBound) },
+        current: { maxHeadOfLineHoldMs: forAudit(nextBound) },
+      });
+    };
+    if (patch.global?.maxHeadOfLineHoldMs !== undefined) {
+      maybeAudit("global", prev.global?.maxHeadOfLineHoldMs, next.global?.maxHeadOfLineHoldMs);
+    }
+    for (const [endpoint, epPatch] of Object.entries(patch.endpoints ?? {})) {
+      if (epPatch?.maxHeadOfLineHoldMs === undefined) continue;
+      maybeAudit(endpoint, prev.endpoints?.[endpoint]?.maxHeadOfLineHoldMs, next.endpoints?.[endpoint]?.maxHeadOfLineHoldMs);
+    }
+    return next;
   };
 
   // WR-404: live probe audit observer replacement. Only the

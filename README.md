@@ -11769,6 +11769,27 @@ throws `Error` (enabling it needs a restart). This only swaps the
 observation receiver — the ordered gate, the head hold bound, and the
 park behavior are untouched.
 
+WR-416: the hold bound itself is revisable live via
+`server.reviseOrdered({ global: { maxHeadOfLineHoldMs } })` /
+`server.reviseOrdered({ endpoints: { [url]: { maxHeadOfLineHoldMs } } })`
+(and `RetryQueue.reviseOrdered(patch)` for direct queue users). The
+patch is partial per scope — an omitted scope keeps its live bound —
+and the new bound applies from the next park evaluation, so a stuck
+downstream can be answered by tightening the bound without dropping
+in-flight deliveries, retry timers, or line state: a head already past
+a lowered bound parks on its next dispatch, a head inside a raised
+bound keeps holding until the new bound, and an already-parked head
+stays dead-lettered. An illegal bound, an unconfigured scope (a global
+revision on a record-only config, or an endpoint with no ordered
+config), or a patch that sets no bound at all throws `RangeError` and
+the live configuration is untouched; a patch identical to the live
+values is a silent no-op. A real revision is audited as one
+`ordered_revised` event per moved scope (`scope`: `"global"` or the
+endpoint URL; `previous` / `current`: `{ maxHeadOfLineHoldMs }`, an
+unbounded bound written as the string `"Infinity"`). The hold clocks,
+the line order, the urgent bypass, and `getOrderedStats()` are
+untouched; enabling ordering for a new scope still needs a restart.
+
 **Fail-fast** — an illegal `ordered` value (bad shape, non-positive
 `maxHeadOfLineHoldMs`, …) throws `RangeError` at construction.
 
