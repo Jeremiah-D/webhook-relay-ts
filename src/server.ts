@@ -443,7 +443,7 @@ import {
   type EgressResidencyOptions,
 } from "./egress-residency.ts";
 import { warmupOutboundPool, resolveWarmupOptions } from "./warmup.ts";
-import { AuditSink, type AuditSinkOptions } from "./audit-sink.ts";
+import { AuditSink, type AuditSinkOptions, type AuditSinkRevision } from "./audit-sink.ts";
 import { SyslogAuditSink, type SyslogAuditSinkOptions } from "./syslog-sink.ts";
 import {
   assertValidProxyUrl,
@@ -2633,7 +2633,9 @@ export interface RelayServerOptions {
    * skipped. The worker never touches the delivery path — a slow or
    * dead sink only delays the cursor, never a webhook — and stops with
    * the server. Unset by default: no forwarding, byte-identical
-   * behavior.
+   * behavior. Live-revisable via `server.reviseAuditSink` (WR-413) —
+   * the forwarding target, secret, per-tenant overrides, and knobs
+   * move at runtime; the cursor never moves.
    */
   auditSink?: AuditSinkOptions;
   /**
@@ -6659,6 +6661,29 @@ export interface RelayServer extends Server {
    * never configured — enabling it needs a restart.
    */
   reviseErrorBudgetAlertCallback?: (cb?: (info: BurnRateAlertInfo) => void) => void;
+  /**
+   * WR-413: live-revise the audit-event webhook sink — the forwarding
+   * target, secret, per-tenant overrides, and knobs — at runtime, no
+   * restart. The patch is partial: an omitted field keeps its live
+   * value; a present `tenantSinks` replaces the whole per-tenant
+   * table. The whole patch is validated first (an illegal value
+   * throws `RangeError` and the live config is untouched), and the new
+   * config applies from the next audit event; events already
+   * delivered are never re-sent, and an in-flight POST finishes on
+   * the config it started with. The cursor never moves — a revision
+   * loses no events and replays none. A patch identical to the live
+   * values is a silent no-op. A real revision is audited as
+   * `audit_sink_revised` with `previous` / `current` recording only
+   * the target origin and the tenant-override count, never secret
+   * material — and the revision event itself is forwarded by the sink
+   * normally, so the SIEM sees the sink was re-pointed. Always set;
+   * throws `Error` when no audit sink was configured — enabling it
+   * needs a restart. This only swaps the forwarding target / secret /
+   * knobs; the cursor file is untouched. Direct sink users use
+   * `AuditSink.reviseOptions` instead — calling the sink method on a
+   * server-owned sink would skip the `audit_sink_revised` audit.
+   */
+  reviseAuditSink?: (patch: AuditSinkRevision) => void;
   /**
    * WR-346: live error-budget burn-rate config — the five knobs.
    * Only set when `errorBudget` was configured; `undefined`
@@ -18388,6 +18413,35 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       event: "error_budget_alert_callback_replaced",
       previous: prev,
       current: next,
+    });
+  };
+
+  // WR-413: live audit-sink revision. The sink owns the config and
+  // validates the whole patch first (an illegal value throws
+  // `RangeError` and the live config is left completely intact); the
+  // server only snapshots before/after. A same-value revision is a
+  // silent no-op — the sink's revision counter does not move, so
+  // nothing is audited. A real revision is audited as
+  // `audit_sink_revised` with `previous` / `current` recording only
+  // the target origin and the tenant-override count, never secret
+  // material. The revision event is appended to the audit log, so the
+  // sink forwards it to the new target normally — the SIEM sees the
+  // sink was re-pointed. Stats and the cursor are untouched: a
+  // revision loses no events and replays none.
+  server.reviseAuditSink = (patch: AuditSinkRevision): void => {
+    if (auditSink === undefined) {
+      throw new Error(
+        "reviseAuditSink: audit sink is not configured — enabling it requires a restart"
+      );
+    }
+    const prev = auditSink.configSnapshot();
+    auditSink.reviseOptions(patch);
+    const next = auditSink.configSnapshot();
+    if (next.version === prev.version) return; // Same-value: silent no-op.
+    opts.auditLog.append({
+      event: "audit_sink_revised",
+      previous: { origin: prev.origin, tenantSinkCount: prev.tenantSinkCount },
+      current: { origin: next.origin, tenantSinkCount: next.tenantSinkCount },
     });
   };
 

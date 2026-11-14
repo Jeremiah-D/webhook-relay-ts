@@ -130,6 +130,52 @@ export interface AuditSinkOptions {
   cursorFile?: string;
 }
 
+/**
+ * WR-413: partial live revision of the sink config, applied by
+ * `AuditSink.reviseOptions`. Every field is optional: an omitted field
+ * keeps its live value; a present `tenantSinks` replaces the whole
+ * per-tenant table (including an empty record, which clears every
+ * override). `cursorFile` is deliberately absent — a revision never
+ * moves the cursor; changing the cursor file would fork offsets and
+ * is a separate item.
+ */
+export interface AuditSinkRevision {
+  /** New default webhook endpoint (absolute http(s) URL). */
+  url?: string;
+  /** New default HMAC secret (non-empty string or Buffer). */
+  secret?: string | Buffer;
+  /** Whole-table replacement for the per-tenant sink overrides. */
+  tenantSinks?: Record<string, AuditSinkTenantConfig>;
+  /** New per-event POST attempt bound (>= 1). */
+  maxAttempts?: number;
+  /** New wait before the first retry in ms. */
+  initialBackoffMs?: number;
+  /** New backoff ceiling in ms. */
+  maxBackoffMs?: number;
+  /** New idle wait between log polls in ms. */
+  pollIntervalMs?: number;
+  /** New per-attempt POST timeout in ms. */
+  httpTimeoutMs?: number;
+}
+
+/**
+ * WR-413: live snapshot of the sink config, as returned by
+ * `AuditSink.configSnapshot`. Secret values are never exposed — only
+ * the default target's origin and the per-tenant override count — so
+ * the server can audit a revision without ever touching secret
+ * material. `version` bumps only on a real revision, so the server
+ * can tell a same-value no-op from a change without comparing
+ * secrets.
+ */
+export interface AuditSinkConfigSnapshot {
+  /** Origin of the default webhook endpoint. */
+  origin: string;
+  /** Number of per-tenant sink overrides. */
+  tenantSinkCount: number;
+  /** Monotonic revision counter; bumps only when a real revision lands. */
+  version: number;
+}
+
 /** Delivery counters; see {@link AuditSink.stats}. */
 export interface AuditSinkStats {
   /** Events delivered (HTTP 2xx). */
@@ -262,6 +308,41 @@ function resolveConfig(opts: AuditSinkOptions, auditLogPath: string): ResolvedAu
   };
 }
 
+/** WR-413: HMAC-secret equality across the string / Buffer forms. */
+function sinkSecretsEqual(a: string | Buffer, b: string | Buffer): boolean {
+  if (typeof a === "string" || typeof b === "string") return a === b;
+  return a.equals(b);
+}
+
+/**
+ * WR-413: resolved-config equality — the same-value test for a
+ * revision. The cursor file is deliberately not compared: it is never
+ * part of a patch and `resolveConfig` derives it identically from the
+ * same live options, so it cannot differ across a revision.
+ */
+function sinkConfigsEqual(a: ResolvedAuditSinkConfig, b: ResolvedAuditSinkConfig): boolean {
+  if (a.defaultUrl.href !== b.defaultUrl.href) return false;
+  if (!sinkSecretsEqual(a.defaultSecret, b.defaultSecret)) return false;
+  if (a.tenantSinks.size !== b.tenantSinks.size) return false;
+  for (const [tenant, entry] of a.tenantSinks) {
+    const other = b.tenantSinks.get(tenant);
+    if (
+      other === undefined ||
+      other.url.href !== entry.url.href ||
+      !sinkSecretsEqual(other.secret, entry.secret)
+    ) {
+      return false;
+    }
+  }
+  return (
+    a.maxAttempts === b.maxAttempts &&
+    a.initialBackoffMs === b.initialBackoffMs &&
+    a.maxBackoffMs === b.maxBackoffMs &&
+    a.pollIntervalMs === b.pollIntervalMs &&
+    a.httpTimeoutMs === b.httpTimeoutMs
+  );
+}
+
 /** Byte size of a file, or 0 when it cannot be stat'ed. Shared with the syslog sink (WR-157). */
 export function fileSize(path: string): number {
   try {
@@ -307,11 +388,24 @@ export function writeCursorFile(path: string, offset: number): void {
 /**
  * Forwards audit-log events to a webhook endpoint on a background
  * worker. Build one per audit log; `start()` begins forwarding,
- * `stop()` halts it. The zero value is unusable.
+ * `stop()` halts it. The zero value is unusable. Live-revisable via
+ * `reviseOptions` (WR-413) — the forwarding target, secret,
+ * per-tenant overrides, and knobs move at runtime; the cursor never
+ * moves.
  */
 export class AuditSink {
   private readonly auditLog: AuditLog;
-  private readonly cfg: ResolvedAuditSinkConfig;
+  // WR-413: deliberately *not* readonly — `reviseOptions` swaps the
+  // whole resolved config atomically; `deliver()` captures the config
+  // it starts with, so an in-flight event finishes on its own config.
+  private cfg: ResolvedAuditSinkConfig;
+  // WR-413: the live construction-time options, kept so
+  // `reviseOptions` can merge a patch over the live values (notably
+  // `cursorFile`, which a revision must never move). Replaced
+  // wholesale on each real revision.
+  private liveOpts: AuditSinkOptions;
+  /** WR-413: revision counter; bumps only on a real change. */
+  private revisionVersion = 0;
   private started = false;
   private stopRequested = false;
   private pollTimer: NodeJS.Timeout | undefined;
@@ -334,6 +428,7 @@ export class AuditSink {
     }
     this.auditLog = auditLog;
     this.cfg = resolveConfig(opts, auditLog.filePath);
+    this.liveOpts = { ...opts };
   }
 
   /**
@@ -373,6 +468,102 @@ export class AuditSink {
   /** Delivery counters: sent, failed attempts, dead-lettered events. */
   stats(): AuditSinkStats {
     return { sent: this.sent, failedAttempts: this.failedAttempts, deadLetters: this.deadLetters };
+  }
+
+  /**
+   * WR-413: the live sink config, without secret material — only the
+   * default target's origin and the per-tenant override count — plus
+   * the revision counter, so the server can audit a real revision
+   * (and recognise a same-value no-op) without ever seeing a secret.
+   */
+  configSnapshot(): AuditSinkConfigSnapshot {
+    return {
+      origin: this.cfg.defaultUrl.origin,
+      tenantSinkCount: this.cfg.tenantSinks.size,
+      version: this.revisionVersion,
+    };
+  }
+
+  /**
+   * WR-413: live-revise the sink config — forwarding target, secret,
+   * per-tenant overrides, and knobs — with no restart and no worker
+   * stop. The patch is partial: an omitted field keeps its live
+   * value; a present `tenantSinks` replaces the whole per-tenant
+   * table. The whole patch is validated first by re-resolving the
+   * merged options with `resolveConfig` — the same gates construction
+   * uses — so an illegal value throws `RangeError` and the live
+   * config stays completely unchanged. The new config applies from
+   * the next event (and the next poll for `pollIntervalMs`); an
+   * in-flight delivery finishes on the config it started with, and
+   * the cursor never moves — a revision loses no events and replays
+   * none. A patch identical to the live values is a silent no-op.
+   * The sink itself holds no audit policy — the server audits a real
+   * revision as `audit_sink_revised` (target origin and
+   * tenant-override count only, never secret material).
+   */
+  reviseOptions(patch: AuditSinkRevision): void {
+    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new RangeError(
+        `audit sink: revision patch must be an object, got ${JSON.stringify(patch)}`
+      );
+    }
+    // The shared resolver only range-checks, so mistyped patch fields
+    // are rejected here first — before the merge — with RangeError.
+    if (patch.url !== undefined && typeof patch.url !== "string") {
+      throw new RangeError("audit sink: revision `url` must be a string when set");
+    }
+    if (
+      patch.secret !== undefined &&
+      !(
+        (typeof patch.secret === "string" && patch.secret.length > 0) ||
+        (Buffer.isBuffer(patch.secret) && patch.secret.length > 0)
+      )
+    ) {
+      throw new RangeError(
+        "audit sink: revision `secret` must be a non-empty string or Buffer when set"
+      );
+    }
+    if (
+      patch.tenantSinks !== undefined &&
+      (patch.tenantSinks === null ||
+        typeof patch.tenantSinks !== "object" ||
+        Array.isArray(patch.tenantSinks))
+    ) {
+      throw new RangeError(
+        "audit sink: revision `tenantSinks` must be a record of tenant id -> sink config when set"
+      );
+    }
+    for (const field of [
+      "maxAttempts",
+      "initialBackoffMs",
+      "maxBackoffMs",
+      "pollIntervalMs",
+      "httpTimeoutMs",
+    ] as const) {
+      if (patch[field] !== undefined && typeof patch[field] !== "number") {
+        throw new RangeError(`audit sink: revision \`${field}\` must be a number when set`);
+      }
+    }
+    const merged: AuditSinkOptions = {
+      ...this.liveOpts,
+      ...(patch.url !== undefined ? { url: patch.url } : {}),
+      ...(patch.secret !== undefined ? { secret: patch.secret } : {}),
+      ...(patch.tenantSinks !== undefined ? { tenantSinks: patch.tenantSinks } : {}),
+      ...(patch.maxAttempts !== undefined ? { maxAttempts: patch.maxAttempts } : {}),
+      ...(patch.initialBackoffMs !== undefined
+        ? { initialBackoffMs: patch.initialBackoffMs }
+        : {}),
+      ...(patch.maxBackoffMs !== undefined ? { maxBackoffMs: patch.maxBackoffMs } : {}),
+      ...(patch.pollIntervalMs !== undefined ? { pollIntervalMs: patch.pollIntervalMs } : {}),
+      ...(patch.httpTimeoutMs !== undefined ? { httpTimeoutMs: patch.httpTimeoutMs } : {}),
+    };
+    // Validate-then-apply: the merged config must pass the
+    // construction gates before the live config moves.
+    const next = resolveConfig(merged, this.auditLog.filePath);
+    if (sinkConfigsEqual(this.cfg, next)) return; // Same-value revision: silent no-op.
+    this.cfg = next;
+    this.liveOpts = merged;
+    this.revisionVersion += 1;
   }
 
   /** Last forwarded byte offset in the audit log. */
@@ -463,10 +654,13 @@ export class AuditSink {
    * dead-lettered one both advance the cursor.
    */
   private async deliver(line: Buffer, eventName: string, tenant: string | undefined): Promise<boolean> {
-    const target =
-      tenant !== undefined ? this.cfg.tenantSinks.get(tenant) : undefined;
-    const url = target?.url ?? this.cfg.defaultUrl;
-    const secret = target?.secret ?? this.cfg.defaultSecret;
+    // WR-413: capture the config this delivery starts with — a live
+    // revision mid-delivery must not split one event across two
+    // endpoints or two backoff schedules.
+    const cfg = this.cfg;
+    const target = tenant !== undefined ? cfg.tenantSinks.get(tenant) : undefined;
+    const url = target?.url ?? cfg.defaultUrl;
+    const secret = target?.secret ?? cfg.defaultSecret;
     const signature = `sha256=${createHmac("sha256", secret).update(line).digest("hex")}`;
     const headers: Record<string, string> = {
       "content-type": "application/json",
@@ -474,21 +668,21 @@ export class AuditSink {
       [AUDIT_SINK_EVENT_HEADER]: eventName,
       ...(tenant !== undefined ? { [AUDIT_SINK_TENANT_HEADER]: tenant } : {}),
     };
-    let backoff = this.cfg.initialBackoffMs;
+    let backoff = cfg.initialBackoffMs;
     for (let attempt = 1; ; attempt++) {
       if (this.stopRequested) return false;
-      const res = await this.post(url, line, headers);
+      const res = await this.post(url, line, headers, cfg.httpTimeoutMs);
       if (res.ok) {
         this.sent++;
         return true;
       }
       this.failedAttempts++;
-      if (attempt >= this.cfg.maxAttempts) {
+      if (attempt >= cfg.maxAttempts) {
         this.deadLetter(eventName, tenant, url, attempt, res.status, res.error);
         return true;
       }
       if (!(await this.sleepInterruptible(backoff))) return false;
-      backoff = Math.min(backoff * 2, this.cfg.maxBackoffMs);
+      backoff = Math.min(backoff * 2, cfg.maxBackoffMs);
     }
   }
 
@@ -496,7 +690,8 @@ export class AuditSink {
   private post(
     url: URL,
     body: Buffer,
-    headers: Record<string, string>
+    headers: Record<string, string>,
+    timeoutMs: number
   ): Promise<{ ok: boolean; status: number; error?: string }> {
     return new Promise((resolve) => {
       const request = url.protocol === "https:" ? httpsRequest : httpRequest;
@@ -505,7 +700,7 @@ export class AuditSink {
         {
           method: "POST",
           headers: { ...headers, "content-length": String(body.length) },
-          timeout: this.cfg.httpTimeoutMs,
+          timeout: timeoutMs,
           signal: this.aborter.signal,
         },
         (res) => {
@@ -517,7 +712,7 @@ export class AuditSink {
         }
       );
       req.on("timeout", () => {
-        req.destroy(new Error(`audit sink: POST timed out after ${this.cfg.httpTimeoutMs}ms`));
+        req.destroy(new Error(`audit sink: POST timed out after ${timeoutMs}ms`));
       });
       req.on("error", (err) => {
         resolve({ ok: false, status: 0, error: (err as Error).message });

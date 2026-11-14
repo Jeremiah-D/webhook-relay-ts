@@ -6329,6 +6329,18 @@ const server = createRelayServer({
 });
 ```
 
+Live revision — `server.reviseAuditSink(patch)` (WR-413) swaps the
+forwarding target, signing key, per-tenant overrides, and knobs at
+runtime with no restart: the next audit event POSTs to the new URL,
+signed with the new key. This only swaps the forwarding target /
+key / knobs — the cursor does not move, so no events are lost or
+replayed, and a same-value revision is a silent no-op. A real
+revision is audited as `audit_sink_revised` (target origin and
+tenant-override count only, never key material) and the revision
+event itself is forwarded to the new target, so the SIEM sees the
+sink was re-pointed. With no `auditSink` configured, `reviseAuditSink`
+throws — enabling the sink needs a restart.
+
 - **Signed** — every delivery carries
   `x-relay-audit-signature: sha256=<hex>` (HMAC-SHA256 over the exact
   log line, the WR-26 convention) plus `x-relay-audit-event` (the audit
