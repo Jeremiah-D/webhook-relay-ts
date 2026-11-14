@@ -966,7 +966,10 @@ export interface MetricsOptions {
    * Called with the `dead_letter_auto_replay` audit event when the
    * auto-replay scheduler stops on rounds exhaustion. The server wires
    * this to its audit log; a raw queue without it simply loses the event
-   * (nothing else is affected).
+   * (nothing else is affected). Live-revisable at runtime via
+   * `reviseAutoReplayAuditCallback()` (WR-411) — the replacement takes
+   * effect from the next exhaustion stop, and stops already reported
+   * are never re-delivered.
    */
   onAutoReplayAudit?: (event: DeadLetterAutoReplayAuditEvent) => void;
   /**
@@ -7030,6 +7033,33 @@ export class RetryQueue {
    */
   getAutoReplayScheduleConfig(): AutoReplayScheduleConfig | undefined {
     return this.autoReplayer?.config();
+  }
+
+  /**
+   * WR-411: live-redirect the dead-letter auto-replay exhaustion audit
+   * observer — the queue-side setter behind
+   * `RelayServer.reviseAutoReplayAuditCallback`. The new callback takes
+   * effect from the next exhaustion stop; stops already reported are
+   * never re-delivered, and the round cadence, the counters, the
+   * `stopped` latch, and `retune` are untouched — only the observation
+   * moves. `null` clears back to no observer (the scheduler still stops
+   * on rounds exhaustion — only the forwarding stops). A non-function
+   * value throws `RangeError` and the live callback is untouched;
+   * replacing with the same reference (or clearing when already unset)
+   * is a no-op. Throws `Error` when auto replay was never configured —
+   * enabling it needs a restart. Under `RelayServer` the replayer holds
+   * the server's audit closure, so direct calls here would replace the
+   * audit wrapper; server users must go through
+   * `RelayServer.reviseAutoReplayAuditCallback`, which swaps only the
+   * operator cell behind the audit closure.
+   */
+  reviseAutoReplayAuditCallback(
+    cb: ((event: DeadLetterAutoReplayAuditEvent) => void) | null
+  ): void {
+    if (this.autoReplayer === undefined) {
+      throw new Error("auto replay is not configured — enabling it requires a restart");
+    }
+    this.autoReplayer.reviseAuditCallback(cb);
   }
 
   /**

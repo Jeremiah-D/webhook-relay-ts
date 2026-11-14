@@ -94,6 +94,7 @@ import type {
   AutoReplayOptions,
   AutoReplayScheduleConfig,
   AutoReplayScheduleRevision,
+  DeadLetterAutoReplayAuditEvent,
 } from "./autoreplay.ts";
 import type {
   DeadLetterPurgedEvent,
@@ -7318,6 +7319,32 @@ export interface RelayServer extends Server {
    */
   reviseAutoReplaySchedule: (patch: AutoReplayScheduleRevision) => AutoReplayScheduleConfig;
   /**
+   * WR-411: live-redirect the dead-letter auto-replay exhaustion audit
+   * observer — the operator callback that fires once per rounds-exhausted
+   * stop (`dead_letter_auto_replay`, with `reason`,
+   * `consecutiveEmptyRounds`, `totalReplayed`, `lastRunAt`). `null`
+   * clears back to audit-only (the scheduler still stops on rounds
+   * exhaustion and the stop is still audited as
+   * `dead_letter_auto_replay`, just no longer forwarded to an operator).
+   * A non-function value throws `RangeError` and the live callback is
+   * untouched; replacing with the same reference (or clearing when
+   * already unset) is a silent no-op. A real replacement is audited as
+   * `auto_replay_audit_callback_revised` with `previous` / `current`
+   * recording only 'set' / 'cleared' presence, never a function body.
+   * Always set; throws `Error` when auto replay was never configured —
+   * enabling it needs a restart. The new callback takes effect from
+   * the next exhaustion stop; stops already reported are never
+   * re-delivered, and the round cadence, the counters, the `stopped`
+   * latch, and `retune` are untouched. Direct queue users use
+   * `RetryQueue.reviseAutoReplayAuditCallback` instead — calling the
+   * queue method on a server-owned queue would replace the audit
+   * wrapper. This moves only the exhaustion observer; WR-344 revises
+   * the round cadence, and WR-399 revises the scheduled-fired observer.
+   */
+  reviseAutoReplayAuditCallback?: (
+    cb: ((event: DeadLetterAutoReplayAuditEvent) => void) | null
+  ) => void;
+  /**
    * WR-344: live dead-letter auto-replay schedule cadence — the three
    * round-rhythm inputs. Only set when `autoReplay` was configured;
    * `undefined` otherwise.
@@ -9807,6 +9834,15 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   let operatorScheduledFiredCallback:
     | ((event: ScheduledFiredEvent) => void)
     | undefined = opts.retry?.onScheduledFired;
+  // WR-411: the operator's dead-letter auto-replay exhaustion audit
+  // callback, held in a mutable cell so
+  // `server.reviseAutoReplayAuditCallback` can replace it at runtime.
+  // The audit wrapper below reads this cell — never the operator
+  // callback directly — so replacing the operator callback cannot
+  // bypass the `dead_letter_auto_replay` audit.
+  let operatorAutoReplayAuditCallback:
+    | ((event: DeadLetterAutoReplayAuditEvent) => void)
+    | undefined = opts.retry?.onAutoReplayAudit;
   // WR-400: the operator's batch-flush callback, held in a mutable
   // cell so `server.reviseBatchCallback` can replace it at runtime.
   // The audit wrapper below reads this cell — never the operator
@@ -10098,7 +10134,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // just observed.
     onAutoReplayAudit: (event) => {
       opts.auditLog.append(event);
-      opts.retry?.onAutoReplayAudit?.(event);
+      // WR-411: forward to the operator cell, never to the constructor
+      // callback directly, so a live revision cannot bypass the audit.
+      operatorAutoReplayAuditCallback?.(event);
     },
     // An explicit server-level `deadLetterRetention` wins over the nested
     // `retry.deadLetterRetention`; either way the queue owns the sweeper.
@@ -19621,6 +19659,45 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       current: next,
     });
     return next;
+  };
+
+  // WR-411: live dead-letter auto-replay exhaustion audit observer
+  // replacement. Only the server-side operator-callback cell moves — the
+  // queue's audit wrapper (which appends `dead_letter_auto_replay`
+  // first, then forwards to the cell) is never touched, so a replacement
+  // cannot bypass the audit. With auto replay unconfigured the queue
+  // throws the canonical "must restart" Error (delegated below, exactly
+  // like WR-344's schedule gate). A non-function callback throws
+  // `RangeError` and the live cell is untouched; a same-reference
+  // replacement (or clearing when already unset) is a silent no-op. A
+  // real replacement is audited as `auto_replay_audit_callback_revised`
+  // with `previous` / `current` recording only 'set' / 'cleared'
+  // presence, never a function body. The new callback takes effect from
+  // the next exhaustion stop; stops already reported are never
+  // re-delivered, and the round cadence, the counters, the `stopped`
+  // latch, and `retune` are untouched.
+  server.reviseAutoReplayAuditCallback = (
+    cb: ((event: DeadLetterAutoReplayAuditEvent) => void) | null
+  ): void => {
+    if (queue.getAutoReplayScheduleConfig() === undefined) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseAutoReplayAuditCallback(cb);
+    }
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseAutoReplayAuditCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === operatorAutoReplayAuditCallback) return;
+    const prev = operatorAutoReplayAuditCallback === undefined ? "cleared" : "set";
+    const nextPresence = next === undefined ? "cleared" : "set";
+    operatorAutoReplayAuditCallback = next;
+    opts.auditLog.append({
+      event: "auto_replay_audit_callback_revised",
+      previous: prev,
+      current: nextPresence,
+    });
   };
 
   // WR-344: live dead-letter auto-replay schedule cadence. Only set

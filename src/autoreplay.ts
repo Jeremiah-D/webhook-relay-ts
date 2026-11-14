@@ -176,7 +176,11 @@ export class DeadLetterAutoReplayer {
   private readonly setTimer: (fn: () => void, ms: number) => ReplayTimerHandle;
   private readonly clearTimer: (handle: ReplayTimerHandle) => void;
   private readonly replayAll: () => DeadLetterBatchReplayResult;
-  private readonly onAudit?: (event: DeadLetterAutoReplayAuditEvent) => void;
+  // WR-411: live-revisable via `reviseAuditCallback()` (the queue's
+  // `reviseAutoReplayAuditCallback` delegates here), so this is
+  // deliberately not `readonly` — swapping the observer never touches
+  // the round cadence, the counters, the `stopped` latch, or `retune`.
+  private onAudit?: (event: DeadLetterAutoReplayAuditEvent) => void;
 
   private running = false;
   private paused = false;
@@ -275,6 +279,27 @@ export class DeadLetterAutoReplayer {
     // scheduler, which is exactly the values-only behavior those want.
     this.scheduleNext();
     return this.config();
+  }
+
+  /**
+   * WR-411: live-redirect the rounds-exhaustion audit observer. The new
+   * callback takes effect from the next exhaustion stop; a stop already
+   * reported is never re-emitted, and the round cadence, the counters
+   * (`consecutiveEmptyRounds`, `totalReplayed`), the `stopped` latch,
+   * and `retune` are untouched — only the observation moves. `null`
+   * clears back to no observer (the scheduler still stops on rounds
+   * exhaustion — only the forwarding stops). A
+   * non-function value throws `RangeError` and the live callback is
+   * untouched; replacing with the same reference (or clearing when
+   * already unset) is a silent no-op.
+   */
+  reviseAuditCallback(cb: ((event: DeadLetterAutoReplayAuditEvent) => void) | null): void {
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError("reviseAuditCallback: handler must be a function or null");
+    }
+    const next = cb ?? undefined;
+    if (next === this.onAudit) return;
+    this.onAudit = next;
   }
 
   /**

@@ -13196,6 +13196,24 @@ the getter is not mounted. This revises the round cadence only — the
 replay-egress rate (WR-345) is a separate control on the same replay
 path.
 
+**Live exhaustion-audit callback revision (WR-411).** Only the observer
+of the rounds-exhaustion stop is revisable at runtime —
+`relay.reviseAutoReplayAuditCallback(cb)` (or
+`queue.reviseAutoReplayAuditCallback(cb)` on a raw queue) — and the new
+callback takes effect from the next exhaustion stop; a stop already
+reported is never re-delivered. `null` clears back to audit-only: the
+scheduler still stops on rounds exhaustion and the stop is still audited
+as `dead_letter_auto_replay`, just no longer forwarded to an operator. A
+non-function value throws `RangeError` and the live callback is
+untouched; replacing with the same reference (or clearing when already
+unset) is a silent no-op. A real revision audits
+`auto_replay_audit_callback_revised` with `previous` / `current`
+recording only 'set' / 'cleared' presence, never a function body.
+Enabling auto-replay itself still needs a restart: on a relay where it
+was never configured, revising throws. This moves only the exhaustion
+observer — the round cadence still goes through
+`reviseAutoReplaySchedule` (WR-344).
+
 The round timer is unref'd, so a configured scheduler never pins the
 process open, and `RetryQueue.stop()` / `shutdown()` cancel any pending
 round — a round never fires mid-shutdown and re-queues dead letters the
