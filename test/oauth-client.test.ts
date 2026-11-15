@@ -417,10 +417,10 @@ function makeSender(
   cache?: OAuth2TokenCache,
   outboundSigning?: { secret: string; keyId?: string }
 ) {
-  const args = Array(33).fill(undefined) as Parameters<typeof createDefaultSender>;
+  const args = Array(34).fill(undefined) as Parameters<typeof createDefaultSender>;
   args[2] = outboundSigning;
-  args[31] = oauth2;
-  args[32] = cache;
+  args[32] = oauth2;
+  args[33] = cache;
   const sender = createDefaultSender(...args);
   return sender;
 }

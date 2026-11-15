@@ -84,6 +84,7 @@ function senderWithRotation(
     undefined, // tlsClientCerts
     undefined, // compressOutbound
     undefined, // http2
+    undefined, // onHttp2Fallback
     undefined, // idempotencyKey
     undefined, // websocket
     undefined, // outboundEncryption
@@ -194,7 +195,7 @@ describe("mtls-rotation: config validation", () => {
         createDefaultSender(
           undefined, undefined, undefined, undefined,
           { [url]: OLD_CERT },
-          undefined, undefined, undefined, undefined, undefined,
+          undefined, undefined, undefined, undefined, undefined, undefined,
           undefined, undefined, undefined, undefined, undefined,
           undefined, undefined, undefined, undefined,
           new Map([[url, new RotatingClientCertSet(rotationCfg())]])
@@ -208,7 +209,7 @@ describe("mtls-rotation: config validation", () => {
       () =>
         createDefaultSender(
           undefined, undefined, undefined, undefined, undefined,
-          undefined, undefined, undefined, undefined, undefined,
+          undefined, undefined, undefined, undefined, undefined, undefined,
           undefined, undefined, undefined, undefined, undefined,
           undefined, undefined, undefined, undefined,
           {} as never
@@ -222,7 +223,7 @@ describe("mtls-rotation: config validation", () => {
       () =>
         createDefaultSender(
           undefined, undefined, undefined, undefined, undefined,
-          undefined, undefined, undefined, undefined, undefined,
+          undefined, undefined, undefined, undefined, undefined, undefined,
           undefined, undefined, undefined, undefined, undefined,
           undefined, undefined, undefined, undefined,
           new Map([["https://127.0.0.1:9/hook", { certificates: [] } as never]])

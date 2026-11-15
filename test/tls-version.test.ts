@@ -172,6 +172,7 @@ describe("tls-version: real TLS handshakes through createDefaultSender", () => {
     createDefaultSender(
       pinsFor(u),
       undefined, undefined, undefined, undefined, undefined, undefined,
+      undefined,
       undefined, undefined, undefined, undefined, undefined, undefined,
       undefined,
       floor === undefined ? undefined : { [u]: floor },
@@ -215,6 +216,7 @@ describe("tls-version: real TLS handshakes through createDefaultSender", () => {
       () =>
         createDefaultSender(
           undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+          undefined,
           undefined, undefined, undefined, undefined, undefined, undefined,
           undefined,
           { "https://x/": "1.0" as "1.2" },

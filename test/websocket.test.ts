@@ -381,7 +381,7 @@ test("sender integration: wss: target honors pins", async () => {
 test("invalid pool options throw RangeError at startup", () => {
   assert.throws(() => new WebSocketPool({ timeoutMs: 0 }), RangeError);
   assert.throws(() => new WebSocketPool({ maxMessageBytes: -1 }), RangeError);
-  assert.throws(() => createDefaultSender(undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, { timeoutMs: -5 }), RangeError);
+  assert.throws(() => createDefaultSender(undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, { timeoutMs: -5 }), RangeError);
 });
 
 test("frame reader handles split headers and 16-bit lengths", () => {

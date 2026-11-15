@@ -20,11 +20,11 @@ import {
 } from "../src/e2ee.ts";
 
 // `createDefaultSender` takes positional options; `compressBrotli` is the
-// 34th parameter (after oauth2TokenCache). The spread fills every slot
+// 35th parameter (after oauth2TokenCache). The spread fills every slot
 // from `from` (1-based) up to it so only the interesting arguments are
 // written out.
 const restFrom = (from: number, compressBrotli: Record<string, unknown>) => [
-  ...Array<undefined>(34 - from).fill(undefined),
+  ...Array<undefined>(35 - from).fill(undefined),
   compressBrotli,
 ] as unknown as [];
 
@@ -261,8 +261,9 @@ describe("brotli compression via createDefaultSender", () => {
           undefined,
           undefined,
           undefined,
+          undefined,
           { [url]: {} }, // WR-75: would gzip this JSON payload
-          ...restFrom(18, { [url]: {} }) // WR-142
+          ...restFrom(19, { [url]: {} }) // WR-142
         );
         const payload = bigJson();
         await sender(item(url, payload));
@@ -304,10 +305,11 @@ describe("brotli compression via createDefaultSender", () => {
           undefined, // tlsClientCerts
           undefined, // compressOutbound
           undefined, // http2
+          undefined, // onHttp2Fallback
           undefined, // idempotencyKey
           undefined, // websocket
           { [url]: { publicKey: kp.publicKey } }, // outboundEncryption (WR-58)
-          ...restFrom(11, { [url]: {} }) // compressBrotli (WR-142)
+          ...restFrom(12, { [url]: {} }) // compressBrotli (WR-142)
         );
         const payload = bigJson();
         await sender(item(url, payload));

@@ -146,6 +146,7 @@ describe("assertValidGuardedCompressConfig", () => {
       () =>
         createDefaultSender(
           undefined, false, undefined, undefined, undefined, undefined, undefined,
+          undefined,
           undefined, undefined, undefined, undefined, undefined, undefined, undefined,
           undefined, undefined,
           { u: { thresholdBytes: 0 } }
@@ -234,6 +235,7 @@ describe("guarded compression via createDefaultSender", () => {
       async (url, seen) => {
         const sender = createDefaultSender(
           undefined, false, undefined, undefined, undefined, undefined, undefined,
+          undefined,
           undefined, undefined, undefined, undefined, undefined, undefined, undefined,
           undefined, undefined,
           { [url]: {} }
@@ -263,6 +265,7 @@ describe("guarded compression via createDefaultSender", () => {
       async (url, seen) => {
         const sender = createDefaultSender(
           undefined, false, undefined, undefined, undefined, undefined, undefined,
+          undefined,
           undefined, undefined, undefined, undefined, undefined, undefined, undefined,
           undefined, undefined,
           { [url]: {} }
@@ -284,6 +287,7 @@ describe("guarded compression via createDefaultSender", () => {
         const fallbacks: GzipFallbackInfo[] = [];
         const sender = createDefaultSender(
           undefined, false, { secret: TEST_KEY }, undefined, undefined, undefined, undefined,
+          undefined,
           undefined, undefined, undefined, undefined, undefined, undefined, undefined,
           undefined, undefined,
           { [url]: {} },
@@ -321,6 +325,7 @@ describe("guarded compression via createDefaultSender", () => {
         let fallbacks = 0;
         const sender = createDefaultSender(
           undefined, false, undefined, undefined, undefined, undefined, undefined,
+          undefined,
           undefined, undefined, undefined, undefined, undefined, undefined, undefined,
           undefined, undefined,
           { [url]: {} },
@@ -345,6 +350,7 @@ describe("guarded compression via createDefaultSender", () => {
         let fallbacks = 0;
         const sender = createDefaultSender(
           undefined, false, undefined, undefined, undefined, undefined, undefined,
+          undefined,
           undefined, undefined, undefined, undefined, undefined, undefined, undefined,
           undefined, undefined,
           { [url]: {} },
@@ -385,7 +391,7 @@ describe("guarded compression via createDefaultSender", () => {
         const sender = createDefaultSender(
           undefined, false, undefined, undefined, undefined,
           { [url]: { thresholdBytes: 1 } }, // WR-40 would compress anything
-          undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+          undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
           undefined, undefined, undefined,
           { [url]: { contentTypeWhitelist: ["text/csv"] } } // guarded: JSON not whitelisted
         );

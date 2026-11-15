@@ -103,6 +103,18 @@ export interface ResolvedHttp2PoolOptions {
   fallbackCooldownMs: number;
 }
 
+/** Fired when an H2 failure falls back to the HTTP/1.1 pool (WR-423). */
+export interface Http2FallbackInfo {
+  /** Delivery id. */
+  id: string;
+  /** End-to-end trace ID. */
+  traceId?: string;
+  /** Downstream endpoint (`targetUrl`). */
+  endpoint: string;
+  /** The `Http2UnavailableError` message that forced the fallback. */
+  error: string;
+}
+
 function assertNonNegativeFinite(name: string, value: number): void {
   if (!Number.isFinite(value) || value < 0) {
     throw new RangeError(

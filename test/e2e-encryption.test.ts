@@ -173,7 +173,7 @@ describe("WR-58 default-sender integration", () => {
       undefined, // tlsPins
       false, // keepAlive
       { secret: SECRET }, // outboundSigning (WR-26)
-      undefined, undefined, undefined, undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined,
       { [encUrl()]: { publicKey: kp.publicKey } } // outboundEncryption (WR-58)
     );
     try {
@@ -195,7 +195,7 @@ describe("WR-58 default-sender integration", () => {
   it("leaves endpoints without a key exactly as before", async () => {
     const sender = createDefaultSender(
       undefined, false, { secret: SECRET },
-      undefined, undefined, undefined, undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined,
       { [encUrl()]: { publicKey: kp.publicKey } }
     );
     try {
@@ -213,7 +213,7 @@ describe("WR-58 default-sender integration", () => {
     const sender = createDefaultSender(
       undefined, false, undefined, undefined, undefined,
       { [encUrl()]: { thresholdBytes: 64 } }, // compressOutbound (WR-40)
-      undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined,
       { [encUrl()]: { publicKey: kp.publicKey } }
     );
     try {
@@ -240,7 +240,7 @@ describe("WR-58 default-sender integration", () => {
     assert.throws(
       () =>
         createDefaultSender(
-          undefined, false, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+          undefined, false, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
           { "http://x/hook": { publicKey: "!!!not-a-key!!!" } }
         ),
       RangeError
@@ -248,7 +248,7 @@ describe("WR-58 default-sender integration", () => {
     assert.throws(
       () =>
         createDefaultSender(
-          undefined, false, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+          undefined, false, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
           { "http://x/hook": { publicKey: Buffer.alloc(16).toString("base64") } }
         ),
       RangeError
@@ -256,7 +256,7 @@ describe("WR-58 default-sender integration", () => {
     assert.throws(
       () =>
         createDefaultSender(
-          undefined, false, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+          undefined, false, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
           // @ts-expect-error - non-string publicKey must fail validation
           { "http://x/hook": { publicKey: 42 } }
         ),

@@ -247,7 +247,7 @@ describe("WR-81 default-sender integration", () => {
     const hookCalls: Array<{ endpoint: string; primaryKeyId: string; previousKeyIds: string[] }> = [];
     const sender = createDefaultSender(
       undefined, false, undefined,
-      undefined, undefined, undefined, undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined,
       {
         [url()]: {
           publicKey: kNew.raw.publicKey,
@@ -294,7 +294,7 @@ describe("WR-81 default-sender integration", () => {
       () =>
         createDefaultSender(
           undefined, false, undefined,
-          undefined, undefined, undefined, undefined, undefined, undefined,
+          undefined, undefined, undefined, undefined, undefined, undefined, undefined,
           { "http://127.0.0.1:1/x": cfg as never }
         );
     assert.throws(bad({ publicKey: k.raw.publicKey, previousKeys: [{ id: "o", publicKey: k.raw.publicKey }] }), RangeError); // keyId required

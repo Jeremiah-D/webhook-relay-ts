@@ -300,10 +300,10 @@ describe("egress-residency: failure classification", () => {
 
 describe("egress-residency: sender wiring", () => {
   it("createDefaultSender builds the gate and validates it up front", () => {
-    // egressResidency is the 51st positional parameter; pad with 50 placeholders.
+    // egressResidency is the 52nd positional parameter; pad with 51 placeholders.
     const callWithGate = (gate: unknown) =>
       (createDefaultSender as (...args: unknown[]) => PooledSender)(
-        ...new Array(50).fill(undefined),
+        ...new Array(51).fill(undefined),
         gate
       );
     const sender = callWithGate({

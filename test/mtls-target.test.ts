@@ -185,6 +185,7 @@ describe("WR-198 sender integration", () => {
           undefined,
           undefined,
           undefined,
+          undefined,
           new Map([["https://hooks.example.com/x", set]])
         ),
       RangeError

@@ -576,8 +576,8 @@ async function stubDpopDownstream(): Promise<{
 }
 
 function makeSender(oauth2: Record<string, OAuth2ClientCredentialsConfig>) {
-  const args = Array(33).fill(undefined) as Parameters<typeof createDefaultSender>;
-  args[31] = oauth2;
+  const args = Array(34).fill(undefined) as Parameters<typeof createDefaultSender>;
+  args[32] = oauth2;
   return createDefaultSender(...args);
 }
 

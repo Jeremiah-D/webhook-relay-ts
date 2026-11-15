@@ -49,7 +49,7 @@ function sniSender(
 ) {
   return createDefaultSender(
     pins, keepAlive, undefined, undefined, undefined,
-    undefined, undefined, undefined, undefined, undefined, overrides
+    undefined, undefined, undefined, undefined, undefined, undefined, overrides
   );
 }
 
@@ -270,7 +270,7 @@ describe("tls-sni: real TLS handshakes over HTTP/1.1", () => {
     const sender = createDefaultSender(
       { [target]: [TLS_FIXTURE_SPKI_PIN] },
       undefined, undefined, undefined, undefined,
-      undefined, undefined, undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, undefined, undefined,
       { [target]: { servername: "front.example.com" } }
     );
     observations.length = 0;
@@ -288,7 +288,7 @@ describe("tls-sni: real TLS handshakes over HTTP/1.1", () => {
     const sender = createDefaultSender(
       { [target]: [WRONG_PIN] },
       undefined, undefined, undefined, undefined,
-      undefined, undefined, undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, undefined, undefined,
       { [target]: { servername: "front.example.com" } }
     );
     await assert.rejects(() => sender(item(target)), TlsPinMismatchError);
@@ -413,7 +413,7 @@ describe("tls-sni: mTLS composition (WR-36)", () => {
       { [target]: [MTLS_SERVER_SPKI_PIN] },
       undefined, undefined, undefined,
       { [target]: { cert: MTLS_CLIENT_CERT_PEM, key: MTLS_CLIENT_KEY_PEM } },
-      undefined, undefined, undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, undefined, undefined,
       { [target]: { servername: "front.example.com" } }
     );
     observations.length = 0;
@@ -461,6 +461,7 @@ describe("tls-sni: HTTP/2 composition (WR-42)", () => {
       { [targetA]: [TLS_FIXTURE_SPKI_PIN], [targetB]: [TLS_FIXTURE_SPKI_PIN] },
       undefined, undefined, undefined, undefined, undefined,
       { enabled: true, hosts: ["127.0.0.1"] },
+      undefined,
       undefined, undefined, undefined,
       { [targetA]: { servername: "h2front.example" }, [targetB]: { servername: "h2edge.example" } }
     );
@@ -550,7 +551,7 @@ describe("tls-sni: proxied endpoints (WR-27)", () => {
       { [target]: [TLS_FIXTURE_SPKI_PIN] },
       undefined, undefined,
       { [target]: `http://127.0.0.1:${proxyPort}` },
-      undefined, undefined, undefined, undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined,
       { [target]: { servername: "proxied.example.com", alpnProtocols: ["http/1.1"] } }
     );
     observations.length = 0;

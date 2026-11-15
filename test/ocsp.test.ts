@@ -160,7 +160,7 @@ describe("ocsp: option validation", () => {
       () =>
         createDefaultSender(
           undefined, undefined, undefined, undefined, undefined, undefined,
-          undefined, undefined, undefined, undefined, undefined, undefined,
+          undefined, undefined, undefined, undefined, undefined, undefined, undefined,
           undefined, undefined, undefined, undefined, undefined, undefined,
           undefined, undefined, undefined, undefined, undefined,
           { "https://x/hook": { mode: "bogus" as never } }
@@ -502,7 +502,7 @@ describe("ocsp: real handshake through createDefaultSender", () => {
     const pins = { [url]: [TLS_FIXTURE_SPKI_PIN] };
     const u = undefined;
     return createDefaultSender(
-      pins, u, u, u, u, u, u, u, u, u, u, u, u, u, u, u, u, u, u, u, u, u, u,
+      pins, u, u, u, u, u, u, undefined, u, u, u, u, u, u, u, u, u, u, u, u, u, u, u, u,
       tlsOcsp,
       monitor
     );

@@ -205,10 +205,10 @@ describe("dns-pin: baseline and drift detection", () => {
 
 describe("dns-pin: sender and server wiring", () => {
   it("createDefaultSender builds the pin and validates it up front", () => {
-    // dnsPin is the 44th positional parameter; pad with 43 placeholders.
+    // dnsPin is the 45th positional parameter; pad with 44 placeholders.
     const callWithDnsPin = (dnsPin: unknown) =>
       (createDefaultSender as (...args: unknown[]) => PooledSender)(
-        ...new Array(43).fill(undefined),
+        ...new Array(44).fill(undefined),
         dnsPin
       );
     const sender = callWithDnsPin({ mode: "warn" });

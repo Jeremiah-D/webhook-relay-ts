@@ -266,7 +266,7 @@ describe("WR-116 config validation", () => {
     const mk = (cfg: Record<string, AwsSigV4EndpointConfig>) =>
       createDefaultSender(
         undefined, undefined, undefined, undefined, undefined, undefined,
-        undefined, undefined, undefined, undefined, undefined, undefined,
+        undefined, undefined, undefined, undefined, undefined, undefined, undefined,
         undefined, undefined, undefined, undefined, undefined, undefined,
         undefined, undefined, undefined, undefined, undefined, undefined,
         undefined, undefined, undefined, undefined, cfg
@@ -340,7 +340,7 @@ describe("WR-116 sender integration", () => {
   ): PooledSender {
     return createDefaultSender(
       undefined, false, outboundSigning, undefined, undefined, undefined,
-      undefined, undefined, undefined, undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined,
       undefined, undefined, undefined, undefined, undefined, undefined,
       undefined, undefined, undefined, undefined, undefined, undefined,
       undefined, undefined, undefined, undefined, cfg, resolver

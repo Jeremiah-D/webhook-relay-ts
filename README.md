@@ -1644,7 +1644,14 @@ reliability primitives that matter for any signed-payload pipeline.
   counters; idle sessions are closed by an unref'd reaper
   (`sessionIdleTimeoutMs`, default 60s), and an idle session's socket never
   pins process exit (re-ref'd per stream). Invalid option values throw
-  `RangeError` at startup. Zero dependencies (`node:http2` only).
+  `RangeError` at startup. Live revision (WR-423):
+  `server.reviseHttp2FallbackCallback(cb | null)` swaps the operator hook
+  called once per H2 failure that falls back to HTTP/1.1
+  (`Http2FallbackInfo`: delivery id, trace id, endpoint,
+  `Http2UnavailableError` message); every fallback is audited as
+  `http2_fallback` first, `null` clears back to audit-only, and with no
+  H2 pool built the revision throws — enabling it needs a restart. Zero
+  dependencies (`node:http2` only).
 - `src/websocket.ts` — outbound WebSocket downstream delivery (WR-45):
   `ws:` / `wss:` targets speak RFC 6455 with zero dependencies
   (`node:net` + `node:tls` + `node:crypto` only — no `ws` package, so the

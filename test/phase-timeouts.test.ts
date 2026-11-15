@@ -25,13 +25,13 @@ import { AuditLog } from "../src/audit.ts";
 
 /**
  * `createDefaultSender` takes its per-endpoint records positionally and
- * `phaseTimeouts` is the last parameter, so this helper fills the rest
+ * `phaseTimeouts` is the 36th positional parameter, so this helper fills the rest
  * with `undefined`. The firstByte integration test below guards the slot
  * behaviorally (a timeout really fires), so a future signature change
  * fails loudly instead of silently testing the wrong parameter.
  */
 const senderWithPhaseTimeouts = (record: Record<string, PhaseTimeoutBudgets>) =>
-  createDefaultSender(...(new Array(34).fill(undefined) as never[]), record);
+  createDefaultSender(...(new Array(35).fill(undefined) as never[]), record);
 
 async function listen(server: { listen(port: number, host: string, cb: () => void): unknown }): Promise<void> {
   await new Promise<void>((resolve) => {

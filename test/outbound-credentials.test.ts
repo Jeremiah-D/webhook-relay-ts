@@ -57,11 +57,11 @@ async function stubTokenEndpoint() {
   return { server, url: `http://127.0.0.1:${port}/oauth/token`, get hits() { return hits; } };
 }
 
-const PARAM_COUNT = 43; // outboundCredentials is the last createDefaultSender parameter
+const PARAM_COUNT = 44; // enough slots to reach outboundCredentials (index 43)
 
-function senderWithCredentials(record: Parameters<typeof createDefaultSender>[42]) {
+function senderWithCredentials(record: Parameters<typeof createDefaultSender>[43]) {
   const args = Array(PARAM_COUNT).fill(undefined) as Parameters<typeof createDefaultSender>;
-  args[42] = record;
+  args[43] = record;
   return createDefaultSender(...args);
 }
 
@@ -294,14 +294,14 @@ describe("WR-192 delivery path", () => {
     const tokenEp = await stubTokenEndpoint();
     try {
       const args = Array(PARAM_COUNT).fill(undefined) as Parameters<typeof createDefaultSender>;
-      args[31] = {
+      args[32] = {
         [downstream.url]: {
           token_endpoint: tokenEp.url,
           client_id: "relay",
           client_secret: "oauth-secret",
         },
       };
-      args[42] = {
+      args[43] = {
         [downstream.url]: [
           { id: "static-1", header: "x-api-key", secretRef: REF, secretResolver: () => "static-v" },
         ],
@@ -319,14 +319,14 @@ describe("WR-192 delivery path", () => {
     const tokenEp = await stubTokenEndpoint();
     try {
       const args = Array(PARAM_COUNT).fill(undefined) as Parameters<typeof createDefaultSender>;
-      args[31] = {
+      args[32] = {
         [downstream.url]: {
           token_endpoint: tokenEp.url,
           client_id: "relay",
           client_secret: "oauth-secret",
         },
       };
-      args[42] = {
+      args[43] = {
         [downstream.url]: [
           { id: "static-auth", header: "Authorization", secretRef: REF, secretResolver: () => "ApiKey static" },
         ],
@@ -341,8 +341,8 @@ describe("WR-192 delivery path", () => {
 
   it("survives a WR-69 forwardHeaders deny on the credential header (relay-forced stamp)", async () => {
     const args = Array(PARAM_COUNT).fill(undefined) as Parameters<typeof createDefaultSender>;
-    args[12] = { [downstream.url]: { deny: ["x-api-key"] } };
-    args[42] = {
+    args[13] = { [downstream.url]: { deny: ["x-api-key"] } };
+    args[43] = {
       [downstream.url]: [
         { id: "k", header: "x-api-key", secretRef: REF, secretResolver: () => "forced" },
       ],

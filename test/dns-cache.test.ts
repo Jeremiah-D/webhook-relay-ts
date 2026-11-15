@@ -406,6 +406,7 @@ describe("dns-cache: Node integration", () => {
       undefined, // tlsClientCerts
       undefined, // compressOutbound
       undefined, // http2
+      undefined, // onHttp2Fallback
       undefined, // idempotencyKey
       undefined, // websocket
       undefined, // outboundEncryption
@@ -454,7 +455,7 @@ describe("dns-cache: Node integration", () => {
       () =>
         createDefaultSender(
           undefined, undefined, undefined, undefined, undefined, undefined,
-          undefined, undefined, undefined, undefined, undefined, undefined,
+          undefined, undefined, undefined, undefined, undefined, undefined, undefined,
           undefined, undefined, undefined, undefined, undefined, undefined,
           undefined, undefined,
           { ttlMs: 0 }

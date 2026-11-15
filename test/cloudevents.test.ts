@@ -196,8 +196,8 @@ describe("WR-207: sender integration (envelope before signing)", () => {
     return seen[0];
   }
 
-  // createDefaultSender's cloudEvents is the last of 46 positional
-  // params; everything between outboundSigning and it stays default.
+  // createDefaultSender's cloudEvents is the 47th positional
+  // param; everything between outboundSigning and it stays default.
   function senderWithCloudEvents(
     ce: Record<string, CloudEventsEndpointConfig>,
     signing?: { secret: string }
@@ -206,7 +206,7 @@ describe("WR-207: sender integration (envelope before signing)", () => {
       undefined,
       false,
       signing,
-      ...Array<undefined>(42).fill(undefined),
+      ...Array<undefined>(43).fill(undefined),
       ce
     );
   }

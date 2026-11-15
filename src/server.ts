@@ -463,6 +463,7 @@ import {
   resolveHttp2PoolOptions,
   runHttp2Stream,
   type ClientHttp2Session,
+  type Http2FallbackInfo,
   type Http2PoolOptions,
 } from "./http2.ts";
 import { WebSocketPool, type WebSocketPoolOptions } from "./websocket.ts";
@@ -2701,7 +2702,9 @@ export interface RelayServerOptions {
  * `outboundHttp2` server option): `{ enabled: true, hosts: [...] }`.
  * Disabled by default. Invalid values throw `RangeError` at startup. The
  * returned sender carries the pool as `.http2Pool` and closes it via
- * `.destroy()` alongside the keep-alive pool.
+ * `.destroy()` alongside the keep-alive pool. `onHttp2Fallback` right
+ * after it is called once per H2 failure that falls back to HTTP/1.1
+ * (`Http2FallbackInfo`: delivery id, trace id, endpoint, error).
  *
  * `idempotencyKey` is the opt-in outbound idempotency key (WR-44, see
  * `src/idempotency-key.ts` and the `outboundIdempotencyKey` server
@@ -2904,6 +2907,12 @@ export function createDefaultSender(
   tlsClientCerts?: Record<string, TlsClientCert>,
   compressOutbound?: Record<string, CompressOutboundOptions>,
   http2?: Http2PoolOptions,
+  /**
+   * WR-423: called once per H2 failure that falls back to the HTTP/1.1
+   * pool. `createRelayServer` audits these as `http2_fallback`;
+   * library users get the hook directly.
+   */
+  onHttp2Fallback?: (info: Http2FallbackInfo) => void,
   idempotencyKey?: IdempotencyKeyOptions,
   websocket?: WebSocketPoolOptions,
   outboundEncryption?: Record<string, OutboundEncryptionConfig>,
@@ -5565,6 +5574,15 @@ export function createDefaultSender(
         return deliverViaHttp2(item, url, pins, clientCert, tlsSni, minTlsVersion, clientCertRotation, oauthToken, oauthDpopProof).catch((err) => {
           if (err instanceof Http2UnavailableError) {
             h2pool!.noteFallback();
+            // WR-423: the H2 failure is observable — the operator hook
+            // fires once per fallback (the delivery itself still rides
+            // the HTTP/1.1 pool below, never lost).
+            onHttp2Fallback?.({
+              id: item.id,
+              ...(item.traceId !== undefined ? { traceId: item.traceId } : {}),
+              endpoint: item.targetUrl,
+              error: err.message,
+            });
             return deliverViaHttp1(item, url, pins, clientCert, proxyUrl, tlsSni, minTlsVersion, clientCertRotation, ocsp, oauthToken, oauthDpopProof, phaseTimeout, callOpts?.signal, caBundle);
           }
           throw err;
@@ -6706,6 +6724,31 @@ export interface RelayServer extends Server {
    */
   reviseGzipFallbackCallback?: (
     cb: ((info: GzipFallbackInfo) => void) | null
+  ) => void;
+  /**
+   * WR-423: live-revise the HTTP/2 fallback observation callback — the
+   * operator hook called once per H2 failure that falls back to the
+   * HTTP/1.1 pool (`Http2FallbackInfo`: delivery id, trace id,
+   * endpoint, `Http2UnavailableError` message). `null` clears back to
+   * audit-only (the fallback still rides HTTP/1.1 and
+   * `http2_fallback` is still audited, just no longer forwarded to an
+   * operator). A non-function value throws `RangeError` and the live
+   * callback is untouched; replacing with the same reference (or
+   * clearing when already unset) is a silent no-op. A real replacement
+   * is audited as `http2_fallback_callback_revised` with `previous` /
+   * `current` recording only 'set' / 'cleared' presence, never a
+   * function body. Always set; throws `Error` when no H2 session pool
+   * was ever built (`outboundHttp2` unconfigured, `enabled: false`,
+   * or `hosts` empty) — enabling it needs a restart. The new callback
+   * takes effect from the next H2 fallback; fallbacks already reported
+   * are never re-emitted, and the H2 session establishment, the
+   * fallback decision, the cooldown, the fallback counter, and the
+   * sender construction are untouched. This swaps only the
+   * fallback-alert recipient; the H2 pool options themselves still
+   * move via a restart.
+   */
+  reviseHttp2FallbackCallback?: (
+    cb: ((info: Http2FallbackInfo) => void) | null
   ) => void;
   /**
    * WR-376: live egress data-residency allowlist for one tenant.
@@ -9457,6 +9500,36 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     onDohFallbackAudit(info);
     operatorDohFallbackCallback?.(info);
   };
+  // WR-423: an H2 failure fell back to the HTTP/1.1 pool — one audit
+  // line per fallback naming the delivery, the endpoint, and the
+  // `Http2UnavailableError` message (the delivery keeps working; the
+  // operator may want to check the origin's H2 support). Shared by
+  // the main sender and every WR-85 shadow sender copy below.
+  const onHttp2FallbackAudit = (info: Http2FallbackInfo) => {
+    opts.auditLog.append({
+      event: "http2_fallback",
+      id: info.id,
+      ...(info.traceId !== undefined ? { traceId: info.traceId } : {}),
+      targetUrl: info.endpoint,
+      error: info.error,
+    });
+  };
+  // WR-423: the operator's H2 fallback observation callback, held
+  // in a mutable cell so `server.reviseHttp2FallbackCallback` can
+  // replace it at runtime. The composite closure below reads this
+  // cell — never the operator callback directly — so replacing the
+  // operator callback cannot bypass the `http2_fallback` audit: the
+  // audit is appended first, then the cell is called. The H2 session
+  // establishment, the fallback decision, and the cooldown are
+  // untouched — the composite reference is passed once at
+  // construction (main sender and every WR-85 shadow sender copy
+  // alike, along WR-380 "same live record governs shadow mirrors")
+  // and the cell lives in this closure.
+  let operatorHttp2FallbackCallback: ((info: Http2FallbackInfo) => void) | undefined;
+  const onHttp2Fallback = (info: Http2FallbackInfo) => {
+    onHttp2FallbackAudit(info);
+    operatorHttp2FallbackCallback?.(info);
+  };
   // WR-194: a pinned hostname's DNS resolution drifted — one audit line
   // per drift naming the hostname, the pinned baseline, the observed
   // addresses, and the pin mode. In "enforce" mode the lookup was
@@ -9775,7 +9848,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     opts.responseGuard ?? {};
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallback, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, opts.awsSigV4, opts.awsSecretResolver, opts.outboundSchemas, opts.oauth2, undefined, opts.compressBrotli, opts.phaseTimeouts, opts.tlsCa, opts.chaos, onChaosInjectedAudit, liveResponseGuard, opts.doh, onDohFallback, proxyHealthMonitor, opts.outboundCredentials, opts.dnsPin, onDnsPinMismatch, opts.cloudEvents, opts.outboundSsrfGuard, onOutboundSsrfBlocked, onOutboundSsrfAllowlisted, onOutboundSsrfProxySkipped, opts.egressResidency, onEgressResidencyBlocked)
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, onHttp2Fallback, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallback, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, opts.awsSigV4, opts.awsSecretResolver, opts.outboundSchemas, opts.oauth2, undefined, opts.compressBrotli, opts.phaseTimeouts, opts.tlsCa, opts.chaos, onChaosInjectedAudit, liveResponseGuard, opts.doh, onDohFallback, proxyHealthMonitor, opts.outboundCredentials, opts.dnsPin, onDnsPinMismatch, opts.cloudEvents, opts.outboundSsrfGuard, onOutboundSsrfBlocked, onOutboundSsrfAllowlisted, onOutboundSsrfProxySkipped, opts.egressResidency, onEgressResidencyBlocked)
       : undefined;
   // WR-146: tail-latency hedging for outbound attempts (opt-in). The
   // wrapper sits around whichever sender the queue uses — the default
@@ -9910,6 +9983,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
                   t.tlsClientCert !== undefined ? { [t.targetUrl]: t.tlsClientCert } : undefined,
                   opts.compressOutbound,
                   opts.outboundHttp2,
+                  onHttp2Fallback,
                   opts.outboundIdempotencyKey,
                   undefined,
                   opts.outboundEncryption,
@@ -18839,6 +18913,49 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     operatorGzipFallbackCallback = next;
     opts.auditLog.append({
       event: "gzip_fallback_callback_revised",
+      previous: prev,
+      current: nextPresence,
+    });
+  };
+
+  // WR-423: live HTTP/2 fallback observation callback revision. Only
+  // the operator-callback cell moves — the composite closure passed
+  // into the sender at construction (which appends the
+  // `http2_fallback` audit first, then forwards to the cell) is never
+  // touched, so a replacement cannot bypass the audit. With no H2
+  // session pool built (`outboundHttp2` unconfigured, `enabled:
+  // false`, or `hosts` empty) the revision throws Error — enabling
+  // it needs a restart. A non-function callback throws `RangeError`
+  // and the live cell is untouched; a same-reference replacement (or
+  // clearing when already unset) is a silent no-op. A real replacement
+  // is audited as `http2_fallback_callback_revised` with `previous` /
+  // `current` recording only 'set' / 'cleared' presence, never a
+  // function body. The new callback takes effect from the next H2
+  // fallback; fallbacks already reported are never re-emitted, and
+  // the H2 session establishment, the fallback decision, the
+  // cooldown, the fallback counter, and the sender construction are
+  // untouched.
+  server.reviseHttp2FallbackCallback = (
+    cb: ((info: Http2FallbackInfo) => void) | null
+  ): void => {
+    if (defaultSender?.http2Pool === undefined) {
+      throw new Error(
+        "reviseHttp2FallbackCallback: HTTP/2 is not configured — enabling it requires a restart: " +
+          "the H2 session pool is built at startup and a running relay cannot observe an H2 fallback without one"
+      );
+    }
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseHttp2FallbackCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === operatorHttp2FallbackCallback) return;
+    const prev = operatorHttp2FallbackCallback === undefined ? "cleared" : "set";
+    const nextPresence = next === undefined ? "cleared" : "set";
+    operatorHttp2FallbackCallback = next;
+    opts.auditLog.append({
+      event: "http2_fallback_callback_revised",
       previous: prev,
       current: nextPresence,
     });

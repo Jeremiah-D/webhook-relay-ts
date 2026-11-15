@@ -94,7 +94,7 @@ describe("WR-44 resolveIdempotencyKeyConfig", () => {
   it("createDefaultSender rejects invalid idempotencyKey config at startup", () => {
     assert.throws(
       () =>
-        createDefaultSender(undefined, false, undefined, undefined, undefined, undefined, undefined, {
+        createDefaultSender(undefined, false, undefined, undefined, undefined, undefined, undefined, undefined, {
           enabled: true,
         }),
       RangeError
@@ -145,8 +145,8 @@ describe("WR-44 sender idempotency-key stamping", () => {
     };
   }
 
-  function senderWith(opts: Parameters<typeof createDefaultSender>[7]) {
-    return createDefaultSender(undefined, false, undefined, undefined, undefined, undefined, undefined, opts);
+  function senderWith(opts: Parameters<typeof createDefaultSender>[8]) {
+    return createDefaultSender(undefined, false, undefined, undefined, undefined, undefined, undefined, undefined, opts);
   }
 
   async function deliverOnce(sender: ReturnType<typeof createDefaultSender>, it: RetryItem) {
@@ -221,6 +221,7 @@ describe("WR-44 retry / replay / batch key semantics through a real queue", () =
     return createDefaultSender(
       undefined,
       false,
+      undefined,
       undefined,
       undefined,
       undefined,

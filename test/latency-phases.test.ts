@@ -302,7 +302,7 @@ describe("WR-95 sender phase measurement (real H1 sender)", () => {
     // keepAlive=false → one-off agent → fresh connection per delivery.
     // 22 params: (tlsPins, keepAlive=false, …, measureLatencyPhases=true).
     const sender = createDefaultSender(
-      undefined, false, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      undefined, false, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
       undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, true
     );
     try {
@@ -359,7 +359,7 @@ describe("WR-95 sender phase measurement (real H1 sender)", () => {
     // reuses it — the reused socket cannot report connect timing.
     // 22 params: (…, keepAlive default, …, measureLatencyPhases=true).
     const sender = createDefaultSender(
-      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
       undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, true
     );
     try {

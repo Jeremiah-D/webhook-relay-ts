@@ -326,10 +326,10 @@ describe("outbound-ssrf-guard: guard lookups", () => {
 
 describe("outbound-ssrf-guard: sender wiring", () => {
   it("createDefaultSender builds the guard and validates it up front", () => {
-    // outboundSsrfGuard is the 47th positional parameter; pad with 46 placeholders.
+    // outboundSsrfGuard is the 48th positional parameter; pad with 47 placeholders.
     const callWithGuard = (guard: unknown) =>
       (createDefaultSender as (...args: unknown[]) => PooledSender)(
-        ...new Array(46).fill(undefined),
+        ...new Array(47).fill(undefined),
         guard
       );
     const sender = callWithGuard({ allowPrivateTargets: { "http://a.test/": true } });

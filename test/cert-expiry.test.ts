@@ -292,7 +292,7 @@ describe("cert-expiry: real handshake through createDefaultSender", () => {
     );
     const sender = createDefaultSender(
       { [url]: [MTLS_SERVER_SPKI_PIN] },
-      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
       undefined, undefined, undefined, undefined,
       monitor
     );
@@ -319,7 +319,7 @@ describe("cert-expiry: real handshake through createDefaultSender", () => {
     const sender = createDefaultSender(
       undefined, undefined, undefined, undefined,
       { "https://never-dialed/hook": { cert: MTLS_CLIENT_CERT_PEM, key: MTLS_CLIENT_KEY_PEM } },
-      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
       monitor
     );
     sender.destroy();
