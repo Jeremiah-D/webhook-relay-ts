@@ -12416,6 +12416,19 @@ const server = createRelayServer({
   `previous` / `current` as `'set'` / `'cleared'` only, never a function
   body. With no OCSP endpoint configured the revision throws — enabling
   OCSP needs a restart.
+- **Live revision** — `server.reviseOcspAlertCallback(cb | null)`
+  (WR-425) swaps the operator hook that observes each `ocsp_alert` at
+  runtime: the callback receives the same alert (`kind` `revoked` |
+  `ocsp_unavailable`, endpoint, mode, detail, outcome, `at`) — one per
+  revoked verdict in both modes and one per fail-open continuation
+  (plus one per fail-closed unreachable responder); `null` clears back
+  to audit-only. The verdicts still stand — revocation still rejects
+  the delivery in both modes, fail-open still proceeds — and the
+  `ocsp_alert` audit and the `relay_ocsp_*` counters continue as
+  before — only the alert recipient changes. A real swap audits as
+  `ocsp_alert_callback_revised` with `previous` / `current` as `'set'` /
+  `'cleared'` only, never a function body. With no OCSP endpoint
+  configured the revision throws — enabling OCSP needs a restart.
 - **Fail-fast** — a bad `mode`, non-boolean `useStapled`, non-http(s)
   `responderUrl`, non-function `responderFetcher`, or out-of-range
   `responderTimeoutMs` throws `RangeError` at startup. Off by default:
