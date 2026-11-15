@@ -12259,6 +12259,18 @@ const server = createRelayServer({
   packets, parallel A/AAAA merging, fallback stats) and
   `test/doh-socks5-integration.test.ts` (end-to-end delivery through a
   fake DoH server, fallback-to-system-DNS audit, pool isolation).
+- **Live revision** — `server.reviseDohFallbackCallback(cb | null)` swaps
+  the operator hook that receives each `doh_fallback` at runtime (WR-421):
+  `null` clears back to audit-only (the fallback still resolves through
+  the system DNS and is still audited), a non-function value throws
+  `RangeError` and leaves the live callback untouched, and revising with
+  no DoH URL configured throws `Error` (enabling DoH needs a restart).
+  A real replacement is audited as `doh_fallback_callback_revised`
+  (`previous` / `current` record only 'set' / 'cleared', never a function
+  body). The new callback takes effect from the next failed lookup;
+  fallbacks already reported are never re-emitted, and the lookup
+  channel, the fallback semantics, and the stats are untouched. Covered
+  by `test/doh-fallback-callback-revision.test.ts`.
 
 ## Outbound Happy Eyeballs connection racing (opt-in, RFC 8305)
 

@@ -6610,6 +6610,29 @@ export interface RelayServer extends Server {
     cb: ((info: DnsPinMismatchInfo) => void) | null
   ) => void;
   /**
+   * WR-421: live-revise the DoH fallback observation callback — the
+   * operator hook called once per DoH failure that falls back to the
+   * system resolver (`{ hostname, error, dohUrl }`). `null` clears
+   * back to audit-only (the fallback still resolves through the
+   * system DNS and `doh_fallback` is still audited, just no longer
+   * forwarded to an operator). A non-function value throws
+   * `RangeError` and the live callback is untouched; replacing with
+   * the same reference (or clearing when already unset) is a silent
+   * no-op. A real replacement is audited as
+   * `doh_fallback_callback_revised` with `previous` / `current`
+   * recording only 'set' / 'cleared' presence, never a function body.
+   * Always set; throws `Error` when no DoH URL was ever configured
+   * — enabling it needs a restart. The new callback takes effect from
+   * the next failed DoH lookup; fallbacks already reported are never
+   * re-emitted, and the DoH lookup channel, the fallback semantics,
+   * the stats, and the sender construction are untouched. This swaps
+   * only the fallback-alert recipient; the DoH URLs themselves still
+   * move via a restart.
+   */
+  reviseDohFallbackCallback?: (
+    cb: ((info: { hostname: string; error: string; dohUrl: string }) => void) | null
+  ) => void;
+  /**
    * WR-375: live outbound SSRF guard allowlist — the endpoints
    * currently opted into intentional private targets. Always set;
    * `{}` when the guard was never configured. Returns a fresh
@@ -9377,6 +9400,23 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       error: info.error,
     });
   };
+  // WR-421: the operator's DoH fallback observation callback, held
+  // in a mutable cell so `server.reviseDohFallbackCallback` can
+  // replace it at runtime. The composite closure below reads this
+  // cell — never the operator callback directly — so replacing the
+  // operator callback cannot bypass the `doh_fallback` audit: the
+  // audit is appended first, then the cell is called. The DoH lookup
+  // channel and the fallback semantics are untouched — the composite
+  // reference is passed once at construction (main sender and every
+  // WR-85 shadow sender copy alike, along WR-380 "same live record
+  // governs shadow mirrors") and the cell lives in this closure.
+  let operatorDohFallbackCallback:
+    | ((info: { hostname: string; error: string; dohUrl: string }) => void)
+    | undefined;
+  const onDohFallback = (info: { hostname: string; error: string; dohUrl: string }) => {
+    onDohFallbackAudit(info);
+    operatorDohFallbackCallback?.(info);
+  };
   // WR-194: a pinned hostname's DNS resolution drifted — one audit line
   // per drift naming the hostname, the pinned baseline, the observed
   // addresses, and the pin mode. In "enforce" mode the lookup was
@@ -9695,7 +9735,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     opts.responseGuard ?? {};
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, opts.awsSigV4, opts.awsSecretResolver, opts.outboundSchemas, opts.oauth2, undefined, opts.compressBrotli, opts.phaseTimeouts, opts.tlsCa, opts.chaos, onChaosInjectedAudit, liveResponseGuard, opts.doh, onDohFallbackAudit, proxyHealthMonitor, opts.outboundCredentials, opts.dnsPin, onDnsPinMismatch, opts.cloudEvents, opts.outboundSsrfGuard, onOutboundSsrfBlocked, onOutboundSsrfAllowlisted, onOutboundSsrfProxySkipped, opts.egressResidency, onEgressResidencyBlocked)
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, opts.awsSigV4, opts.awsSecretResolver, opts.outboundSchemas, opts.oauth2, undefined, opts.compressBrotli, opts.phaseTimeouts, opts.tlsCa, opts.chaos, onChaosInjectedAudit, liveResponseGuard, opts.doh, onDohFallback, proxyHealthMonitor, opts.outboundCredentials, opts.dnsPin, onDnsPinMismatch, opts.cloudEvents, opts.outboundSsrfGuard, onOutboundSsrfBlocked, onOutboundSsrfAllowlisted, onOutboundSsrfProxySkipped, opts.egressResidency, onEgressResidencyBlocked)
       : undefined;
   // WR-146: tail-latency hedging for outbound attempts (opt-in). The
   // wrapper sits around whichever sender the queue uses — the default
@@ -9889,7 +9929,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
                   // its own per-DoH-URL cache), with the same
                   // doh_fallback audit line on failure.
                   opts.doh,
-                  onDohFallbackAudit,
+                  onDohFallback,
                   // proxyHealthMonitor / outboundCredentials / dnsPin /
                   // onDnsPinMismatch / outboundSsrfGuard stay off for
                   // shadow copies (pre-existing); the trailing slots
@@ -18573,6 +18613,47 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     operatorDnsPinMismatchCallback = next;
     opts.auditLog.append({
       event: "dns_pin_mismatch_callback_revised",
+      previous: prev,
+      current: nextPresence,
+    });
+  };
+
+  // WR-421: live DoH fallback observation callback revision. Only
+  // the operator-callback cell moves — the composite closure passed
+  // into the sender at construction (which appends the
+  // `doh_fallback` audit first, then forwards to the cell) is never
+  // touched, so a replacement cannot bypass the audit. With no DoH
+  // URL configured the revision throws Error — enabling it needs a
+  // restart. A non-function callback throws `RangeError` and the
+  // live cell is untouched; a same-reference replacement (or clearing
+  // when already unset) is a silent no-op. A real replacement is
+  // audited as `doh_fallback_callback_revised` with `previous` /
+  // `current` recording only 'set' / 'cleared' presence, never a
+  // function body. The new callback takes effect from the next
+  // failed DoH lookup; fallbacks already reported are never
+  // re-emitted, and the DoH lookup channel, the fallback semantics,
+  // the stats, and the sender construction are untouched.
+  server.reviseDohFallbackCallback = (
+    cb: ((info: { hostname: string; error: string; dohUrl: string }) => void) | null
+  ): void => {
+    if (opts.doh === undefined || Object.keys(opts.doh).length === 0) {
+      throw new Error(
+        "reviseDohFallbackCallback: DoH is not configured — enabling it requires a restart: " +
+          "the per-endpoint DoH lookup channel is built at startup and a running relay cannot start falling back through DoH without one"
+      );
+    }
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseDohFallbackCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === operatorDohFallbackCallback) return;
+    const prev = operatorDohFallbackCallback === undefined ? "cleared" : "set";
+    const nextPresence = next === undefined ? "cleared" : "set";
+    operatorDohFallbackCallback = next;
+    opts.auditLog.append({
+      event: "doh_fallback_callback_revised",
       previous: prev,
       current: nextPresence,
     });
