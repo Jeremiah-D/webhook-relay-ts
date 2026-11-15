@@ -420,6 +420,7 @@ import {
 import {
   CertExpiryMonitor,
   resolveCertExpiryOptions,
+  type CertExpiringAuditEvent,
   type CertExpiryOptions,
 } from "./cert-expiry.ts";
 import { OutboundConnectionPool, type KeepAlivePoolOptions, type OutboundKeepAliveRevision } from "./keepalive.ts";
@@ -7035,6 +7036,33 @@ export interface RelayServer extends Server {
    */
   reviseTlsMinVersion: (endpoint: string, floor: MinTlsVersion) => MinTlsVersion;
   /**
+   * WR-426: live-revise the cert-expiry warning observation callback —
+   * the operator hook called once per certificate entering the warning
+   * window (`CertExpiringAuditEvent`: `kind` `downstream` | `client`,
+   * endpoint, `notAfter`, `expirySeconds`, `thresholdSeconds`, `at`).
+   * That is one warning per downstream peer certificate and one per
+   * mTLS client certificate that lands inside `thresholdSeconds` of
+   * expiry — edge-triggered, not per handshake. `null` clears back to
+   * audit-only (the `cert_expiring` audit and the
+   * `relay_cert_expiry_seconds` gauge continue — only the warning
+   * recipient changes). A non-function value throws `RangeError` and
+   * the live callback is untouched; replacing with the same reference
+   * (or clearing when already unset) is a silent no-op. A real
+   * replacement is audited as `cert_expiring_callback_revised` with
+   * `previous` / `current` recording only 'set' / 'cleared' presence,
+   * never a function body. Always set; throws `Error` when
+   * `tlsCertExpiry` was never enabled — enabling it needs a restart.
+   * The new callback takes effect from the next warning; certificates
+   * already reported are never re-emitted (a renewed certificate with
+   * a new fingerprint alerts again), and the threshold, the gauge, the
+   * client-certificate startup check, and the monitor construction are
+   * untouched. This swaps only the warning recipient; the threshold
+   * itself still moves only via `tlsCertExpiry` at startup.
+   */
+  reviseCertExpiringCallback?: (
+    cb: ((event: CertExpiringAuditEvent) => void) | null
+  ) => void;
+  /**
    * WR-343: remove one endpoint's live TLS minimum-version override
    * at runtime — the endpoint falls back to no floor (unlimited,
    * the construction default for an unlisted endpoint). Returns
@@ -9449,10 +9477,32 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // WR-73: the cert-expiry monitor is always constructed but inert
   // unless enabled; every edge-triggered `cert_expiring` event lands in
   // the audit log. Invalid values throw RangeError at startup.
+  // WR-426: the operator's cert-expiry warning observation callback,
+  // held in a mutable cell so `server.reviseCertExpiringCallback` can
+  // replace it at runtime. The composite closure below reads this cell —
+  // never the operator callback directly — so replacing the operator
+  // callback cannot bypass the `cert_expiring` audit: the audit is
+  // appended first, then the cell is called. The monitor's `readonly`
+  // hooks field and construction semantics are untouched — the
+  // composite reference is passed once at construction and the cell
+  // lives in this closure. (Unlike `OcspMonitor`, `CertExpiryMonitor`
+  // invokes its hook unwrapped, so the composite guards the operator
+  // callback itself: a throwing callback is swallowed here and can
+  // never break the delivery whose handshake it observes — the
+  // monitor stays an observer, never a gate.)
+  let operatorCertExpiringCallback:
+    | ((event: CertExpiringAuditEvent) => void)
+    | undefined;
+  const onCertExpiring = (event: CertExpiringAuditEvent) => {
+    opts.auditLog.append(event);
+    try {
+      operatorCertExpiringCallback?.(event);
+    } catch {
+      // Fail-soft: a broken operator sink must not break delivery.
+    }
+  };
   const certExpiryMonitor = new CertExpiryMonitor(resolveCertExpiryOptions(opts.tlsCertExpiry), {
-    onCertExpiring: (event) => {
-      opts.auditLog.append(event);
-    },
+    onCertExpiring,
   });
   // WR-74: the TLS floor monitor is always constructed but inert unless
   // an endpoint configures a floor; every `tls_version_rejected` event
@@ -18919,6 +18969,51 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     operatorOcspAlertCallback = next;
     opts.auditLog.append({
       event: "ocsp_alert_callback_revised",
+      previous: prev,
+      current: nextPresence,
+    });
+  };
+
+  // WR-426: live cert-expiry warning observation callback revision.
+  // Only the operator-callback cell moves — the composite closure
+  // passed into the monitor at construction (which appends the
+  // `cert_expiring` audit first, then forwards to the cell) is never
+  // touched, so a replacement cannot bypass the audit. With
+  // `tlsCertExpiry` disabled the revision throws Error — enabling it
+  // needs a restart. A non-function callback throws `RangeError` and
+  // the live cell is untouched; a same-reference replacement (or
+  // clearing when already unset) is a silent no-op. A real
+  // replacement is audited as `cert_expiring_callback_revised` with
+  // `previous` / `current` recording only 'set' / 'cleared' presence,
+  // never a function body. The new callback takes effect from the
+  // next warning; certificates already reported are never re-emitted
+  // (the monitor's edge-triggered `alerted` set is untouched — a
+  // renewed certificate with a new fingerprint alerts again), and
+  // the threshold, the gauge, the client-certificate startup check,
+  // and the monitor construction are untouched. A throwing operator
+  // callback is swallowed by the composite, so it can never break
+  // the delivery whose handshake it observes.
+  server.reviseCertExpiringCallback = (
+    cb: ((event: CertExpiringAuditEvent) => void) | null
+  ): void => {
+    if (!certExpiryMonitor.enabled) {
+      throw new Error(
+        "reviseCertExpiringCallback: TLS certificate expiry monitoring is not enabled — enabling it requires a restart: " +
+          "the monitor is constructed inert at startup and a running relay cannot start warning about expiring certificates without one"
+      );
+    }
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseCertExpiringCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === operatorCertExpiringCallback) return;
+    const prev = operatorCertExpiringCallback === undefined ? "cleared" : "set";
+    const nextPresence = next === undefined ? "cleared" : "set";
+    operatorCertExpiringCallback = next;
+    opts.auditLog.append({
+      event: "cert_expiring_callback_revised",
       previous: prev,
       current: nextPresence,
     });

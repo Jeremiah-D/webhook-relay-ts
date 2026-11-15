@@ -1442,7 +1442,21 @@ reliability primitives that matter for any signed-payload pipeline.
   stays byte-identical until the first certificate is observed. The monitor
   is an observer, never a gate: unreadable or empty peer certificates
   (resumed TLS 1.3 sessions re-send none) are skipped silently. Invalid
-  values throw `RangeError` at startup. Zero dependencies (`node:crypto`
+  values throw `RangeError` at startup.
+- **Live revision** — `server.reviseCertExpiringCallback(cb | null)`
+  (WR-426) swaps the operator hook that observes each `cert_expiring`
+  warning at runtime: the callback receives the same event (`kind`
+  `downstream` | `client`, endpoint, `notAfter`, `expirySeconds`,
+  `thresholdSeconds`, `at`) — one per certificate entering the warning
+  window; `null` clears back to audit-only. The `cert_expiring` audit
+  and the `relay_cert_expiry_seconds` gauge continue as before — only
+  the warning recipient changes. Certificates already reported are
+  never re-sent (a renewed certificate with a new fingerprint alerts
+  again); the threshold still moves only via `tlsCertExpiry` at
+  startup. A real swap audits as `cert_expiring_callback_revised`
+  with `previous` / `current` as `'set'` / `'cleared'` only, never a
+  function body. With `tlsCertExpiry` disabled the revision throws —
+  enabling it needs a restart. Zero dependencies (`node:crypto`
   only).
 - `src/tls-version.ts` — outbound per-endpoint TLS minimum version (WR-74):
   `createRelayServer({ minTlsVersions: { "<exact targetUrl>": "1.2" | "1.3" } })`
