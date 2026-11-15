@@ -12073,6 +12073,22 @@ const server = createRelayServer({
   Resolved addresses go into the block audit event only — never into
   metrics labels, and never into the error message (which also lands in
   the `dead_letter` audit's `error` field).
+- **Live observation-callback revision** —
+  `server.reviseEgressResidencyBlockedCallback(cb)` (WR-419) swaps only
+  the refusal-alert recipient at runtime: `cb` is called once per
+  refused delivery (`EgressResidencyBlockedInfo`: tenant, endpoint,
+  hostname, country, offending addresses); `null` clears back to
+  audit-only (the refusal still dead-letters and is still audited, just
+  no longer forwarded). A real revision is audited as
+  `egress_residency_blocked_callback_revised` (`previous` / `current`
+  record only 'set' / 'cleared', never a function body); a
+  same-reference replacement or clearing an already-unset hook is a
+  silent no-op, and a non-function value throws `RangeError` with the
+  live callback untouched. With the gate unconfigured the method throws
+  `Error` — enabling it needs a restart. The new callback takes effect
+  from the next refusal; already-reported refusals are never
+  re-emitted. The tenant country tables themselves still move only via
+  `reviseEgressResidency` (WR-376).
 - **Layering** — the gate reuses the WR-158 table (same first-match-wins
   order: document the more specific range first when ranges overlap)
   and resolves through the WR-92 cache when one is configured (the

@@ -6612,6 +6612,31 @@ export interface RelayServer extends Server {
    */
   reviseEgressResidency?: (tenant: string, countries: string[] | null) => string[] | undefined;
   /**
+   * WR-419: live-revise the egress-residency-blocked observation
+   * callback — the operator hook called once per residency-refused
+   * delivery (`EgressResidencyBlockedInfo`: tenant, endpoint,
+   * hostname, offending country, offending addresses). `null` clears
+   * back to audit-only (the refusal still dead-letters as
+   * `non_retryable` and `egress_residency_blocked` is still audited,
+   * just no longer forwarded to an operator). A non-function value
+   * throws `RangeError` and the live callback is untouched; replacing
+   * with the same reference (or clearing when already unset) is a
+   * silent no-op. A real replacement is audited as
+   * `egress_residency_blocked_callback_revised` with `previous` /
+   * `current` recording only 'set' / 'cleared' presence, never a
+   * function body. Always set; throws `Error` when the egress
+   * residency gate was never configured — enabling it needs a restart.
+   * The new callback takes effect from the next refused delivery;
+   * refusals already reported are never re-emitted, and the tenant
+   * country tables, the decision classification, the stats, and the
+   * gate construction are untouched. This swaps only the refusal-alert
+   * recipient; the tables themselves still move via
+   * `reviseEgressResidency`.
+   */
+  reviseEgressResidencyBlockedCallback?: (
+    cb: ((info: EgressResidencyBlockedInfo) => void) | null
+  ) => void;
+  /**
    * WR-376: live egress data-residency allowlist for one tenant.
    * Always set; `undefined` when the tenant is unlimited (no entry)
    * or the gate was never configured. Returns a fresh array, never a
@@ -9432,6 +9457,25 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       at: info.at,
     });
   };
+  // WR-419: the operator's egress-residency-blocked observation
+  // callback, held in a mutable cell so
+  // `server.reviseEgressResidencyBlockedCallback` can replace it at
+  // runtime. The composite closure below reads this cell — never the
+  // operator callback directly — so replacing the operator callback
+  // cannot bypass the `egress_residency_blocked` audit: the audit is
+  // appended first, then the cell is called. The gate's `readonly`
+  // callback field and construction semantics are untouched — the
+  // composite reference is passed once at construction and the cell
+  // lives in this closure. (A caller-supplied compiled
+  // `EgressResidencyGate` keeps its own `onBlocked`, exactly like the
+  // WR-417 guard — the cell only wires the options-built gate.)
+  let operatorEgressResidencyBlockedCallback:
+    | ((info: EgressResidencyBlockedInfo) => void)
+    | undefined;
+  const onEgressResidencyBlocked = (info: EgressResidencyBlockedInfo) => {
+    onEgressResidencyBlockedAudit(info);
+    operatorEgressResidencyBlockedCallback?.(info);
+  };
   // WR-165: a chaos-drill fault was injected — one audit line per fault
   // naming the endpoint, the fault kind, and the detail (latency or
   // synthetic status). Injected faults are always distinguishable from
@@ -9609,7 +9653,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     opts.responseGuard ?? {};
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, opts.awsSigV4, opts.awsSecretResolver, opts.outboundSchemas, opts.oauth2, undefined, opts.compressBrotli, opts.phaseTimeouts, opts.tlsCa, opts.chaos, onChaosInjectedAudit, liveResponseGuard, opts.doh, onDohFallbackAudit, proxyHealthMonitor, opts.outboundCredentials, opts.dnsPin, onDnsPinMismatchAudit, opts.cloudEvents, opts.outboundSsrfGuard, onOutboundSsrfBlocked, onOutboundSsrfAllowlisted, onOutboundSsrfProxySkipped, opts.egressResidency, onEgressResidencyBlockedAudit)
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, opts.awsSigV4, opts.awsSecretResolver, opts.outboundSchemas, opts.oauth2, undefined, opts.compressBrotli, opts.phaseTimeouts, opts.tlsCa, opts.chaos, onChaosInjectedAudit, liveResponseGuard, opts.doh, onDohFallbackAudit, proxyHealthMonitor, opts.outboundCredentials, opts.dnsPin, onDnsPinMismatchAudit, opts.cloudEvents, opts.outboundSsrfGuard, onOutboundSsrfBlocked, onOutboundSsrfAllowlisted, onOutboundSsrfProxySkipped, opts.egressResidency, onEgressResidencyBlocked)
       : undefined;
   // WR-146: tail-latency hedging for outbound attempts (opt-in). The
   // wrapper sits around whichever sender the queue uses — the default
@@ -18477,6 +18521,50 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       current: next,
     });
     return next;
+  };
+
+  // WR-419: live egress-residency-blocked observation callback
+  // revision. Only the operator-callback cell moves — the composite
+  // closure passed into the gate at construction (which appends the
+  // `egress_residency_blocked` audit first, then forwards to the
+  // cell) is never touched, so a replacement cannot bypass the audit.
+  // With the gate unconfigured the revision throws the same
+  // must-restart Error as `reviseEgressResidency` — enabling it needs
+  // a restart. A non-function callback throws `RangeError` and the
+  // live cell is untouched; a same-reference replacement (or clearing
+  // when already unset) is a silent no-op. A real replacement is
+  // audited as `egress_residency_blocked_callback_revised` with
+  // `previous` / `current` recording only 'set' / 'cleared' presence,
+  // never a function body. The new callback takes effect from the
+  // next refused delivery; refusals already reported are never
+  // re-emitted, and the tenant country tables, the decision
+  // classification, the stats, and the gate construction are
+  // untouched.
+  server.reviseEgressResidencyBlockedCallback = (
+    cb: ((info: EgressResidencyBlockedInfo) => void) | null
+  ): void => {
+    const gate = defaultSender?.egressResidencyGate;
+    if (gate === undefined) {
+      throw new Error(
+        "reviseEgressResidencyBlockedCallback: egress residency gate is not configured — enabling it requires a restart: " +
+          "the gate is created at startup and a running relay cannot start gating egress without one"
+      );
+    }
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseEgressResidencyBlockedCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === operatorEgressResidencyBlockedCallback) return;
+    const prev = operatorEgressResidencyBlockedCallback === undefined ? "cleared" : "set";
+    const nextPresence = next === undefined ? "cleared" : "set";
+    operatorEgressResidencyBlockedCallback = next;
+    opts.auditLog.append({
+      event: "egress_residency_blocked_callback_revised",
+      previous: prev,
+      current: nextPresence,
+    });
   };
 
   // WR-376: live egress data-residency allowlist for one tenant.
