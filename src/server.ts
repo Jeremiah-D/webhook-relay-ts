@@ -406,6 +406,7 @@ import {
   OcspMonitor,
   resolveOcspEndpointOptions,
   type OcspEndpointOptions,
+  type OcspRevokedAuditEvent,
   type ResolvedOcspEndpointOptions,
 } from "./ocsp.ts";
 import {
@@ -6628,6 +6629,31 @@ export interface RelayServer extends Server {
     cb: ((info: DnsPinMismatchInfo) => void) | null
   ) => void;
   /**
+   * WR-424: live-revise the OCSP revoked observation callback — the
+   * operator hook called once per `revoked` verdict
+   * (`OcspRevokedAuditEvent`: endpoint, serial, revocation time,
+   * mode, source). `null` clears back to audit-only (the revocation
+   * still rejects the delivery with `OcspRevokedError` and
+   * `ocsp_revoked` is still audited, just no longer forwarded to an
+   * operator). A non-function value throws `RangeError` and the live
+   * callback is untouched; replacing with the same reference (or
+   * clearing when already unset) is a silent no-op. A real
+   * replacement is audited as `ocsp_revoked_callback_revised` with
+   * `previous` / `current` recording only 'set' / 'cleared' presence,
+   * never a function body. Always set; throws `Error` when no OCSP
+   * endpoint was ever configured — enabling it needs a restart. The
+   * new callback takes effect from the next revoked verdict;
+   * revocations already reported are never re-emitted, and the
+   * revocation semantics, the fail-open / fail-closed modes, the
+   * alert hook, the `relay_ocsp_*` counters, the verified-socket
+   * cache, and the monitor construction are untouched. This swaps
+   * only the revocation-alert recipient; the OCSP configuration
+   * itself still moves via a restart.
+   */
+  reviseOcspRevokedCallback?: (
+    cb: ((event: OcspRevokedAuditEvent) => void) | null
+  ) => void;
+  /**
    * WR-421: live-revise the DoH fallback observation callback — the
    * operator hook called once per DoH failure that falls back to the
    * system resolver (`{ hostname, error, dohUrl }`). `null` clears
@@ -9414,6 +9440,24 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       });
     },
   });
+  // WR-424: the operator's OCSP revoked observation callback, held in
+  // a mutable cell so `server.reviseOcspRevokedCallback` can replace
+  // it at runtime. The composite closure below reads this cell —
+  // never the operator callback directly — so replacing the operator
+  // callback cannot bypass the `ocsp_revoked` audit: the audit is
+  // appended first, then the cell is called. The monitor's `readonly`
+  // hooks field and construction semantics are untouched — the
+  // composite reference is passed once at construction and the cell
+  // lives in this closure. (A throwing operator callback never
+  // downgrades the verdict: the monitor swallows hook throws, see
+  // src/ocsp.ts.)
+  let operatorOcspRevokedCallback:
+    | ((event: OcspRevokedAuditEvent) => void)
+    | undefined;
+  const onOcspRevoked = (event: OcspRevokedAuditEvent) => {
+    opts.auditLog.append(event);
+    operatorOcspRevokedCallback?.(event);
+  };
   // WR-101: the OCSP revocation monitor is only constructed when at
   // least one endpoint opts in via `tlsOcsp` — otherwise no
   // `relay_ocsp_*` series ever appears. Every `ocsp_revoked` event lands
@@ -9423,9 +9467,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   const ocspMonitor =
     opts.tlsOcsp !== undefined
       ? new OcspMonitor({
-          onRevoked: (event) => {
-            opts.auditLog.append(event);
-          },
+          onRevoked: onOcspRevoked,
           onAlert: (alert) => {
             opts.auditLog.append({
               event: "ocsp_alert",
@@ -18746,6 +18788,49 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     operatorDnsPinMismatchCallback = next;
     opts.auditLog.append({
       event: "dns_pin_mismatch_callback_revised",
+      previous: prev,
+      current: nextPresence,
+    });
+  };
+
+  // WR-424: live OCSP revoked observation callback revision. Only
+  // the operator-callback cell moves — the composite closure passed
+  // into the monitor at construction (which appends the
+  // `ocsp_revoked` audit first, then forwards to the cell) is never
+  // touched, so a replacement cannot bypass the audit. With no OCSP
+  // endpoint configured the revision throws Error — enabling it
+  // needs a restart. A non-function callback throws `RangeError` and
+  // the live cell is untouched; a same-reference replacement (or
+  // clearing when already unset) is a silent no-op. A real
+  // replacement is audited as `ocsp_revoked_callback_revised` with
+  // `previous` / `current` recording only 'set' / 'cleared' presence,
+  // never a function body. The new callback takes effect from the
+  // next revoked verdict; revocations already reported are never
+  // re-emitted, and the revocation semantics, the fail-open /
+  // fail-closed modes, the alert hook, the `relay_ocsp_*` counters,
+  // the verified-socket cache, and the monitor construction are
+  // untouched.
+  server.reviseOcspRevokedCallback = (
+    cb: ((event: OcspRevokedAuditEvent) => void) | null
+  ): void => {
+    if (ocspMonitor === undefined) {
+      throw new Error(
+        "reviseOcspRevokedCallback: OCSP revocation checking is not configured — enabling it requires a restart: " +
+          "the monitor is created at startup and a running relay cannot start checking revocations without one"
+      );
+    }
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseOcspRevokedCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === operatorOcspRevokedCallback) return;
+    const prev = operatorOcspRevokedCallback === undefined ? "cleared" : "set";
+    const nextPresence = next === undefined ? "cleared" : "set";
+    operatorOcspRevokedCallback = next;
+    opts.auditLog.append({
+      event: "ocsp_revoked_callback_revised",
       previous: prev,
       current: nextPresence,
     });
