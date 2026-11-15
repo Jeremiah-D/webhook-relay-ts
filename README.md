@@ -11883,6 +11883,22 @@ const server = createRelayServer({
   pinned baseline, observed addresses, mode). Operators re-baseline
   after a verified change with `sender.dnsPin.reset(hostname)` and
   inspect baselines with `sender.dnsPin.getPinned(hostname)`.
+- **Live observation-callback revision** —
+  `server.reviseDnsPinMismatchCallback(cb)` (WR-420) swaps only the
+  drift-alert recipient at runtime: `cb` is called once per detected
+  drift (`DnsPinMismatchInfo`: hostname, pinned baseline, observed
+  addresses, mode); `null` clears back to audit-only (the drift is
+  still detected, enforce mode still refuses the lookup, and
+  `dns_pin_mismatch` is still audited, just no longer forwarded). A
+  real revision is audited as `dns_pin_mismatch_callback_revised`
+  (`previous` / `current` record only 'set' / 'cleared', never a
+  function body); a same-reference replacement or clearing an
+  already-unset hook is a silent no-op, and a non-function value throws
+  `RangeError` with the live callback untouched. With pinning
+  unconfigured the method throws `Error` — enabling it needs a restart.
+  The new callback takes effect from the next drift; already-reported
+  drifts are never re-emitted. The pin baselines themselves still move
+  only via `sender.dnsPin.reset(hostname)`.
 - **Layering** — the pin wraps the effective lookup (the WR-92 cache when
   configured, the system resolver otherwise) via `dns.lookup`-compatible
   `pin.lookup`, so it judges exactly the addresses the connection will
