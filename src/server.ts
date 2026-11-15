@@ -6684,6 +6684,30 @@ export interface RelayServer extends Server {
     cb: ((info: EgressResidencyBlockedInfo) => void) | null
   ) => void;
   /**
+   * WR-422: live-revise the gzip fallback observation callback — the
+   * operator hook called once per 415-triggered plaintext fallback
+   * resend (`GzipFallbackInfo`: delivery id, trace id, endpoint,
+   * bytes saved). `null` clears back to audit-only (the 415 fallback
+   * still resends as plaintext and `gzip_fallback_plaintext` is still
+   * audited, just no longer forwarded to an operator). A non-function
+   * value throws `RangeError` and the live callback is untouched;
+   * replacing with the same reference (or clearing when already
+   * unset) is a silent no-op. A real replacement is audited as
+   * `gzip_fallback_callback_revised` with `previous` / `current`
+   * recording only 'set' / 'cleared' presence, never a function body.
+   * Always set; throws `Error` when guarded compression was never
+   * configured — enabling it needs a restart. The new callback takes
+   * effect from the next 415 fallback; fallbacks already reported
+   * are never re-emitted, and the guarded-compression configuration,
+   * the 415 fallback semantics, the byte-savings accounting, and the
+   * sender construction are untouched. This swaps only the
+   * fallback-alert recipient; the compression thresholds themselves
+   * are untouched.
+   */
+  reviseGzipFallbackCallback?: (
+    cb: ((info: GzipFallbackInfo) => void) | null
+  ) => void;
+  /**
    * WR-376: live egress data-residency allowlist for one tenant.
    * Always set; `undefined` when the tenant is unlimited (no entry)
    * or the gate was never configured. Returns a fresh array, never a
@@ -9387,6 +9411,22 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       bytesSaved: info.bytesSaved,
     });
   };
+  // WR-422: the operator's gzip fallback observation callback, held
+  // in a mutable cell so `server.reviseGzipFallbackCallback` can
+  // replace it at runtime. The composite closure below reads this
+  // cell — never the operator callback directly — so replacing the
+  // operator callback cannot bypass the `gzip_fallback_plaintext`
+  // audit: the audit is appended first, then the cell is called. The
+  // guarded-compression configuration and the 415 fallback semantics
+  // are untouched — the composite reference is passed once at
+  // construction (main sender and every WR-85 shadow sender copy
+  // alike, along WR-380 "same live record governs shadow mirrors")
+  // and the cell lives in this closure.
+  let operatorGzipFallbackCallback: ((info: GzipFallbackInfo) => void) | undefined;
+  const onGzipFallback = (info: GzipFallbackInfo) => {
+    onGzipFallbackAudit(info);
+    operatorGzipFallbackCallback?.(info);
+  };
   // WR-170: a DoH resolution failed and fell back to the system
   // resolver — one audit line per failure naming the hostname and the
   // DoH URL (the delivery keeps working; the operator may want to check
@@ -9735,7 +9775,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     opts.responseGuard ?? {};
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallbackAudit, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, opts.awsSigV4, opts.awsSecretResolver, opts.outboundSchemas, opts.oauth2, undefined, opts.compressBrotli, opts.phaseTimeouts, opts.tlsCa, opts.chaos, onChaosInjectedAudit, liveResponseGuard, opts.doh, onDohFallback, proxyHealthMonitor, opts.outboundCredentials, opts.dnsPin, onDnsPinMismatch, opts.cloudEvents, opts.outboundSsrfGuard, onOutboundSsrfBlocked, onOutboundSsrfAllowlisted, onOutboundSsrfProxySkipped, opts.egressResidency, onEgressResidencyBlocked)
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallback, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, opts.awsSigV4, opts.awsSecretResolver, opts.outboundSchemas, opts.oauth2, undefined, opts.compressBrotli, opts.phaseTimeouts, opts.tlsCa, opts.chaos, onChaosInjectedAudit, liveResponseGuard, opts.doh, onDohFallback, proxyHealthMonitor, opts.outboundCredentials, opts.dnsPin, onDnsPinMismatch, opts.cloudEvents, opts.outboundSsrfGuard, onOutboundSsrfBlocked, onOutboundSsrfAllowlisted, onOutboundSsrfProxySkipped, opts.egressResidency, onEgressResidencyBlocked)
       : undefined;
   // WR-146: tail-latency hedging for outbound attempts (opt-in). The
   // wrapper sits around whichever sender the queue uses — the default
@@ -9880,7 +9920,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
                   opts.minTlsVersions,
                   tlsVersionMonitor,
                   opts.compressThreshold,
-                  onGzipFallbackAudit,
+                  onGzipFallback,
                   onE2eeKeyRotatedAudit,
                   undefined,
                   // WR-92: shadow senders share the relay's DNS cache
@@ -15302,6 +15342,25 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     const passthrough: Record<string, string | string[] | undefined> = {};
     for (const [k, v] of Object.entries(headers)) {
       if (k === "host" || k === "content-length") continue;
+      // WR-422: hop-by-hop headers describe the inbound connection, not
+      // the event — a proxy must never forward them (RFC 9110 §7.6.1).
+      // Forwarding `connection` broke every relay HTTP/2 delivery from
+      // a client that sends it (Node/curl send `connection: keep-alive`
+      // by default): session.request() throws "HTTP/1 Connection
+      // specific headers are forbidden", the attempt fell back to
+      // HTTP/1.1, and an h2c downstream answered with a parse error.
+      // Stripped at intake, before any forward allowlist, so no
+      // endpoint rule can re-admit them.
+      if (
+        k === "connection" ||
+        k === "keep-alive" ||
+        k === "proxy-connection" ||
+        k === "te" ||
+        k === "trailer" ||
+        k === "transfer-encoding" ||
+        k === "upgrade"
+      )
+        continue;
       // WR-40: the payload was decompressed above, so a stale inbound
       // `content-encoding: gzip` must not travel with the plain bytes —
       // the downstream would try to gunzip JSON and fail.
@@ -18738,6 +18797,48 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     operatorEgressResidencyBlockedCallback = next;
     opts.auditLog.append({
       event: "egress_residency_blocked_callback_revised",
+      previous: prev,
+      current: nextPresence,
+    });
+  };
+
+  // WR-422: live gzip fallback observation callback revision. Only
+  // the operator-callback cell moves — the composite closure passed
+  // into the sender at construction (which appends the
+  // `gzip_fallback_plaintext` audit first, then forwards to the
+  // cell) is never touched, so a replacement cannot bypass the audit.
+  // With guarded compression unconfigured the revision throws Error
+  // — enabling it needs a restart. A non-function callback throws
+  // `RangeError` and the live cell is untouched; a same-reference
+  // replacement (or clearing when already unset) is a silent no-op.
+  // A real replacement is audited as `gzip_fallback_callback_revised`
+  // with `previous` / `current` recording only 'set' / 'cleared'
+  // presence, never a function body. The new callback takes effect
+  // from the next 415 fallback; fallbacks already reported are never
+  // re-emitted, and the guarded-compression configuration, the 415
+  // fallback semantics, the byte-savings accounting, and the sender
+  // construction are untouched.
+  server.reviseGzipFallbackCallback = (
+    cb: ((info: GzipFallbackInfo) => void) | null
+  ): void => {
+    if (opts.compressThreshold === undefined || Object.keys(opts.compressThreshold).length === 0) {
+      throw new Error(
+        "reviseGzipFallbackCallback: guarded compression is not configured — enabling it requires a restart: " +
+          "the 415 plaintext fallback only arises when guarded compression is configured at startup"
+      );
+    }
+    if (cb !== null && typeof cb !== "function") {
+      throw new RangeError(
+        "reviseGzipFallbackCallback: handler must be a function or null"
+      );
+    }
+    const next = cb ?? undefined;
+    if (next === operatorGzipFallbackCallback) return;
+    const prev = operatorGzipFallbackCallback === undefined ? "cleared" : "set";
+    const nextPresence = next === undefined ? "cleared" : "set";
+    operatorGzipFallbackCallback = next;
+    opts.auditLog.append({
+      event: "gzip_fallback_callback_revised",
       previous: prev,
       current: nextPresence,
     });

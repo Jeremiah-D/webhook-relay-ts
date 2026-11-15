@@ -4935,8 +4935,18 @@ const server = createRelayServer({
   payloads are JSON by contract), and when a guarded delivery is answered
   `415`, the sender resends it once as plaintext *inside the same
   delivery attempt* — no retry budget consumed, no circuit event — and
-  audits `gzip_fallback_plaintext`. A `415` on the plaintext resend (or
-  any other failure) follows the normal retry / dead-letter path.
+  audits `gzip_fallback_plaintext`. The operator hook for each fallback
+  is live-revisable: `server.reviseGzipFallbackCallback(cb | null)`
+  swaps the recipient at runtime (WR-422) — `null` clears back to
+  audit-only, a non-function value throws `RangeError`, and revising
+  with no guarded compression configured throws `Error` (enabling it
+  needs a restart). A real replacement is audited as
+  `gzip_fallback_callback_revised` (`previous` / `current` record only
+  'set' / 'cleared', never a function body), takes effect from the next
+  415 fallback, and never re-emits fallbacks already reported. Covered
+  by `test/gzip-fallback-callback-revision.test.ts`. A `415` on the
+  plaintext resend (or any other failure) follows the normal retry /
+  dead-letter path.
   Compressed bytes saved per endpoint are counted in
   `relay_compressed_bytes_saved_total`. When both `compressOutbound` and
   `compressThreshold` configure an endpoint, the guarded path wins. The
@@ -5661,7 +5671,12 @@ inbound request's headers (minus the relay-owned strips the intake
 applies: `host`, `content-length`, stale `content-encoding`, `x-relay-*`,
 `x-tenant-id`, `x-api-key`) — convenient for trace correlation, but it
 also means a caller's `authorization` or `cookie` header reaches a
-downstream that never asked for it.
+downstream that never asked for it. Hop-by-hop headers (`connection`,
+`keep-alive`, `proxy-connection`, `te`, `trailer`, `transfer-encoding`,
+`upgrade`) are stripped at intake, before any allowlist, because they
+describe the inbound connection, not the event (RFC 9110 §7.6.1) — no
+endpoint rule can re-admit them, and forwarding `connection` used to
+break every relay HTTP/2 delivery outright (WR-422).
 
 ```ts
 const server = createRelayServer({

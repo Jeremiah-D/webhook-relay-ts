@@ -204,6 +204,70 @@ describe("WR-69 server wiring", () => {
     );
   });
 
+  it("hop-by-hop headers are stripped at intake and never forwarded (WR-422)", async () => {
+    // RFC 9110 §7.6.1: connection, keep-alive, proxy-connection, te,
+    // trailer, transfer-encoding, upgrade describe the inbound hop, not
+    // the event. Forwarding `connection` broke relay HTTP/2 outright
+    // (session.request() throws on connection-specific headers, the
+    // attempt fell back to HTTP/1.1, an h2c downstream parse-errored).
+    // The strip happens at intake, before any forward allowlist, so no
+    // endpoint rule can re-admit them.
+    const hopByHop: Record<string, string> = {
+      // `connection: close` is the discriminating value: the sender's
+      // own keep-alive client stamps `keep-alive`, so seeing `keep-alive`
+      // proves the inbound value was stripped, not forwarded.
+      connection: "close",
+      "keep-alive": "timeout=5",
+      "proxy-connection": "keep-alive",
+      te: "trailers",
+      trailer: "x-checksum",
+      "transfer-encoding": "chunked",
+      upgrade: "websocket",
+    };
+    await withRelay({}, async (port) => {
+      seen.length = 0;
+      const res = await post(port, { ...inboundHeaders(), ...hopByHop });
+      assert.equal(res.status, 202);
+      const deadline = Date.now() + 5000;
+      while (seen.length === 0 && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      assert.equal(seen.length, 1, "stub received the delivery");
+      const got = seen[0];
+      assert.equal(got["connection"], "keep-alive", "the sender stamps its own Connection; the inbound `close` must not travel");
+      for (const name of Object.keys(hopByHop)) {
+        if (name === "connection") continue;
+        assert.equal(got[name], undefined, `${name} must not be forwarded`);
+      }
+      assert.equal(got["x-custom-id"], "evt-1", "end-to-end headers still pass");
+    });
+  });
+
+  it("an explicit forward allow cannot re-admit hop-by-hop headers (WR-422)", async () => {
+    const forwardUrl = `http://127.0.0.1:${stubPort}/hook`;
+    await withRelay(
+      { forwardHeaders: { [forwardUrl]: { allow: ["connection", "keep-alive", "x-custom-id"] } } },
+      async (port) => {
+        seen.length = 0;
+        const res = await post(port, {
+          ...inboundHeaders(),
+          connection: "close",
+          "keep-alive": "timeout=5",
+        });
+        assert.equal(res.status, 202);
+        const deadline = Date.now() + 5000;
+        while (seen.length === 0 && Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 25));
+        }
+        assert.equal(seen.length, 1, "stub received the delivery");
+        const got = seen[0];
+        assert.equal(got["connection"], "keep-alive", "the sender stamps its own Connection; the inbound `close` must not travel");
+        assert.equal(got["keep-alive"], undefined);
+        assert.equal(got["x-custom-id"], "evt-1");
+      }
+    );
+  });
+
   it("rules are per endpoint: other targets are unaffected", async () => {
     await withRelay(
       { forwardHeaders: { "http://other.example/hook": {} } },
