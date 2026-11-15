@@ -86,7 +86,9 @@ describe("WR-134 adaptive per-origin socket-cap sizing", () => {
   });
 
   it("scales the cap down when idle and reaps only idle sockets", async () => {
-    const { server: s2 } = delayedServer(300);
+    // blockingServer, not a fixed delay: the test releases the requests
+    // itself, so completion never races the evaluator under load.
+    const { server: s2, release: rel2 } = blockingServer();
     await new Promise<void>((r) => s2.listen(0, "127.0.0.1", r));
     const p2 = (s2.address() as { port: number }).port;
     const pool = new OutboundConnectionPool({
@@ -105,8 +107,20 @@ describe("WR-134 adaptive per-origin socket-cap sizing", () => {
       assert.equal(mid.currentMaxSockets, 2);
       assert.equal(mid.activeSockets, 2); // in-flight deliveries are never touched
       assert.equal(mid.reaped, 0); // nothing idle to reap yet
-      await sleep(250); // requests done (~300ms), second eval: 2 -> 1, reaps 1 idle
-      const shrunk = pool.getStats().endpoints[0];
+      rel2(); // let both requests complete; the next eval shrinks 2 -> 1 and reaps 1 idle
+      // Poll for the shrink AND the reap instead of a fixed sleep: under
+      // load the evaluator runs late. (A shrink that lands while the
+      // requests are still in flight reaps nothing — active sockets are
+      // never touched — so the reap may arrive on the eval after they drain.)
+      const deadline = Date.now() + 10000;
+      let shrunk = pool.getStats().endpoints[0];
+      while (
+        !(shrunk.currentMaxSockets === 1 && shrunk.reaped === 1) &&
+        Date.now() < deadline
+      ) {
+        await sleep(25);
+        shrunk = pool.getStats().endpoints[0];
+      }
       assert.equal(shrunk.currentMaxSockets, 1);
       assert.ok(shrunk.scaleDowns >= 2, `expected >= 2 scale-downs, got ${shrunk.scaleDowns}`);
       assert.equal(shrunk.reaped, 1);
@@ -114,6 +128,7 @@ describe("WR-134 adaptive per-origin socket-cap sizing", () => {
       const statuses = await Promise.all(pending);
       assert.deepEqual(statuses, [200, 200]); // shrink never broke in-flight requests
     } finally {
+      rel2(); // release the held requests even if an assert above failed
       pool.destroy();
       s2.close();
     }

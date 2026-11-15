@@ -165,6 +165,9 @@ describe("audit sink (WR-90)", () => {
       log.append({ event: "accepted", id: "evt-1", targetUrl: "https://down.example/hook" });
       log.append({ event: "delivered", id: "evt-2", tenant: "acme" });
       await waitFor(() => hits.length >= 2, 5000, "2 forwarded events");
+      // `sent` only increments when each response completes, which lags
+      // the stub recording the hit (request arrival).
+      await waitFor(() => sink.stats().sent >= 2, 5000, "2 events counted as sent");
       assert.equal(sink.stats().sent, 2);
 
       const first = hits[0];
@@ -312,6 +315,12 @@ describe("audit sink (WR-90)", () => {
     sink.start();
     log.append({ event: "accepted", id: "before-stop" });
     await waitFor(() => hits.length >= 1, 5000, "first event forwarded");
+    // The stub records a hit when the request arrives, but the cursor is
+    // only persisted after the response completes — stop() aborts an
+    // in-flight POST, so stopping here would leave the cursor behind
+    // 'before-stop' and the restart would replay it. Wait for the send
+    // to be counted first; the cursor write follows synchronously.
+    await waitFor(() => sink.stats().sent >= 1, 5000, "first event counted as sent");
     sink.stop();
     log.append({ event: "accepted", id: "after-stop" });
     await new Promise((r) => setTimeout(r, 150));

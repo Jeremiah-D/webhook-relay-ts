@@ -16725,9 +16725,20 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       sendQueue = sendQueue.then(() => {
         if (socket.destroyed) return;
         try {
-          socket.write(wsCloseFrame(code, reasonText), () => socket.destroy());
+          // Graceful close: `end()` sends the close frame then a FIN,
+          // so the peer can still read the buffered frames — this close
+          // frame included — before EOF. Destroying in the write
+          // callback instead RSTs the connection whenever unread inbound
+          // data is pending (the slow-consumer case: ~19k unread
+          // envelopes), discarding the peer's unread receive buffer and
+          // the close frame with it before a slow peer reads it.
+          socket.end(wsCloseFrame(code, reasonText));
           // If the peer never drains, don't linger: the audit is written.
-          const killer = setTimeout(() => socket.destroy(), 1000);
+          // Five seconds, not one: a slow peer needs time to drain the
+          // buffered acks and read the close frame before the socket is
+          // destroyed — destroying at 1s RSTs the close frame away just
+          // as reliably as destroying in the write callback.
+          const killer = setTimeout(() => socket.destroy(), 5000);
           (killer as unknown as { unref?: () => unknown }).unref?.();
         } catch {
           socket.destroy();

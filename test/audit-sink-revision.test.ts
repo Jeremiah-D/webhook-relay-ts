@@ -429,6 +429,10 @@ describe("audit sink live revision (WR-413)", () => {
     try {
       log.append({ event: "accepted", id: "noop-1" });
       await waitFor(() => stub.hits.length >= 1, "first event delivered");
+      // Snapshot only after the send is counted: `sent` lags the hit
+      // (response completion vs request arrival), and a snapshot taken
+      // too early would make the no-op comparison fail spuriously.
+      await waitFor(() => sink.stats().sent >= 1, "first event counted as sent");
       const statsBefore = sink.stats();
       const cursorBefore = sink.cursorOffset();
 
@@ -448,6 +452,7 @@ describe("audit sink live revision (WR-413)", () => {
 
       log.append({ event: "accepted", id: "noop-2" });
       await waitFor(() => stub.hits.length >= 2, "second event delivered");
+      await waitFor(() => sink.stats().sent >= 2, "second event counted as sent");
       assert.equal(sink.stats().sent, 2);
     } finally {
       sink.stop();
@@ -600,6 +605,10 @@ describe("audit sink live revision (WR-413)", () => {
       log.append({ event: "accepted", id: "seq-1" });
       log.append({ event: "accepted", id: "seq-2" });
       await waitFor(() => oldStub.hits.length >= 2, "pre-revision events delivered");
+      // Snapshot only after both sends are counted (`sent` lags the
+      // hits): otherwise `statsBefore` can read 1 and the revision
+      // no-op comparison below fails spuriously.
+      await waitFor(() => sink.stats().sent >= 2, "pre-revision sends counted");
       const statsBefore = sink.stats();
       const cursorBefore = sink.cursorOffset();
       assert.equal(statsBefore.sent, 2);
@@ -611,6 +620,10 @@ describe("audit sink live revision (WR-413)", () => {
       log.append({ event: "accepted", id: "seq-3" });
       log.append({ event: "accepted", id: "seq-4" });
       await waitFor(() => newStub.hits.length >= 2, "post-revision events delivered");
+      // The stub records a hit when the request arrives, but `sent` only
+      // increments when the response completes — under load the last
+      // delivery's response can still be in flight when the hits land.
+      await waitFor(() => sink.stats().sent >= 4, "sink sent counter reaches 4");
       assert.deepEqual(
         newStub.hits.map((h) => parsedBody(h).id),
         ["seq-3", "seq-4"]

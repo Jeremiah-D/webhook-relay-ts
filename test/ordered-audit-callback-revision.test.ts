@@ -646,11 +646,14 @@ describe("RelayServer ordered audit callback revision (WR-401)", () => {
     await waitFor(() => first.some((e) => e.id === urgent.id), "ordered_bypassed callback");
     assert.equal(first.find((e) => e.id === urgent.id)?.traceId, urgent.traceId);
     relay.reviseOrderedAuditCallback!(null);
-    const beforeBypass = eventsOf(auditLog, "ordered_bypassed").length;
     const urgent2 = await postOne(port, { "x-priority": "urgent" });
+    // Wait for THIS item's bypass audit, not for the count to move: the
+    // first urgent item retries (the sender always fails) and every
+    // retry dispatch re-enters the gate, so a count increase can come
+    // from the old item's retry instead of urgent2's bypass.
     await waitFor(
-      () => eventsOf(auditLog, "ordered_bypassed").length > beforeBypass,
-      "ordered_bypassed audit after clear"
+      () => eventsOf(auditLog, "ordered_bypassed").some((e) => e.id === urgent2.id),
+      "ordered_bypassed audit for urgent2 after clear"
     );
     assert.ok(!first.some((e) => e.id === urgent2.id), "cleared hook stays silent");
     const bypasses = eventsOf(auditLog, "ordered_bypassed").filter((e) => e.id === urgent2.id);

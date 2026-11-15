@@ -556,7 +556,15 @@ describe("WebSocket gateway in GET /metrics (WR-105)", () => {
         const res = await get(port, "/metrics", { authorization: "Bearer op-token" });
         assert.equal(res.status, 200);
         text = res.text;
-        if (text.includes("relay_websocket_messages_out_total") || Date.now() > deadline) break;
+        // Poll for the reply counter, not just the HELP line: the HELP
+        // text exists as soon as the metric family is registered, but
+        // `messages_in` only reaches 1 once the stub's reply has been
+        // received and counted — under load that lags the send.
+        if (
+          text.includes(`relay_websocket_messages_in_total{origin="${origin}"} 1`) ||
+          Date.now() > deadline
+        )
+          break;
         await new Promise((r) => setTimeout(r, 50));
       }
       assert.ok(text.includes(`relay_websocket_messages_out_total{origin="${origin}"} 1`), text);

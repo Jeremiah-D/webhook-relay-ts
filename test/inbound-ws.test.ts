@@ -204,11 +204,19 @@ async function wsConnect(
         resolve(q);
         return;
       }
-      const timer = setTimeout(() => reject(new Error("frame timeout")), 10000);
-      pending.push((f) => {
+      // A timed-out waiter must leave `pending`: otherwise the next
+      // frame would be handed to this already-rejected waiter and lost
+      // to the caller that retries after the timeout.
+      const waiter = (f: ServerFrame): void => {
         clearTimeout(timer);
         resolve(f);
-      });
+      };
+      const timer = setTimeout(() => {
+        const idx = pending.indexOf(waiter);
+        if (idx >= 0) pending.splice(idx, 1);
+        reject(new Error("frame timeout"));
+      }, 10000);
+      pending.push(waiter);
     });
   return {
     socket,
@@ -253,6 +261,7 @@ interface TestRelay {
   relay: Server;
   port: number;
   seen: RetryItem[];
+  audit: AuditLog;
 }
 
 const relays: Server[] = [];
@@ -274,7 +283,7 @@ function makeRelay(extraOpts: Record<string, unknown> = {}): Promise<TestRelay> 
     ...extraOpts,
   });
   relays.push(relay);
-  return listen(relay).then((port) => ({ relay, port, seen }));
+  return listen(relay).then((port) => ({ relay, port, seen, audit }));
 }
 
 /** One signed event envelope, shaped like a WR-61 batch item. */
@@ -528,27 +537,54 @@ describe("inbound WebSocket intake (WR-130)", () => {
   });
 
   it("disconnects slow consumers past 1MiB of buffered acks", async () => {
-    const { port } = await makeRelay();
+    const { port, audit } = await makeRelay();
     const client = await wsConnect(port);
     clients.push(client);
-    // Never read: the server's outbound buffer grows until the 1MiB
-    // slow-consumer guard (shared with SSE /events) fires. ~40k small
-    // acks ≈ 6MB, enough to fill the kernel send buffer and push node's
-    // own buffer past the threshold.
-    client.pause();
-    const raw = Buffer.from(JSON.stringify({ junk: 1 }));
-    const badEnv = JSON.stringify({
-      payload: raw.toString("base64"),
-      headers: { "x-signature": signSha256(raw, "wrong-key") },
+    // Never read while the guard is pending: the server's outbound
+    // buffer only grows while the client is not draining it. Resuming
+    // right after the send loop lets a loaded server's ack trickle fall
+    // behind the client's drain rate, so the 1MiB guard never fires.
+    // Instead, stay paused until the guard itself fires — tearDown
+    // audits `ws_disconnected`/`slow_consumer` synchronously — and only
+    // then resume to read the close frame. Watch for that audit event
+    // with a live `subscribe()` listener, not `query()` polling: the
+    // 40k rejected envelopes append ~21k audit lines, and polling
+    // `query()` re-scans that growing tail on every poll, which starves
+    // the same event loop the server needs. ~40k small acks ≈ 6MB,
+    // enough to fill the kernel send buffer and push node's own buffer
+    // past the threshold.
+    let guardFired = false;
+    const unsub = audit.subscribe((e) => {
+      if (e.event === "ws_disconnected" && e.reason === "slow_consumer") guardFired = true;
     });
-    for (let i = 0; i < 40000; i++) {
-      client.sendText(badEnv);
+    try {
+      client.pause();
+      const raw = Buffer.from(JSON.stringify({ junk: 1 }));
+      const badEnv = JSON.stringify({
+        payload: raw.toString("base64"),
+        headers: { "x-signature": signSha256(raw, "wrong-key") },
+      });
+      for (let i = 0; i < 40000; i++) {
+        client.sendText(badEnv);
+      }
+      await waitFor(() => guardFired, 120000);
+    } finally {
+      unsub();
     }
     client.resume();
     let code = 0;
-    const deadline = Date.now() + 60000;
+    const deadline = Date.now() + 120000;
     while (code !== 1011 && Date.now() < deadline) {
-      const f = await client.nextFrame();
+      // The close frame rides behind the queued acks; a single 10s frame
+      // wait can expire while it is still on its way — retry until the
+      // deadline instead of failing on the first quiet window.
+      let f: ServerFrame;
+      try {
+        f = await client.nextFrame();
+      } catch (err) {
+        if ((err as Error).message === "frame timeout") continue;
+        throw err;
+      }
       if (f.opcode === 0x8) code = f.payload.readUInt16BE(0);
     }
     assert.equal(code, 1011);

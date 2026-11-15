@@ -108,15 +108,28 @@ describe("happy-eyeballs: racing", () => {
   let v4: Server;
   let v6like: Server;
   let port: number;
+  /** Sockets accepted by either server, so `after` can destroy stragglers. */
+  const liveSockets = new Set<Socket>();
+  const track = (s: Server): void => {
+    s.on("connection", (sock: Socket) => {
+      liveSockets.add(sock);
+      sock.on("close", () => liveSockets.delete(sock));
+    });
+  };
 
   before(async () => {
     v4 = createServer(okHandler);
     port = await listenOn(v4, V4_ADDR);
     v6like = createServer(okHandler);
     await listenOn(v6like, V6_ADDR, port);
+    track(v4);
+    track(v6like);
   });
 
   after(async () => {
+    // Destroy any connection a test left behind before closing:
+    // server.close() waits for open connections forever.
+    for (const sock of liveSockets) sock.destroy();
     await new Promise<void>((resolve) => v4.close(() => resolve()));
     await new Promise<void>((resolve) => v6like.close(() => resolve()));
   });
@@ -225,7 +238,13 @@ describe("happy-eyeballs: racing", () => {
       if (connects === 1) {
         const self: Socket = this as Socket;
         setTimeout(() => {
-          (origConnect as (...a: unknown[]) => unknown).apply(self, args);
+          // The race may already have settled and destroyed this attempt
+          // (the winner was returned); connecting a destroyed socket
+          // resurrects it with no owner, and the stray connection then
+          // strands the `after` hook's server.close() forever.
+          if (!self.destroyed) {
+            (origConnect as (...a: unknown[]) => unknown).apply(self, args);
+          }
         }, 50);
         return self;
       }

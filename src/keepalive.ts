@@ -925,8 +925,15 @@ export class OutboundConnectionPool {
         );
         this.setEntryMaxSockets(entry, next, now);
         entry.scaleDowns += 1;
-        this.shrinkIdleSockets(entry);
       }
+      // WR-134: a scale-down that lands while sockets are still in flight
+      // reaps nothing (active sockets are never touched), but those
+      // sockets go idle afterwards — above the new, lower cap, with no
+      // further shrink to trigger a reap. Reap the idle excess on every
+      // eval so the pool actually fits its cap once the in-flight work
+      // drains (the idle reaper may be off, and the cap floor stops
+      // further scale-downs).
+      this.shrinkIdleSockets(entry);
     }
   }
 

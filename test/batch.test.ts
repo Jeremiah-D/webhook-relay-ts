@@ -333,7 +333,7 @@ describe("batch server integration", () => {
       forwardUrl: `http://127.0.0.1:${stubPort}/hook`,
       auditLog: audit,
       operatorToken: "op",
-      retry: { batch: { windowMs: 80, maxBatchSize: 10 }, baseDelayMs: 10, jitterMs: 0 },
+      retry: { batch: { windowMs: 200, maxBatchSize: 10 }, baseDelayMs: 10, jitterMs: 0 },
     });
     await new Promise<void>((resolve) => relay.listen(0, "127.0.0.1", resolve));
     const port = (relay.address() as AddressInfo).port;
@@ -343,10 +343,13 @@ describe("batch server integration", () => {
       await new Promise((r) => s.once("close", r));
     };
     try {
-      for (const n of ["one", "two", "three"]) {
-        const res = await post(port, Buffer.from(JSON.stringify({ n })));
-        assert.equal(res.status, 202);
-      }
+      // Post concurrently: sequential round-trips under load can straddle
+      // the batch window, so the three webhooks would land in separate
+      // flushes instead of merging into one.
+      const results = await Promise.all(
+        ["one", "two", "three"].map((n) => post(port, Buffer.from(JSON.stringify({ n }))))
+      );
+      for (const res of results) assert.equal(res.status, 202);
       const deadline = Date.now() + 5000;
       while (received.length === 0 && Date.now() < deadline) {
         await new Promise((r) => setTimeout(r, 25));

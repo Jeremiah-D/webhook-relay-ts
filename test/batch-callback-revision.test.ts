@@ -353,11 +353,21 @@ describe("RelayServer batch callback revision (WR-400)", () => {
     return { relay, auditLog, sent };
   }
 
-  /** Post two items and wait until `seen` grows past `before`. */
+  /**
+   * Post two items and wait until `seen` grows past `before` AND the
+   * merged delivery has landed (`sent` grows past `beforeSent`). The
+   * flush callback fires synchronously inside the flush, but the merged
+   * delivery is dispatched asynchronously afterwards (0ms timer + the
+   * async dispatch gates), so waiting for the callback alone does not
+   * prove the delivery happened — under load the dispatch can still be
+   * pending when the callback is observed.
+   */
   async function flushOnce(
     port: number,
     seen: BatchInfo[],
-    before: number
+    before: number,
+    sent: RetryItem[],
+    beforeSent: number
   ): Promise<{ traceIds: string[] }> {
     const t1 = JSON.parse(
       (
@@ -375,7 +385,10 @@ describe("RelayServer batch callback revision (WR-400)", () => {
         })
       ).text
     ) as { traceId: string };
-    await waitFor(() => seen.length > before, "batch flush callback");
+    await waitFor(
+      () => seen.length > before && sent.length > beforeSent,
+      "batch flush callback and merged delivery"
+    );
     return { traceIds: [t1.traceId, t2.traceId] };
   }
 
@@ -386,7 +399,7 @@ describe("RelayServer batch callback revision (WR-400)", () => {
       onBatch: (info) => first.push(info),
     });
     const port = await listen(relay);
-    const { traceIds: t1 } = await flushOnce(port, first, 0);
+    const { traceIds: t1 } = await flushOnce(port, first, 0, sent, 0);
     assert.equal(first.length, 1);
     assert.ok(first[0].batchId.startsWith("batch:"));
     assert.equal(first[0].endpoint, EP2);
@@ -395,7 +408,7 @@ describe("RelayServer batch callback revision (WR-400)", () => {
     assert.equal(eventsOf(auditLog, "batch_flushed").length, 1);
     assert.equal(sent.length, 1);
     relay.reviseBatchCallback!((info) => second.push(info));
-    const { traceIds: t2 } = await flushOnce(port, second, 0);
+    const { traceIds: t2 } = await flushOnce(port, second, 0, sent, 1);
     assert.equal(first.length, 1);
     assert.equal(second.length, 1);
     assert.ok(second[0].batchId.startsWith("batch:"));
@@ -418,7 +431,7 @@ describe("RelayServer batch callback revision (WR-400)", () => {
       onBatch: (info) => first.push(info),
     });
     const port = await listen(relay);
-    await flushOnce(port, first, 0);
+    await flushOnce(port, first, 0, sent, 0);
     assert.equal(first.length, 1);
     relay.reviseBatchCallback!(null);
     const beforeAudit = eventsOf(auditLog, "batch_flushed").length;
@@ -434,6 +447,10 @@ describe("RelayServer batch callback revision (WR-400)", () => {
       () => eventsOf(auditLog, "batch_flushed").length > beforeAudit,
       "batch_flushed audit after clear"
     );
+    // The audit lands synchronously in the flush, but the merged
+    // delivery is dispatched asynchronously afterwards — wait for it
+    // to land too before asserting the count.
+    await waitFor(() => sent.length >= 2, "merged delivery after clear");
     assert.equal(first.length, 1, "cleared hook stays silent");
     assert.equal(sent.length, 2, "merging keeps delivering after the clear");
     const revised = eventsOf(auditLog, "batch_callback_revised");
@@ -445,7 +462,7 @@ describe("RelayServer batch callback revision (WR-400)", () => {
   it("a non-function value throws RangeError and the live callback is untouched; same-reference is a silent no-op", async () => {
     const first: BatchInfo[] = [];
     const onBatch = (info: BatchInfo) => first.push(info);
-    const { relay, auditLog } = batchingServer({ onBatch });
+    const { relay, auditLog, sent } = batchingServer({ onBatch });
     const port = await listen(relay);
     for (const bad of ["x", 42, {}] as never[]) {
       assert.throws(() => relay.reviseBatchCallback!(bad), RangeError, String(bad));
@@ -453,7 +470,7 @@ describe("RelayServer batch callback revision (WR-400)", () => {
     assert.equal(eventsOf(auditLog, "batch_callback_revised").length, 0);
     relay.reviseBatchCallback!(onBatch);
     assert.equal(eventsOf(auditLog, "batch_callback_revised").length, 0);
-    await flushOnce(port, first, 0);
+    await flushOnce(port, first, 0, sent, 0);
     assert.equal(first.length, 1);
   });
 
