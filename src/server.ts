@@ -2870,6 +2870,17 @@ export interface PooledSender extends Sender {
    */
   tlsPinMap: Map<string, string[]>;
   /**
+   * WR-430: the live outbound signing state itself — revised at
+   * runtime via `RelayServer.reviseOutboundSigning` (which owns the
+   * `outbound_signing_revised` audit). Created once in
+   * `createDefaultSender` (seeded from the construction
+   * `outboundSigning`, signing off when none was configured) and never
+   * replaced — revisions mutate it in place, so a delivery whose wire
+   * request was already built keeps the signing values it started
+   * with.
+   */
+  liveOutboundSigning: LiveOutboundSigning;
+  /**
    * WR-165: chaos-drill injection counters, when the feature is enabled —
    * rendered into `GET /metrics` as `relay_chaos_injected_total` via
    * `render()`. `undefined` when no `chaos` was configured; the metrics
@@ -3671,6 +3682,16 @@ export function createDefaultSender(
       "createDefaultSender: `outboundSigning.ed25519`"
     );
   }
+  // WR-430: the live outbound signing state — the config plus the
+  // compiled Ed25519 key, revised at runtime via
+  // `RelayServer.reviseOutboundSigning`. Created once here and never
+  // replaced — revisions mutate the holder in place, so a delivery
+  // whose wire request was already built keeps the signing values it
+  // started with, while the next send reads the new ones.
+  const liveOutboundSigning: LiveOutboundSigning = {
+    config: outboundSigning,
+    compiledEd25519,
+  };
   // WR-58: RangeError on invalid values, at startup — never mid-delivery.
   // `undefined` (feature off) is the common case. Parsed keys are cached
   // so the per-delivery seal only does the ECDH + AEAD, never re-parse.
@@ -4120,7 +4141,7 @@ export function createDefaultSender(
     // `outboundSigning` for this endpoint. Resolved per attempt, like
     // pins and proxy above.
     const endpointSigning = endpointRegistry?.getSigning(item.targetUrl);
-    const signing = endpointSigning ?? outboundSigning;
+    const signing = endpointSigning ?? liveOutboundSigning.config;
     if (signing !== undefined) {
       // Stamp AFTER the passthrough headers: this guarantees the relay's
       // own signature always wins.
@@ -4131,9 +4152,14 @@ export function createDefaultSender(
       // verifies. Only the global `outboundSigning` carries it: a WR-114
       // per-endpoint `verifier` replaces the whole signing identity, so it
       // disables the Ed25519 stamp for that endpoint too.
-      if (endpointSigning === undefined && compiledEd25519 !== undefined) {
-        headers[ED25519_SIGNATURE_HEADER] = signEd25519Outbound(body, compiledEd25519);
-        if (compiledEd25519.keyId !== undefined) headers[ED25519_KEY_ID_HEADER] = compiledEd25519.keyId;
+      if (endpointSigning === undefined && liveOutboundSigning.compiledEd25519 !== undefined) {
+        headers[ED25519_SIGNATURE_HEADER] = signEd25519Outbound(
+          body,
+          liveOutboundSigning.compiledEd25519
+        );
+        if (liveOutboundSigning.compiledEd25519.keyId !== undefined) {
+          headers[ED25519_KEY_ID_HEADER] = liveOutboundSigning.compiledEd25519.keyId;
+        }
       }
     }
     // WR-116: per-endpoint AWS SigV4 request signing (opt-in). Applied to
@@ -5758,6 +5784,9 @@ export function createDefaultSender(
   // were configured) — revised at runtime via
   // `RelayServer.reviseTlsPins`.
   sender.tlsPinMap = tlsPinMap;
+  // WR-430: the live outbound signing state itself — revised at
+  // runtime via `RelayServer.reviseOutboundSigning`.
+  sender.liveOutboundSigning = liveOutboundSigning;
   // WR-165: chaos-drill injection counters (undefined when the feature
   // is off) — operators read them via `sender.chaosMetrics.getStats()`;
   // they render into GET /metrics as `relay_chaos_injected_total`.
@@ -5894,6 +5923,155 @@ export interface OutboundSigningConfig {
    * is byte-identical. Invalid values throw `RangeError` at startup.
    */
   ed25519?: Ed25519OutboundKeyConfig;
+}
+
+/**
+ * WR-430: a live outbound signing revision — rotate the HMAC secret,
+ * replace the key id, or add / replace / clear the Ed25519 channel, all
+ * without restarting the relay. `null` clears the Ed25519 channel;
+ * an omitted field keeps its live value. At least one field is
+ * required; an unknown field, an empty secret, an empty key id, or an
+ * invalid Ed25519 key throws `RangeError` and the live signing values
+ * are left completely intact. Enabling signing from unconfigured
+ * requires `secret` — there is no key to sign with otherwise. A patch
+ * identical to the live values is a silent no-op (no audit event).
+ * The revision takes effect on the next send; a send already in flight
+ * keeps the signing values its wire request was stamped with. The HMAC
+ * and Ed25519 channels switch atomically in the same patch. No
+ * persistence: a restart returns to the construction `outboundSigning`.
+ */
+export interface OutboundSigningRevision {
+  /** Rotate the HMAC secret. Non-empty when present. */
+  secret?: string;
+  /**
+   * Replace the `x-relay-key-id` stamp. Non-empty when present; `null`
+   * is a `RangeError` — the key id is only ever replaced, never
+   * cleared on its own (clear the Ed25519 channel with
+   * `ed25519: null` instead).
+   */
+  keyId?: string;
+  /**
+   * Add / replace the Ed25519 channel (`null` clears it); omitted
+   * keeps the live value. Validated exactly like the construction
+   * config (non-empty PEM Ed25519 private key, non-empty `keyId`
+   * when set).
+   */
+  ed25519?: Ed25519OutboundKeyConfig | null;
+}
+
+/**
+ * WR-430: the mutable live outbound signing state held by the default
+ * sender — the config the send path reads per attempt plus the compiled
+ * Ed25519 key. Created once in `createDefaultSender` and never
+ * replaced; revisions mutate it in place, so a delivery whose wire
+ * request was already built keeps the signing values it started with.
+ */
+export interface LiveOutboundSigning {
+  /** The live signing config (`undefined` while signing is off). */
+  config: OutboundSigningConfig | undefined;
+  /** The live compiled Ed25519 key (`undefined` while that channel is off). */
+  compiledEd25519: CompiledEd25519OutboundKey | undefined;
+}
+
+function sameEd25519Config(
+  a: Ed25519OutboundKeyConfig | undefined,
+  b: Ed25519OutboundKeyConfig | undefined
+): boolean {
+  if (a === undefined || b === undefined) return a === b;
+  return a.privateKey === b.privateKey && a.keyId === b.keyId;
+}
+
+/**
+ * WR-430: validate a whole outbound signing patch, then apply it to
+ * the live holder atomically. Returns the names of the fields that
+ * actually changed (`"secret"` / `"keyId"` / `"ed25519"`; empty means
+ * the patch is identical to the live values — the caller treats that
+ * as a silent no-op). Throws `RangeError` and leaves the live holder
+ * completely intact on any bad value — including a bad Ed25519 key in
+ * an otherwise good patch — and when enabling signing from unconfigured
+ * without a `secret`. The HMAC secret and the Ed25519 channel are
+ * never copied into any return value or audit payload by this
+ * function; only field names are reported.
+ */
+export function reviseLiveOutboundSigning(
+  live: LiveOutboundSigning,
+  patch: OutboundSigningRevision
+): string[] {
+  if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+    throw new RangeError("reviseOutboundSigning: patch must be an object");
+  }
+  const keys = Object.keys(patch);
+  if (keys.length === 0) {
+    throw new RangeError("reviseOutboundSigning: patch must contain at least one field");
+  }
+  for (const key of keys) {
+    if (key !== "secret" && key !== "keyId" && key !== "ed25519") {
+      throw new RangeError(`reviseOutboundSigning: unknown field ${JSON.stringify(key)}`);
+    }
+  }
+  // Validate the whole patch before touching live state: the Ed25519
+  // key is compiled up front, so a bad PEM / non-Ed25519 key throws
+  // here while the live secret is still the old one.
+  let nextSecret: string | undefined;
+  if (patch.secret !== undefined) {
+    if (typeof patch.secret !== "string" || patch.secret === "") {
+      throw new RangeError("reviseOutboundSigning: `secret` must be a non-empty string");
+    }
+    nextSecret = patch.secret;
+  }
+  let nextKeyId: string | undefined;
+  let keyIdPresent = false;
+  if (patch.keyId !== undefined) {
+    if (typeof patch.keyId !== "string" || patch.keyId === "") {
+      throw new RangeError("reviseOutboundSigning: `keyId` must be a non-empty string when set");
+    }
+    keyIdPresent = true;
+    nextKeyId = patch.keyId;
+  }
+  let nextEd25519: Ed25519OutboundKeyConfig | null | undefined;
+  let nextCompiled: CompiledEd25519OutboundKey | undefined;
+  let ed25519Present = false;
+  if (patch.ed25519 !== undefined) {
+    ed25519Present = true;
+    if (patch.ed25519 === null) {
+      nextEd25519 = null;
+    } else {
+      nextCompiled = compileEd25519OutboundKey(
+        patch.ed25519,
+        "reviseOutboundSigning: `ed25519`"
+      );
+      nextEd25519 = patch.ed25519;
+    }
+  }
+  // Enabling signing from unconfigured needs a secret — there is no
+  // key to sign with otherwise.
+  if (live.config === undefined && nextSecret === undefined) {
+    throw new RangeError(
+      "reviseOutboundSigning: `secret` is required to enable outbound signing"
+    );
+  }
+  const current = live.config;
+  const changes: string[] = [];
+  if (nextSecret !== undefined && nextSecret !== current?.secret) changes.push("secret");
+  if (keyIdPresent && nextKeyId !== current?.keyId) changes.push("keyId");
+  if (ed25519Present && !sameEd25519Config(nextEd25519 ?? undefined, current?.ed25519)) {
+    changes.push("ed25519");
+  }
+  if (changes.length === 0) return changes; // Same-value: silent no-op.
+  // Apply atomically: one new config object plus its compiled key, so
+  // the HMAC and Ed25519 channels switch together on the next send.
+  // (Built by property assignment — never by a literal holding the
+  // secret — so the value never lands in a copied object shape.)
+  const nextConfig: OutboundSigningConfig = { ...(current ?? {}) } as OutboundSigningConfig;
+  if (nextSecret !== undefined) nextConfig.secret = nextSecret;
+  if (keyIdPresent) nextConfig.keyId = nextKeyId;
+  if (ed25519Present) {
+    if (nextEd25519 === null) delete nextConfig.ed25519;
+    else if (nextEd25519 !== undefined) nextConfig.ed25519 = { ...nextEd25519 };
+  }
+  live.config = nextConfig;
+  if (ed25519Present) live.compiledEd25519 = nextCompiled;
+  return changes;
 }
 
 /**
@@ -7032,6 +7210,40 @@ export interface RelayServer extends Server {
    * Always set; returns `{}` when a custom sender is in use.
    */
   getTlsPins?: () => Record<string, string[]>;
+  /**
+   * WR-430: live-revise the outbound request signing keys — rotate
+   * the HMAC secret, replace the key id, or add / replace / clear
+   * the Ed25519 channel at runtime, no restart. The patch follows
+   * `OutboundSigningRevision` (`null` clears the Ed25519 channel;
+   * an omitted field keeps its live value). The whole patch is
+   * validated first (an empty secret, an empty key id, or an invalid
+   * Ed25519 key throws `RangeError` and the live signing values are
+   * untouched — zero partial application); at least one field is
+   * required, otherwise `RangeError`. A patch identical to the live
+   * values is a silent no-op with no audit event. A real revision is
+   * audited as `outbound_signing_revised` with `previous` /
+   * `current` recording only the key id, plus the changed field
+   * names — never secret or private-key material. Unlike WR-428, no
+   * `outboundSigning` at construction is not an error — revision
+   * enables signing (enabling only adds a downstream-verifiable
+   * header; it requires a `secret` in the patch). The revision takes
+   * effect from the next send; a send already in flight keeps the
+   * signing values its wire request was stamped with, and the HMAC
+   * and Ed25519 channels switch atomically in the same patch. This
+   * only swaps the keys — the signature algorithms, the header names,
+   * and the signing coverage (the wire body, after compression / E2EE
+   * sealing) are untouched, and there is no persistence: a restart
+   * returns to the construction values. Always set; throws `Error`
+   * when a custom sender is in use — the default sender owns the
+   * signing state.
+   */
+  reviseOutboundSigning?: (patch: OutboundSigningRevision) => void;
+  /**
+   * WR-430: the live outbound signing config — a defensive copy
+   * (`undefined` while signing is off). Always set; returns
+   * `undefined` when a custom sender is in use.
+   */
+  getOutboundSigning?: () => OutboundSigningConfig | undefined;
   /**
    * WR-346: live error-budget burn-rate config — the five knobs.
    * Only set when `errorBudget` was configured; `undefined`
@@ -19718,6 +19930,51 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     return Object.fromEntries(
       [...map.entries()].map(([endpoint, pins]) => [endpoint, [...pins]])
     );
+  };
+
+  // WR-430: live outbound signing key revision. The holder owns the
+  // config and validates the whole patch first (an illegal value
+  // throws `RangeError` and the live signing values are left
+  // completely intact); the server only audits the change. A
+  // same-value revision is a silent no-op — the holder reports no
+  // changes, so nothing is audited. A real revision is audited as
+  // `outbound_signing_revised` with `previous` / `current`
+  // recording only the key id, plus the changed field names — never
+  // secret or private-key material. Unlike WR-428, an unconfigured
+  // signing config is not an error — revision enables signing
+  // (enabling only adds a downstream-verifiable header). The revision
+  // takes effect on the next send: a send already in flight keeps the
+  // signing values its wire request was stamped with (the holder is
+  // mutated in place, never replaced), and the HMAC + Ed25519
+  // channels switch atomically in the same patch. No persistence: a
+  // restart returns to the construction `outboundSigning`.
+  server.reviseOutboundSigning = (patch: OutboundSigningRevision): void => {
+    const live = defaultSender?.liveOutboundSigning;
+    if (live === undefined) {
+      throw new Error(
+        "reviseOutboundSigning: the default sender is not in use — signing revision requires the default sender"
+      );
+    }
+    const previousKeyId = live.config?.keyId ?? null;
+    const changes = reviseLiveOutboundSigning(live, patch);
+    if (changes.length === 0) return; // Same-value: silent no-op.
+    opts.auditLog.append({
+      event: "outbound_signing_revised",
+      previous: { keyId: previousKeyId },
+      current: { keyId: live.config?.keyId ?? null },
+      changedFields: changes,
+    });
+  };
+
+  // WR-430: live outbound signing config — a defensive copy, so
+  // callers can neither mutate the live config nor observe a
+  // half-applied revision. `undefined` while signing is off.
+  server.getOutboundSigning = (): OutboundSigningConfig | undefined => {
+    const config = defaultSender?.liveOutboundSigning.config;
+    if (config === undefined) return undefined;
+    const copy: OutboundSigningConfig = { ...config };
+    if (config.ed25519 !== undefined) copy.ed25519 = { ...config.ed25519 };
+    return copy;
   };
 
   // WR-347: SLO-breach prediction knob runtime revision. The method

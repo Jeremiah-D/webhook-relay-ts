@@ -1058,7 +1058,20 @@ reliability primitives that matter for any signed-payload pipeline.
   header set, so a sender can never smuggle a forged relay signature
   downstream. The config applies to the default sender only — an injected
   sender signs (or doesn't) on its own. Invalid values throw `RangeError`
-  at startup.
+  at startup. Live revision (WR-430): `reviseOutboundSigning(patch)`
+  rotates the HMAC key, replaces the key id, or adds / replaces /
+  clears the Ed25519 channel at runtime, no restart — `null` clears the
+  Ed25519 channel, an omitted field keeps its live value, and a whole
+  patch with a bad value throws `RangeError` with the live keys
+  untouched. Revision also enables signing when nothing was configured
+  (it requires a key in the patch). It only swaps keys: the signature
+  algorithms and header names never change, a send already in flight
+  keeps the keys its wire request was stamped with, and the revision
+  takes effect on the next send; `getOutboundSigning()` returns the
+  live config. A real revision is audited as `outbound_signing_revised`
+  with only the key id and the changed field names — never key
+  material. No persistence: a restart returns to the construction
+  values.
 - RFC 9421 HTTP Message Signatures outbound signing (`src/rfc9421.ts`,
   WR-187): the IETF-standard alternative to the relay's custom
   `x-relay-signature` / `x-relay-ed25519-signature` stamps above — any RFC
