@@ -1547,15 +1547,16 @@ export class WebSocketPool {
         return;
       }
       // WR-105: measure the keep-alive round trip for the per-origin
-      // ping-RTT gauge (bounded recent window).
-      const start = Date.now();
+      // ping-RTT gauge (bounded recent window). Sub-millisecond clock:
+      // Date.now() can record 0 for a loopback pong in the same tick.
+      const start = performance.now();
       const timer = setTimeout(() => {
         conn.pongWaiter = undefined;
         resolve(false);
       }, this.opts.timeoutMs);
       conn.pongWaiter = () => {
         clearTimeout(timer);
-        const rtt = Date.now() - start;
+        const rtt = performance.now() - start;
         const row = this.originRow(conn.origin);
         row.pingRtts.push(rtt);
         if (row.pingRtts.length > MAX_PING_RTT_SAMPLES) row.pingRtts.shift();
