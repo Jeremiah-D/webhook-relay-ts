@@ -43,13 +43,6 @@ function sample(
   c.recordDelivered(id, endpoint);
 }
 
-/** Let the deliver() promise chain settle. */
-async function flush(ticks = 20) {
-  for (let i = 0; i < ticks; i++) {
-    await new Promise((r) => setImmediate(r));
-  }
-}
-
 async function waitFor(cond: () => boolean, label: string, timeoutMs = 5000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!cond()) {
@@ -387,11 +380,13 @@ describe("RetryQueue adaptive max-delay revision (WR-335)", () => {
     q.start();
     try {
       // Enqueue sequentially: each delivery is accepted at the current
-      // manual time, so each samples exactly 4000ms.
+      // manual time, so each samples exactly 4000ms — the first delivery
+      // must complete before the second is enqueued, or the second
+      // sample spans both advances. A fixed flush() loses that ordering
+      // under load (same race as adaptive-max-delay.test.ts).
       q.enqueue({ id: "w0", payload: BODY, targetUrl: URL_A, headers: {} });
-      await flush();
+      await waitFor(() => q.getAdaptiveMaxDelayStats()[0]?.samples === 1, "first sample lands");
       q.enqueue({ id: "w1", payload: BODY, targetUrl: URL_A, headers: {} });
-      await flush();
       await waitFor(() => q.getAdaptiveMaxDelayStats()[0]?.samples === 2, "endpoint warms");
       assert.equal(q.getAdaptiveMaxDelayStats()[0].capMs, 4000);
       // Attempt 1 waits min(cap 4000, 1000 * 2) = 2000ms.

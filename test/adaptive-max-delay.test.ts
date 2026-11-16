@@ -11,13 +11,6 @@ const A = "http://a/hook";
 const B = "http://b/hook";
 const BODY = Buffer.from(JSON.stringify({ hello: "webhook" }));
 
-/** Let the deliver() promise chain settle. */
-async function flush(ticks = 20) {
-  for (let i = 0; i < ticks; i++) {
-    await new Promise((r) => setImmediate(r));
-  }
-}
-
 /** Poll until `cond()` is true (bounded) — robust against scheduling flakes. */
 async function waitFor(cond: () => boolean, ticks = 500) {
   for (let i = 0; i < ticks; i++) {
@@ -313,11 +306,15 @@ describe("RetryQueue adaptiveMaxDelay integration", () => {
     });
     q.start();
     try {
+      // Each sample's latency is accepted→delivered on the manual clock,
+      // and acceptance is stamped synchronously at enqueue — so the first
+      // delivery must complete before the second is enqueued, or the
+      // second sample spans both advances (4000 instead of 2000). A
+      // fixed flush() loses that ordering under load.
       for (let i = 0; i < 2; i++) {
         q.enqueue({ id: `s${i}`, payload: BODY, targetUrl: A, headers: {} });
-        await flush();
+        await waitFor(() => q.getAdaptiveMaxDelayStats()[0]?.samples === i + 1);
       }
-      await waitFor(() => q.getAdaptiveMaxDelayStats()[0]?.samples === 2);
       const rows = q.getAdaptiveMaxDelayStats();
       assert.equal(rows.length, 1);
       assert.equal(rows[0].capMs, 2000);
@@ -359,10 +356,13 @@ describe("RetryQueue adaptiveMaxDelay integration", () => {
     });
     q.start();
     try {
+      // Same ordering as the test above: each delivery must complete
+      // before the next is enqueued, or the second sample spans both
+      // 4000ms advances (8000 instead of 4000 — the CI failure on run
+      // 43807792341).
       q.enqueue({ id: "w0", payload: BODY, targetUrl: A, headers: {} });
-      await flush();
+      await waitFor(() => q.getAdaptiveMaxDelayStats()[0]?.samples === 1);
       q.enqueue({ id: "w1", payload: BODY, targetUrl: A, headers: {} });
-      await flush();
       await waitFor(() => q.getAdaptiveMaxDelayStats()[0]?.samples === 2);
       assert.equal(q.getAdaptiveMaxDelayStats()[0].capMs, 4000);
       const before = q.delayForAttempt(10, A);
