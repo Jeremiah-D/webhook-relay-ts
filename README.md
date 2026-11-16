@@ -6126,6 +6126,22 @@ than accepting webhooks it could never deliver.
 - Invalid configs (bad shape, duplicate `id`/`header` within an
   endpoint, unresolvable `secretRef`) throw `RangeError` at startup —
   never mid-delivery.
+- **Live revision** — `server.reviseOutboundCredentials(patch)` (WR-428)
+  swaps, adds, or clears per-endpoint bindings at runtime, no restart:
+  the patch maps exact `targetUrl` → `OutboundCredentialConfig[] | null`
+  (`null` clears that endpoint's bindings; an omitted endpoint keeps its
+  live value). The whole patch is validated first — a bad header, a
+  duplicate id/header, or an unresolvable `secretRef` throws `RangeError`
+  and the live bindings are untouched — and at least one field is
+  required. A same-value patch is a silent no-op. A real revision is
+  audited as `outbound_credentials_revised` with `previous` / `current`
+  recording only the endpoint, the credential ids, and `'set'` /
+  `'cleared'` — never secret values or secretRef contents. The revision
+  takes effect from the next send; a send already in flight keeps the
+  binding it started with. Throws `Error` when no `outboundCredentials`
+  were configured — enabling the feature needs a restart. Only the
+  bindings change: the secret values still resolve live per send through
+  `secretResolver`, and the header-injection logic is untouched.
 
 ## W3C trace-context propagation (opt-in)
 

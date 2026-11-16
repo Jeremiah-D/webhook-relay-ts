@@ -218,6 +218,127 @@ export function resolveOutboundCredentialsConfig(
 }
 
 /**
+ * Live revision patch for the outbound credential bindings (WR-428):
+ * `targetUrl` → `OutboundCredentialConfig[] | null`. `null` clears that
+ * endpoint's bindings; an omitted endpoint keeps its live value. At
+ * least one field must be present — an empty patch throws `RangeError`.
+ *
+ * This revises only the BINDING map (which endpoints carry which
+ * credential id/header/secretRef). Secret VALUES are never in the
+ * patch — they keep resolving live per send through `secretResolver`
+ * (see `applyOutboundCredentials`).
+ */
+export type OutboundCredentialsRevision = Record<string, OutboundCredentialConfig[] | null>;
+
+/** One endpoint's binding change, as returned by `reviseOutboundCredentialsMap`. */
+export interface OutboundCredentialChange {
+  /** The exact `targetUrl` whose bindings changed. */
+  endpoint: string;
+  /** Credential ids live before the revision (`null` when none existed). */
+  previous: string[] | null;
+  /** Credential ids live after the revision (`null` when cleared). */
+  current: string[] | null;
+}
+
+/**
+ * Whether two compiled binding lists are the same binding: the same
+ * credential ids, and per id the same header (case-insensitive), the
+ * same secretRef, and the same resolver. Order is irrelevant — the
+ * credentials stamp distinct headers, so reordering changes nothing on
+ * the wire. The resolver is part of the identity: a different resolver
+ * function for the same ref may fetch a different value.
+ */
+function sameBindings(
+  a: CompiledOutboundCredential[],
+  b: CompiledOutboundCredential[]
+): boolean {
+  if (a.length !== b.length) return false;
+  const byId = new Map(b.map((c) => [c.id, c]));
+  return a.every((c) => {
+    const other = byId.get(c.id);
+    return (
+      other !== undefined &&
+      other.headerLower === c.headerLower &&
+      other.secretRef === c.secretRef &&
+      other.secretResolver === c.secretResolver
+    );
+  });
+}
+
+/**
+ * Live-revise the outbound credential binding map at runtime (WR-428),
+ * no restart. The whole patch is validated first (the non-null entries
+ * go through `resolveOutboundCredentialsConfig` — the WR-192 startup
+ * gate — so a bad header, a duplicate id/header, or an unresolvable
+ * `secretRef` rejects the whole patch with `RangeError`, zero partial
+ * application); at least one field is required, otherwise `RangeError`.
+ * A `null` entry clears that endpoint's bindings; an omitted endpoint
+ * keeps its live value.
+ *
+ * A patch entry is a no-op when the endpoint already carries the same
+ * bindings (same ids, headers, secretRefs, resolvers); clearing an
+ * endpoint with no bindings is likewise a no-op. Returns one entry per
+ * endpoint whose bindings actually changed — an empty array when the
+ * whole patch was a no-op, so the caller can stay silent. The map is
+ * mutated in place (never replaced), so a send whose wire request was
+ * already built keeps the binding array it started with — the revision
+ * takes effect from the next send.
+ */
+export function reviseOutboundCredentialsMap(
+  live: Map<string, CompiledOutboundCredential[]>,
+  patch: OutboundCredentialsRevision
+): OutboundCredentialChange[] {
+  if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+    throw new RangeError(
+      "reviseOutboundCredentials: patch must be a Record<exact targetUrl, OutboundCredentialConfig[] | null>"
+    );
+  }
+  const entries = Object.entries(patch);
+  if (entries.length === 0) {
+    throw new RangeError("reviseOutboundCredentials: patch must contain at least one field");
+  }
+  for (const [targetUrl] of entries) {
+    if (targetUrl === "") {
+      throw new RangeError(
+        "reviseOutboundCredentials: targetUrl must be a non-empty exact target URL"
+      );
+    }
+  }
+  // Validate-then-apply: the non-null entries go through the same
+  // startup gate, so a bad record binds nothing.
+  const nonNull: Record<string, OutboundCredentialConfig[]> = {};
+  for (const [targetUrl, list] of entries) {
+    if (list !== null) nonNull[targetUrl] = list;
+  }
+  const compiled = resolveOutboundCredentialsConfig(nonNull);
+  const changes: OutboundCredentialChange[] = [];
+  for (const [targetUrl, list] of entries) {
+    const prev = live.get(targetUrl);
+    if (list === null) {
+      if (prev === undefined) continue; // Clearing an unbound endpoint: no-op.
+      live.delete(targetUrl);
+      changes.push({ endpoint: targetUrl, previous: prev.map((c) => c.id), current: null });
+    } else {
+      const next = compiled.get(targetUrl);
+      if (next === undefined) {
+        // Unreachable: every non-null entry was compiled above.
+        throw new RangeError(
+          `reviseOutboundCredentials: internal error — no compiled bindings for ${JSON.stringify(targetUrl)}`
+        );
+      }
+      if (prev !== undefined && sameBindings(prev, next)) continue; // Same-value: no-op.
+      live.set(targetUrl, next);
+      changes.push({
+        endpoint: targetUrl,
+        previous: prev === undefined ? null : prev.map((c) => c.id),
+        current: next.map((c) => c.id),
+      });
+    }
+  }
+  return changes;
+}
+
+/**
  * Stamp an endpoint's static credentials onto the wire headers.
  *
  * For each credential: drop any passthrough header with the same name

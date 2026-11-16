@@ -599,8 +599,10 @@ import {
 import {
   applyOutboundCredentials,
   resolveOutboundCredentialsConfig,
+  reviseOutboundCredentialsMap,
   type CompiledOutboundCredential,
   type OutboundCredentialConfig,
+  type OutboundCredentialsRevision,
 } from "./outbound-credentials.ts";
 
 /**
@@ -2846,6 +2848,17 @@ export interface PooledSender extends Sender {
    * in `createDefaultSender` and never replaced.
    */
   outboundSchemaRegistry: OutboundSchemaRegistry | undefined;
+  /**
+   * WR-428: the live outbound credential binding map itself, when the
+   * feature is enabled — revised at runtime via
+   * `RelayServer.reviseOutboundCredentials` (which owns the
+   * `outbound_credentials_revised` audit). `undefined` when no
+   * `outboundCredentials` were configured; the map is created once in
+   * `createDefaultSender` and never replaced — revisions mutate it in
+   * place, so a send whose wire request was already built keeps the
+   * binding array it started with.
+   */
+  outboundCredentialMap: Map<string, CompiledOutboundCredential[]> | undefined;
   /**
    * WR-165: chaos-drill injection counters, when the feature is enabled —
    * rendered into `GET /metrics` as `relay_chaos_injected_total` via
@@ -5714,6 +5727,9 @@ export function createDefaultSender(
   // WR-427: the registry itself (undefined when the feature is off) —
   // revised at runtime via `RelayServer.reviseOutboundSchemas`.
   sender.outboundSchemaRegistry = outboundSchemaRegistry;
+  // WR-428: the binding map itself (undefined when the feature is off)
+  // — revised at runtime via `RelayServer.reviseOutboundCredentials`.
+  sender.outboundCredentialMap = outboundCredentialMap;
   // WR-165: chaos-drill injection counters (undefined when the feature
   // is off) — operators read them via `sender.chaosMetrics.getStats()`;
   // they render into GET /metrics as `relay_chaos_injected_total`.
@@ -6936,6 +6952,28 @@ export interface RelayServer extends Server {
    * are untouched.
    */
   reviseOutboundSchemas?: (patch: OutboundSchemasRevision) => void;
+  /**
+   * WR-428: live-revise the outbound static credential bindings — swap,
+   * add, or clear per-endpoint bindings at runtime, no restart. The
+   * patch maps exact `targetUrl` → `OutboundCredentialConfig[] | null`
+   * (`null` clears that endpoint's bindings; an omitted endpoint keeps
+   * its live value). The whole patch is validated first (a bad header,
+   * a duplicate id/header, or an unresolvable `secretRef` throws
+   * `RangeError` and the live bindings are untouched — zero partial
+   * application); at least one field is required, otherwise
+   * `RangeError`. A patch identical to the live bindings is a silent
+   * no-op with no audit event. A real revision is audited as
+   * `outbound_credentials_revised` with `previous` / `current`
+   * recording only the endpoint, the credential ids, and `'set'` /
+   * `'cleared'` — never secret values or secretRef contents. The
+   * revision takes effect from the next send; a send already in flight
+   * keeps the binding it started with. Always set; throws `Error`
+   * when no `outboundCredentials` were configured — enabling the
+   * feature needs a restart. This only swaps the bindings — the
+   * secret values still resolve live per send through `secretResolver`,
+   * and the header-injection logic is untouched.
+   */
+  reviseOutboundCredentials?: (patch: OutboundCredentialsRevision) => void;
   /**
    * WR-346: live error-budget burn-rate config — the five knobs.
    * Only set when `errorBudget` was configured; `undefined`
@@ -19519,6 +19557,48 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     });
     opts.auditLog.append({
       event: "outbound_schemas_revised",
+      previous: changes.map((c) => ({ endpoint: c.endpoint, ...describe(c.previous) })),
+      current: changes.map((c) => ({ endpoint: c.endpoint, ...describe(c.current) })),
+    });
+  };
+
+  // WR-428: live outbound credential binding revision. The map owns
+  // the bindings and validates the whole patch first (an illegal value
+  // throws `RangeError` and the live bindings are left completely
+  // intact); the server only audits the change and keeps the
+  // `accepted` event's `credentialIds` snapshot truthful. A same-value
+  // revision is a silent no-op — the map reports no changes, so
+  // nothing is audited. A real revision is audited as
+  // `outbound_credentials_revised` with `previous` / `current`
+  // recording only the endpoint, the credential ids, and 'set' /
+  // 'cleared' — never secret values or secretRef contents. The
+  // revision takes effect on the next send: a send already in flight
+  // keeps the binding array its wire request was built with (the map
+  // is mutated in place, never replaced).
+  server.reviseOutboundCredentials = (patch: OutboundCredentialsRevision): void => {
+    const map = defaultSender?.outboundCredentialMap;
+    if (map === undefined) {
+      throw new Error(
+        "reviseOutboundCredentials: outbound credentials are not configured — enabling them requires a restart"
+      );
+    }
+    const changes = reviseOutboundCredentialsMap(map, patch);
+    if (changes.length === 0) return; // Same-value: silent no-op.
+    // Keep the `accepted` audit's credentialIds in step: the snapshot
+    // built at startup would otherwise keep naming cleared bindings
+    // and miss newly bound ones.
+    if (outboundCredentialIds !== undefined) {
+      for (const change of changes) {
+        if (change.current === null) outboundCredentialIds.delete(change.endpoint);
+        else outboundCredentialIds.set(change.endpoint, change.current);
+      }
+    }
+    const describe = (ids: string[] | null) => ({
+      credentialIds: ids,
+      action: ids === null ? ("cleared" as const) : ("set" as const),
+    });
+    opts.auditLog.append({
+      event: "outbound_credentials_revised",
       previous: changes.map((c) => ({ endpoint: c.endpoint, ...describe(c.previous) })),
       current: changes.map((c) => ({ endpoint: c.endpoint, ...describe(c.current) })),
     });
