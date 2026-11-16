@@ -18,6 +18,16 @@ async function flush(ticks = 20) {
   }
 }
 
+/** Poll until `cond` holds (5s) — a fixed tick count is not a settled signal under load. */
+async function waitFor(cond: () => boolean, what: string, timeoutMs = 5000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (cond()) return;
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  throw new Error(`timed out waiting for ${what}`);
+}
+
 function item(id: string, targetUrl: string) {
   return { id, payload: BODY, targetUrl, headers: {} };
 }
@@ -218,7 +228,9 @@ describe("RetryQueue adaptiveTimeout integration", () => {
     });
     q.start();
     q.enqueue(item("w1", A));
-    await flush();
+    // Wait for the sender to run: a fixed flush() loses the race under
+    // load (CI: `seen` was still [] when the assertion ran).
+    await waitFor(() => seen.length === 1, "sender to run");
     assert.deepEqual(seen, [750]);
     q.stop();
   });
@@ -231,7 +243,7 @@ describe("RetryQueue adaptiveTimeout integration", () => {
     const q = new RetryQueue({ sender, maxAttempts: 1 });
     q.start();
     q.enqueue(item("w1", A));
-    await flush();
+    await waitFor(() => seen.length === 1, "sender to run");
     assert.deepEqual(seen, [undefined]);
     q.stop();
   });
@@ -275,7 +287,10 @@ describe("RetryQueue adaptiveTimeout integration", () => {
     q.start();
     assert.deepEqual(q.getAdaptiveTimeoutStats(), []);
     q.enqueue(item("s1", A));
-    await flush();
+    // Wait for the stats row to appear: the sample lands when the
+    // delivery completes, and a fixed flush() loses that race under
+    // load (CI: 0 rows when the assertion ran).
+    await waitFor(() => q.getAdaptiveTimeoutStats().length === 1, "stats row to appear");
     const rows = q.getAdaptiveTimeoutStats();
     assert.equal(rows.length, 1);
     assert.equal(rows[0].endpoint, A);
