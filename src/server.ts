@@ -541,6 +541,7 @@ import {
   OutboundSchemaRegistry,
   OutboundSchemaViolationError,
   type OutboundSchemaMetrics,
+  type OutboundSchemasRevision,
 } from "./outbound-schema.ts";
 import type { ProbeAuditEvent, ProbeConfig, ProbeEndpointsRevision, ProbeOptions, ProbeRevision } from "./downstream-probe.ts";
 import {
@@ -2837,6 +2838,14 @@ export interface PooledSender extends Sender {
    * `GET /metrics` byte-identical for relays that never enable it.
    */
   outboundSchemaMetrics: OutboundSchemaMetrics | undefined;
+  /**
+   * WR-427: the live outbound schema registry itself, when the feature
+   * is enabled — revised at runtime via `RelayServer.reviseOutboundSchemas`
+   * (which owns the `outbound_schemas_revised` audit). `undefined` when
+   * no `outboundSchemas` were configured; the registry is created once
+   * in `createDefaultSender` and never replaced.
+   */
+  outboundSchemaRegistry: OutboundSchemaRegistry | undefined;
   /**
    * WR-165: chaos-drill injection counters, when the feature is enabled —
    * rendered into `GET /metrics` as `relay_chaos_injected_total` via
@@ -5702,6 +5711,9 @@ export function createDefaultSender(
   // — operators read them via `sender.outboundSchemaMetrics.getStats()`;
   // they render into GET /metrics as `relay_outbound_schema_total`.
   sender.outboundSchemaMetrics = outboundSchemaRegistry?.metrics;
+  // WR-427: the registry itself (undefined when the feature is off) —
+  // revised at runtime via `RelayServer.reviseOutboundSchemas`.
+  sender.outboundSchemaRegistry = outboundSchemaRegistry;
   // WR-165: chaos-drill injection counters (undefined when the feature
   // is off) — operators read them via `sender.chaosMetrics.getStats()`;
   // they render into GET /metrics as `relay_chaos_injected_total`.
@@ -6903,6 +6915,27 @@ export interface RelayServer extends Server {
    * server-owned sink would skip the `audit_sink_revised` audit.
    */
   reviseAuditSink?: (patch: AuditSinkRevision) => void;
+  /**
+   * WR-427: live-revise the outbound payload schema registry — swap,
+   * add, or clear per-endpoint rules at runtime, no restart. The
+   * patch maps exact `targetUrl` → `PayloadSchema | null` (`null`
+   * clears that endpoint's rule; an omitted endpoint keeps its live
+   * value). The whole patch is validated first (a bad record throws
+   * `RangeError` and the live rules are untouched — zero partial
+   * application); at least one field is required, otherwise
+   * `RangeError`. A patch identical to the live rules is a silent
+   * no-op with no audit event. A real revision is audited as
+   * `outbound_schemas_revised` with `previous` / `current` recording
+   * only the endpoint, the schema name/version, and `'set'` /
+   * `'cleared'` — never the schema body. The revision takes effect
+   * from the next delivery validation; a validation already in flight
+   * keeps the rule it started with. Always set; throws `Error` when
+   * no `outboundSchemas` were configured — enabling the feature needs
+   * a restart. This only swaps the rules — the validation semantics,
+   * the fail-closed gate, and the `OutboundSchemaMetrics` counting
+   * are untouched.
+   */
+  reviseOutboundSchemas?: (patch: OutboundSchemasRevision) => void;
   /**
    * WR-346: live error-budget burn-rate config — the five knobs.
    * Only set when `errorBudget` was configured; `undefined`
@@ -19455,6 +19488,39 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       event: "audit_sink_revised",
       previous: { origin: prev.origin, tenantSinkCount: prev.tenantSinkCount },
       current: { origin: next.origin, tenantSinkCount: next.tenantSinkCount },
+    });
+  };
+
+  // WR-427: live outbound schema revision. The registry owns the
+  // config and validates the whole patch first (an illegal value
+  // throws `RangeError` and the live rules are left completely
+  // intact); the server only audits the change. A same-value revision
+  // is a silent no-op — the registry reports no changes, so nothing
+  // is audited. A real revision is audited as
+  // `outbound_schemas_revised` with `previous` / `current` recording
+  // only the endpoint, the schema name/version, and 'set' / 'cleared'
+  // — never the schema body. The revision takes effect on the next
+  // delivery validation: a validation already in flight keeps the
+  // schema reference it started with (OutboundSchemaRegistry
+  // captures the rule up front in `validatePayload`).
+  server.reviseOutboundSchemas = (patch: OutboundSchemasRevision): void => {
+    const registry = defaultSender?.outboundSchemaRegistry;
+    if (registry === undefined) {
+      throw new Error(
+        "reviseOutboundSchemas: outbound schemas are not configured — enabling them requires a restart"
+      );
+    }
+    const changes = registry.revise(patch);
+    if (changes.length === 0) return; // Same-value: silent no-op.
+    const describe = (snap: { name: string; version: string } | null) => ({
+      schemaName: snap?.name ?? null,
+      schemaVersion: snap?.version ?? null,
+      action: snap === null ? ("cleared" as const) : ("set" as const),
+    });
+    opts.auditLog.append({
+      event: "outbound_schemas_revised",
+      previous: changes.map((c) => ({ endpoint: c.endpoint, ...describe(c.previous) })),
+      current: changes.map((c) => ({ endpoint: c.endpoint, ...describe(c.current) })),
     });
   };
 

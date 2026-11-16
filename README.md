@@ -5839,6 +5839,22 @@ both directions; the built-in `createRequiredFieldsSchema` from
   the exposition renders empty until the first validated delivery, so
   `/metrics` stays byte-identical for relays that never enable the
   feature.
+- **Live revision** — `server.reviseOutboundSchemas(patch)` (WR-427)
+  swaps, adds, or clears per-endpoint rules at runtime, no restart:
+  the patch maps exact `targetUrl` → `PayloadSchema | null` (`null`
+  clears that endpoint's rule; an omitted endpoint keeps its live
+  value). The whole patch is validated first — a bad record throws
+  `RangeError` and the live rules are untouched — and at least one
+  field is required. A same-value patch is a silent no-op. A real
+  revision is audited as `outbound_schemas_revised` with
+  `previous` / `current` recording only the endpoint, the schema
+  name/version, and `'set'` / `'cleared'` — never the schema body.
+  The revision takes effect from the next delivery validation; a
+  validation already in flight keeps the rule it started with.
+  Throws `Error` when no `outboundSchemas` were configured — enabling
+  the feature needs a restart. Only the rules change: the validation
+  semantics, the fail-closed gate, and the metrics counting are
+  untouched.
 
 ## AWS SigV4 outbound signing (opt-in)
 

@@ -113,6 +113,24 @@ export function assertValidOutboundSchemas(
 }
 
 /**
+ * Live revision patch for the outbound schema registry (WR-427):
+ * `targetUrl` → `PayloadSchema | null`. `null` clears that endpoint's
+ * rule; an omitted endpoint keeps its live value. At least one field
+ * must be present — an empty patch throws `RangeError`.
+ */
+export type OutboundSchemasRevision = Record<string, PayloadSchema | null>;
+
+/** One endpoint's rule change, as returned by `OutboundSchemaRegistry.revise`. */
+export interface OutboundSchemaChange {
+  /** The exact `targetUrl` whose rule changed. */
+  endpoint: string;
+  /** The rule live before the revision (`null` when no rule existed). */
+  previous: { name: string; version: string } | null;
+  /** The rule live after the revision (`null` when the rule was cleared). */
+  current: { name: string; version: string } | null;
+}
+
+/**
  * Per-endpoint outbound schema counters: validations that passed vs.
  * validations that failed (any failure mode — shape violation,
  * non-JSON payload, throwing validator — counts as `"invalid"`).
@@ -212,6 +230,65 @@ export class OutboundSchemaRegistry {
   }
 
   /**
+   * Live-revise the registry's rules at runtime (WR-427), no restart.
+   * The whole patch is validated first (`assertValidOutboundSchemas`
+   * over the non-null entries — a bad record rejects the whole patch
+   * with `RangeError`, zero partial application); at least one field
+   * is required, otherwise `RangeError`. A `null` entry clears that
+   * endpoint's rule; an omitted endpoint keeps its live value.
+   *
+   * A patch entry is a no-op when the endpoint already carries a rule
+   * with the same schema name and version (name/version are the
+   * rule's identity — the schema body is never compared or
+   * serialized); clearing an endpoint with no rule is likewise a
+   * no-op. Returns one entry per endpoint whose rule actually
+   * changed — an empty array when the whole patch was a no-op, so
+   * the caller can stay silent. A revision takes effect from the
+   * next `validatePayload` call: a validation already in flight
+   * keeps the schema reference it started with (see below).
+   */
+  revise(patch: OutboundSchemasRevision): OutboundSchemaChange[] {
+    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new RangeError("reviseOutboundSchemas: patch must be a Record<exact targetUrl, PayloadSchema | null>");
+    }
+    const entries = Object.entries(patch);
+    if (entries.length === 0) {
+      throw new RangeError("reviseOutboundSchemas: patch must contain at least one field");
+    }
+    // Validate-then-apply: the non-null schemas go through the same
+    // startup gate, so a bad record registers nothing.
+    const nonNull: Record<string, PayloadSchema> = {};
+    for (const [targetUrl, schema] of entries) {
+      if (schema !== null) nonNull[targetUrl] = schema;
+    }
+    assertValidOutboundSchemas(nonNull);
+    const changes: OutboundSchemaChange[] = [];
+    for (const [targetUrl, schema] of entries) {
+      const prev = this.rules.get(targetUrl);
+      if (schema === null) {
+        if (prev === undefined) continue; // Clearing an unruled endpoint: no-op.
+        this.rules.delete(targetUrl);
+        changes.push({
+          endpoint: targetUrl,
+          previous: { name: prev.name, version: prev.version },
+          current: null,
+        });
+      } else {
+        if (prev !== undefined && prev.name === schema.name && prev.version === schema.version) {
+          continue; // Same-value: no-op.
+        }
+        this.rules.set(targetUrl, schema);
+        changes.push({
+          endpoint: targetUrl,
+          previous: prev === undefined ? null : { name: prev.name, version: prev.version },
+          current: { name: schema.name, version: schema.version },
+        });
+      }
+    }
+    return changes;
+  }
+
+  /**
    * The schema rule for an exact `targetUrl`, or `undefined` when none
    * is configured. Never throws.
    */
@@ -234,6 +311,9 @@ export class OutboundSchemaRegistry {
    * `classifyFailure` maps to `"non_retryable"`.
    */
   validatePayload(targetUrl: string, body: Buffer): void {
+    // WR-427: the rule is captured up front, so a live revision
+    // mid-validation cannot change the rule this delivery is judged
+    // by — the revision takes effect from the next validation.
     const schema = this.rules.get(targetUrl);
     if (schema === undefined) return;
     const fail = (message: string, cause?: unknown): never => {
