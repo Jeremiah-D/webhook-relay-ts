@@ -1,6 +1,7 @@
 import { lookup as dnsLookup, promises as dnsPromises, type LookupAddress } from "node:dns";
 import { Socket, type LookupFunction } from "node:net";
 import { connect as tlsConnect } from "node:tls";
+import { sniServernameForHost } from "./tls-sni.ts";
 
 /**
  * Outbound Happy Eyeballs connection racing (RFC 8305, WR-164).
@@ -324,7 +325,10 @@ export function makeHappyEyeballsCreateConnection(
           tlsSocket = tlsConnect({
             ...(options as object),
             socket: tcpSocket,
-            servername: (options.servername as string | undefined) ?? hostname,
+            // Same IP-literal rule as the direct path (see
+            // `sniServernameForHost`): an explicit IP servername is
+            // rejected outright by Node 25+.
+            servername: sniServernameForHost((options.servername as string | undefined) ?? hostname),
           });
         } catch (err) {
           tcpSocket.destroy();

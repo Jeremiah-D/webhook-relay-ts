@@ -3,6 +3,7 @@ import { Agent as HttpsAgent } from "node:https";
 import { connect as tcpConnect, isIP, type Socket } from "node:net";
 import { connect as tlsConnect } from "node:tls";
 import { createHash } from "node:crypto";
+import { sniServernameForHost } from "./tls-sni.ts";
 
 /**
  * Outbound SOCKS5 proxy support (WR-171).
@@ -498,7 +499,10 @@ export function createSocks5Agent(
         }
         const tlsSock = tlsConnect({
           socket: sock,
-          servername: (options.servername as string | undefined) ?? targetHost,
+          // Same IP-literal rule as the direct path (see
+          // `sniServernameForHost`): an explicit IP servername is
+          // rejected outright by Node 25+.
+          servername: sniServernameForHost((options.servername as string | undefined) ?? targetHost),
           ALPNProtocols: options.ALPNProtocols as string[] | undefined,
           rejectUnauthorized: options.rejectUnauthorized !== false,
         });

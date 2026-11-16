@@ -116,7 +116,12 @@ describe("ratelimit: 429s at the relay server intake", () => {
       forwardUrl: "http://127.0.0.1:9/unused", // never reached: intake gate is before delivery
       auditLog: audit,
       operatorToken: OPERATOR,
-      rateLimit: { perIpPerSecond: 2 },
+      // Frozen clock: the bucket refills continuously, so sequential
+      // round-trips under a loaded runner can span a refill window and
+      // the third request is admitted instead of rejected (flake: 202
+      // instead of 429). The limiter's injectable `now` exists for
+      // deterministic tests — with time pinned, no refill ever happens.
+      rateLimit: { perIpPerSecond: 2, now: () => 1_700_000_000_000 },
     });
     await new Promise<void>((resolve) => relay.listen(0, "127.0.0.1", resolve));
     const addr = relay.address();

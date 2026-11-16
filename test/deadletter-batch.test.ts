@@ -319,7 +319,12 @@ describe("POST /dead-letter/replay operator endpoint", () => {
       const sig = { "x-signature": signSha256(BODY, SECRET) };
       assert.equal((await post(port, "/", BODY, sig)).status, 202);
       assert.equal((await post(port, "/", BODY, sig)).status, 202);
-      let listed = await getDeadLetterEntries(port, auth);
+      // Wait for BOTH entries: the helper's default expected=1 returns as
+      // soon as the first entry dead-letters, and the length==2 assertion
+      // below then loses the race under load (CI/local flake: 1 instead
+      // of 2). The helper already takes the expected count — the later
+      // call in this test passes 2.
+      let listed = await getDeadLetterEntries(port, auth, 2);
       assert.equal(listed.length, 2);
       const ids = listed.map((e) => e.id);
 

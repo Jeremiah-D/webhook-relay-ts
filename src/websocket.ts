@@ -2,6 +2,7 @@ import { connect as netConnect, type Socket } from "node:net";
 import { connect as tlsConnect, type TLSSocket } from "node:tls";
 import { createHash, randomBytes } from "node:crypto";
 import { normalizePin, spkiFingerprint, TlsPinMismatchError } from "./pinning.ts";
+import { sniServernameForHost } from "./tls-sni.ts";
 import { HttpDeliveryError } from "./failure.ts";
 import {
   PERMESSAGE_DEFLATE_OFFER,
@@ -1607,7 +1608,11 @@ export class WebSocketPool {
         ? tlsConnect({
             host,
             port,
-            servername: host,
+            // SNI carries no IP addresses (RFC 6066): an IP literal here
+            // is rejected outright by Node 25+ (DEP0123 became
+            // ERR_INVALID_ARG_VALUE), so only DNS hosts send a servername
+            // — Node omits SNI for IP literals by default.
+            servername: sniServernameForHost(host),
             // WR-21: with a pin whitelist the pins are the trust anchor
             // and replace PKI verification (same as the HTTP/1.1 path).
             rejectUnauthorized: pins === undefined,

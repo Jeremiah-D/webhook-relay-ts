@@ -54,6 +54,16 @@ async function flush(ticks = 10) {
   }
 }
 
+/** Poll until `cond` holds (5s) — a fixed tick count is not a settled signal under load. */
+async function waitFor(cond: () => boolean, what: string, timeoutMs = 5000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (cond()) return;
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  throw new Error(`timed out waiting for ${what}`);
+}
+
 function item(id: string, targetUrl: string = EP) {
   return { id, payload: BODY, targetUrl, headers: {} };
 }
@@ -415,7 +425,13 @@ describe("RelayServer stale-pause audit callback revision (WR-402)", () => {
     });
     const port = await listen(relay);
     await postWebhook(port);
-    await flush(20); // let the delivery settle before advancing the clock
+    // Wait for the delivery to settle — the sweep skips endpoints with
+    // anything still pending, so advancing the clock on a fixed tick
+    // count loses the race under load (CI: the first sweep paused
+    // nothing). The audit "delivered" event lands after the success
+    // stamp (retry.ts records the success before firing onDelivered),
+    // so it is the settled signal.
+    await waitFor(() => eventsOf(auditLog, "delivered").length === 1, "delivery to settle");
     c.advance(31 * DAY_MS);
     sweep();
     assert.equal(first.length, 1);
@@ -457,7 +473,9 @@ describe("RelayServer stale-pause audit callback revision (WR-402)", () => {
     });
     const port = await listen(relay);
     await postWebhook(port);
-    await flush(20);
+    // Same settled-signal wait as the test above: a fixed flush() loses
+    // the race under load and the first sweep then pauses nothing.
+    await waitFor(() => eventsOf(auditLog, "delivered").length === 1, "delivery to settle");
     c.advance(31 * DAY_MS);
     sweep();
     assert.equal(first.length, 1);
@@ -487,7 +505,9 @@ describe("RelayServer stale-pause audit callback revision (WR-402)", () => {
     relay.reviseStalePauseAuditCallback!(onStalePauseAudit);
     assert.equal(eventsOf(auditLog, "stale_pause_audit_callback_revised").length, 0);
     await postWebhook(port);
-    await flush(20);
+    // Same settled-signal wait as the tests above: a fixed flush() loses
+    // the race under load and the sweep then pauses nothing.
+    await waitFor(() => eventsOf(auditLog, "delivered").length === 1, "delivery to settle");
     c.advance(31 * DAY_MS);
     sweep();
     assert.equal(first.length, 1);

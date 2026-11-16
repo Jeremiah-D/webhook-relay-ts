@@ -12,8 +12,8 @@ import { createHash } from "node:crypto";
  *   sets it explicitly, so the relay can connect to one fronting host
  *   while presenting a different name (and, conversely, avoid leaking the
  *   real backend host in the default SNI). An IP literal is rejected at
- *   startup: SNI carries no IP addresses (RFC 6066), and Node would only
- *   warn and ignore it.
+ *   startup: SNI carries no IP addresses (RFC 6066), and Node rejects
+ *   one outright from v25/26 (`ERR_INVALID_ARG_VALUE`).
  * - `alpnProtocols`: the ALPN protocols offered in the ClientHello, in
  *   preference order. Defaults to `["h2", "http/1.1"]`. Endpoints without
  *   an entry keep the exact current behavior — no `servername` and no
@@ -68,6 +68,20 @@ export interface TlsSniOverride {
 export const DEFAULT_TLS_ALPN_PROTOCOLS: readonly string[] = ["h2", "http/1.1"];
 
 /**
+ * The SNI `servername` to pass to `tls.connect` for a handshake to
+ * `host`, or `undefined` when `host` is an IP literal. SNI carries no
+ * IP addresses (RFC 6066): Node only warned about an IP servername up
+ * to v24 (DEP0123) and rejects it outright with `ERR_INVALID_ARG_VALUE`
+ * from Node 25/26 — CI's floating `lts/*` moved to Node 26 and the
+ * `wss:` pin tests started throwing there. Omitting the option is also
+ * Node's default behavior (SNI is sent for DNS names, skipped for IP
+ * literals), so DNS hosts pass through unchanged.
+ */
+export function sniServernameForHost(host: string): string | undefined {
+  return isIP(host) === 0 ? host : undefined;
+}
+
+/**
  * The effective TLS identity for one endpoint: an override entry exists
  * for its `targetUrl` and these are the wire values to use.
  */
@@ -76,7 +90,7 @@ export interface ResolvedTlsSniOverride {
    * The SNI servername to send, or `undefined` to keep Node's default.
    * `undefined` only happens when the entry sets no `servername` and the
    * target host is an IP literal — Node sends no SNI for IPs, and passing
-   * one explicitly would only trigger a deprecation warning.
+   * one explicitly is rejected outright from Node 25/26.
    */
   servername: string | undefined;
   /** The ALPN protocols to offer, in preference order (a fresh copy). */

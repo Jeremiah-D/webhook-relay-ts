@@ -387,6 +387,11 @@ describe("otlp: retry-queue integration", () => {
     assert.equal(attrs["relay.endpoint"], "http://127.0.0.1:9/hook");
     assert.equal(attrs["relay.attempts"], "1");
     assert.equal(collector.posts[0].contentType, "application/json");
+    // The collector records the POST on receipt, before the exporter's
+    // post() resolves and bumps `exported` — so wait for the counter
+    // itself instead of reading it right after the POST lands (CI read
+    // exported 0 here under load).
+    await waitFor(() => q.getOtlpStats().exported === 1, 5000, "export POST to complete");
     const stats = q.getOtlpStats();
     assert.equal(stats.enabled, true);
     assert.equal(stats.exported, 1);

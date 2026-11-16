@@ -449,12 +449,17 @@ describe("RelayServer endpoint concurrency revision (WR-321)", () => {
       await waitFor(() => started.length === 2, "both deliveries to start unlimited");
       releaseAll();
       await waitFor(() => relay.getEndpointConcurrency(EP_A).inFlight === 0, "deliveries to drain");
-      // Now finite: the second arrival queues.
+      // Now finite: the second arrival queues. Wait for the queued state
+      // itself, not a fixed flush: under a loaded runner the queue's turn
+      // may not have admitted the second delivery yet when a fixed number
+      // of ticks has passed (CI: queued 0 instead of 1).
       relay.reviseEndpointConcurrency(EP_A, 1);
       assert.equal((await post(port)).status, 202);
       assert.equal((await post(port)).status, 202);
-      await waitFor(() => started.length === 3, "third delivery to start under the cap");
-      await flush();
+      await waitFor(
+        () => started.length === 3 && relay.getEndpointConcurrency(EP_A).queued === 1,
+        "third delivery to start and fourth to park on the limiter"
+      );
       assert.equal(started.length, 3);
       assert.deepEqual(relay.getEndpointConcurrency(EP_A), {
         configuredLimit: 1,

@@ -162,7 +162,11 @@ describe("tenant-inbound-ratelimit: 429s at the relay server intake", () => {
       forwardUrl: "http://127.0.0.1:9/unused", // never reached: intake gate is before delivery
       auditLog: audit,
       operatorToken: OPERATOR,
-      inboundTenantRateLimit: { perTenantPerSecond: 2 },
+      // Frozen clock, same refill race as the per-IP limiter: with time
+      // pinned the buckets never refill, so the burn-then-reject
+      // sequences in every test below are deterministic and the
+      // cross-test "already over budget" comments hold exactly.
+      inboundTenantRateLimit: { perTenantPerSecond: 2, now: () => 1_700_000_000_000 },
     });
     await new Promise<void>((resolve) => relay.listen(0, "127.0.0.1", resolve));
     const addr = relay.address();

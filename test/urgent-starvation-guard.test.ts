@@ -454,8 +454,11 @@ describe("composes with WR-27 proxy tunneling (WR-12 + WR-121 + WR-27)", () => {
       });
       q.start();
       for (let i = 1; i <= 5; i++) q.enqueue(mk(`u-${i}`));
-      // Real network: poll until all deliveries land.
-      for (let i = 0; i < 200 && received.length < 5; i++) {
+      // Real network: poll until all deliveries land AND the queue has
+      // settled them — the target records receipt before the queue's
+      // bookkeeping catches up, so stopping at received==5 alone leaves
+      // a straggler pending under load (flake: pendingCount 1, not 0).
+      for (let i = 0; i < 200 && (received.length < 5 || q.pendingCount() > 0); i++) {
         await new Promise((r) => setTimeout(r, 20));
       }
       assert.equal(received.length, 5);

@@ -223,6 +223,10 @@ describe("server setDedupWindow (WR-308)", () => {
     const { relay, delivered, auditLog } = makeServer({ dedup: { windowMs: 60_000 } });
     const port = await listen(relay);
     await post(port, body, signed(body));
+    // The settle the sibling tests use: the delivery dispatches on the
+    // queue's own tick after admission, so asserting `delivered` right
+    // after the 202 returns loses the race under load (flake: 0, not 1).
+    await settle();
     assert.equal(delivered.length, 1);
     assert.throws(() => relay.setDedupWindow!({ windowMs: 0 }), RangeError);
     assert.throws(() => relay.setDedupWindow!({ maxEntries: 0 }), RangeError);

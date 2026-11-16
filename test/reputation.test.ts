@@ -409,8 +409,15 @@ describe("server intake wiring", () => {
   });
 
   it("forces signature verification for a degraded API-key sender", async () => {
+    // Controllable clock for the intake limiter only: the bucket refills
+    // continuously, so sequential round-trips under a loaded runner can
+    // span a refill window and requests 5-8 are admitted instead of
+    // rejected (flake: 202 instead of 429). The reputation tracker keeps
+    // real time — its 10-minute half-life makes 1s of decay negligible —
+    // so only the limiter's clock is pinned here.
+    let nowMs = 1_700_000_000_000;
     const { relay, audit } = makeRelay({
-      rateLimit: { perIpPerSecond: 4 },
+      rateLimit: { perIpPerSecond: 4, now: () => nowMs },
       apiKeys: { rules: [{ pattern: "/hooks/keyed", keys: [{ id: "k1", key: keyA }] }] },
       // Two rate-limit hits downgrade k1 (70 -> 30).
       senderReputation: { rateLimitPenalty: 35, lowThreshold: 40, highThreshold: 70 },
@@ -429,9 +436,10 @@ describe("server intake wiring", () => {
     assert.equal(downgraded.length, 1);
     assert.equal(downgraded[0].keyId, "k1");
 
-    // The main limiter refills 4/s; wait for enough tokens that both the
-    // forced-verify probe and the signed control request reach admission.
-    await new Promise((r) => setTimeout(r, 800));
+    // The main limiter refills 4/s; advance the clock enough that both
+    // the forced-verify probe and the signed control request reach
+    // admission — deterministic, no wall-clock sleep.
+    nowMs += 1000;
     // Healthy behavior for this rule (requireSignature unset): the API
     // key alone authenticates, no signature needed -> would be 202. The
     // degraded sender is forced through verification -> 401.

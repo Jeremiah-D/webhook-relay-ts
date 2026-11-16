@@ -115,9 +115,19 @@ describe("end-to-end delivery", () => {
 
       // Backoff visibly grows between attempts (base*2^1=200ms, base*2^2=400ms).
       const gap1 = hits[1].at - hits[0].at;
-      const gap2 = hits[2].at - hits[1].at;
       assert.ok(gap1 >= 100, `first retry came too fast (${gap1}ms)`);
-      assert.ok(gap2 >= gap1 * 1.5, `backoff did not grow: ${gap1}ms then ${gap2}ms`);
+      // The scheduled delays themselves, from the audit trail, are the
+      // exact configured backoff: wall-clock gaps conflate the schedule
+      // with runner scheduling overhead — under load the first gap
+      // inflates and the ratio check fails on a correct 200→400 schedule
+      // (observed 284ms then 412ms). `nextDelayMs` is written by the
+      // queue when the retry is scheduled, before the timer fires.
+      await waitFor(() => audit.query({ event: "retrying" }).length >= 2, 5000, "retrying audit entries");
+      const retrying = audit.query({ event: "retrying" }) as Array<{ nextDelayMs: number }>;
+      assert.deepEqual(
+        retrying.map((r) => r.nextDelayMs),
+        [200, 400]
+      );
 
       // The audit trail records the successful delivery with its attempt count.
       await waitFor(() => audit.query({ event: "delivered" }).length > 0, 5000, "delivered audit entry");

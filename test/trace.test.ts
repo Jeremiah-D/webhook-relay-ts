@@ -275,6 +275,13 @@ describe("server-level trace propagation", () => {
       assert.match(traceId, /^[0-9a-f]{32}$/);
       await waitFor(() => downstreamHeaders[0]);
       assert.equal(downstreamHeaders[0][TRACE_ID_HEADER], traceId);
+      // The downstream stub records headers on receipt, before the
+      // delivery completes — the audit "delivered" entry lands later, so
+      // wait for it instead of reading the trail right after the first
+      // byte arrives (under load the trail held only "accepted").
+      await waitFor(() =>
+        (audit.query({ traceId }) as Array<{ event: string }>).find((e) => e.event === "delivered")
+      );
       const accepted = audit.query({ traceId }) as Array<{ event: string }>;
       // One trace id correlates the full trail: accepted + delivered.
       assert.deepEqual(
