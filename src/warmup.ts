@@ -57,7 +57,13 @@ import { spkiFingerprint, normalizePin } from "./pinning.ts";
 
 /** Per-endpoint outbound config maps, mirroring the sender's lookups. */
 export interface WarmupEndpointConfig {
-  tlsPins?: Record<string, string[]>;
+  /**
+   * Per-endpoint pin whitelists. A plain record is the construction
+   * snapshot; a `Map` is the sender's live whitelist (WR-429) — a
+   * revision landing while warm-up is still connecting warms the
+   * revised pins.
+   */
+  tlsPins?: Record<string, string[]> | Map<string, string[]>;
   proxies?: Record<string, string>;
   tlsClientCerts?: Record<string, TlsClientCert>;
   tlsSniOverrides?: Record<string, TlsSniOverride>;
@@ -149,6 +155,18 @@ interface ResolvedWarmupTarget {
 }
 
 /**
+ * Resolve one endpoint's pins from the warm-up config: a plain record
+ * reads by key, a `Map` is the sender's live whitelist (WR-429).
+ */
+function pinsForEndpoint(
+  pins: Record<string, string[]> | Map<string, string[]> | undefined,
+  endpoint: string
+): string[] | undefined {
+  if (pins === undefined) return undefined;
+  return pins instanceof Map ? pins.get(endpoint) : pins[endpoint];
+}
+
+/**
  * Resolve one configured endpoint to the pool inputs the delivery path
  * uses, mirroring `defaultSender`'s per-endpoint lookups (exact
  * `targetUrl` match). Returns the failure reason instead of throwing for
@@ -172,7 +190,7 @@ function resolveWarmupTarget(
   // SNI overrides resolve per target, proxies fall back to the
   // environment (read now — a proxy rotation after startup only affects
   // deliveries, which re-resolve per attempt).
-  const pins = url.protocol === "https:" ? cfg.tlsPins?.[endpoint] : undefined;
+  const pins = url.protocol === "https:" ? pinsForEndpoint(cfg.tlsPins, endpoint) : undefined;
   // WR-89: a rotation endpoint warms the primary identity's agent — the
   // one new handshakes will use — mirroring defaultSender's lookup.
   const clientCert =

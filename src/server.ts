@@ -364,7 +364,7 @@ import {
   type ResolvedInboundWsOptions,
 } from "./inbound-ws.ts";
 import { decompressMessage, WsInflateBombError } from "./deflate.ts";
-import { assertValidCaBundle, assertValidPins, normalizePin, spkiFingerprint, TlsPinMismatchError } from "./pinning.ts";
+import { assertValidCaBundle, assertValidPins, normalizePin, reviseTlsPinsMap, spkiFingerprint, TlsPinMismatchError, type TlsPinsRevision } from "./pinning.ts";
 import {
   assertValidClientCert,
   assertValidClientCertTargetKey,
@@ -2860,6 +2860,16 @@ export interface PooledSender extends Sender {
    */
   outboundCredentialMap: Map<string, CompiledOutboundCredential[]> | undefined;
   /**
+   * WR-429: the live outbound TLS pin whitelist itself — revised at
+   * runtime via `RelayServer.reviseTlsPins` (which owns the
+   * `tls_pins_revised` audit). Created once in `createDefaultSender`
+   * (seeded from the construction `tlsPins`, empty when none were
+   * configured — a revision creates the binding) and never replaced —
+   * revisions mutate it in place, so a delivery whose wire request
+   * was already built keeps the pin array it started with.
+   */
+  tlsPinMap: Map<string, string[]>;
+  /**
    * WR-165: chaos-drill injection counters, when the feature is enabled —
    * rendered into `GET /metrics` as `relay_chaos_injected_total` via
    * `render()`. `undefined` when no `chaos` was configured; the metrics
@@ -3270,6 +3280,14 @@ export function createDefaultSender(
       }
     }
   }
+  // WR-429: the live pin whitelist — seeded from the construction
+  // `tlsPins` record and never replaced; `RelayServer.reviseTlsPins`
+  // mutates it in place (see `reviseTlsPinsMap`), so a delivery whose
+  // wire request was already built keeps the pin array it started
+  // with, and every transport resolves pins per attempt from this map.
+  const tlsPinMap = new Map<string, string[]>(
+    Object.entries(tlsPins ?? {}).map(([endpoint, pins]) => [endpoint, [...pins]])
+  );
   // WR-207: fail fast on a CloudEvents config a consumer could never
   // parse — a typo must not silently emit a malformed envelope.
   if (cloudEvents !== undefined) {
@@ -5437,10 +5455,16 @@ export function createDefaultSender(
     // fingerprint before the upgrade handshake is written.
     const pins =
       url.protocol === "https:" || url.protocol === "wss:"
-        ? // WR-114: the registry's per-endpoint pins win over the static
-          // `tlsPins` record; an endpoint without a registry entry (or
-          // without pins in its record) falls back to the static config.
-          (endpointRegistry?.getTlsPins(item.targetUrl) ?? tlsPins?.[item.targetUrl])
+        ? // WR-114: the registry's per-endpoint pins win over the live
+          // `tlsPins` map; an endpoint without a registry entry (or
+          // without pins in its record) falls back to the live map
+          // (WR-429: resolved per attempt, so a `reviseTlsPins` lands
+          // on the next handshake — the HTTP/1.1, HTTP/2, and
+          // WebSocket paths all read this one variable, and the
+          // keep-alive / H2 pools key agents and sessions by the pin
+          // whitelist, so the next connect for the affected origin
+          // handshakes against the new pins).
+          (endpointRegistry?.getTlsPins(item.targetUrl) ?? tlsPinMap.get(item.targetUrl))
         : undefined;
     // WR-163: per-endpoint private CA bundle (exact targetUrl match,
     // `https:` only — the wss: path keeps its pinning-only handshake and
@@ -5730,6 +5754,10 @@ export function createDefaultSender(
   // WR-428: the binding map itself (undefined when the feature is off)
   // — revised at runtime via `RelayServer.reviseOutboundCredentials`.
   sender.outboundCredentialMap = outboundCredentialMap;
+  // WR-429: the live pin whitelist itself (empty when no `tlsPins`
+  // were configured) — revised at runtime via
+  // `RelayServer.reviseTlsPins`.
+  sender.tlsPinMap = tlsPinMap;
   // WR-165: chaos-drill injection counters (undefined when the feature
   // is off) — operators read them via `sender.chaosMetrics.getStats()`;
   // they render into GET /metrics as `relay_chaos_injected_total`.
@@ -6974,6 +7002,36 @@ export interface RelayServer extends Server {
    * and the header-injection logic is untouched.
    */
   reviseOutboundCredentials?: (patch: OutboundCredentialsRevision) => void;
+  /**
+   * WR-429: live-revise the outbound TLS pin whitelist — swap, add, or
+   * clear per-endpoint pins at runtime, no restart. The patch maps
+   * exact `targetUrl` → `string[] | null` (`null` removes that
+   * endpoint's pins entirely — it falls back to default PKI
+   * validation; an omitted endpoint keeps its live value). The whole
+   * patch is validated first (a malformed pin or an empty whitelist
+   * throws `RangeError` and the live whitelist is untouched — zero
+   * partial application); at least one field is required, otherwise
+   * `RangeError`. A patch identical to the live whitelist is a silent
+   * no-op with no audit event. A real revision is audited as
+   * `tls_pins_revised` with `previous` / `current` recording the
+   * endpoint, the pin list, and `'set'` / `'cleared'` — pins are
+   * public trust anchors, safe to record. The revision takes effect
+   * from the next handshake; a delivery already in flight keeps the
+   * pin array it started with. Always set; throws `Error` when a
+   * custom sender is in use — the default sender owns the whitelist.
+   * Unlike WR-428, no `tlsPins` at construction is not an error —
+   * revision creates the binding (adding pins only tightens
+   * validation). This only swaps the whitelist — the pin-validation
+   * semantics and the default PKI validation are untouched, and there
+   * is no persistence: a restart returns to the construction values.
+   */
+  reviseTlsPins?: (patch: TlsPinsRevision) => void;
+  /**
+   * WR-429: the live outbound TLS pin whitelist — a copy of the
+   * current endpoint → pin-list map (`{}` when no pins are live).
+   * Always set; returns `{}` when a custom sender is in use.
+   */
+  getTlsPins?: () => Record<string, string[]>;
   /**
    * WR-346: live error-budget burn-rate config — the five knobs.
    * Only set when `errorBudget` was configured; `undefined`
@@ -11631,7 +11689,15 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         { certIdentity: clientCertIdentity(set.primary().cert) },
       ]),
     ]),
-    tlsPins: { ...(opts.tlsPins ?? {}) },
+    // WR-429: the inventory reads the LIVE pin whitelist, not the
+    // construction record — a snapshot taken after a revision must
+    // record the revised pins, or the drift comparison would report
+    // false drift against the live server.
+    tlsPins: Object.fromEntries(
+      [...(defaultSender?.tlsPinMap?.entries() ?? Object.entries(opts.tlsPins ?? {}))].map(
+        ([endpoint, pins]) => [endpoint, [...pins]]
+      )
+    ),
     proxies: Object.fromEntries(
       Object.entries(opts.proxies ?? {}).map(([endpoint, proxyUrl]) => {
         let hasCredentials = false;
@@ -17713,7 +17779,10 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     const pool = defaultSender?.pool;
     if (pool !== undefined && warmupCfg.endpoints.length > 0) {
       const endpointCfg = {
-        tlsPins: opts.tlsPins,
+        // WR-429: warm-up reads the LIVE pin whitelist — a revision
+        // landing while warm-up is still connecting must warm the
+        // revised pins, not the construction snapshot.
+        tlsPins: defaultSender?.tlsPinMap ?? opts.tlsPins,
         proxies: opts.proxies,
         tlsClientCerts: opts.tlsClientCerts,
         tlsSniOverrides: opts.tlsSniOverrides,
@@ -19602,6 +19671,53 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       previous: changes.map((c) => ({ endpoint: c.endpoint, ...describe(c.previous) })),
       current: changes.map((c) => ({ endpoint: c.endpoint, ...describe(c.current) })),
     });
+  };
+
+  // WR-429: live TLS pin whitelist revision. The map owns the whitelist
+  // and validates the whole patch first (a bad pin throws `RangeError`
+  // and the live whitelist is left completely intact); the server only
+  // audits the change. A same-value revision is a silent no-op — the
+  // map reports no changes, so nothing is audited. A real revision is
+  // audited as `tls_pins_revised` with `previous` / `current`
+  // recording the endpoint, the pin list, and 'set' / 'cleared' —
+  // pins are public trust anchors, safe to record. The revision takes
+  // effect on the next handshake: a delivery already in flight keeps
+  // the pin array its wire request was built with (the map is mutated
+  // in place, never replaced), and the keep-alive / H2 / WebSocket
+  // pools key agents and sessions by the pin whitelist, so the next
+  // connect for the affected origin handshakes against the new pins.
+  // Unlike WR-428, an unconfigured whitelist is not an error —
+  // revision creates the binding (adding pins only tightens
+  // validation). No persistence: a restart returns to the construction
+  // `tlsPins`.
+  server.reviseTlsPins = (patch: TlsPinsRevision): void => {
+    const map = defaultSender?.tlsPinMap;
+    if (map === undefined) {
+      throw new Error(
+        "reviseTlsPins: the default sender is not in use — pin revision requires the default sender"
+      );
+    }
+    const changes = reviseTlsPinsMap(map, patch);
+    if (changes.length === 0) return; // Same-value: silent no-op.
+    const describe = (pins: string[] | null) => ({
+      pins,
+      action: pins === null ? ("cleared" as const) : ("set" as const),
+    });
+    opts.auditLog.append({
+      event: "tls_pins_revised",
+      previous: changes.map((c) => ({ endpoint: c.endpoint, ...describe(c.previous) })),
+      current: changes.map((c) => ({ endpoint: c.endpoint, ...describe(c.current) })),
+    });
+  };
+
+  // WR-429: live TLS pin whitelist — a defensive copy, so callers can
+  // neither mutate the live map nor observe a half-applied revision.
+  server.getTlsPins = (): Record<string, string[]> => {
+    const map = defaultSender?.tlsPinMap;
+    if (map === undefined) return {};
+    return Object.fromEntries(
+      [...map.entries()].map(([endpoint, pins]) => [endpoint, [...pins]])
+    );
   };
 
   // WR-347: SLO-breach prediction knob runtime revision. The method

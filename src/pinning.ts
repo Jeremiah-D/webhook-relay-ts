@@ -101,6 +101,117 @@ export function pinMatches(certDer: Buffer, pins: readonly string[]): boolean {
 }
 
 /**
+ * Live revision patch for the outbound TLS pin whitelist (WR-429):
+ * `targetUrl` → `string[] | null`. `null` removes that endpoint's pins
+ * entirely (it falls back to default PKI validation); an omitted
+ * endpoint keeps its live value. At least one field must be present —
+ * an empty patch throws `RangeError`.
+ *
+ * This revises only the WHITELIST map (which endpoints carry which
+ * pins). The pin-validation semantics are untouched: a pin is still a
+ * 32-byte base64 SPKI digest in any of the three accepted spellings,
+ * and the whitelist still replaces PKI verification for its endpoint.
+ */
+export type TlsPinsRevision = Record<string, string[] | null>;
+
+/** One endpoint's pin change, as returned by `reviseTlsPinsMap`. */
+export interface TlsPinChange {
+  /** The exact `targetUrl` whose pins changed. */
+  endpoint: string;
+  /** Pins live before the revision (`null` when none existed). */
+  previous: string[] | null;
+  /** Pins live after the revision (`null` when cleared). */
+  current: string[] | null;
+}
+
+/**
+ * Whether two pin whitelists are the same whitelist: the same digests
+ * after normalizing the `sha256:`/`sha256/` spelling. Order is
+ * irrelevant — the whitelist is a set, so reordering changes nothing
+ * on the wire.
+ */
+function samePins(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length !== b.length) return false;
+  const sortedA = a.map(normalizePin).sort();
+  const sortedB = b.map(normalizePin).sort();
+  return sortedA.every((pin, i) => pin === sortedB[i]);
+}
+
+/**
+ * Live-revise the outbound TLS pin whitelist map at runtime (WR-429),
+ * no restart. The whole patch is validated first (every non-null entry
+ * goes through `assertValidPins` — the startup gate — so a malformed
+ * pin, an empty whitelist, or a non-array value rejects the whole patch
+ * with `RangeError`, zero partial application); at least one field is
+ * required, otherwise `RangeError`.
+ *
+ * A `null` entry clears that endpoint's pins (it falls back to default
+ * PKI validation); an omitted endpoint keeps its live value. Adding
+ * pins for an endpoint that had none creates the binding — adding pins
+ * only tightens validation, so unlike WR-428 this is not an error when
+ * unconfigured.
+ *
+ * A patch entry is a no-op when the endpoint already carries the same
+ * pins (same digests after normalization, any order or spelling);
+ * clearing an endpoint with no pins is likewise a no-op. Returns one
+ * entry per endpoint whose pins actually changed — an empty array when
+ * the whole patch was a no-op, so the caller can stay silent. The map
+ * is mutated in place (never replaced) and each stored list is a fresh
+ * copy, so a delivery whose wire request was already built keeps the
+ * pin array it started with — the revision takes effect from the next
+ * handshake.
+ */
+export function reviseTlsPinsMap(
+  live: Map<string, string[]>,
+  patch: TlsPinsRevision
+): TlsPinChange[] {
+  if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+    throw new RangeError(
+      "reviseTlsPins: patch must be a Record<exact targetUrl, string[] | null>"
+    );
+  }
+  const entries = Object.entries(patch);
+  if (entries.length === 0) {
+    throw new RangeError("reviseTlsPins: patch must contain at least one field");
+  }
+  for (const [targetUrl, pins] of entries) {
+    if (targetUrl === "") {
+      throw new RangeError(
+        "reviseTlsPins: targetUrl must be a non-empty exact target URL"
+      );
+    }
+    if (pins !== null) {
+      if (!Array.isArray(pins)) {
+        throw new RangeError(
+          `reviseTlsPins: pins for ${targetUrl} must be a string[] or null`
+        );
+      }
+      // Validate-then-apply: the whole patch is gated before any entry
+      // lands, so a bad pin binds nothing.
+      assertValidPins(pins);
+    }
+  }
+  const changes: TlsPinChange[] = [];
+  for (const [targetUrl, pins] of entries) {
+    const prev = live.get(targetUrl);
+    if (pins === null) {
+      if (prev === undefined) continue; // Clearing an unpinned endpoint: no-op.
+      live.delete(targetUrl);
+      changes.push({ endpoint: targetUrl, previous: [...prev], current: null });
+    } else {
+      if (prev !== undefined && samePins(prev, pins)) continue; // Same-value: no-op.
+      live.set(targetUrl, [...pins]);
+      changes.push({
+        endpoint: targetUrl,
+        previous: prev === undefined ? null : [...prev],
+        current: [...pins],
+      });
+    }
+  }
+  return changes;
+}
+
+/**
  * Outbound private-CA trust bundle (WR-163).
  *
  * Validate a PEM CA bundle the way a constructor would: it must contain at

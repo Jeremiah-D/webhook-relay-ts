@@ -1364,6 +1364,25 @@ reliability primitives that matter for any signed-payload pipeline.
   never rides the opt-in HTTP/2 pool (falls back to HTTP/1.1, where the bundle
   rides the handshake). Invalid bundles throw `RangeError` at startup.
   `https:` targets only — `wss:` targets keep the pinning handshake.
+- **Live revision** — `server.reviseTlsPins(patch)` (WR-429) swaps, adds,
+  or clears per-endpoint pins at runtime, no restart: the patch maps
+  exact `targetUrl` → `string[] | null` (`null` removes that endpoint's
+  pins entirely — it falls back to default PKI validation; an omitted
+  endpoint keeps its live value). The whole patch is validated first —
+  a malformed pin or an empty whitelist throws `RangeError` and the
+  live whitelist is untouched — and at least one field is required. A
+  same-value patch is a silent no-op. A real revision is audited as
+  `tls_pins_revised` with `previous` / `current` recording the endpoint,
+  the pin list, and `'set'` / `'cleared'` (pins are public trust
+  anchors). The revision takes effect from the next handshake; a
+  delivery already in flight keeps the pin array it started with, and
+  the keep-alive / H2 / WebSocket pools key agents and sessions by the
+  pin whitelist, so the next connect for the affected origin
+  handshakes against the new pins. Adding pins for an endpoint that
+  had none creates the binding. Only the whitelist changes: the
+  pin-validation semantics are unchanged, there is no persistence (a
+  restart returns to the construction `tlsPins`), and
+  `server.getTlsPins()` returns a copy of the live whitelist.
 - `src/mtls.ts` — outbound mTLS client certificates: a per-endpoint client
   identity (`tlsClientCerts: { "<exact targetUrl | *.hostname | path-prefix URL>":
   { cert, key, passphrase? } }`, WR-198 target resolution with priority
