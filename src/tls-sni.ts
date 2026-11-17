@@ -98,6 +98,83 @@ export interface ResolvedTlsSniOverride {
 }
 
 /**
+ * WR-436: a live revision patch for one endpoint's TLS SNI/ALPN
+ * override (partial — omitted fields keep their live values; `null`
+ * clears a field back to its default: `servername` to the target URL's
+ * host, `alpnProtocols` to `["h2", "http/1.1"]`). Clearing every field
+ * the entry holds deletes the entry: the endpoint falls back to the
+ * URL host as SNI with the default ALPN.
+ */
+export interface TlsSniRevision {
+  /**
+   * New SNI `servername`, or `null` to clear it back to the target
+   * URL's host. Must be a DNS name, never an IP literal, when present.
+   */
+  servername?: string | null;
+  /**
+   * New ALPN protocols in preference order, or `null` to clear them
+   * back to `["h2", "http/1.1"]`. Must be a non-empty array of
+   * non-empty protocol names when present.
+   */
+  alpnProtocols?: string[] | null;
+}
+
+/**
+ * WR-436: the outcome of merging a {@link TlsSniRevision} onto the
+ * live entry for one endpoint.
+ */
+export interface TlsSniRevisionChange {
+  /**
+   * The entry to store for the endpoint, or `undefined` to delete it
+   * (the patch cleared every field the entry held). `undefined` with
+   * `changed: false` means there was no entry and the patch changed
+   * nothing — clearing fields that were never set is a no-op.
+   */
+  entry: TlsSniOverride | undefined;
+  /** False when the patch leaves the live entry exactly as it was. */
+  changed: boolean;
+}
+
+function sameStringList(a: readonly string[] | undefined, b: readonly string[] | undefined): boolean {
+  if (a === undefined || b === undefined) return a === b;
+  return a.length === b.length && a.every((v, i) => v === b[i]);
+}
+
+/**
+ * WR-436: merge one live revision patch onto the stored entry for an
+ * endpoint. Pure and unit-testable: the caller owns the live record
+ * and only applies the returned `entry` when `changed` is true.
+ * Validate-first-then-apply — the candidate entry is built and run
+ * through {@link assertValidTlsSniOverride} before anything is
+ * returned, so an illegal patch (IP-literal servername, empty ALPN)
+ * throws `RangeError` and the live record is untouched.
+ */
+export function reviseTlsSniOverrideMap(
+  prev: TlsSniOverride | undefined,
+  patch: TlsSniRevision,
+  label: string
+): TlsSniRevisionChange {
+  const candidate: TlsSniOverride = { ...(prev ?? {}) };
+  if (patch.servername !== undefined) {
+    if (patch.servername === null) delete candidate.servername;
+    else candidate.servername = patch.servername;
+  }
+  if (patch.alpnProtocols !== undefined) {
+    if (patch.alpnProtocols === null) delete candidate.alpnProtocols;
+    else candidate.alpnProtocols = [...patch.alpnProtocols];
+  }
+  assertValidTlsSniOverride(candidate, label);
+  const same =
+    prev !== undefined &&
+    prev.servername === candidate.servername &&
+    sameStringList(prev.alpnProtocols, candidate.alpnProtocols);
+  if (same) return { entry: prev, changed: false };
+  const empty = candidate.servername === undefined && candidate.alpnProtocols === undefined;
+  if (empty) return { entry: undefined, changed: prev !== undefined };
+  return { entry: candidate, changed: true };
+}
+
+/**
  * Validate one override entry the way a constructor would. Throws
  * `RangeError` on the first problem so a bad config fails at startup,
  * never mid-handshake.

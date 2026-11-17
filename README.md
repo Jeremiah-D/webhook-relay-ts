@@ -1453,8 +1453,22 @@ reliability primitives that matter for any signed-payload pipeline.
   certificate rides the same handshake), the H2 pool, and proxied endpoints
   (the handshake runs over the CONNECT tunnel). Applies to `https:` targets;
   empty servernames, IP-literal servernames, and empty/malformed
-  `alpnProtocols` throw `RangeError` at startup. Zero dependencies
-  (`node:net` + `node:crypto`).
+  `alpnProtocols` throw `RangeError` at startup. Live revision (WR-436) —
+  `server.reviseTlsSniOverride(endpoint, patch)` revises one endpoint's
+  two knobs at runtime (`servername` / `alpnProtocols`, partial — omitted
+  fields keep their live values; `null` clears a field back to its default,
+  `servername` falling back to the target URL's host and `alpnProtocols` to
+  `["h2", "http/1.1"]` while the entry survives; clearing every field the
+  entry holds deletes the entry). The sender resolves the override live on
+  every send and the pool key binds the effective TLS identity, so the next
+  send handshakes under the new SNI while a connection already pooled keeps
+  the identity it was built with. Endpoints never configured at startup can
+  be opted in without a restart. An illegal patch throws `RangeError` with
+  the live record untouched; an empty patch is an `Error`; a same-value
+  revision is a silent no-op. A real revision is audited as
+  `tls_sni_revised` (`endpoint` plus `previous` / `current`);
+  `server.getTlsSniOverride(endpoint)` returns a copy of the live entry.
+  Zero dependencies (`node:net` + `node:crypto`).
 - `src/cert-expiry.ts` — downstream + own TLS certificate expiry warning (WR-73):
   `createRelayServer({ tlsCertExpiry: { enabled: true, thresholdSeconds? } })`
   (also exposed as the fourteenth `createDefaultSender(...)` argument). When

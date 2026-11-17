@@ -399,8 +399,10 @@ import {
 import {
   assertValidTlsSniOverride,
   resolveTlsSniOverride,
+  reviseTlsSniOverrideMap,
   type ResolvedTlsSniOverride,
   type TlsSniOverride,
+  type TlsSniRevision,
 } from "./tls-sni.ts";
 import {
   assertTlsVersionMeetsFloor,
@@ -7621,6 +7623,42 @@ export interface RelayServer extends Server {
    */
   getTlsMinVersion?: (endpoint: string) => MinTlsVersion | undefined;
   /**
+   * WR-436: revise one endpoint's live TLS SNI/ALPN override at
+   * runtime (`servername` / `alpnProtocols`, partial — omitted fields
+   * keep their live values; `null` clears a field back to its default,
+   * `servername` falling back to the target URL's host and
+   * `alpnProtocols` to `["h2", "http/1.1"]` while the entry survives;
+   * clearing every field the entry holds deletes the entry and the
+   * endpoint falls back to the URL host as SNI with the default ALPN).
+   * The revision takes effect on the next handshake for that endpoint
+   * (the sender resolves the override live on every send and the pool
+   * key binds the effective TLS identity, so the next send handshakes
+   * under the new SNI while a connection already pooled keeps the
+   * identity it was built with). An illegal patch throws `RangeError`
+   * and the live record is untouched; an empty patch is an `Error`; a
+   * same-value revision is a silent no-op with no audit event. A real
+   * revision is audited as `tls_sni_revised` with `endpoint` plus
+   * `previous` / `current` (the construction values as first
+   * `previous`; `undefined` when the entry did not exist or was just
+   * deleted), and returns the live override for the endpoint
+   * (`undefined` when the entry was deleted). Always set — unlike the
+   * WR-343 floor revision, a brand-new endpoint can be opted in
+   * without a restart (the SNI resolution code path is always live;
+   * only the record starts empty). Orthogonal to WR-60 (which owns
+   * the override mechanism itself), WR-21 (pinning) and WR-74 (the
+   * TLS version floor — a different ClientHello dimension).
+   */
+  reviseTlsSniOverride?: (
+    endpoint: string,
+    patch: TlsSniRevision
+  ) => TlsSniOverride | undefined;
+  /**
+   * WR-436: live per-endpoint TLS SNI/ALPN override — a copy of the
+   * entry for `endpoint`, or `undefined` when the endpoint has no
+   * override entry. Always set.
+   */
+  getTlsSniOverride?: (endpoint: string) => TlsSniOverride | undefined;
+  /**
    * WR-349: revise one endpoint's live failover thresholds at runtime
    * (`failureThreshold` / `autoFailback` / `failbackIntervalMs`,
    * partial — omitted fields keep their live values). The new values
@@ -10575,9 +10613,33 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         { ...cfg },
       ])
     );
+  // WR-436: the live TLS SNI/ALPN override record, same shape as the
+  // WR-435 compression record above. `createDefaultSender` captures
+  // this record by reference (the override is resolved per send on
+  // the HTTP/1.1 and HTTP/2 paths), so the server holds the SAME
+  // object and hands it to both the main and the shadow sender;
+  // `reviseTlsSniOverride` mutates it in place — never replaces it —
+  // or the senders would keep reading a stale record. Each entry is
+  // copied at construction (including its `alpnProtocols` list) so a
+  // caller mutating their config object afterwards cannot move the
+  // live values. When unconfigured, the empty record behaves exactly
+  // like `undefined` (no override resolved), so revise can opt a
+  // brand-new endpoint in without a restart.
+  const liveTlsSniOverrides: Record<string, TlsSniOverride> =
+    Object.fromEntries(
+      Object.entries(opts.tlsSniOverrides ?? {}).map(([endpoint, override]) => [
+        endpoint,
+        {
+          ...override,
+          ...(override.alpnProtocols !== undefined
+            ? { alpnProtocols: [...override.alpnProtocols] }
+            : {}),
+        },
+      ])
+    );
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, onHttp2Fallback, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, liveResponseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallback, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, opts.awsSigV4, opts.awsSecretResolver, opts.outboundSchemas, opts.oauth2, undefined, opts.compressBrotli, opts.phaseTimeouts, opts.tlsCa, opts.chaos, onChaosInjectedAudit, liveResponseGuard, opts.doh, onDohFallback, proxyHealthMonitor, opts.outboundCredentials, opts.dnsPin, onDnsPinMismatch, opts.cloudEvents, opts.outboundSsrfGuard, onOutboundSsrfBlocked, onOutboundSsrfAllowlisted, onOutboundSsrfProxySkipped, opts.egressResidency, onEgressResidencyBlocked)
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, onHttp2Fallback, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, liveTlsSniOverrides, liveResponseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallback, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, opts.awsSigV4, opts.awsSecretResolver, opts.outboundSchemas, opts.oauth2, undefined, opts.compressBrotli, opts.phaseTimeouts, opts.tlsCa, opts.chaos, onChaosInjectedAudit, liveResponseGuard, opts.doh, onDohFallback, proxyHealthMonitor, opts.outboundCredentials, opts.dnsPin, onDnsPinMismatch, opts.cloudEvents, opts.outboundSsrfGuard, onOutboundSsrfBlocked, onOutboundSsrfAllowlisted, onOutboundSsrfProxySkipped, opts.egressResidency, onEgressResidencyBlocked)
       : undefined;
   // WR-146: tail-latency hedging for outbound attempts (opt-in). The
   // wrapper sits around whichever sender the queue uses — the default
@@ -10716,7 +10778,10 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
                   opts.outboundIdempotencyKey,
                   undefined,
                   opts.outboundEncryption,
-                  opts.tlsSniOverrides,
+                  // WR-436: the same live record as the main sender, so
+                  // a revision governs shadow mirrors from the next
+                  // attempt too.
+                  liveTlsSniOverrides,
                   // WR-435: the same live record as the main sender, so
                   // a revision governs shadow mirrors from the next
                   // attempt too.
@@ -18251,7 +18316,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         tlsPins: defaultSender?.tlsPinMap ?? opts.tlsPins,
         proxies: opts.proxies,
         tlsClientCerts: opts.tlsClientCerts,
-        tlsSniOverrides: opts.tlsSniOverrides,
+        // WR-436: warm-up reads the LIVE SNI override record, same as
+        // the WR-429 pin rule above.
+        tlsSniOverrides: liveTlsSniOverrides,
         // WR-89: rotation endpoints warm the primary identity's agent —
         // the agent new handshakes will actually use.
         tlsClientCertRotations: clientCertRotations,
@@ -20667,6 +20734,86 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     server.getTlsMinVersion = (endpoint: string): MinTlsVersion | undefined =>
       opts.minTlsVersions![endpoint];
   }
+
+  // WR-436: live revision of one endpoint's TLS SNI/ALPN override.
+  // Same contract as `reviseResponseCompression` above: partial
+  // patch, `null` clears a field back to its default (servername →
+  // the target URL's host, alpnProtocols → `["h2", "http/1.1"]`),
+  // clearing every field the entry holds deletes the entry (the
+  // endpoint falls back to the URL host as SNI with the default
+  // ALPN). Validate-then-apply through `reviseTlsSniOverrideMap`
+  // (which runs the same per-value validator as startup), so an
+  // illegal patch throws RangeError and the live record is left
+  // completely intact. A real revision is audited as
+  // `tls_sni_revised` with the endpoint plus previous / current
+  // (snapshots; `undefined` when the entry did not exist or was just
+  // deleted); an empty or same-value patch is a silent no-op. The
+  // sender resolves the override live on every send and the pool key
+  // binds the effective TLS identity, so the next send handshakes
+  // under the new SNI while a connection already pooled keeps the
+  // identity it was built with — no pooled connection is ever
+  // force-closed by a revision.
+  server.reviseTlsSniOverride = (
+    endpoint: string,
+    patch: TlsSniRevision
+  ): TlsSniOverride | undefined => {
+    if (typeof endpoint !== "string" || endpoint.length === 0) {
+      throw new RangeError("reviseTlsSniOverride: endpoint must be a non-empty string");
+    }
+    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new RangeError("reviseTlsSniOverride: patch must be an object");
+    }
+    if (patch.servername === undefined && patch.alpnProtocols === undefined) {
+      throw new Error("reviseTlsSniOverride: empty patch — nothing to revise");
+    }
+    const copy = (entry: TlsSniOverride | undefined): TlsSniOverride | undefined =>
+      entry === undefined
+        ? undefined
+        : {
+            ...entry,
+            ...(entry.alpnProtocols !== undefined
+              ? { alpnProtocols: [...entry.alpnProtocols] }
+              : {}),
+          };
+    const prev = copy(liveTlsSniOverrides[endpoint]);
+    const change = reviseTlsSniOverrideMap(
+      liveTlsSniOverrides[endpoint],
+      patch,
+      `reviseTlsSniOverride[${endpoint}]`
+    );
+    if (!change.changed) {
+      return prev;
+    }
+    // Mutate the live record in place — never replace the record
+    // object itself, or the senders' captured reference would go stale.
+    if (change.entry === undefined) {
+      delete liveTlsSniOverrides[endpoint];
+    } else {
+      liveTlsSniOverrides[endpoint] = change.entry;
+    }
+    const current = copy(change.entry);
+    opts.auditLog.append({
+      event: "tls_sni_revised",
+      endpoint,
+      previous: prev,
+      current,
+    });
+    return current;
+  };
+
+  // WR-436: live per-endpoint TLS SNI/ALPN override. Always set;
+  // returns a copy so callers cannot mutate the live record through
+  // it (including the `alpnProtocols` list).
+  server.getTlsSniOverride = (endpoint: string): TlsSniOverride | undefined => {
+    const entry = liveTlsSniOverrides[endpoint];
+    if (entry === undefined) return undefined;
+    return {
+      ...entry,
+      ...(entry.alpnProtocols !== undefined
+        ? { alpnProtocols: [...entry.alpnProtocols] }
+        : {}),
+    };
+  };
 
   // WR-349: live per-endpoint failover threshold revision. The method
   // is always set (like reviseTlsMinVersion above); with the endpoint
