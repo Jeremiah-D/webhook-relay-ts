@@ -598,9 +598,12 @@ import {
   type ResponseGuardRevision,
 } from "./response-limit.ts";
 import {
+  forwardHeadersRuleToConfig,
   resolveForwardHeadersConfig,
+  reviseForwardHeadersMap,
   shouldForwardHeader,
   type CompiledForwardHeadersRule,
+  type ForwardHeadersRevision,
   type ForwardHeadersRuleConfig,
 } from "./forward-headers.ts";
 import {
@@ -2922,6 +2925,19 @@ export interface PooledSender extends Sender {
    * transforms that were never configured.
    */
   payloadTransforms: PayloadTransformer | undefined;
+  /**
+   * WR-433: the live header forwarding rules themselves — revised at
+   * runtime via `RelayServer.reviseForwardHeaders` (which owns the
+   * `forward_headers_revised` audit). The same `Map` created once in
+   * `createDefaultSender` (seeded from the construction
+   * `forwardHeaders`) and never replaced — revisions mutate it in
+   * place, so the sender (which reads the compiled rule on every
+   * send) picks a revision up from the next send, while a send
+   * already in flight keeps the compiled rule object it read.
+   * `undefined` when no `forwardHeaders` were configured; a revision
+   * cannot enable forwarding rules that were never configured.
+   */
+  liveForwardHeaders: Map<string, CompiledForwardHeadersRule> | undefined;
   /**
    * WR-89: take-and-clear the id of the rotation client certificate most
    * recently used in a handshake attempt for the delivery `deliveryId`
@@ -5831,6 +5847,9 @@ export function createDefaultSender(
   // WR-431: the live chaos rules themselves — revised at runtime via
   // `RelayServer.reviseChaosRules`.
   sender.liveChaos = resolvedChaos;
+  // WR-433: the live header forwarding rules themselves — revised at
+  // runtime via `RelayServer.reviseForwardHeaders`.
+  sender.liveForwardHeaders = forwardHeadersRules;
   // WR-92: the shared DNS cache instance (undefined when the feature is
   // off) — operators read counters via `sender.dnsCache.getStats()`.
   sender.dnsCache = resolvedDnsCache;
@@ -7354,6 +7373,39 @@ export interface RelayServer extends Server {
    * use.
    */
   getPayloadTransforms?: () => Record<string, PayloadTransformRules>;
+  /**
+   * WR-433: live-revise the outbound header forwarding rules — set a
+   * new rule for an endpoint, replace one, or clear one (`null`), no
+   * restart. The patch follows `ForwardHeadersRevision` (an omitted
+   * endpoint keeps its live rule). The whole patch is validated first
+   * (an illegal regex throws `RangeError` and the live rules are
+   * untouched — zero partial application); an empty patch throws
+   * `RangeError`. A patch identical to the live rules is a silent
+   * no-op with no audit event. A real revision is audited as
+   * `forward_headers_revised` with `previous` / `current` recording
+   * the endpoint, the action ('set' / 'cleared'), and the allow/deny
+   * pattern source strings — header names/patterns only, never header
+   * values. With no `forwardHeaders` configured at construction this
+   * throws `Error` — enabling forwarding rules requires a restart.
+   * The revision takes effect from the next send; a send already in
+   * flight keeps the compiled rule object it read at the start.
+   * Clearing a rule restores the no-rule behavior for that endpoint
+   * (forward everything, including `authorization` / `cookie`, as
+   * before any rule existed). This only swaps rules — the
+   * `shouldForwardHeader` evaluation, the hop-by-hop stripping at
+   * intake, the relay-forced headers, and the default deny table are
+   * untouched, and there is no persistence: a restart returns to the
+   * construction `forwardHeaders`. Always set; throws `Error` when a
+   * custom sender is in use — the default sender owns the forwarding
+   * state.
+   */
+  reviseForwardHeaders?: (patch: ForwardHeadersRevision) => void;
+  /**
+   * WR-433: the live header forwarding rules — a defensive deep copy
+   * of the current endpoint → rule record (`{}` when no rules are
+   * live). Always set; returns `{}` when a custom sender is in use.
+   */
+  getForwardHeaders?: () => Record<string, ForwardHeadersRuleConfig>;
   /**
    * WR-346: live error-budget burn-rate config — the five knobs.
    * Only set when `errorBudget` was configured; `undefined`
@@ -20209,6 +20261,60 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     const transformer = defaultSender?.payloadTransforms;
     if (transformer === undefined) return {};
     return transformer.getRawRules();
+  };
+
+  // WR-433: live header forwarding rule revision. The map owns the
+  // rules and validates the whole patch first (an illegal regex
+  // throws `RangeError` and the live rules are left completely
+  // intact); the server only audits the change. A same-value
+  // revision is a silent no-op — the map reports no changes, so
+  // nothing is audited. A real revision is audited as
+  // `forward_headers_revised` with `previous` / `current` recording
+  // the endpoint, the action ('set' / 'cleared'), and the allow/deny
+  // pattern source strings — header names/patterns only, never
+  // header values. With no `forwardHeaders` configured this throws
+  // `Error` — enabling forwarding rules requires a restart. The
+  // revision takes effect from the next send: a send already in
+  // flight keeps the compiled rule object it read at the start (the
+  // Map is mutated in place, never replaced). No persistence: a
+  // restart returns to the construction `forwardHeaders`.
+  server.reviseForwardHeaders = (patch: ForwardHeadersRevision): void => {
+    const live = defaultSender?.liveForwardHeaders;
+    if (live === undefined) {
+      throw new Error(
+        "reviseForwardHeaders: forward headers are not configured — enabling them requires a restart"
+      );
+    }
+    const changes = reviseForwardHeadersMap(live, patch);
+    if (changes.length === 0) return; // Same-value: silent no-op.
+    // Audit pattern source strings only: header names/patterns, never
+    // header values (no values ever pass through this table).
+    const describe = (rule: CompiledForwardHeadersRule | null) => {
+      if (rule === null) {
+        return { action: "cleared" as const, allow: null, deny: null };
+      }
+      return {
+        action: "set" as const,
+        allow: rule.allow === undefined ? null : rule.allow.map((re) => re.source),
+        deny: rule.deny.map((re) => re.source),
+      };
+    };
+    opts.auditLog.append({
+      event: "forward_headers_revised",
+      previous: changes.map((c) => ({ endpoint: c.endpoint, ...describe(c.previous) })),
+      current: changes.map((c) => ({ endpoint: c.endpoint, ...describe(c.current) })),
+    });
+  };
+
+  // WR-433: live header forwarding rules — a defensive deep copy, so
+  // callers can neither mutate the live rules nor observe a
+  // half-applied revision. `{}` when no forwarding rules are live.
+  server.getForwardHeaders = (): Record<string, ForwardHeadersRuleConfig> => {
+    const live = defaultSender?.liveForwardHeaders;
+    if (live === undefined) return {};
+    return Object.fromEntries(
+      [...live.entries()].map(([endpoint, rule]) => [endpoint, forwardHeadersRuleToConfig(rule)])
+    );
   };
 
   // WR-347: SLO-breach prediction knob runtime revision. The method

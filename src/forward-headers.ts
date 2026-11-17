@@ -134,3 +134,108 @@ export function shouldForwardHeader(rule: CompiledForwardHeadersRule, name: stri
   }
   return !(FORWARD_HEADERS_DEFAULT_DENY as readonly string[]).some((d) => d === lower);
 }
+
+/**
+ * A live forward-headers patch (WR-433): exact `targetUrl` → new
+ * forwarding rule, or `null` to clear that endpoint's rule. Endpoints
+ * omitted from the patch keep their live rule.
+ */
+export type ForwardHeadersRevision = Record<string, ForwardHeadersRuleConfig | null>;
+
+/** One endpoint's rule change, as returned by `reviseForwardHeadersMap`. */
+export interface ForwardHeadersChange {
+  /** The endpoint whose rule changed. */
+  endpoint: string;
+  /** The live rule before the revision (`null` = no rule was live). */
+  previous: CompiledForwardHeadersRule | null;
+  /** The live rule after the revision (`null` = rule cleared). */
+  current: CompiledForwardHeadersRule | null;
+}
+
+/** Same-value test for two compiled rules (pattern source + flags, order-insensitive). */
+function sameCompiledRule(a: CompiledForwardHeadersRule, b: CompiledForwardHeadersRule): boolean {
+  const key = (list: RegExp[] | undefined): string | null =>
+    list === undefined
+      ? null
+      : JSON.stringify(
+          list.map((re) => [re.source, re.flags]).sort((x, y) => (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0))
+        );
+  return key(a.allow) === key(b.allow) && key(a.deny) === key(b.deny);
+}
+
+/**
+ * Revise the live forward-headers rules in place (WR-433): validate the
+ * whole patch first — the non-null entries go through the same gates
+ * `resolveForwardHeadersConfig` applies at construction — then apply it
+ * entry by entry, mutating `live` in place (never replacing the Map
+ * object, so the sender, which reads the Map on every send, picks a
+ * revision up from the next send, while a send already in flight keeps
+ * the compiled rule object it read). Returns the per-endpoint changes;
+ * an empty array means the patch was a same-value no-op (clearing an
+ * endpoint with no rule, or setting a rule identical to the live one).
+ *
+ * Throws `RangeError` on a non-object or empty patch, or on any
+ * invalid rule — with the live rules left completely intact (zero
+ * partial application).
+ */
+export function reviseForwardHeadersMap(
+  live: Map<string, CompiledForwardHeadersRule>,
+  patch: ForwardHeadersRevision
+): ForwardHeadersChange[] {
+  if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+    throw new RangeError(
+      "reviseForwardHeaders: patch must be a Record<targetUrl, ForwardHeadersRuleConfig | null>"
+    );
+  }
+  const entries = Object.entries(patch);
+  if (entries.length === 0) {
+    throw new RangeError("reviseForwardHeaders: patch must contain at least one endpoint");
+  }
+  for (const [endpoint] of entries) {
+    if (endpoint === "") {
+      throw new RangeError("reviseForwardHeaders: patch keys must be non-empty endpoint strings");
+    }
+  }
+  // Validate-then-apply: resolve the non-null entries through the
+  // construction-time gates, so a bad rule binds nothing.
+  // `Object.fromEntries` (not `obj[key] = …`) so an endpoint key like
+  // `"__proto__"` lands as an own property instead of mutating a prototype.
+  const newRules: Record<string, ForwardHeadersRuleConfig> = Object.fromEntries(
+    entries.filter(([, rule]) => rule !== null) as Array<[string, ForwardHeadersRuleConfig]>
+  );
+  const resolved = resolveForwardHeadersConfig(newRules);
+  const changes: ForwardHeadersChange[] = [];
+  for (const [endpoint, rule] of entries) {
+    const prev = live.get(endpoint) ?? null;
+    if (rule === null) {
+      if (prev === null) continue; // Clearing an endpoint with no rule: no-op.
+      live.delete(endpoint);
+      changes.push({ endpoint, previous: prev, current: null });
+    } else {
+      const next = resolved.get(endpoint)!;
+      if (prev !== null && sameCompiledRule(prev, next)) continue; // Same-value: no-op.
+      live.set(endpoint, next);
+      changes.push({ endpoint, previous: prev, current: next });
+    }
+  }
+  return changes;
+}
+
+/**
+ * The live compiled rule as a user-facing config — patterns rebuilt
+ * without the stateful `g`/`y` flags, so callers get a defensive copy
+ * that can neither mutate the live rule nor share a stateful regex
+ * with it. Only the fields the rule actually sets are present
+ * (`allow` omitted when absent, `deny` omitted when empty), matching
+ * the construction-time shape.
+ */
+export function forwardHeadersRuleToConfig(rule: CompiledForwardHeadersRule): ForwardHeadersRuleConfig {
+  const clone = (re: RegExp): RegExp => {
+    const flags = re.flags.replace(/[gy]/g, "");
+    return new RegExp(re.source, flags.includes("i") ? flags : flags + "i");
+  };
+  const cfg: ForwardHeadersRuleConfig = {};
+  if (rule.allow !== undefined) cfg.allow = rule.allow.map(clone);
+  if (rule.deny.length > 0) cfg.deny = rule.deny.map(clone);
+  return cfg;
+}

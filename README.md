@@ -5771,6 +5771,23 @@ const server = createRelayServer({
 - Matching is case-insensitive; `RegExp` patterns are rebuilt without
   the stateful `g`/`y` flags so forwarding is deterministic. Invalid
   rules throw `RangeError` at startup — never mid-delivery.
+- **Live revision (WR-433)** — `RelayServer.reviseForwardHeaders(patch)`
+  swaps rules at runtime with no restart: set a new rule for an
+  endpoint, replace one, or clear one (`null`); an omitted endpoint
+  keeps its live rules. The whole patch is validated first (an illegal
+  regex throws `RangeError` and the live rules are untouched); a
+  same-value patch is a silent no-op. A real revision audits
+  `forward_headers_revised` with `previous` / `current` per endpoint
+  (endpoint, action, and allow/deny pattern source strings — header
+  names/patterns only, never header values). It takes effect from the
+  next send — a send already in flight keeps the compiled rule it
+  read. Only the rules change: the deny > allow > default-deny
+  precedence, the hop-by-hop stripping at intake (no rule can re-admit
+  a hop-by-hop header), the relay-forced headers, and the default deny
+  table are untouched. With no `forwardHeaders` configured, revision
+  throws `Error`: enabling forwarding rules requires a restart.
+  `getForwardHeaders()` returns a defensive deep copy of the live
+  rules.
 
 ## Per-endpoint payload transform (opt-in)
 
