@@ -107,8 +107,11 @@ import {
   assertValidResponseAssertionRule,
   evaluateResponseAssertionRule,
   isResponseStatusWhitelisted,
+  reviseResponseAssertionsMap,
   type AssertionFailureInfo,
+  type ResponseAssertionChange,
   type ResponseAssertionRule,
+  type ResponseAssertionsRevision,
 } from "./response-assertions.ts";
 import {
   LatencyTracker,
@@ -543,8 +546,10 @@ export type {
   AssertionFailureInfo,
   AssertionOperator,
   ResponseAssertion,
+  ResponseAssertionChange,
   ResponseAssertionRule,
   ResponseAssertionVerdict,
+  ResponseAssertionsRevision,
 } from "./response-assertions.ts";
 export type { DownstreamResponseSummary };
 export type { FailoverConfig, FailoverEndpointConfig, FailoverEndpointStats, FailoverRevision, FailoverSwitchEvent };
@@ -13483,6 +13488,49 @@ export class RetryQueue {
     const next = cb ?? undefined;
     if (next === this.onAssertionFailure) return;
     this.onAssertionFailure = next;
+  }
+
+  /**
+   * WR-434: live-revise the per-endpoint declarative response assertion
+   * rules — the queue-side setter behind
+   * `RelayServer.reviseResponseAssertions`. The new rules take effect
+   * from the next attempt: an attempt already evaluating keeps the
+   * rule object it read at evaluation start (the table is mutated in
+   * place, never replaced), and already-reported assertion failures
+   * are never re-emitted. `null` clears that endpoint's rule —
+   * clearing the last rule restores plain 2xx semantics for that
+   * endpoint, after which this method (and
+   * `reviseAssertionFailureCallback`) throws the must-restart `Error`
+   * again. The whole patch is validated first (an illegal rule throws
+   * `RangeError` and the live rules are untouched — zero partial
+   * application); an empty patch throws `RangeError`; a same-value
+   * revision is a silent no-op returning `[]`. Returns the
+   * per-endpoint changes; the server layer audits them as
+   * `response_assertions_revised` and never touches the evaluation
+   * path. Throws `Error` when no response assertion rule is
+   * configured — enabling assertions requires a restart.
+   */
+  reviseResponseAssertions(patch: ResponseAssertionsRevision): ResponseAssertionChange[] {
+    if (!this.responseAssertionsConfigured()) {
+      throw new Error(
+        "reviseResponseAssertions: response assertions are not configured — enabling them requires a restart"
+      );
+    }
+    return reviseResponseAssertionsMap(this.responseAssertionRules, patch);
+  }
+
+  /**
+   * WR-434: the live per-endpoint response assertion rules — a
+   * defensive deep copy, so callers can neither mutate the live rules
+   * nor observe a half-applied revision. `{}` when no rules are live.
+   */
+  getResponseAssertions(): Record<string, ResponseAssertionRule> {
+    return Object.fromEntries(
+      [...this.responseAssertionRules.entries()].map(([endpoint, rule]) => [
+        endpoint,
+        structuredClone(rule),
+      ])
+    );
   }
 
   /**

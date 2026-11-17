@@ -111,6 +111,23 @@ export interface ResponseAssertionRule {
 }
 
 /**
+ * A live response-assertions patch (WR-434): exact `targetUrl` → new
+ * rule, or `null` to clear that endpoint's rule. Endpoints omitted
+ * from the patch keep their live rule.
+ */
+export type ResponseAssertionsRevision = Record<string, ResponseAssertionRule | null>;
+
+/** One endpoint's rule change, as returned by `reviseResponseAssertionsMap`. */
+export interface ResponseAssertionChange {
+  /** The endpoint whose rule changed. */
+  endpoint: string;
+  /** The live rule before the revision (`null` = no rule was live). */
+  previous: ResponseAssertionRule | null;
+  /** The live rule after the revision (`null` = rule cleared). */
+  current: ResponseAssertionRule | null;
+}
+
+/**
  * Structured delivery failure: a whitelisted downstream response
  * failed one or more response assertions. Classified
  * `"assertion_failed"` by `classifyFailure` (see `src/failure.ts`) —
@@ -448,4 +465,133 @@ function evaluateOneAssertion(document: unknown, assertion: ResponseAssertion): 
         : `expected ${at} to match ${JSON.stringify(assertion.value)}, got ${JSON.stringify(actual)}`;
     }
   }
+}
+
+/** Deep-equality for JSON-shaped assertion values (the `eq`/`ne` operands). */
+function deepEqualValue(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (a === null || b === null || typeof a !== "object" || typeof b !== "object") return false;
+  if (Array.isArray(a) || Array.isArray(b)) {
+    return (
+      Array.isArray(a) &&
+      Array.isArray(b) &&
+      a.length === b.length &&
+      a.every((v, i) => deepEqualValue(v, b[i]))
+    );
+  }
+  const aObj = a as Record<string, unknown>;
+  const bObj = b as Record<string, unknown>;
+  const aKeys = Object.keys(aObj);
+  const bKeys = Object.keys(bObj);
+  return (
+    aKeys.length === bKeys.length &&
+    aKeys.every(
+      (k) => Object.prototype.hasOwnProperty.call(bObj, k) && deepEqualValue(aObj[k], bObj[k])
+    )
+  );
+}
+
+/**
+ * Same-value test for two raw rules: the same target, the same status
+ * whitelist (an omitted list is the default 2xx, so it equals an
+ * omitted list — never an explicit list), and the same assertions in
+ * the same order. Deep-equal on assertion values, so a re-sent rule
+ * is a no-op even when it arrives as a fresh object.
+ */
+function sameResponseAssertionRule(a: ResponseAssertionRule, b: ResponseAssertionRule): boolean {
+  if (a.targetUrl !== b.targetUrl) return false;
+  const aStatuses = a.expectedStatuses;
+  const bStatuses = b.expectedStatuses;
+  if ((aStatuses === undefined) !== (bStatuses === undefined)) return false;
+  if (
+    aStatuses !== undefined &&
+    bStatuses !== undefined &&
+    (aStatuses.length !== bStatuses.length ||
+      aStatuses.some((code, i) => code !== bStatuses[i]))
+  ) {
+    return false;
+  }
+  const aAssertions = a.assertions ?? [];
+  const bAssertions = b.assertions ?? [];
+  return (
+    aAssertions.length === bAssertions.length &&
+    aAssertions.every(
+      (assertion, i) =>
+        assertion.path === bAssertions[i]!.path &&
+        assertion.op === bAssertions[i]!.op &&
+        deepEqualValue(assertion.value, bAssertions[i]!.value)
+    )
+  );
+}
+
+/**
+ * Revise the live response assertion rules in place (WR-434): validate
+ * the whole patch first — every non-null entry goes through the same
+ * gates `assertValidResponseAssertionRule` applies at construction,
+ * staged into a temp table (a rule whose `targetUrl` does not match
+ * its patch endpoint, or a second rule for the same `targetUrl`, is a
+ * `RangeError`) — then apply it entry by entry, mutating `live` in
+ * place (never replacing the Map object, so an attempt already
+ * evaluating keeps the rule object it read at evaluation start, while
+ * the next attempt reads the revised entry). The stored rule is a
+ * clone, so later caller-side mutation of the patch object can never
+ * move the live rules. Returns the per-endpoint changes; an empty
+ * array means the patch was a same-value no-op (clearing an endpoint
+ * with no rule, or setting a rule identical to the live one).
+ *
+ * Throws `RangeError` on a non-object or empty patch, or on any
+ * invalid rule — with the live rules left completely intact (zero
+ * partial application).
+ */
+export function reviseResponseAssertionsMap(
+  live: Map<string, ResponseAssertionRule>,
+  patch: ResponseAssertionsRevision
+): ResponseAssertionChange[] {
+  if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+    throw new RangeError(
+      "reviseResponseAssertions: patch must be a Record<targetUrl, ResponseAssertionRule | null>"
+    );
+  }
+  const entries = Object.entries(patch);
+  if (entries.length === 0) {
+    throw new RangeError("reviseResponseAssertions: patch must contain at least one endpoint");
+  }
+  for (const [endpoint] of entries) {
+    if (endpoint === "") {
+      throw new RangeError("reviseResponseAssertions: patch keys must be non-empty endpoint strings");
+    }
+  }
+  // Validate-then-apply: every new rule through the construction-time
+  // gates into a temp table, so a bad rule binds nothing.
+  const staged = new Map<string, ResponseAssertionRule>();
+  for (const [endpoint, rule] of entries) {
+    if (rule === null) continue;
+    assertValidResponseAssertionRule(rule, `reviseResponseAssertions[${JSON.stringify(endpoint)}]`);
+    if (rule.targetUrl !== endpoint) {
+      throw new RangeError(
+        `reviseResponseAssertions: rule targetUrl ${JSON.stringify(rule.targetUrl)} does not match patch endpoint ${JSON.stringify(endpoint)}`
+      );
+    }
+    if (staged.has(rule.targetUrl)) {
+      throw new RangeError(
+        `reviseResponseAssertions: duplicate rule for targetUrl ${JSON.stringify(rule.targetUrl)}`
+      );
+    }
+    staged.set(rule.targetUrl, structuredClone(rule));
+  }
+  const changes: ResponseAssertionChange[] = [];
+  for (const [endpoint, rule] of entries) {
+    const prev = live.get(endpoint) ?? null;
+    if (rule === null) {
+      if (prev === null) continue; // Clearing an endpoint with no rule: no-op.
+      live.delete(endpoint);
+      changes.push({ endpoint, previous: prev, current: null });
+    } else {
+      const next = staged.get(endpoint)!;
+      if (prev !== null && sameResponseAssertionRule(prev, next)) continue; // Same-value: no-op.
+      live.set(endpoint, next);
+      changes.push({ endpoint, previous: prev, current: next });
+    }
+  }
+  return changes;
 }

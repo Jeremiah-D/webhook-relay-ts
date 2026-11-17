@@ -28,7 +28,7 @@ import {
   selectSignatureAlgorithmVerifier,
   type SignatureAlgorithmRule,
 } from "./signature-alg.ts";
-import { RetryQueue, errorBudgetBurnAuditEvent, type AssertionFailureInfo, type AttemptFailedInfo, type BatchInfo, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutEvent, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeadLetterEscalationCallbacksRevision, type DeliveryDeadlineConfig, type DeliveryDeadlineExceededInfo, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type DownstreamResponseSummary, type EndpointAutoDisableRevision, type EndpointPauseCallbacksRevision, type EndpointPauseInfo, type ErrorBudgetConfig, type ErrorBudgetRevision, type EscalationConfig, type EscalationRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type FailureClass, type QuorumCallbacksRevision, type QuorumRetention, type QuorumRetentionRevision, type ReplayCallbacksRevision, type ReplayForcedInfo, type ReplaySkippedInfo, type RetryItem, type RetryBudgetDepletedInfo, type ScheduledFiredEvent, type Sender, type SenderCallOptions, type SemanticFailureInfo, type ShadowCallbacksRevision, type MaintenanceWindowTransition, type SloMissInfo, type SloRiskConfig, type SloRiskInfo, type SloRiskRevision, type StarvationGuardAuditEvent, type TenantBudgetAuditEvent, type UrgentDowngradedEvent, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
+import { RetryQueue, errorBudgetBurnAuditEvent, type AssertionFailureInfo, type AttemptFailedInfo, type BatchInfo, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutEvent, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeadLetterEscalationCallbacksRevision, type DeliveryDeadlineConfig, type DeliveryDeadlineExceededInfo, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type DownstreamResponseSummary, type EndpointAutoDisableRevision, type EndpointPauseCallbacksRevision, type EndpointPauseInfo, type ErrorBudgetConfig, type ErrorBudgetRevision, type EscalationConfig, type EscalationRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type FailureClass, type QuorumCallbacksRevision, type QuorumRetention, type QuorumRetentionRevision, type ReplayCallbacksRevision, type ReplayForcedInfo, type ReplaySkippedInfo, type ResponseAssertionRule, type ResponseAssertionsRevision, type RetryItem, type RetryBudgetDepletedInfo, type ScheduledFiredEvent, type Sender, type SenderCallOptions, type SemanticFailureInfo, type ShadowCallbacksRevision, type MaintenanceWindowTransition, type SloMissInfo, type SloRiskConfig, type SloRiskInfo, type SloRiskRevision, type StarvationGuardAuditEvent, type TenantBudgetAuditEvent, type UrgentDowngradedEvent, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
 import { parseDeliverAtHeader, DELIVER_AT_HEADER } from "./retry.ts";
 import type { ShadowDeliveredInfo, ShadowFailedInfo, ShadowTargetConfig, ShadowTargetsConfig } from "./retry.ts";
 import type {
@@ -9056,6 +9056,39 @@ export interface RelayServer extends Server {
   reviseAssertionFailureCallback?: (
     cb: ((info: AssertionFailureInfo) => void) | null
   ) => void;
+  /**
+   * WR-434: live-revise the per-endpoint declarative response assertion
+   * rules — set new rules for an endpoint, replace one, or clear one
+   * (`null`), no restart. The patch follows
+   * `ResponseAssertionsRevision` (an omitted endpoint keeps its live
+   * rule). The whole patch is validated first (an illegal value throws
+   * `RangeError` and the live rules are untouched — zero partial
+   * application); an empty patch throws `RangeError`. A patch identical
+   * to the live rules is a silent no-op with no audit event. A real
+   * revision is audited as `response_assertions_revised` with
+   * `previous` / `current` recording the endpoint, the action ('set' /
+   * 'cleared'), the status whitelist, and the assertion path/op list —
+   * never assertion values (they may carry business thresholds or
+   * sample bodies). With no `responseAssertions` configured at
+   * construction this throws `Error` — enabling assertions requires a
+   * restart. The revision takes effect from the next attempt; an
+   * attempt already evaluating keeps the rule object it read at
+   * evaluation start. Clearing the last rule restores plain 2xx
+   * semantics for that endpoint and closes the
+   * `reviseAssertionFailureCallback` gate. This only swaps rules — the
+   * `evaluateResponseAssertionRule` semantics, the `assertion_failed`
+   * classification, the `assertionFailureCounts` counting, and the
+   * `onAssertionFailure` callback are untouched, and there is no
+   * persistence: a restart returns to the construction
+   * `responseAssertions`. Always set.
+   */
+  reviseResponseAssertions?: (patch: ResponseAssertionsRevision) => void;
+  /**
+   * WR-434: the live per-endpoint response assertion rules — a
+   * defensive deep copy of the current endpoint → rule record (`{}`
+   * when no rules are live). Always set.
+   */
+  getResponseAssertions?: () => Record<string, ResponseAssertionRule>;
   /**
    * WR-391: live-redirect the delivery-deadline-exceeded observer — the
    * operator callback that fires once per delivery whose end-to-end
@@ -20315,6 +20348,53 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     return Object.fromEntries(
       [...live.entries()].map(([endpoint, rule]) => [endpoint, forwardHeadersRuleToConfig(rule)])
     );
+  };
+
+  // WR-434: live per-endpoint response assertion rule revision. The
+  // queue owns the rules and validates the whole patch first (an
+  // illegal value throws `RangeError` and the live rules are left
+  // completely intact); the server only audits the change. A
+  // same-value revision is a silent no-op — the queue reports no
+  // changes, so nothing is audited. A real revision is audited as
+  // `response_assertions_revised` with `previous` / `current`
+  // recording the endpoint, the action ('set' / 'cleared'), the status
+  // whitelist, and the assertion path/op list — never assertion values.
+  // With no `responseAssertions` configured the queue throws `Error` —
+  // enabling assertions requires a restart. The revision takes effect
+  // from the next attempt: an attempt already evaluating keeps the rule
+  // object it read at evaluation start (the Map is mutated in place,
+  // never replaced). Clearing the last rule restores plain 2xx
+  // semantics for that endpoint and closes the
+  // `reviseAssertionFailureCallback` gate. No persistence: a restart
+  // returns to the construction `responseAssertions`.
+  server.reviseResponseAssertions = (patch: ResponseAssertionsRevision): void => {
+    const changes = queue.reviseResponseAssertions(patch);
+    if (changes.length === 0) return; // Same-value: silent no-op.
+    // Audit path/op only: assertion values may carry business
+    // thresholds or sample bodies, so they never reach the audit trail.
+    const describe = (rule: ResponseAssertionRule | null) => {
+      if (rule === null) {
+        return { action: "cleared" as const, expectedStatuses: null, assertions: null };
+      }
+      return {
+        action: "set" as const,
+        expectedStatuses: rule.expectedStatuses ?? null,
+        assertions: (rule.assertions ?? []).map((a) => ({ path: a.path, op: a.op })),
+      };
+    };
+    opts.auditLog.append({
+      event: "response_assertions_revised",
+      previous: changes.map((c) => ({ endpoint: c.endpoint, ...describe(c.previous) })),
+      current: changes.map((c) => ({ endpoint: c.endpoint, ...describe(c.current) })),
+    });
+  };
+
+  // WR-434: live per-endpoint response assertion rules — a defensive
+  // deep copy (via the queue getter), so callers can neither mutate
+  // the live rules nor observe a half-applied revision. `{}` when no
+  // rules are live.
+  server.getResponseAssertions = (): Record<string, ResponseAssertionRule> => {
+    return queue.getResponseAssertions();
   };
 
   // WR-347: SLO-breach prediction knob runtime revision. The method

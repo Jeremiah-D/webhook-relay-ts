@@ -5725,6 +5725,20 @@ queue.getDeliveryStats(); // per-endpoint rows incl. `assertionFailures`
   `queue.getDeliveryStats()` and the `relay_assertion_failures_total`
   Prometheus counter (activity-gated: absent entirely when the feature
   is off). Endpoints without a rule behave byte-identically to before.
+- **Live revision (WR-434)** — `relay.reviseResponseAssertions(patch)` /
+  `queue.reviseResponseAssertions(patch)` swaps per-endpoint rules without
+  a restart (`null` clears an endpoint's rule; an omitted endpoint keeps
+  its live rule). Rules must be configured before revision is possible —
+  with no `responseAssertions` configured this throws `Error` (enabling
+  them requires a restart). Clearing the last rule restores plain 2xx
+  semantics for that endpoint and closes the
+  `reviseAssertionFailureCallback` gate. The whole patch is validated
+  first (illegal values throw `RangeError` and the live rules are
+  untouched); a same-value revision is a silent no-op. Revisions are
+  audited as `response_assertions_revised` with the endpoint, the action,
+  the status whitelist, and the assertion path/op list only — never
+  assertion values. `relay.getResponseAssertions()` returns a defensive
+  copy of the live rules.
 
 ## Outbound header forwarding allowlist
 
