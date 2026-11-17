@@ -67,6 +67,13 @@ export interface ChaosConfig {
   rules: Record<string, ChaosFaultRule>;
 }
 
+/**
+ * A live chaos-rules patch (WR-431): exact `targetUrl` → new fault
+ * rule, or `null` to clear that endpoint's rule. Endpoints omitted
+ * from the patch keep their live rule.
+ */
+export type ChaosRulesRevision = Record<string, ChaosFaultRule | null>;
+
 /** A validated fault rule (what the injector reads). */
 export interface ResolvedChaosFaultRule {
   latencyMs: number | undefined;
@@ -159,6 +166,84 @@ export function resolveChaosConfig(
     resolved.set(endpoint, { latencyMs, resetConnection, statusCode });
   }
   return { rules: resolved };
+}
+
+/** One endpoint's rule change, as returned by `reviseChaosRulesMap`. */
+export interface ChaosRuleChange {
+  /** The endpoint whose rule changed. */
+  endpoint: string;
+  /** The live rule before the revision (`null` = no rule was live). */
+  previous: ResolvedChaosFaultRule | null;
+  /** The live rule after the revision (`null` = rule cleared). */
+  current: ResolvedChaosFaultRule | null;
+}
+
+/** Same-value test for two resolved rules (all three fault fields). */
+function sameRule(a: ResolvedChaosFaultRule, b: ResolvedChaosFaultRule): boolean {
+  return (
+    a.latencyMs === b.latencyMs &&
+    a.resetConnection === b.resetConnection &&
+    a.statusCode === b.statusCode
+  );
+}
+
+/**
+ * Revise the live chaos rules in place (WR-431): validate the whole
+ * patch first — the non-null entries go through the same gates
+ * `resolveChaosConfig` applies at construction — then apply it entry
+ * by entry, mutating `live.rules` in place (never replacing the
+ * config object, so the sender wrapper, which reads the same Map on
+ * every attempt, picks a revision up from the next attempt, while an
+ * attempt already in flight keeps the rule object it read).
+ * Returns the per-endpoint changes; an empty array means the patch
+ * was a same-value no-op (clearing an endpoint with no rule, or
+ * setting a rule identical to the live one).
+ *
+ * Throws `RangeError` on a non-object or empty patch, or on any
+ * invalid rule — with the live rules left completely intact (zero
+ * partial application).
+ */
+export function reviseChaosRulesMap(
+  live: ResolvedChaosConfig,
+  patch: ChaosRulesRevision
+): ChaosRuleChange[] {
+  if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+    throw new RangeError(
+      "reviseChaosRules: patch must be a Record<targetUrl, ChaosFaultRule | null>"
+    );
+  }
+  const entries = Object.entries(patch);
+  if (entries.length === 0) {
+    throw new RangeError("reviseChaosRules: patch must contain at least one endpoint");
+  }
+  // Validate-then-apply: resolve the non-null entries through the
+  // construction-time gates, so a bad rule binds nothing.
+  // `Object.fromEntries` (not `obj[key] = …`) so an endpoint key like
+  // `"__proto__"` lands as an own property instead of mutating a prototype.
+  const newRules: Record<string, ChaosFaultRule> = Object.fromEntries(
+    entries.filter(([, rule]) => rule !== null) as Array<[string, ChaosFaultRule]>
+  );
+  for (const [endpoint] of entries) {
+    if (endpoint === "") {
+      throw new RangeError("reviseChaosRules: patch keys must be non-empty endpoint strings");
+    }
+  }
+  const resolved = resolveChaosConfig({ rules: newRules }, "reviseChaosRules")!;
+  const changes: ChaosRuleChange[] = [];
+  for (const [endpoint, rule] of entries) {
+    const prev = live.rules.get(endpoint) ?? null;
+    if (rule === null) {
+      if (prev === null) continue; // Clearing an endpoint with no rule: no-op.
+      live.rules.delete(endpoint);
+      changes.push({ endpoint, previous: prev, current: null });
+    } else {
+      const next = resolved.rules.get(endpoint)!;
+      if (prev !== null && sameRule(prev, next)) continue; // Same-value: no-op.
+      live.rules.set(endpoint, next);
+      changes.push({ endpoint, previous: prev, current: next });
+    }
+  }
+  return changes;
 }
 
 /** Per-endpoint injection counters, shared by the wrapper. */

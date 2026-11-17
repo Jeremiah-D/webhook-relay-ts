@@ -131,10 +131,16 @@ import { ReplayApprovalError, type ReplayApprovalDenyReason, type ReplayApproval
 import { HttpDeliveryError, parseRetryAfterMs } from "./failure.ts";
 import {
   resolveChaosConfig,
+  reviseChaosRulesMap,
   wrapSenderWithChaos,
   ChaosMetrics,
   type ChaosConfig,
+  type ChaosFaultKind,
+  type ChaosFaultRule,
   type ChaosInjectionInfo,
+  type ChaosRulesRevision,
+  type ResolvedChaosConfig,
+  type ResolvedChaosFaultRule,
 } from "./chaos.ts";
 import { normalizeErrorSignature } from "./deadletter-cluster.ts";
 import {
@@ -2888,6 +2894,19 @@ export interface PooledSender extends Sender {
    * `GET /metrics` byte-identical for relays that never run a drill.
    */
   chaosMetrics: ChaosMetrics | undefined;
+  /**
+   * WR-431: the live chaos drill rules themselves — revised at runtime
+   * via `RelayServer.reviseChaosRules` (which owns the
+   * `chaos_rules_revised` audit). The same `ResolvedChaosConfig`
+   * object created once in `createDefaultSender` (seeded from the
+   * construction `chaos`) and never replaced — revisions mutate its
+   * `rules` Map in place, so the sender wrapper (which reads the Map
+   * on every attempt) picks a revision up from the next attempt,
+   * while an attempt already in flight keeps the rule object it
+   * read. `undefined` when no `chaos` was configured; a revision
+   * cannot enable a drill that was never configured.
+   */
+  liveChaos: ResolvedChaosConfig | undefined;
   /**
    * WR-89: take-and-clear the id of the rotation client certificate most
    * recently used in a handshake attempt for the delivery `deliveryId`
@@ -5791,6 +5810,9 @@ export function createDefaultSender(
   // is off) — operators read them via `sender.chaosMetrics.getStats()`;
   // they render into GET /metrics as `relay_chaos_injected_total`.
   sender.chaosMetrics = chaosMetrics;
+  // WR-431: the live chaos rules themselves — revised at runtime via
+  // `RelayServer.reviseChaosRules`.
+  sender.liveChaos = resolvedChaos;
   // WR-92: the shared DNS cache instance (undefined when the feature is
   // off) — operators read counters via `sender.dnsCache.getStats()`.
   sender.dnsCache = resolvedDnsCache;
@@ -7244,6 +7266,40 @@ export interface RelayServer extends Server {
    * `undefined` when a custom sender is in use.
    */
   getOutboundSigning?: () => OutboundSigningConfig | undefined;
+  /**
+   * WR-431: live-revise the chaos drill rules — set a new fault rule
+   * for an endpoint, replace one, or clear one (`null`), no restart.
+   * The patch follows `ChaosRulesRevision` (an omitted endpoint
+   * keeps its live rule). The whole patch is validated first (an
+   * invalid latency / status / reset+status combination throws
+   * `RangeError` and the live rules are untouched — zero partial
+   * application); an empty patch throws `RangeError`. A patch
+   * identical to the live rules is a silent no-op with no audit
+   * event. A real revision is audited as `chaos_rules_revised`
+   * with `previous` / `current` recording the endpoint, the fault
+   * summary (kind, latencyMs / statusCode values — drill parameters
+   * are not secret), and 'set' / 'cleared'. With no `chaos`
+   * configured at construction this throws `Error` — enabling a
+   * drill requires a restart (the sender was never wrapped). The
+   * revision takes effect from the next attempt; an attempt already
+   * in flight keeps the rule it read (a latency hold already
+   * applied is not withdrawn, a synthetic status already thrown is
+   * not recomputed). Clearing the last rule leaves the drill
+   * armed-but-empty: the metrics object and counters stay. This
+   * only swaps rules — the fault semantics, the `chaos_injected`
+   * audit, and the `relay_chaos_injected_total` counter are
+   * untouched, and there is no persistence: a restart returns to
+   * the construction `chaos`. Always set; throws `Error` when a
+   * custom sender is in use — the default sender owns the chaos
+   * state.
+   */
+  reviseChaosRules?: (patch: ChaosRulesRevision) => void;
+  /**
+   * WR-431: the live chaos drill rules — a defensive copy of the
+   * current endpoint → fault-rule record (`{}` when no drill is
+   * live). Always set; returns `{}` when a custom sender is in use.
+   */
+  getChaosRules?: () => Record<string, ChaosFaultRule>;
   /**
    * WR-346: live error-budget burn-rate config — the five knobs.
    * Only set when `errorBudget` was configured; `undefined`
@@ -19975,6 +20031,68 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     const copy: OutboundSigningConfig = { ...config };
     if (config.ed25519 !== undefined) copy.ed25519 = { ...config.ed25519 };
     return copy;
+  };
+
+  // WR-431: live chaos drill rule revision. The map owns the rules
+  // and validates the whole patch first (an illegal value throws
+  // `RangeError` and the live rules are left completely intact);
+  // the server only audits the change. A same-value revision is a
+  // silent no-op — the map reports no changes, so nothing is
+  // audited. A real revision is audited as `chaos_rules_revised`
+  // with `previous` / `current` recording the endpoint, the fault
+  // summary (kind + latencyMs / statusCode — drill parameters are
+  // not secret), and 'set' / 'cleared'. With no `chaos` configured
+  // this throws `Error` — enabling a drill requires a restart (the
+  // sender was never wrapped). The revision takes effect from the
+  // next attempt: an attempt already in flight keeps the rule it
+  // read (the Map is mutated in place, never replaced). No
+  // persistence: a restart returns to the construction `chaos`.
+  server.reviseChaosRules = (patch: ChaosRulesRevision): void => {
+    const live = defaultSender?.liveChaos;
+    if (live === undefined) {
+      throw new Error(
+        "reviseChaosRules: chaos is not configured — enabling it requires a restart"
+      );
+    }
+    const changes = reviseChaosRulesMap(live, patch);
+    if (changes.length === 0) return; // Same-value: silent no-op.
+    const describe = (rule: ResolvedChaosFaultRule | null) => {
+      if (rule === null) return { action: "cleared" as const, rule: null };
+      const kinds: ChaosFaultKind[] = [];
+      if (rule.latencyMs !== undefined) kinds.push("latency");
+      if (rule.resetConnection) kinds.push("reset");
+      if (rule.statusCode !== undefined) kinds.push("status");
+      return {
+        action: "set" as const,
+        kinds,
+        ...(rule.latencyMs !== undefined ? { latencyMs: rule.latencyMs } : {}),
+        ...(rule.resetConnection ? { resetConnection: true } : {}),
+        ...(rule.statusCode !== undefined ? { statusCode: rule.statusCode } : {}),
+      };
+    };
+    opts.auditLog.append({
+      event: "chaos_rules_revised",
+      previous: changes.map((c) => ({ endpoint: c.endpoint, ...describe(c.previous) })),
+      current: changes.map((c) => ({ endpoint: c.endpoint, ...describe(c.current) })),
+    });
+  };
+
+  // WR-431: live chaos drill rules — a defensive copy (only the
+  // user-facing fields, so callers can neither mutate the live
+  // rules nor observe a half-applied revision). `{}` when no drill
+  // is live.
+  server.getChaosRules = (): Record<string, ChaosFaultRule> => {
+    const live = defaultSender?.liveChaos;
+    if (live === undefined) return {};
+    return Object.fromEntries(
+      [...live.rules.entries()].map(([endpoint, rule]) => {
+        const copy: ChaosFaultRule = {};
+        if (rule.latencyMs !== undefined) copy.latencyMs = rule.latencyMs;
+        if (rule.resetConnection) copy.resetConnection = true;
+        if (rule.statusCode !== undefined) copy.statusCode = rule.statusCode;
+        return [endpoint, copy];
+      })
+    );
   };
 
   // WR-347: SLO-breach prediction knob runtime revision. The method

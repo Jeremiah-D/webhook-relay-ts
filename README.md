@@ -3362,6 +3362,16 @@ createRelayServer({
   Off by default: with no `chaos` configured the sender is returned
   unwrapped — zero behavior change, zero overhead. Shadow senders
   (WR-85) stay drill-free: chaos targets the main outbound path.
+- **Live revision (WR-431)** — `RelayServer.reviseChaosRules(patch)`
+  swaps rules at runtime with no restart: set a new rule, replace one,
+  or clear one (`null`); an omitted endpoint keeps its live rule. The
+  whole patch is validated first (a bad rule throws `RangeError` and
+  the live rules are untouched); a same-value patch is a silent no-op.
+  A real revision audits `chaos_rules_revised` with `previous` /
+  `current` per endpoint. It takes effect from the next attempt — an
+  attempt already in flight keeps the rule it read. With no `chaos`
+  configured, revision throws `Error`: enabling a drill requires a
+  restart. `getChaosRules()` returns a defensive copy of the live rules.
 
 ## Dynamic endpoint registry (opt-in)
 
