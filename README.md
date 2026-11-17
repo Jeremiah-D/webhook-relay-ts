@@ -5664,6 +5664,23 @@ const server = createRelayServer({
 - **Observability** — the decoded `contentEncoding` rides
   `DownstreamResponse` into the WR-37 validator and the audit
   `response_summary`, so operators can see which downstreams compress.
+- **Live revision (WR-435)** — `server.reviseResponseCompression(endpoint, patch)`
+  revises one endpoint's two knobs at runtime (`acceptEncoding` /
+  `maxDecompressedBytes`, partial — omitted fields keep their live values;
+  `null` clears a field back to its default, `acceptEncoding` falling back
+  to `"gzip, deflate, br"` and `maxDecompressedBytes` to 65536 while the
+  entry survives; clearing both fields deletes the entry and the endpoint
+  stops negotiating decompression). The sender reads the live record on
+  every attempt, so the next attempt for that endpoint is governed by the
+  new options while a response read already in flight keeps the cap it
+  started under. Endpoints never configured at startup can be opted in
+  without a restart. An illegal patch throws `RangeError` with the live
+  record untouched; an empty patch is an `Error`; a same-value revision
+  is a silent no-op. A real revision is audited as
+  `response_compression_revised` (`endpoint` plus `previous` / `current`);
+  `server.getResponseCompression(endpoint)` returns a copy of the live
+  entry. This is the revision entry point only — WR-62 owns the
+  decompression mechanism itself.
 - Endpoints without an entry send no `Accept-Encoding` and behave
   byte-identically to before.
 

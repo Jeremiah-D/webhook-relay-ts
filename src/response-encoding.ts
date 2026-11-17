@@ -51,6 +51,27 @@ export interface ResponseCompressionOptions {
   maxDecompressedBytes?: number;
 }
 
+/**
+ * WR-435: a live revision patch for one endpoint's response
+ * compression options (partial — omitted fields keep their live
+ * values; `null` clears a field back to its default). Clearing both
+ * fields deletes the entry: the endpoint stops negotiating
+ * decompression altogether.
+ */
+export interface ResponseCompressionRevision {
+  /**
+   * New advertised `Accept-Encoding` value, or `null` to clear it back
+   * to the `"gzip, deflate, br"` default. Must be a non-empty string
+   * when present.
+   */
+  acceptEncoding?: string | null;
+  /**
+   * New decompressed-bytes cap, or `null` to clear it back to the
+   * 65536 default. Must be a positive integer when present.
+   */
+  maxDecompressedBytes?: number | null;
+}
+
 /** Validate a `responseCompression` record. Throws `RangeError` on bad values. */
 export function assertValidResponseCompressionConfig(
   config: Record<string, ResponseCompressionOptions>

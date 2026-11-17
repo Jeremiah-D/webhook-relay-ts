@@ -584,6 +584,7 @@ import {
   decodeResponseBody,
   DEFAULT_OUTBOUND_ACCEPT_ENCODING,
   type ResponseCompressionOptions,
+  type ResponseCompressionRevision,
 } from "./response-encoding.ts";
 import {
   verifyContentDigest,
@@ -6807,6 +6808,43 @@ export interface RelayServer extends Server {
    */
   getResponseGuard?: (endpoint: string) => ResponseGuardConfig | undefined;
   /**
+   * WR-435: revise one endpoint's outbound response compression
+   * options at runtime (`acceptEncoding` / `maxDecompressedBytes`,
+   * partial — omitted fields keep their live values; `null` clears a
+   * field back to its default, `acceptEncoding` falling back to
+   * `"gzip, deflate, br"` and `maxDecompressedBytes` to 65536 while
+   * the entry survives; clearing both fields deletes the entry and
+   * the endpoint stops negotiating decompression). The revision takes
+   * effect on the next attempt for that endpoint (the sender reads the
+   * live record per attempt); a response already being read keeps the
+   * cap it started under, and a delivery already resolved is never
+   * re-decoded. An illegal patch throws `RangeError` and the live
+   * record is untouched; an empty patch is an `Error`; a same-value
+   * revision is a no-op with no audit event. A real revision is
+   * audited as `response_compression_revised` with `endpoint` plus
+   * `previous` / `current` (the construction values as first
+   * `previous`; `undefined` when the entry did not exist or was just
+   * deleted), and returns the live config for the endpoint
+   * (`undefined` when the entry was deleted). Always set — unlike the
+   * WR-341 deadline revision, a brand-new endpoint can be opted in
+   * without a restart (the negotiation code path is always live; only
+   * the record starts empty). Orthogonal to WR-62 (which owns the
+   * decompression mechanism itself) and WR-380 (which revises the
+   * response-guard knobs in the same shape, for a different object).
+   */
+  reviseResponseCompression?: (
+    endpoint: string,
+    patch: ResponseCompressionRevision
+  ) => ResponseCompressionOptions | undefined;
+  /**
+   * WR-435: live per-endpoint outbound response compression options —
+   * a copy of the entry for `endpoint`, or `undefined` when the
+   * endpoint has no compression entry. Always set.
+   */
+  getResponseCompression?: (
+    endpoint: string
+  ) => ResponseCompressionOptions | undefined;
+  /**
    * WR-339: revise the live adaptive backoff config at runtime
    * (`minBaseMs` / `maxBaseMs` / `upFactor` / `downFactor`, partial —
    * omitted fields keep their live values). Retuning clamps every
@@ -10519,9 +10557,27 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // can opt a brand-new endpoint in without a restart.
   const liveResponseGuard: Record<string, ResponseGuardConfig> =
     opts.responseGuard ?? {};
+  // WR-435: the live response-compression record, same shape as the
+  // WR-380 guard record above. `createDefaultSender` captures this
+  // record by reference (read per attempt on the HTTP/1.1 and HTTP/2
+  // paths), so the server holds the SAME object and hands it to both
+  // the main and the shadow sender; `reviseResponseCompression`
+  // mutates it in place — never replaces it — or the senders would
+  // keep reading a stale record. Each entry is copied at construction
+  // so a caller mutating their config object afterwards cannot move
+  // the live values. When unconfigured, the empty record behaves
+  // exactly like `undefined` (no `Accept-Encoding` advertised), so
+  // revise can opt a brand-new endpoint in without a restart.
+  const liveResponseCompression: Record<string, ResponseCompressionOptions> =
+    Object.fromEntries(
+      Object.entries(opts.responseCompression ?? {}).map(([endpoint, cfg]) => [
+        endpoint,
+        { ...cfg },
+      ])
+    );
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, onHttp2Fallback, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, opts.responseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallback, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, opts.awsSigV4, opts.awsSecretResolver, opts.outboundSchemas, opts.oauth2, undefined, opts.compressBrotli, opts.phaseTimeouts, opts.tlsCa, opts.chaos, onChaosInjectedAudit, liveResponseGuard, opts.doh, onDohFallback, proxyHealthMonitor, opts.outboundCredentials, opts.dnsPin, onDnsPinMismatch, opts.cloudEvents, opts.outboundSsrfGuard, onOutboundSsrfBlocked, onOutboundSsrfAllowlisted, onOutboundSsrfProxySkipped, opts.egressResidency, onEgressResidencyBlocked)
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, onHttp2Fallback, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, opts.tlsSniOverrides, liveResponseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallback, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, opts.awsSigV4, opts.awsSecretResolver, opts.outboundSchemas, opts.oauth2, undefined, opts.compressBrotli, opts.phaseTimeouts, opts.tlsCa, opts.chaos, onChaosInjectedAudit, liveResponseGuard, opts.doh, onDohFallback, proxyHealthMonitor, opts.outboundCredentials, opts.dnsPin, onDnsPinMismatch, opts.cloudEvents, opts.outboundSsrfGuard, onOutboundSsrfBlocked, onOutboundSsrfAllowlisted, onOutboundSsrfProxySkipped, opts.egressResidency, onEgressResidencyBlocked)
       : undefined;
   // WR-146: tail-latency hedging for outbound attempts (opt-in). The
   // wrapper sits around whichever sender the queue uses — the default
@@ -10661,7 +10717,10 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
                   undefined,
                   opts.outboundEncryption,
                   opts.tlsSniOverrides,
-                  opts.responseCompression,
+                  // WR-435: the same live record as the main sender, so
+                  // a revision governs shadow mirrors from the next
+                  // attempt too.
+                  liveResponseCompression,
                   opts.forwardHeaders,
                   certExpiryMonitor,
                   opts.minTlsVersions,
@@ -19164,6 +19223,83 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // returns a copy so callers cannot mutate the live record through it.
   server.getResponseGuard = (endpoint: string): ResponseGuardConfig | undefined => {
     const entry = liveResponseGuard[endpoint];
+    return entry === undefined ? undefined : { ...entry };
+  };
+
+  // WR-435: live revision of one endpoint's outbound response
+  // compression options. Same contract as `reviseResponseGuard`
+  // above: partial patch, `null` clears a field back to its default
+  // (acceptEncoding → "gzip, deflate, br", maxDecompressedBytes →
+  // 65536), clearing both fields deletes the entry (the endpoint
+  // stops negotiating decompression and sends no `Accept-Encoding`).
+  // Validate-then-apply through the same per-value validator as
+  // startup, so an illegal patch throws RangeError and the live
+  // record is left completely intact. A real revision is audited as
+  // `response_compression_revised` with the endpoint plus previous /
+  // current (snapshots; `undefined` when the entry did not exist or
+  // was just deleted); an empty or same-value patch is a silent
+  // no-op.
+  server.reviseResponseCompression = (
+    endpoint: string,
+    patch: ResponseCompressionRevision
+  ): ResponseCompressionOptions | undefined => {
+    if (typeof endpoint !== "string" || endpoint.length === 0) {
+      throw new RangeError("reviseResponseCompression: endpoint must be a non-empty string");
+    }
+    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new RangeError("reviseResponseCompression: patch must be an object");
+    }
+    if (patch.acceptEncoding === undefined && patch.maxDecompressedBytes === undefined) {
+      throw new Error("reviseResponseCompression: empty patch — nothing to revise");
+    }
+    const prev =
+      liveResponseCompression[endpoint] === undefined
+        ? undefined
+        : { ...liveResponseCompression[endpoint] };
+    const candidate: ResponseCompressionOptions = { ...(liveResponseCompression[endpoint] ?? {}) };
+    if (patch.acceptEncoding !== undefined) {
+      if (patch.acceptEncoding === null) delete candidate.acceptEncoding;
+      else candidate.acceptEncoding = patch.acceptEncoding;
+    }
+    if (patch.maxDecompressedBytes !== undefined) {
+      if (patch.maxDecompressedBytes === null) delete candidate.maxDecompressedBytes;
+      else candidate.maxDecompressedBytes = patch.maxDecompressedBytes;
+    }
+    assertValidResponseCompressionConfig({ [endpoint]: candidate });
+    const isEmpty =
+      candidate.acceptEncoding === undefined && candidate.maxDecompressedBytes === undefined;
+    const same =
+      (prev === undefined && isEmpty) ||
+      (prev !== undefined &&
+        prev.acceptEncoding === candidate.acceptEncoding &&
+        prev.maxDecompressedBytes === candidate.maxDecompressedBytes);
+    if (same) {
+      return prev === undefined ? undefined : { ...prev };
+    }
+    // Mutate the live record in place — never replace the record
+    // object itself, or the senders' captured reference would go stale.
+    if (isEmpty) {
+      delete liveResponseCompression[endpoint];
+    } else {
+      liveResponseCompression[endpoint] = candidate;
+    }
+    const current = isEmpty ? undefined : { ...candidate };
+    opts.auditLog.append({
+      event: "response_compression_revised",
+      endpoint,
+      previous: prev,
+      current,
+    });
+    return current;
+  };
+
+  // WR-435: live per-endpoint outbound response compression options.
+  // Always set; returns a copy so callers cannot mutate the live
+  // record through it.
+  server.getResponseCompression = (
+    endpoint: string
+  ): ResponseCompressionOptions | undefined => {
+    const entry = liveResponseCompression[endpoint];
     return entry === undefined ? undefined : { ...entry };
   };
 
