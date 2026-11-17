@@ -196,6 +196,7 @@ import {
   PayloadTransformError,
   TemplateError,
   type PayloadTransformRules,
+  type PayloadTransformsRevision,
 } from "./transform.ts";
 export { PayloadTransformer, PayloadTransformError, TemplateError };
 export type { PayloadTransformRules, TransformContext } from "./transform.ts";
@@ -2907,6 +2908,20 @@ export interface PooledSender extends Sender {
    * cannot enable a drill that was never configured.
    */
   liveChaos: ResolvedChaosConfig | undefined;
+  /**
+   * WR-432: the live payload transform rules themselves — revised at
+   * runtime via `RelayServer.revisePayloadTransforms` (which owns
+   * the `payload_transforms_revised` audit). The same
+   * `PayloadTransformer` object created once in `createDefaultSender`
+   * (seeded from the construction `payloadTransforms`) and never
+   * replaced — revisions mutate its rule Maps in place, so the
+   * sender (which reads the compiled rules on every send) picks a
+   * revision up from the next send, while a send already in flight
+   * keeps the compiled rules object it read. `undefined` when no
+   * `payloadTransforms` were configured; a revision cannot enable
+   * transforms that were never configured.
+   */
+  payloadTransforms: PayloadTransformer | undefined;
   /**
    * WR-89: take-and-clear the id of the rotation client certificate most
    * recently used in a handshake attempt for the delivery `deliveryId`
@@ -5796,6 +5811,9 @@ export function createDefaultSender(
   // WR-427: the registry itself (undefined when the feature is off) —
   // revised at runtime via `RelayServer.reviseOutboundSchemas`.
   sender.outboundSchemaRegistry = outboundSchemaRegistry;
+  // WR-432: the transformer itself (undefined when the feature is off)
+  // — revised at runtime via `RelayServer.revisePayloadTransforms`.
+  sender.payloadTransforms = payloadTransforms;
   // WR-428: the binding map itself (undefined when the feature is off)
   // — revised at runtime via `RelayServer.reviseOutboundCredentials`.
   sender.outboundCredentialMap = outboundCredentialMap;
@@ -7300,6 +7318,42 @@ export interface RelayServer extends Server {
    * live). Always set; returns `{}` when a custom sender is in use.
    */
   getChaosRules?: () => Record<string, ChaosFaultRule>;
+  /**
+   * WR-432: live-revise the outbound payload transform rules — set
+   * new rules for an endpoint, replace one, or clear one (`null`),
+   * no restart. The patch follows `PayloadTransformsRevision` (an
+   * omitted endpoint keeps its live rules). The whole patch is
+   * validated first (an illegal path, a reserved header name, a
+   * non-JSON constant, or an unclosed template throws
+   * `RangeError`/`TemplateError` and the live rules are untouched —
+   * zero partial application); an empty patch throws `RangeError`.
+   * A patch identical to the live rules is a silent no-op with no
+   * audit event. A real revision is audited as
+   * `payload_transforms_revised` with `previous` / `current`
+   * recording the endpoint and the changed field names per class
+   * (renames / deletes / maps / constants / headers set or cleared)
+   * — never template bodies or constant values. With no
+   * `payloadTransforms` configured at construction this throws
+   * `Error` — enabling transforms requires a restart. The revision
+   * takes effect from the next send; a send already in flight keeps
+   * the compiled rules object it read at the start. Clearing the
+   * last rule leaves the endpoint at byte passthrough. This only
+   * swaps rules — the transform semantics, the pipeline order
+   * (transform → gzip → E2EE → signing), the signing coverage, and
+   * the `transform_failed` / non_retryable classification are
+   * untouched, and there is no persistence: a restart returns to
+   * the construction `payloadTransforms`. Always set; throws `Error`
+   * when a custom sender is in use — the default sender owns the
+   * transform state.
+   */
+  revisePayloadTransforms?: (patch: PayloadTransformsRevision) => void;
+  /**
+   * WR-432: the live payload transform rules — a defensive deep copy
+   * of the current endpoint → rules record (`{}` when no transforms
+   * are live). Always set; returns `{}` when a custom sender is in
+   * use.
+   */
+  getPayloadTransforms?: () => Record<string, PayloadTransformRules>;
   /**
    * WR-346: live error-budget burn-rate config — the five knobs.
    * Only set when `errorBudget` was configured; `undefined`
@@ -20093,6 +20147,68 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         return [endpoint, copy];
       })
     );
+  };
+
+  // WR-432: live payload transform rule revision. The transformer owns
+  // the rules and validates the whole patch first (an illegal value
+  // throws `RangeError`/`TemplateError` and the live rules are left
+  // completely intact); the server only audits the change. A
+  // same-value revision is a silent no-op — the transformer reports
+  // no changes, so nothing is audited. A real revision is audited as
+  // `payload_transforms_revised` with `previous` / `current`
+  // recording the endpoint and the changed field names per class —
+  // never template bodies or constant values. With no
+  // `payloadTransforms` configured this throws `Error` — enabling
+  // transforms requires a restart. The revision takes effect from the
+  // next send: a send already in flight keeps the compiled rules
+  // object it read at the start (the Maps are mutated in place,
+  // never replaced). No persistence: a restart returns to the
+  // construction `payloadTransforms`.
+  server.revisePayloadTransforms = (patch: PayloadTransformsRevision): void => {
+    const transformer = defaultSender?.payloadTransforms;
+    if (transformer === undefined) {
+      throw new Error(
+        "revisePayloadTransforms: payload transforms are not configured — enabling them requires a restart"
+      );
+    }
+    const changes = transformer.revise(patch);
+    if (changes.length === 0) return; // Same-value: silent no-op.
+    // Audit field names only: header names and constant paths, never
+    // template bodies or constant values.
+    const describe = (rules: PayloadTransformRules | null) => {
+      if (rules === null) {
+        return {
+          action: "cleared" as const,
+          renames: null,
+          deletes: null,
+          maps: null,
+          constants: null,
+          headers: null,
+        };
+      }
+      return {
+        action: "set" as const,
+        renames: Object.keys(rules.fieldRenames ?? {}),
+        deletes: [...(rules.fieldDeletes ?? [])],
+        maps: Object.keys(rules.fieldMaps ?? {}),
+        constants: Object.keys(rules.constants ?? {}),
+        headers: Object.keys(rules.headerInjections ?? {}),
+      };
+    };
+    opts.auditLog.append({
+      event: "payload_transforms_revised",
+      previous: changes.map((c) => ({ endpoint: c.endpoint, ...describe(c.previous) })),
+      current: changes.map((c) => ({ endpoint: c.endpoint, ...describe(c.current) })),
+    });
+  };
+
+  // WR-432: live payload transform rules — a defensive deep copy, so
+  // callers can neither mutate the live rules nor observe a
+  // half-applied revision. `{}` when no transforms are live.
+  server.getPayloadTransforms = (): Record<string, PayloadTransformRules> => {
+    const transformer = defaultSender?.payloadTransforms;
+    if (transformer === undefined) return {};
+    return transformer.getRawRules();
   };
 
   // WR-347: SLO-breach prediction knob runtime revision. The method

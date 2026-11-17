@@ -5832,6 +5832,21 @@ const server = createRelayServer({
   emitted as canonical JSON (`JSON.stringify`); endpoints without rules
   pass bytes through untouched. Invalid rules throw `RangeError` /
   `TemplateError` at startup — never mid-delivery.
+- **Live revision (WR-432)** — `RelayServer.revisePayloadTransforms(patch)`
+  swaps rules at runtime with no restart: set new rules for an
+  endpoint, replace one, or clear one (`null`); an omitted endpoint
+  keeps its live rules. The whole patch is validated first (a bad
+  rule throws `RangeError` / `TemplateError` and the live rules are
+  untouched); a same-value patch is a silent no-op. A real revision
+  audits `payload_transforms_revised` with `previous` / `current`
+  per endpoint (field names only — never template bodies or constant
+  values). It takes effect from the next send — a send already in
+  flight keeps the compiled rules it read. Only the rules change:
+  the pipeline order (transform → gzip → E2EE → signing) and the
+  signing coverage are untouched. With no `payloadTransforms`
+  configured, revision throws `Error`: enabling transforms requires
+  a restart. `getPayloadTransforms()` returns a defensive deep copy
+  of the live rules.
 
 ## Outbound payload schema validation (opt-in)
 

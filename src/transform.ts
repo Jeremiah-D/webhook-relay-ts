@@ -128,6 +128,23 @@ export interface PayloadTransformRules {
   headerInjections?: Record<string, string>;
 }
 
+/**
+ * A live payload-transform patch (WR-432): exact `targetUrl` → new
+ * transform rules, or `null` to clear that endpoint's rules. Endpoints
+ * omitted from the patch keep their live rules.
+ */
+export type PayloadTransformsRevision = Record<string, PayloadTransformRules | null>;
+
+/** One endpoint's rule change, as returned by `PayloadTransformer.revise`. */
+export interface PayloadTransformsRevisionChange {
+  /** The endpoint whose rules changed. */
+  endpoint: string;
+  /** The live raw rules before the revision (`null` = no rules were live). */
+  previous: PayloadTransformRules | null;
+  /** The live raw rules after the revision (`null` = rules cleared). */
+  current: PayloadTransformRules | null;
+}
+
 /** The four template variables WR-115 supports. */
 const TEMPLATE_VARS = new Set(["event_id", "endpoint", "attempt", "timestamp"]);
 
@@ -322,6 +339,113 @@ function deletePath(root: unknown, segments: string[]): void {
 }
 
 /**
+ * Compile one endpoint's rules through the construction-time path:
+ * every class validated (`RangeError`/`TemplateError` on illegal
+ * shapes, paths, header names, constants, or templates) and lowered
+ * to segment arrays. Shared by the constructor and by
+ * `PayloadTransformer.revise`, so a live revision is checked by the
+ * exact same gates as a startup config — never mid-delivery.
+ */
+function compileEndpointRules(endpoint: string, rules: PayloadTransformRules): CompiledRules {
+  const r = rules;
+  const compiled: CompiledRules = { renames: [], deletes: [], maps: [], constants: [], headers: [] };
+  if (r.fieldRenames !== undefined) {
+    if (r.fieldRenames === null || typeof r.fieldRenames !== "object" || Array.isArray(r.fieldRenames)) {
+      throw new RangeError(`fieldRenames for ${JSON.stringify(endpoint)} must be an object, got ${JSON.stringify(r.fieldRenames)}`);
+    }
+    for (const [from, to] of Object.entries(r.fieldRenames)) {
+      compiled.renames.push({
+        from: checkPath(from, `fieldRenames source for ${JSON.stringify(endpoint)}`),
+        to: checkPath(to, `fieldRenames target for ${JSON.stringify(endpoint)}`),
+      });
+    }
+  }
+  if (r.fieldDeletes !== undefined) {
+    if (!Array.isArray(r.fieldDeletes)) {
+      throw new RangeError(`fieldDeletes for ${JSON.stringify(endpoint)} must be an array, got ${JSON.stringify(r.fieldDeletes)}`);
+    }
+    for (const p of r.fieldDeletes) {
+      compiled.deletes.push(checkPath(p, `fieldDeletes path for ${JSON.stringify(endpoint)}`));
+    }
+  }
+  if (r.fieldMaps !== undefined) {
+    if (r.fieldMaps === null || typeof r.fieldMaps !== "object" || Array.isArray(r.fieldMaps)) {
+      throw new RangeError(`fieldMaps for ${JSON.stringify(endpoint)} must be an object, got ${JSON.stringify(r.fieldMaps)}`);
+    }
+    for (const [to, from] of Object.entries(r.fieldMaps)) {
+      compiled.maps.push({
+        from: checkPath(from, `fieldMaps source for ${JSON.stringify(endpoint)}`),
+        to: checkPath(to, `fieldMaps target for ${JSON.stringify(endpoint)}`),
+      });
+    }
+  }
+  if (r.constants !== undefined) {
+    if (r.constants === null || typeof r.constants !== "object" || Array.isArray(r.constants)) {
+      throw new RangeError(`constants for ${JSON.stringify(endpoint)} must be an object, got ${JSON.stringify(r.constants)}`);
+    }
+    for (const [path, value] of Object.entries(r.constants)) {
+      checkJsonValue(value, `constants value at ${JSON.stringify(path)} for ${JSON.stringify(endpoint)}`);
+      compiled.constants.push({
+        path: checkPath(path, `constants path for ${JSON.stringify(endpoint)}`),
+        value,
+      });
+    }
+  }
+  if (r.headerInjections !== undefined) {
+    if (
+      r.headerInjections === null ||
+      typeof r.headerInjections !== "object" ||
+      Array.isArray(r.headerInjections)
+    ) {
+      throw new RangeError(
+        `headerInjections for ${JSON.stringify(endpoint)} must be an object, got ${JSON.stringify(r.headerInjections)}`
+      );
+    }
+    for (const [name, tpl] of Object.entries(r.headerInjections)) {
+      checkHeaderName(name);
+      if (typeof tpl !== "string") {
+        throw new RangeError(
+          `headerInjections value for ${JSON.stringify(name)} must be a string, got ${JSON.stringify(tpl)}`
+        );
+      }
+      compileTemplate(tpl, `headerInjections ${JSON.stringify(name)} for ${JSON.stringify(endpoint)}`);
+      compiled.headers.push({ name, template: tpl });
+    }
+  }
+  return compiled;
+}
+
+/** Order-insensitive deep equality for JSON-shaped values. */
+function jsonDeepEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (a === null || b === null) return false;
+  if (typeof a !== "object" || typeof b !== "object") return false;
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+    return a.every((v, i) => jsonDeepEqual(v, b[i]));
+  }
+  const ra = a as Record<string, unknown>;
+  const rb = b as Record<string, unknown>;
+  const ka = Object.keys(ra);
+  const kb = Object.keys(rb);
+  if (ka.length !== kb.length) return false;
+  return ka.every(
+    (k) => Object.prototype.hasOwnProperty.call(rb, k) && jsonDeepEqual(ra[k], rb[k])
+  );
+}
+
+/** Same-value test for two raw rule records (absent class = empty class). */
+function sameRules(a: PayloadTransformRules, b: PayloadTransformRules): boolean {
+  return (
+    jsonDeepEqual(a.fieldRenames ?? {}, b.fieldRenames ?? {}) &&
+    jsonDeepEqual(a.fieldDeletes ?? [], b.fieldDeletes ?? []) &&
+    jsonDeepEqual(a.fieldMaps ?? {}, b.fieldMaps ?? {}) &&
+    jsonDeepEqual(a.constants ?? {}, b.constants ?? {}) &&
+    jsonDeepEqual(a.headerInjections ?? {}, b.headerInjections ?? {})
+  );
+}
+
+/**
  * Per-endpoint payload transforms. Construct once at startup from the
  * `payloadTransforms` server option; the same instance backs every
  * delivery. Invalid shapes, paths, header names, or templates throw
@@ -329,6 +453,13 @@ function deletePath(root: unknown, segments: string[]): void {
  */
 export class PayloadTransformer {
   private readonly rules = new Map<string, CompiledRules>();
+  /**
+   * WR-432: the raw (uncompiled) rules per endpoint, kept alongside
+   * the compiled form for same-value comparison in `revise` and for
+   * the defensive deep copy `getRawRules` returns. Mutated in place
+   * by `revise`, never replaced.
+   */
+  private readonly rawRules = new Map<string, PayloadTransformRules>();
 
   /**
    * `rulesByEndpoint` maps an endpoint (the delivery `targetUrl`) to its
@@ -350,73 +481,92 @@ export class PayloadTransformer {
           `payload-transform rules for ${JSON.stringify(endpoint)} must be an object, got ${JSON.stringify(rules)}`
         );
       }
-      const r = rules as PayloadTransformRules;
-      const compiled: CompiledRules = { renames: [], deletes: [], maps: [], constants: [], headers: [] };
-      if (r.fieldRenames !== undefined) {
-        if (r.fieldRenames === null || typeof r.fieldRenames !== "object" || Array.isArray(r.fieldRenames)) {
-          throw new RangeError(`fieldRenames for ${JSON.stringify(endpoint)} must be an object, got ${JSON.stringify(r.fieldRenames)}`);
-        }
-        for (const [from, to] of Object.entries(r.fieldRenames)) {
-          compiled.renames.push({
-            from: checkPath(from, `fieldRenames source for ${JSON.stringify(endpoint)}`),
-            to: checkPath(to, `fieldRenames target for ${JSON.stringify(endpoint)}`),
-          });
-        }
-      }
-      if (r.fieldDeletes !== undefined) {
-        if (!Array.isArray(r.fieldDeletes)) {
-          throw new RangeError(`fieldDeletes for ${JSON.stringify(endpoint)} must be an array, got ${JSON.stringify(r.fieldDeletes)}`);
-        }
-        for (const p of r.fieldDeletes) {
-          compiled.deletes.push(checkPath(p, `fieldDeletes path for ${JSON.stringify(endpoint)}`));
-        }
-      }
-      if (r.fieldMaps !== undefined) {
-        if (r.fieldMaps === null || typeof r.fieldMaps !== "object" || Array.isArray(r.fieldMaps)) {
-          throw new RangeError(`fieldMaps for ${JSON.stringify(endpoint)} must be an object, got ${JSON.stringify(r.fieldMaps)}`);
-        }
-        for (const [to, from] of Object.entries(r.fieldMaps)) {
-          compiled.maps.push({
-            from: checkPath(from, `fieldMaps source for ${JSON.stringify(endpoint)}`),
-            to: checkPath(to, `fieldMaps target for ${JSON.stringify(endpoint)}`),
-          });
-        }
-      }
-      if (r.constants !== undefined) {
-        if (r.constants === null || typeof r.constants !== "object" || Array.isArray(r.constants)) {
-          throw new RangeError(`constants for ${JSON.stringify(endpoint)} must be an object, got ${JSON.stringify(r.constants)}`);
-        }
-        for (const [path, value] of Object.entries(r.constants)) {
-          checkJsonValue(value, `constants value at ${JSON.stringify(path)} for ${JSON.stringify(endpoint)}`);
-          compiled.constants.push({
-            path: checkPath(path, `constants path for ${JSON.stringify(endpoint)}`),
-            value,
-          });
-        }
-      }
-      if (r.headerInjections !== undefined) {
-        if (
-          r.headerInjections === null ||
-          typeof r.headerInjections !== "object" ||
-          Array.isArray(r.headerInjections)
-        ) {
-          throw new RangeError(
-            `headerInjections for ${JSON.stringify(endpoint)} must be an object, got ${JSON.stringify(r.headerInjections)}`
-          );
-        }
-        for (const [name, tpl] of Object.entries(r.headerInjections)) {
-          checkHeaderName(name);
-          if (typeof tpl !== "string") {
-            throw new RangeError(
-              `headerInjections value for ${JSON.stringify(name)} must be a string, got ${JSON.stringify(tpl)}`
-            );
-          }
-          compileTemplate(tpl, `headerInjections ${JSON.stringify(name)} for ${JSON.stringify(endpoint)}`);
-          compiled.headers.push({ name, template: tpl });
-        }
-      }
-      this.rules.set(endpoint, compiled);
+      // Compile first: an illegal endpoint binds nothing, and the raw
+      // copy stored below is already known to be JSON-shaped.
+      this.rules.set(endpoint, compileEndpointRules(endpoint, rules));
+      this.rawRules.set(endpoint, structuredClone(rules));
     }
+  }
+
+  /**
+   * Revise the live transform rules in place (WR-432): validate the
+   * whole patch first — every non-null entry goes through the same
+   * gates `compileEndpointRules` applies at construction, compiled
+   * into temporary tables — then apply it entry by entry, mutating
+   * the Maps in place (never replacing the transformer object, so a
+   * send whose `apply()` already read its compiled rules keeps them,
+   * while the next send reads the revised ones). Returns the
+   * per-endpoint changes; an empty array means the patch was a
+   * same-value no-op (clearing an endpoint with no rules, or setting
+   * rules identical to the live ones).
+   *
+   * Throws `RangeError` on a non-object or empty patch, or on any
+   * invalid rule, and `TemplateError` on an unclosed template — with
+   * the live rules left completely intact (zero partial application).
+   */
+  revise(patch: PayloadTransformsRevision): PayloadTransformsRevisionChange[] {
+    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new RangeError(
+        "revisePayloadTransforms: patch must be a Record<targetUrl, PayloadTransformRules | null>"
+      );
+    }
+    const entries = Object.entries(patch);
+    if (entries.length === 0) {
+      throw new RangeError("revisePayloadTransforms: patch must contain at least one endpoint");
+    }
+    for (const [endpoint] of entries) {
+      if (endpoint === "") {
+        throw new RangeError("revisePayloadTransforms: patch keys must be non-empty endpoint strings");
+      }
+    }
+    // Validate-then-apply: compile the non-null entries through the
+    // construction-time path into temp tables, so a bad rule binds
+    // nothing. The raw copies are cloned here, so later caller-side
+    // mutation of the patch object can never move the live rules.
+    const compiled = new Map<string, CompiledRules>();
+    const raw = new Map<string, PayloadTransformRules>();
+    for (const [endpoint, rules] of entries) {
+      if (rules === null) continue;
+      if (rules === undefined || typeof rules !== "object" || Array.isArray(rules)) {
+        throw new RangeError(
+          `revisePayloadTransforms: rules for ${JSON.stringify(endpoint)} must be an object, got ${JSON.stringify(rules)}`
+        );
+      }
+      compiled.set(endpoint, compileEndpointRules(endpoint, rules));
+      raw.set(endpoint, structuredClone(rules));
+    }
+    const changes: PayloadTransformsRevisionChange[] = [];
+    for (const [endpoint, rules] of entries) {
+      const prevRaw = this.rawRules.get(endpoint) ?? null;
+      if (rules === null) {
+        if (prevRaw === null) continue; // Clearing an endpoint with no rules: no-op.
+        this.rawRules.delete(endpoint);
+        this.rules.delete(endpoint);
+        changes.push({ endpoint, previous: structuredClone(prevRaw), current: null });
+      } else {
+        const nextRaw = raw.get(endpoint)!;
+        if (prevRaw !== null && sameRules(prevRaw, nextRaw)) continue; // Same-value: no-op.
+        this.rawRules.set(endpoint, nextRaw);
+        this.rules.set(endpoint, compiled.get(endpoint)!);
+        changes.push({
+          endpoint,
+          previous: prevRaw === null ? null : structuredClone(prevRaw),
+          current: structuredClone(nextRaw),
+        });
+      }
+    }
+    return changes;
+  }
+
+  /**
+   * The live raw rules — a defensive deep copy, so callers can
+   * neither mutate the live rules nor observe a half-applied
+   * revision.
+   */
+  getRawRules(): Record<string, PayloadTransformRules> {
+    return Object.fromEntries(
+      [...this.rawRules.entries()].map(([endpoint, rules]) => [endpoint, structuredClone(rules)])
+    );
   }
 
   /** Whether `endpoint` has at least one transform rule. */
