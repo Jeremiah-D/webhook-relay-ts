@@ -187,8 +187,21 @@ describe("WR-107 relay mesh server wiring", () => {
     seen.length = 0;
     const res = await post(port, "/", inboundHeaders(secret, headers));
     assert.equal(res.status, 202);
-    await waitFor(() => seen.length > 0, 5000, "stub received the delivery");
-    return seen[0] as Record<string, string>;
+    // Match the delivery by its own trace ID, not by arrival order: the
+    // stub is shared across this file's tests, and an earlier test's
+    // in-flight delivery can still land after this test reset `seen`
+    // (the chain test caught exactly that — a foreign trace ID stamped
+    // hops "2" from the maxHops test's below-cap delivery). Waiting for
+    // just any entry would let this test assert on another test's delivery.
+    const accepted = JSON.parse(res.text) as { traceId: string };
+    await waitFor(
+      () => seen.some((s) => (s as Record<string, string>)["x-trace-id"] === accepted.traceId),
+      5000,
+      "stub received the delivery"
+    );
+    return seen.find(
+      (s) => (s as Record<string, string>)["x-trace-id"] === accepted.traceId
+    ) as Record<string, string>;
   }
 
   it("mesh disabled: the hops header is stripped and never stamped (zero behavior change)", async () => {
@@ -244,6 +257,7 @@ describe("WR-107 relay mesh server wiring", () => {
   it("mesh enabled: hops at maxHops are rejected 400 and counted", async () => {
     await withRelay("s-maxhops", { mesh: { maxHops: 2 } }, async (port, dir) => {
       // Below the cap: accepted.
+      const before = seen.length;
       const ok = await post(port, "/", inboundHeaders("s-maxhops", { [RELAY_HOPS_HEADER]: "1" }));
       assert.equal(ok.status, 202);
       // At the cap: rejected, never delivered.
@@ -255,6 +269,11 @@ describe("WR-107 relay mesh server wiring", () => {
       assert.equal(rejected.maxHops, 2);
       const metrics = await get(port, "/metrics", { authorization: `Bearer ${OPERATOR_TOKEN}` });
       assert.match(metrics.text, /relay_mesh_hop_limit_rejections_total\{endpoint="[^"]+"\} 1/);
+      // Drain the below-cap delivery before close: the stub is shared, and
+      // an in-flight delivery landing after the next test resets `seen`
+      // would be mistaken for that test's delivery (the chain test caught
+      // a foreign trace ID stamped hops "2" exactly this way).
+      await waitFor(() => seen.length > before, 5000, "stub received the below-cap delivery");
     });
   });
 
@@ -295,8 +314,17 @@ describe("WR-107 relay mesh server wiring", () => {
       const res = await post(portA, "/", inboundHeaders("secret-a"));
       assert.equal(res.status, 202);
       const acceptedA = JSON.parse(res.text) as { traceId: string };
-      await waitFor(() => seen.length > 0, 5000, "stub received the chained delivery");
-      const wire = seen[0] as Record<string, string>;
+      // Match the chained delivery by its own trace ID, not by arrival
+      // order (see postAndWaitDelivery): the maxHops test's below-cap
+      // delivery can land on the shared stub after this reset.
+      await waitFor(
+        () => seen.some((s) => (s as Record<string, string>)["x-trace-id"] === acceptedA.traceId),
+        5000,
+        "stub received the chained delivery"
+      );
+      const wire = seen.find(
+        (s) => (s as Record<string, string>)["x-trace-id"] === acceptedA.traceId
+      ) as Record<string, string>;
       // Two mesh traversals: A stamped 1, B stamped 2.
       assert.equal(wire[RELAY_HOPS_HEADER], "2");
       // One end-to-end trace across both relays.
