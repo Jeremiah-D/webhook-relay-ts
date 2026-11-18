@@ -6015,6 +6015,21 @@ fails the attempt loudly instead of signing a lie).
   and rotation works without a restart. A missing secret fails the
   attempt as `SigV4SecretUnavailableError` (classified `non_retryable`:
   retrying a config problem burns the budget for nothing).
+- **Live revision (WR-437)** — `server.reviseAwsSigV4(endpoint, patch)`
+  revises one endpoint's signing config at runtime (partial — omitted
+  fields keep their live values; `null` deletes the entry and the
+  endpoint stops SigV4 signing; a brand-new endpoint opts in only with
+  all four required fields — `accessKeyId` / `secretRef` / `region` /
+  `service` — at once). `secretRef` is never the raw key: the secret is
+  resolved fresh per attempt through `awsSecretResolver`, so rotating
+  the ref (or the value behind it) takes effect on the next attempt
+  while an attempt already built keeps the signature it was built
+  with. An illegal or empty patch throws `RangeError` with the live
+  record untouched; a same-value revision is a silent no-op. A real
+  revision is audited as `aws_sigv4_revised` (`endpoint` plus
+  `previous` / `current`, carrying only the five config fields — never
+  key material); `server.getAwsSigV4(endpoint)` returns a copy of the
+  live entry.
 - **Orthogonal to WR-26** — both stamps may be enabled for one
   endpoint; SigV4 never signs `x-relay-signature`, so the two never
   order-depend. Inbound `authorization` / `x-amz-date` headers are

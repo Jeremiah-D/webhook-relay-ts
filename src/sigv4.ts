@@ -184,6 +184,121 @@ export function assertValidAwsSigV4Config(cfg: unknown, label: string): asserts 
   }
 }
 
+/**
+ * WR-437: a live revision patch for one endpoint's SigV4 signing
+ * config (partial — omitted fields keep their live values). A
+ * `null` field is rejected: the four required fields have no
+ * "clear back to a default" semantics — clearing is whole-entry
+ * deletion only (a `null` patch). `additionalSignedHeaders` clears
+ * by passing an empty list, not `null`.
+ */
+export interface AwsSigV4Revision {
+  /** New AWS access key id. */
+  accessKeyId?: string;
+  /** New secret-store reference (a name, never the raw secret). */
+  secretRef?: string;
+  /** New AWS region. */
+  region?: string;
+  /** New AWS service name. */
+  service?: string;
+  /** New extra signed headers (an empty list clears the list). */
+  additionalSignedHeaders?: string[];
+}
+
+/**
+ * WR-437: the outcome of merging an {@link AwsSigV4Revision} onto
+ * the live entry for one endpoint.
+ */
+export interface AwsSigV4RevisionChange {
+  /**
+   * The entry to store for the endpoint, or `undefined` to delete it
+   * (the patch was `null`). `undefined` with `changed: false` means
+   * there was no entry and the patch changed nothing.
+   */
+  entry: AwsSigV4EndpointConfig | undefined;
+  /** False when the patch leaves the live entry exactly as it was. */
+  changed: boolean;
+}
+
+function sameStringList(a: readonly string[] | undefined, b: readonly string[] | undefined): boolean {
+  if (a === undefined || b === undefined) return a === b;
+  return a.length === b.length && a.every((v, i) => v === b[i]);
+}
+
+function sameSigV4Config(
+  a: AwsSigV4EndpointConfig,
+  b: AwsSigV4EndpointConfig
+): boolean {
+  return (
+    a.accessKeyId === b.accessKeyId &&
+    a.secretRef === b.secretRef &&
+    a.region === b.region &&
+    a.service === b.service &&
+    sameStringList(a.additionalSignedHeaders, b.additionalSignedHeaders)
+  );
+}
+
+/**
+ * WR-437: merge one live revision patch onto the stored entry for an
+ * endpoint. Pure and unit-testable: the caller owns the live map and
+ * only applies the returned `entry` when `changed` is true — the map
+ * itself is never mutated here. Validate-first-then-apply — the
+ * candidate entry is built and run through
+ * {@link assertValidAwsSigV4Config} before anything is returned, so
+ * an illegal patch (a missing required field on opt-in, a bad region,
+ * a `null` field, an empty patch) throws `RangeError` and the live
+ * record is untouched. A `null` patch deletes the entry (the endpoint
+ * stops SigV4 signing); a same-value patch is a silent no-op.
+ */
+export function reviseAwsSigV4Map(
+  map: ReadonlyMap<string, AwsSigV4EndpointConfig>,
+  endpoint: string,
+  patch: AwsSigV4Revision | null,
+  label = `awsSigV4[${endpoint}]`
+): AwsSigV4RevisionChange {
+  const prev = map.get(endpoint);
+  if (patch === null) {
+    return { entry: undefined, changed: prev !== undefined };
+  }
+  if (typeof patch !== "object" || Array.isArray(patch)) {
+    throw new RangeError(`${label}: patch must be an object`);
+  }
+  const p = patch as Record<string, unknown>;
+  for (const field of ["accessKeyId", "secretRef", "region", "service", "additionalSignedHeaders"]) {
+    if (p[field] === null) {
+      throw new RangeError(`${label}: \`${field}\` must not be null (clearing is whole-entry deletion only)`);
+    }
+  }
+  if (
+    p.accessKeyId === undefined &&
+    p.secretRef === undefined &&
+    p.region === undefined &&
+    p.service === undefined &&
+    p.additionalSignedHeaders === undefined
+  ) {
+    throw new RangeError(`${label}: empty patch — nothing to revise`);
+  }
+  const candidate: AwsSigV4EndpointConfig = {
+    ...(prev ?? {}),
+    ...(p.accessKeyId !== undefined ? { accessKeyId: p.accessKeyId as string } : {}),
+    ...(p.secretRef !== undefined ? { secretRef: p.secretRef as string } : {}),
+    ...(p.region !== undefined ? { region: p.region as string } : {}),
+    ...(p.service !== undefined ? { service: p.service as string } : {}),
+    ...(p.additionalSignedHeaders !== undefined
+      ? { additionalSignedHeaders: [...(p.additionalSignedHeaders as string[])] }
+      : {}),
+  } as AwsSigV4EndpointConfig;
+  // Opt-in needs all four required fields at once; a partial patch
+  // on an unconfigured endpoint fails here, before anything is
+  // applied. The same call also rejects a bad region/service or a
+  // malformed additionalSignedHeaders list on an existing entry.
+  assertValidAwsSigV4Config(candidate, label);
+  if (prev !== undefined && sameSigV4Config(prev, candidate)) {
+    return { entry: prev, changed: false };
+  }
+  return { entry: candidate, changed: true };
+}
+
 /** Case-insensitive header lookup over a wire-headers map. */
 export function headerValueIgnoreCase(
   headers: Record<string, string | string[] | undefined>,

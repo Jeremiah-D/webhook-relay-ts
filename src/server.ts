@@ -208,8 +208,10 @@ import {
   assertValidAwsSigV4Config,
   defaultSecretResolver,
   headerValueIgnoreCase,
+  reviseAwsSigV4Map,
   signAwsSigV4,
   type AwsSigV4EndpointConfig,
+  type AwsSigV4Revision,
   type SecretResolver,
 } from "./sigv4.ts";
 export {
@@ -1845,7 +1847,9 @@ export interface RelayServerOptions {
    * for one endpoint. A missing secret fails the attempt as
    * `SigV4SecretUnavailableError` (classified `non_retryable`).
    * Applies to the default sender only. Invalid values throw
-   * `RangeError` at startup.
+   * `RangeError` at startup. Live-revisable at runtime via
+   * `server.reviseAwsSigV4(endpoint, patch)` (WR-437) — partial
+   * patch, `null` deletes the entry; see `reviseAwsSigV4`.
    */
   awsSigV4?: Record<string, AwsSigV4EndpointConfig>;
   /**
@@ -3141,9 +3145,13 @@ export function createDefaultSender(
    * orthogonal to the WR-26 HMAC `x-relay-signature` (both may be
    * enabled; SigV4 never signs `x-relay-signature`, so the two never
    * order-depend). Entries are validated at startup (`RangeError`);
-   * `undefined` keeps the exact pre-WR-116 wire shape.
+   * `undefined` keeps the exact pre-WR-116 wire shape. WR-437: a
+   * live `Map` is used by reference — `createRelayServer` passes its
+   * live holder so `reviseAwsSigV4` revisions govern the next
+   * attempt without a restart; a plain record is copied into a
+   * fresh map, as before.
    */
-  awsSigV4?: Record<string, AwsSigV4EndpointConfig>,
+  awsSigV4?: Record<string, AwsSigV4EndpointConfig> | Map<string, AwsSigV4EndpointConfig>,
   /**
    * WR-116: resolves `AwsSigV4EndpointConfig.secretRef` to key material
    * per delivery attempt (rotation without restart). Defaults to
@@ -3685,10 +3693,16 @@ export function createDefaultSender(
   // WR-116: RangeError on invalid values, at startup — never
   // mid-delivery. Only the shape is validated here; the secret itself
   // resolves per attempt (rotation without restart), so a missing env
-  // var fails attempts loudly instead of refusing to boot.
-  const sigv4Configs = new Map<string, AwsSigV4EndpointConfig>();
+  // var fails attempts loudly instead of refusing to boot. WR-437: a
+  // live `Map` is used by reference (never copied, never replaced) so
+  // `reviseAwsSigV4` revisions govern the next attempt; a plain
+  // record is copied into a fresh map, as before.
+  const sigv4Configs: Map<string, AwsSigV4EndpointConfig> =
+    awsSigV4 instanceof Map ? awsSigV4 : new Map<string, AwsSigV4EndpointConfig>();
   if (awsSigV4 !== undefined) {
-    for (const [endpoint, cfg] of Object.entries(awsSigV4)) {
+    const seed: Iterable<[string, AwsSigV4EndpointConfig]> =
+      awsSigV4 instanceof Map ? awsSigV4 : Object.entries(awsSigV4);
+    for (const [endpoint, cfg] of seed) {
       try {
         assertValidAwsSigV4Config(cfg, `awsSigV4[${endpoint}]`);
       } catch (err) {
@@ -3696,7 +3710,7 @@ export function createDefaultSender(
           `createDefaultSender: invalid awsSigV4 for ${endpoint}: ${(err as Error).message}`
         );
       }
-      sigv4Configs.set(endpoint, cfg);
+      if (!(awsSigV4 instanceof Map)) sigv4Configs.set(endpoint, cfg);
     }
   }
   // WR-117: RangeError on invalid values, at startup — never
@@ -7659,6 +7673,45 @@ export interface RelayServer extends Server {
    */
   getTlsSniOverride?: (endpoint: string) => TlsSniOverride | undefined;
   /**
+   * WR-437: revise one endpoint's live AWS SigV4 signing config at
+   * runtime (`accessKeyId` / `secretRef` / `region` / `service` /
+   * `additionalSignedHeaders`, partial — omitted fields keep their
+   * live values; a `null` patch deletes the entry and the endpoint
+   * stops SigV4 signing). The revision takes effect on the next
+   * attempt for that endpoint (the sender resolves the config live
+   * on every attempt and the secret resolves fresh per attempt, so
+   * the next attempt signs under the new region / account / headers
+   * while an attempt already built keeps the signature it was built
+   * with). A brand-new endpoint can be opted in without a restart,
+   * but only with all four required fields at once — otherwise
+   * `RangeError`. A single-field `null` is rejected (the required
+   * fields have no "clear back to a default" semantics); an empty
+   * patch is a `RangeError`; an illegal patch throws `RangeError`
+   * and the live record is untouched; a same-value revision is a
+   * silent no-op with no audit event. A real revision is audited as
+   * `aws_sigv4_revised` with `endpoint` plus `previous` / `current`
+   * (the construction values as first `previous`; `undefined` when
+   * the entry did not exist or was just deleted) — both carry only
+   * `accessKeyId` / `secretRef` / `region` / `service` /
+   * `additionalSignedHeaders`; `secretRef` is a reference name, never
+   * raw key material, so no secret ever enters the audit. Returns the
+   * live config for the endpoint (`undefined` when the entry was
+   * deleted). Always set. Orthogonal to WR-116 (which owns the SigV4
+   * mechanism itself), WR-430 (global HMAC/Ed25519 outbound signing
+   * revision — a different signing layer) and WR-188 (the S3 sink,
+   * which reuses `signAwsSigV4` for PUT uploads, not deliveries).
+   */
+  reviseAwsSigV4?: (
+    endpoint: string,
+    patch: AwsSigV4Revision | null
+  ) => AwsSigV4EndpointConfig | undefined;
+  /**
+   * WR-437: live per-endpoint AWS SigV4 signing config — a copy of
+   * the entry for `endpoint`, or `undefined` when the endpoint has
+   * no SigV4 entry. Always set.
+   */
+  getAwsSigV4?: (endpoint: string) => AwsSigV4EndpointConfig | undefined;
+  /**
    * WR-349: revise one endpoint's live failover thresholds at runtime
    * (`failureThreshold` / `autoFailback` / `failbackIntervalMs`,
    * partial — omitted fields keep their live values). The new values
@@ -10637,9 +10690,34 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         },
       ])
     );
+  // WR-437: the live AWS SigV4 signing-config holder, same shape as
+  // the WR-436 SNI record above but a `Map` (the shape the sender
+  // reads per attempt). `createDefaultSender` captures this map by
+  // reference (the config is resolved per attempt on the HTTP path),
+  // so the server holds the SAME map and hands it to the main sender;
+  // `reviseAwsSigV4` mutates it in place — never replaces it — or
+  // the sender would keep reading a stale map. Each entry is copied
+  // at construction (including its `additionalSignedHeaders` list) so
+  // a caller mutating their config object afterwards cannot move the
+  // live values. When unconfigured, the empty map behaves exactly
+  // like `undefined` (no signing), so revise can opt a brand-new
+  // endpoint in without a restart. Shadow senders keep SigV4 off
+  // (pre-existing: shadow mirrors are byte-identical copies, never
+  // re-signed).
+  const liveAwsSigV4Configs: Map<string, AwsSigV4EndpointConfig> = new Map(
+    Object.entries(opts.awsSigV4 ?? {}).map(([endpoint, cfg]) => [
+      endpoint,
+      {
+        ...cfg,
+        ...(cfg.additionalSignedHeaders !== undefined
+          ? { additionalSignedHeaders: [...cfg.additionalSignedHeaders] }
+          : {}),
+      },
+    ])
+  );
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, onHttp2Fallback, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, liveTlsSniOverrides, liveResponseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallback, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, opts.awsSigV4, opts.awsSecretResolver, opts.outboundSchemas, opts.oauth2, undefined, opts.compressBrotli, opts.phaseTimeouts, opts.tlsCa, opts.chaos, onChaosInjectedAudit, liveResponseGuard, opts.doh, onDohFallback, proxyHealthMonitor, opts.outboundCredentials, opts.dnsPin, onDnsPinMismatch, opts.cloudEvents, opts.outboundSsrfGuard, onOutboundSsrfBlocked, onOutboundSsrfAllowlisted, onOutboundSsrfProxySkipped, opts.egressResidency, onEgressResidencyBlocked)
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, onHttp2Fallback, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, liveTlsSniOverrides, liveResponseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallback, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, liveAwsSigV4Configs, opts.awsSecretResolver, opts.outboundSchemas, opts.oauth2, undefined, opts.compressBrotli, opts.phaseTimeouts, opts.tlsCa, opts.chaos, onChaosInjectedAudit, liveResponseGuard, opts.doh, onDohFallback, proxyHealthMonitor, opts.outboundCredentials, opts.dnsPin, onDnsPinMismatch, opts.cloudEvents, opts.outboundSsrfGuard, onOutboundSsrfBlocked, onOutboundSsrfAllowlisted, onOutboundSsrfProxySkipped, opts.egressResidency, onEgressResidencyBlocked)
       : undefined;
   // WR-146: tail-latency hedging for outbound attempts (opt-in). The
   // wrapper sits around whichever sender the queue uses — the default
@@ -20811,6 +20889,83 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       ...entry,
       ...(entry.alpnProtocols !== undefined
         ? { alpnProtocols: [...entry.alpnProtocols] }
+        : {}),
+    };
+  };
+
+  // WR-437: live revision of one endpoint's AWS SigV4 signing
+  // config. Same contract as `reviseTlsSniOverride` above: partial
+  // patch, `null` deletes the whole entry (the endpoint stops SigV4
+  // signing), a brand-new endpoint opts in only with all four
+  // required fields at once. Validate-then-apply through
+  // `reviseAwsSigV4Map` (which runs the same per-value validator as
+  // startup), so an illegal patch throws RangeError and the live
+  // record is left completely intact. A real revision is audited as
+  // `aws_sigv4_revised` with the endpoint plus previous / current
+  // (snapshots; `undefined` when the entry did not exist or was just
+  // deleted); `secretRef` in those snapshots is a reference name,
+  // never raw key material. An empty or same-value patch is a silent
+  // no-op. The sender resolves the config live on every attempt and
+  // the secret resolves fresh per attempt, so the next attempt signs
+  // under the new config while an attempt already built keeps the
+  // signature it was built with — no in-flight delivery is ever
+  // re-signed by a revision.
+  server.reviseAwsSigV4 = (
+    endpoint: string,
+    patch: AwsSigV4Revision | null
+  ): AwsSigV4EndpointConfig | undefined => {
+    if (typeof endpoint !== "string" || endpoint.length === 0) {
+      throw new RangeError("reviseAwsSigV4: endpoint must be a non-empty string");
+    }
+    if (patch !== null && (typeof patch !== "object" || Array.isArray(patch))) {
+      throw new RangeError("reviseAwsSigV4: patch must be an object or null");
+    }
+    const copy = (entry: AwsSigV4EndpointConfig | undefined): AwsSigV4EndpointConfig | undefined =>
+      entry === undefined
+        ? undefined
+        : {
+            ...entry,
+            ...(entry.additionalSignedHeaders !== undefined
+              ? { additionalSignedHeaders: [...entry.additionalSignedHeaders] }
+              : {}),
+          };
+    const prev = copy(liveAwsSigV4Configs.get(endpoint));
+    const change = reviseAwsSigV4Map(
+      liveAwsSigV4Configs,
+      endpoint,
+      patch,
+      `reviseAwsSigV4[${endpoint}]`
+    );
+    if (!change.changed) {
+      return prev;
+    }
+    // Mutate the live holder in place — never replace the map itself,
+    // or the sender's captured reference would go stale.
+    if (change.entry === undefined) {
+      liveAwsSigV4Configs.delete(endpoint);
+    } else {
+      liveAwsSigV4Configs.set(endpoint, change.entry);
+    }
+    const current = copy(change.entry);
+    opts.auditLog.append({
+      event: "aws_sigv4_revised",
+      endpoint,
+      previous: prev,
+      current,
+    });
+    return current;
+  };
+
+  // WR-437: live per-endpoint AWS SigV4 signing config. Always set;
+  // returns a copy so callers cannot mutate the live record through
+  // it (including the `additionalSignedHeaders` list).
+  server.getAwsSigV4 = (endpoint: string): AwsSigV4EndpointConfig | undefined => {
+    const entry = liveAwsSigV4Configs.get(endpoint);
+    if (entry === undefined) return undefined;
+    return {
+      ...entry,
+      ...(entry.additionalSignedHeaders !== undefined
+        ? { additionalSignedHeaders: [...entry.additionalSignedHeaders] }
         : {}),
     };
   };
