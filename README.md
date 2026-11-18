@@ -6235,6 +6235,21 @@ document). A stale inbound `content-type` is stripped first (the WR-26
 anti-forgery pattern). Invalid configs throw `RangeError` at startup —
 never mid-delivery.
 
+Live-revisable at runtime via `server.reviseCloudEvents(endpoint, patch)`
+(WR-440): a partial patch changes the envelope from the next delivery —
+`source` / `type` re-label the event, `subject` / `idPrefix` /
+`datacontenttype` move with it, `extensions` merges per key (a `null`
+value deletes that one key) — while a delivery already in flight keeps
+the envelope it was built with. A brand-new endpoint opts in only with
+`source` and `type` at once; `null` deletes the whole entry (the endpoint
+resumes raw-payload delivery); a single-field `null` clears that optional
+field, but `source` / `type` reject `null` (clearing is whole-entry
+deletion only), and the `nowMs` / `randomId` test hooks cannot be revised.
+An illegal patch throws `RangeError` and the live record is untouched, an
+empty patch is an `Error`, a same-value revision is a silent no-op, and a
+real revision is audited as `cloud_events_revised` with `endpoint` plus
+`previous` / `current` (the six data fields only — never the hooks).
+
 ## Outbound static credentials (opt-in)
 
 Some downstreams gate webhooks on a static secret — an `x-api-key`

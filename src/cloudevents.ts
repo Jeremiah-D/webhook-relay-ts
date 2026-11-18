@@ -237,3 +237,194 @@ export function buildCloudEventEnvelope(
   }
   return Buffer.from(JSON.stringify(envelope));
 }
+
+/**
+ * WR-440: a live revision patch for one endpoint's CloudEvents
+ * envelope config (partial — omitted fields keep their live
+ * values). A `null` field clears that optional field back to its
+ * default (the field disappears from the envelope); `source` /
+ * `type` are required and have no "clear back to a default"
+ * semantics — `null` for either is rejected, clearing is
+ * whole-entry deletion only (a `null` patch), exactly like
+ * WR-437's required-field rule. `extensions` merges per key: a
+ * provided key is added or overwritten, a `null` value deletes
+ * that key, and keys the patch never mentions are preserved; a
+ * `null` `extensions` clears the whole extensions field.
+ * `nowMs` / `randomId` are construction-time test hooks and are not
+ * revisable — they never appear in this type, and a patch carrying
+ * either is rejected.
+ */
+export interface CloudEventsRevision {
+  /** New `ce-source` (required, non-empty; `null` is rejected). */
+  source?: string | null;
+  /** New `ce-type` (required, non-empty; `null` is rejected). */
+  type?: string | null;
+  /** New `ce-subject`; `null` clears the field. */
+  subject?: string | null;
+  /** New id prefix for the random-id fallback; `null` clears it. */
+  idPrefix?: string | null;
+  /** New `datacontenttype` override; `null` clears it. */
+  datacontenttype?: string | null;
+  /**
+   * Per-key extension changes; `null` as the whole field clears
+   * all extensions, a `null` value deletes that one key.
+   */
+  extensions?: Record<string, CloudEventsExtensionValue | null> | null;
+}
+
+/**
+ * WR-440: the outcome of merging a {@link CloudEventsRevision}
+ * onto the live entry for one endpoint.
+ */
+export interface CloudEventsRevisionChange {
+  /**
+   * The entry to store for the endpoint, or `undefined` to delete it
+   * (the patch was `null`). `undefined` with `changed: false` means
+   * there was no entry and the patch changed nothing.
+   */
+  entry: CloudEventsEndpointConfig | undefined;
+  /** False when the patch leaves the live entry exactly as it was. */
+  changed: boolean;
+}
+
+function sameExtensions(
+  a: Record<string, CloudEventsExtensionValue> | undefined,
+  b: Record<string, CloudEventsExtensionValue> | undefined
+): boolean {
+  if (a === undefined || b === undefined) return a === b;
+  const aKeys = Object.keys(a).sort();
+  const bKeys = Object.keys(b).sort();
+  return (
+    aKeys.length === bKeys.length &&
+    aKeys.every((k, i) => k === bKeys[i] && a[k] === b[k])
+  );
+}
+
+function sameCloudEventsConfig(
+  a: CloudEventsEndpointConfig,
+  b: CloudEventsEndpointConfig
+): boolean {
+  return (
+    a.source === b.source &&
+    a.type === b.type &&
+    a.subject === b.subject &&
+    a.idPrefix === b.idPrefix &&
+    a.datacontenttype === b.datacontenttype &&
+    sameExtensions(a.extensions, b.extensions) &&
+    a.nowMs === b.nowMs &&
+    a.randomId === b.randomId
+  );
+}
+
+/**
+ * WR-440: merge one live revision patch onto the stored entry for
+ * an endpoint. Pure and unit-testable: the caller owns the live map
+ * and only applies the returned `entry` when `changed` is true —
+ * the map itself is never mutated here. Validate-first-then-apply —
+ * the candidate entry is built and run through
+ * {@link assertValidCloudEventsConfig} before anything is returned,
+ * so an illegal patch (a missing required field on opt-in, a `null`
+ * required field, a bad extension name/value, an empty patch)
+ * throws and the live record is untouched. A `null` patch deletes
+ * the entry (the endpoint resumes raw-payload delivery); a
+ * same-value patch is a silent no-op.
+ */
+export function reviseCloudEventsMap(
+  map: ReadonlyMap<string, CloudEventsEndpointConfig>,
+  endpoint: string,
+  patch: CloudEventsRevision | null,
+  label = `cloudEvents[${endpoint}]`
+): CloudEventsRevisionChange {
+  const prev = map.get(endpoint);
+  if (patch === null) {
+    return { entry: undefined, changed: prev !== undefined };
+  }
+  if (typeof patch !== "object" || Array.isArray(patch)) {
+    throw new RangeError(`${label}: patch must be an object`);
+  }
+  const p = patch as Record<string, unknown>;
+  // The construction-time test hooks are not revisable: a patch
+  // carrying either fails closed instead of silently dropping it.
+  if (p.nowMs !== undefined || p.randomId !== undefined) {
+    throw new RangeError(
+      `${label}: \`nowMs\` / \`randomId\` are construction-time test hooks and cannot be revised`
+    );
+  }
+  // Required fields have no "clear back to a default" semantics —
+  // clearing is whole-entry deletion only (a `null` patch).
+  for (const field of ["source", "type"]) {
+    if (p[field] === null) {
+      throw new RangeError(
+        `${label}: \`${field}\` must not be null (clearing is whole-entry deletion only)`
+      );
+    }
+  }
+  if (p.extensions !== undefined && p.extensions !== null) {
+    if (
+      typeof p.extensions !== "object" ||
+      Array.isArray(p.extensions)
+    ) {
+      throw new RangeError(`${label}: \`extensions\` must be an object or null`);
+    }
+  }
+  if (
+    p.source === undefined &&
+    p.type === undefined &&
+    p.subject === undefined &&
+    p.idPrefix === undefined &&
+    p.datacontenttype === undefined &&
+    p.extensions === undefined
+  ) {
+    throw new Error(`${label}: empty patch — nothing to revise`);
+  }
+  const candidate: CloudEventsEndpointConfig = { ...(prev ?? {}) };
+  if (p.source !== undefined) candidate.source = p.source as string;
+  if (p.type !== undefined) candidate.type = p.type as string;
+  for (const field of ["subject", "idPrefix", "datacontenttype"] as const) {
+    if (p[field] !== undefined) {
+      if (p[field] === null) delete candidate[field];
+      else candidate[field] = p[field] as string;
+    }
+  }
+  if (p.extensions !== undefined) {
+    if (p.extensions === null) {
+      delete candidate.extensions;
+    } else {
+      const merged: Record<string, CloudEventsExtensionValue> = {
+        ...(candidate.extensions ?? {}),
+      };
+      for (const [name, value] of Object.entries(
+        p.extensions as Record<string, CloudEventsExtensionValue | null>
+      )) {
+        if (value === null) delete merged[name];
+        else merged[name] = value;
+      }
+      // Deleting the last extension key removes the field entirely —
+      // an empty extensions object would stamp nothing anyway.
+      if (Object.keys(merged).length === 0) delete candidate.extensions;
+      else candidate.extensions = merged;
+    }
+  }
+  // A clear-only patch on an unconfigured endpoint leaves an empty
+  // candidate — a no-op (there was nothing to clear), never an
+  // opt-in.
+  if (
+    prev === undefined &&
+    candidate.source === undefined &&
+    candidate.type === undefined &&
+    candidate.subject === undefined &&
+    candidate.idPrefix === undefined &&
+    candidate.datacontenttype === undefined &&
+    candidate.extensions === undefined
+  ) {
+    return { entry: undefined, changed: false };
+  }
+  // The same per-value validator as startup: a missing required
+  // field on opt-in, a bad extension name/value, or a bad optional
+  // field throws RangeError and the live record is untouched.
+  assertValidCloudEventsConfig(candidate, label);
+  if (prev !== undefined && sameCloudEventsConfig(prev, candidate)) {
+    return { entry: prev, changed: false };
+  }
+  return { entry: candidate, changed: true };
+}

@@ -511,7 +511,9 @@ import {
   assertValidCloudEventsConfig,
   buildCloudEventEnvelope,
   CLOUD_EVENTS_STRUCTURED_CONTENT_TYPE,
+  reviseCloudEventsMap,
   type CloudEventsEndpointConfig,
+  type CloudEventsRevision,
 } from "./cloudevents.ts";
 import {
   AuditS3Offloader,
@@ -1836,7 +1838,10 @@ export interface RelayServerOptions {
    * batch document). Opt-in; endpoints without a record keep
    * byte-exact current behavior. Applies to the default sender only
    * (shadow mirrors apply the same record). Invalid values throw
-   * `RangeError` at startup — never mid-delivery.
+   * `RangeError` at startup — never mid-delivery. Live-revisable at
+   * runtime via `server.reviseCloudEvents(endpoint, patch)` (WR-440)
+   * — partial patch, `null` deletes the entry; see
+   * `reviseCloudEvents`.
    */
   cloudEvents?: Record<string, CloudEventsEndpointConfig>;
   /**
@@ -7844,6 +7849,53 @@ export interface RelayServer extends Server {
    */
   getCompressOutbound?: (endpoint: string) => CompressOutboundOptions | undefined;
   /**
+   * WR-440: revise one endpoint's live CloudEvents 1.0 structured-mode
+   * envelope config at runtime (`source` / `type` / `subject` /
+   * `idPrefix` / `datacontenttype` / `extensions`, partial — omitted
+   * fields keep their live values; `extensions` merges per key, a
+   * `null` value deletes that one key). The new envelope governs the
+   * next delivery: changing `source` / `type` re-labels the event for
+   * the downstream consumer, while a delivery already in flight keeps
+   * the envelope it was built with (the envelope is built per attempt
+   * in `buildWireRequest`). A brand-new endpoint can be opted in
+   * without a restart, but only with `source` and `type` at once —
+   * otherwise `RangeError`. `null` deletes the whole entry (the
+   * endpoint resumes raw-payload delivery and its content-type stops
+   * being `application/cloudevents+json`). A single-field `null`
+   * clears that optional field (`subject` / `idPrefix` /
+   * `datacontenttype` / `extensions`); `source` / `type` have no
+   * "clear back to a default" semantics, so `null` for either is a
+   * `RangeError`. `nowMs` / `randomId` are construction-time test
+   * hooks and cannot be revised (a patch carrying either is a
+   * `RangeError`). An illegal patch throws `RangeError` and the live
+   * record is untouched; an empty patch is an `Error`; a same-value
+   * revision is a silent no-op with no audit event. A real revision
+   * is audited as `cloud_events_revised` with `endpoint` plus
+   * `previous` / `current` (the construction values as first
+   * `previous`; `undefined` when the entry did not exist or was just
+   * deleted) — both carry only `source` / `type` / `subject` /
+   * `idPrefix` / `datacontenttype` / `extensions`, never the
+   * `nowMs` / `randomId` hooks. Returns the live config for the
+   * endpoint (`undefined` when the entry was deleted). Always set.
+   * Orthogonal to WR-207 (which owns the envelope mechanism itself),
+   * WR-17 (the relay's own batch envelope), WR-115 (payload
+   * transforms — the envelope wraps the transformed payload),
+   * WR-117 (outbound schemas — validated before the wrap), WR-58
+   * (E2EE sealing — the envelope is sealed, not the raw payload)
+   * and WR-439 (outbound compression threshold — the envelope is
+   * compressed, not the raw payload).
+   */
+  reviseCloudEvents?: (
+    endpoint: string,
+    patch: CloudEventsRevision | null
+  ) => CloudEventsEndpointConfig | undefined;
+  /**
+   * WR-440: live per-endpoint CloudEvents envelope config — a copy of
+   * the entry for `endpoint`, or `undefined` when the endpoint has
+   * no CloudEvents entry. Always set.
+   */
+  getCloudEvents?: (endpoint: string) => CloudEventsEndpointConfig | undefined;
+  /**
    * WR-349: revise one endpoint's live failover thresholds at runtime
    * (`failureThreshold` / `autoFailback` / `failbackIntervalMs`,
    * partial — omitted fields keep their live values). The new values
@@ -10888,9 +10940,31 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         { ...cfg },
       ])
     );
+  // WR-440: the live CloudEvents envelope record, same shape as the
+  // WR-439 compression record above. `createDefaultSender` captures
+  // this record by reference (read per attempt on the HTTP/1.1 and
+  // HTTP/2 paths), so the server holds the SAME object and hands it
+  // to both the main and the shadow sender; `reviseCloudEvents`
+  // mutates it in place — never replaces it — or the senders would
+  // keep reading a stale record. Each entry is copied at
+  // construction (including its `extensions` object) so a caller
+  // mutating their config object afterwards cannot move the live
+  // values. When unconfigured, the empty record behaves exactly like
+  // `undefined` (no envelope), so revise can opt a brand-new
+  // endpoint in without a restart.
+  const liveCloudEvents: Record<string, CloudEventsEndpointConfig> =
+    Object.fromEntries(
+      Object.entries(opts.cloudEvents ?? {}).map(([endpoint, cfg]) => [
+        endpoint,
+        {
+          ...cfg,
+          ...(cfg.extensions !== undefined ? { extensions: { ...cfg.extensions } } : {}),
+        },
+      ])
+    );
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, liveCompressOutbound, opts.outboundHttp2, onHttp2Fallback, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, liveTlsSniOverrides, liveResponseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallback, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, liveAwsSigV4Configs, opts.awsSecretResolver, opts.outboundSchemas, liveOauth2Configs, undefined, opts.compressBrotli, opts.phaseTimeouts, opts.tlsCa, opts.chaos, onChaosInjectedAudit, liveResponseGuard, opts.doh, onDohFallback, proxyHealthMonitor, opts.outboundCredentials, opts.dnsPin, onDnsPinMismatch, opts.cloudEvents, opts.outboundSsrfGuard, onOutboundSsrfBlocked, onOutboundSsrfAllowlisted, onOutboundSsrfProxySkipped, opts.egressResidency, onEgressResidencyBlocked)
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, liveCompressOutbound, opts.outboundHttp2, onHttp2Fallback, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, liveTlsSniOverrides, liveResponseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallback, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, liveAwsSigV4Configs, opts.awsSecretResolver, opts.outboundSchemas, liveOauth2Configs, undefined, opts.compressBrotli, opts.phaseTimeouts, opts.tlsCa, opts.chaos, onChaosInjectedAudit, liveResponseGuard, opts.doh, onDohFallback, proxyHealthMonitor, opts.outboundCredentials, opts.dnsPin, onDnsPinMismatch, liveCloudEvents, opts.outboundSsrfGuard, onOutboundSsrfBlocked, onOutboundSsrfAllowlisted, onOutboundSsrfProxySkipped, opts.egressResidency, onEgressResidencyBlocked)
       : undefined;
   // WR-146: tail-latency hedging for outbound attempts (opt-in). The
   // wrapper sits around whichever sender the queue uses — the default
@@ -11105,7 +11179,10 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
                   undefined,
                   // WR-207: shadow deliveries mirror the identical wire
                   // request, so they apply the same CloudEvents envelope.
-                  opts.cloudEvents
+                  // WR-440: the same live record as the main sender, so
+                  // a revision governs shadow mirrors from the next
+                  // attempt too.
+                  liveCloudEvents
                 ),
               })
             ),
@@ -21326,6 +21403,109 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   server.getCompressOutbound = (endpoint: string): CompressOutboundOptions | undefined => {
     const entry = liveCompressOutbound[endpoint];
     return entry === undefined ? undefined : { ...entry };
+  };
+
+  // WR-440: live revision of one endpoint's CloudEvents 1.0
+  // structured-mode envelope config. Same contract as
+  // `reviseCompressOutbound` above: partial patch, `null` deletes
+  // the whole entry (the endpoint resumes raw-payload delivery),
+  // a brand-new endpoint opts in only with `source` and `type` at
+  // once. A single-field `null` clears that optional field
+  // (`subject` / `idPrefix` / `datacontenttype` / `extensions`);
+  // `source` / `type` reject `null` (no "clear back to a default"
+  // semantics). `extensions` merges per key — a provided key is
+  // added or overwritten, a `null` value deletes that key, other
+  // keys are preserved. Validate-then-apply through
+  // `reviseCloudEventsMap` (which runs the same per-value validator
+  // as startup), so an illegal patch throws RangeError and the live
+  // record is left completely intact; an empty patch is an Error. A
+  // real revision is audited as `cloud_events_revised` with the
+  // endpoint plus previous / current (snapshots carrying only the
+  // six data fields — `undefined` when the entry did not exist or
+  // was just deleted — never the `nowMs` / `randomId` hooks, which
+  // are functions and cannot be audited); an empty or same-value
+  // patch is a silent no-op. The sender reads the live record per
+  // attempt, so the next delivery wraps under the new envelope
+  // while a delivery already in flight keeps the envelope it was
+  // built with — and `x-relay-signature` still covers exactly the
+  // envelope bytes the downstream receives.
+  server.reviseCloudEvents = (
+    endpoint: string,
+    patch: CloudEventsRevision | null
+  ): CloudEventsEndpointConfig | undefined => {
+    if (typeof endpoint !== "string" || endpoint.length === 0) {
+      throw new RangeError("reviseCloudEvents: endpoint must be a non-empty string");
+    }
+    if (patch !== null && (typeof patch !== "object" || Array.isArray(patch))) {
+      throw new RangeError("reviseCloudEvents: patch must be an object or null");
+    }
+    const copy = (
+      entry: CloudEventsEndpointConfig | undefined
+    ): CloudEventsEndpointConfig | undefined =>
+      entry === undefined
+        ? undefined
+        : {
+            ...entry,
+            ...(entry.extensions !== undefined
+              ? { extensions: { ...entry.extensions } }
+              : {}),
+          };
+    // Audit snapshots carry only the six data fields — never the
+    // `nowMs` / `randomId` hooks (function values cannot be audited).
+    const snapshot = (
+      entry: CloudEventsEndpointConfig | undefined
+    ): Record<string, unknown> | undefined =>
+      entry === undefined
+        ? undefined
+        : {
+            source: entry.source,
+            type: entry.type,
+            ...(entry.subject !== undefined ? { subject: entry.subject } : {}),
+            ...(entry.idPrefix !== undefined ? { idPrefix: entry.idPrefix } : {}),
+            ...(entry.datacontenttype !== undefined
+              ? { datacontenttype: entry.datacontenttype }
+              : {}),
+            ...(entry.extensions !== undefined
+              ? { extensions: { ...entry.extensions } }
+              : {}),
+          };
+    const prev = copy(liveCloudEvents[endpoint]);
+    const change = reviseCloudEventsMap(
+      new Map(Object.entries(liveCloudEvents)),
+      endpoint,
+      patch,
+      `reviseCloudEvents[${endpoint}]`
+    );
+    if (!change.changed) {
+      return prev;
+    }
+    // Mutate the live record in place — never replace the record
+    // object itself, or the senders' captured reference would go stale.
+    if (change.entry === undefined) {
+      delete liveCloudEvents[endpoint];
+    } else {
+      liveCloudEvents[endpoint] = change.entry;
+    }
+    const current = copy(change.entry);
+    opts.auditLog.append({
+      event: "cloud_events_revised",
+      endpoint,
+      previous: snapshot(prev),
+      current: snapshot(change.entry),
+    });
+    return current;
+  };
+
+  // WR-440: live per-endpoint CloudEvents envelope config. Always
+  // set; returns a copy so callers cannot mutate the live record
+  // through it (including the `extensions` object).
+  server.getCloudEvents = (endpoint: string): CloudEventsEndpointConfig | undefined => {
+    const entry = liveCloudEvents[endpoint];
+    if (entry === undefined) return undefined;
+    return {
+      ...entry,
+      ...(entry.extensions !== undefined ? { extensions: { ...entry.extensions } } : {}),
+    };
   };
 
   // WR-349: live per-endpoint failover threshold revision. The method
