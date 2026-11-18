@@ -4992,6 +4992,19 @@ const server = createRelayServer({
   gzip` is stamped and `Content-Length` reflects the compressed size.
   `x-relay-signature` covers the compressed wire bytes — exactly what the
   downstream receives and verifies.
+- **Live revision (WR-439)** — `server.reviseCompressOutbound(endpoint, patch)`
+  revises one endpoint's threshold at runtime (partial — the single
+  `thresholdBytes` knob; `null` clears it back to the 1024 default, and
+  since it is the entry's only field, clearing it deletes the entry and
+  the endpoint stops compressing; a `null` patch deletes the whole
+  entry; a brand-new endpoint opts in with a `thresholdBytes` in the
+  patch). The next delivery compresses under the new threshold while a
+  delivery already in flight keeps the wire bytes it was built with.
+  An illegal or empty patch throws `RangeError` with the live record
+  untouched; a same-value revision is a silent no-op. A real revision
+  is audited as `compress_outbound_revised` (`endpoint` plus
+  `previous` / `current`); `server.getCompressOutbound(endpoint)`
+  returns a copy of the live entry.
 - **Guarded compression (`compressThreshold`)** — a stricter per-endpoint
   variant for downstreams that may not speak gzip:
 

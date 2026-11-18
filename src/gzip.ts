@@ -56,6 +56,92 @@ export function assertValidCompressOutboundConfig(
 }
 
 /**
+ * WR-439: a live revision patch for one endpoint's outbound gzip
+ * compression config (partial — the single knob). A `null`
+ * `thresholdBytes` clears the field back to its default (1024);
+ * since it is the entry's only field, clearing it empties — and
+ * deletes — the entry (the endpoint falls back to no compression),
+ * exactly like WR-435's "clear both fields deletes the entry" for
+ * the two-knob response-compression record.
+ */
+export interface CompressOutboundRevision {
+  /**
+   * New payload-size threshold (bytes). `null` clears it back to
+   * the 1024 default.
+   */
+  thresholdBytes?: number | null;
+}
+
+/**
+ * WR-439: the outcome of merging a {@link CompressOutboundRevision}
+ * onto the live entry for one endpoint.
+ */
+export interface CompressOutboundRevisionChange {
+  /**
+   * The entry to store for the endpoint, or `undefined` to delete it
+   * (the patch was `null`, or it cleared the entry's only field).
+   * `undefined` with `changed: false` means there was no entry and
+   * the patch changed nothing.
+   */
+  entry: CompressOutboundOptions | undefined;
+  /** False when the patch leaves the live entry exactly as it was. */
+  changed: boolean;
+}
+
+/**
+ * WR-439: merge one live revision patch onto the stored entry for an
+ * endpoint. Pure and unit-testable: the caller owns the live map and
+ * only applies the returned `entry` when `changed` is true — the map
+ * itself is never mutated here. Validate-first-then-apply — the
+ * candidate entry is built and run through
+ * {@link assertValidCompressOutboundConfig} before anything is
+ * returned, so an illegal patch (a bad threshold, an empty patch)
+ * throws `RangeError` and the live record is untouched. A `null`
+ * patch deletes the entry (the endpoint stops compressing); a
+ * same-value patch is a silent no-op.
+ */
+export function reviseCompressOutboundMap(
+  map: ReadonlyMap<string, CompressOutboundOptions>,
+  endpoint: string,
+  patch: CompressOutboundRevision | null,
+  label = `compressOutbound[${endpoint}]`
+): CompressOutboundRevisionChange {
+  const prev = map.get(endpoint);
+  if (patch === null) {
+    return { entry: undefined, changed: prev !== undefined };
+  }
+  if (typeof patch !== "object" || Array.isArray(patch)) {
+    throw new RangeError(`${label}: patch must be an object`);
+  }
+  if (patch.thresholdBytes === undefined) {
+    throw new RangeError(`${label}: empty patch — nothing to revise`);
+  }
+  const candidate: CompressOutboundOptions = { ...(prev ?? {}) };
+  if (patch.thresholdBytes === null) delete candidate.thresholdBytes;
+  else candidate.thresholdBytes = patch.thresholdBytes;
+  // Opt-in needs the threshold at once: a null-clear on an
+  // unconfigured endpoint leaves an empty candidate, which is a
+  // no-op (there was nothing to clear), never an opt-in.
+  if (prev === undefined && candidate.thresholdBytes === undefined) {
+    return { entry: undefined, changed: false };
+  }
+  // The same per-value validator as startup: a non-positive or
+  // non-integer threshold throws RangeError and the live record is
+  // untouched.
+  assertValidCompressOutboundConfig({ [endpoint]: candidate });
+  // Clearing the only field empties the entry — the endpoint falls
+  // back to no compression (WR-435's "clear both fields deletes the
+  // entry", for the single-knob record).
+  if (candidate.thresholdBytes === undefined) {
+    return { entry: undefined, changed: true };
+  }
+  if (prev !== undefined && prev.thresholdBytes === candidate.thresholdBytes) {
+    return { entry: prev, changed: false };
+  }
+  return { entry: candidate, changed: true };
+}
+
+/**
  * Compress `payload` for one endpoint when opted in and worthwhile.
  * Returns the wire bytes plus the `content-encoding` value to stamp
  * (absent when the payload goes out as-is). Never compresses when the

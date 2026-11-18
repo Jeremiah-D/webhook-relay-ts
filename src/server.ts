@@ -580,8 +580,10 @@ import {
   maybeCompressOutbound,
   outboundContentType,
   OutboundCompressionTracker,
+  reviseCompressOutboundMap,
   assertValidGuardedCompressConfig,
   type CompressOutboundOptions,
+  type CompressOutboundRevision,
   type GuardedCompressOptions,
   type GzipFallbackInfo,
 } from "./gzip.ts";
@@ -1378,7 +1380,10 @@ export interface RelayServerOptions {
    * decompressed after signature verification (which covers the raw wire
    * bytes the sender signed) — decompression is streaming and capped at
    * `maxBodyBytes`, so a gzip bomb is answered 413 like any oversized
-   * body. Invalid values throw `RangeError` at startup.
+   * body. Invalid values throw `RangeError` at startup. Live-revisable
+   * at runtime via `server.reviseCompressOutbound(endpoint, patch)`
+   * (WR-439) — partial patch, `null` deletes the entry; see
+   * `reviseCompressOutbound`.
    */
   compressOutbound?: Record<string, CompressOutboundOptions>;
   /**
@@ -7806,6 +7811,39 @@ export interface RelayServer extends Server {
    */
   getOauth2?: (endpoint: string) => OAuth2ClientCredentialsConfig | undefined;
   /**
+   * WR-439: revise one endpoint's live outbound gzip compression
+   * threshold at runtime (`thresholdBytes`, partial — the single
+   * knob). The new threshold governs the next delivery: raising it
+   * skips compression for payloads below it, lowering it compresses
+   * payloads that previously went out plain, while a delivery already
+   * in flight keeps the wire bytes it was built with. A brand-new
+   * endpoint can be opted in without a restart, but only with a
+   * `thresholdBytes` in the patch. `thresholdBytes: null` clears the
+   * field back to its 1024 default; since it is the entry's only
+   * field, clearing it deletes the entry (the endpoint stops
+   * compressing). `null` deletes the whole entry. An illegal patch
+   * throws `RangeError` and the live record is untouched; an empty
+   * patch is a `RangeError`; a same-value revision is a silent no-op
+   * with no audit event. A real revision is audited as
+   * `compress_outbound_revised` with `endpoint` plus `previous` /
+   * `current` (the construction values as first `previous`;
+   * `undefined` when the entry did not exist or was just deleted),
+   * and returns the live config for the endpoint (`undefined` when
+   * the entry was deleted). Always set. Orthogonal to WR-75 (which
+   * owns the guarded compression path) and WR-142 (brotli) — this
+   * revises only the legacy fire-and-forget gzip record.
+   */
+  reviseCompressOutbound?: (
+    endpoint: string,
+    patch: CompressOutboundRevision | null
+  ) => CompressOutboundOptions | undefined;
+  /**
+   * WR-439: live per-endpoint outbound gzip compression config — a
+   * copy of the entry for `endpoint`, or `undefined` when the endpoint
+   * has no compression entry. Always set.
+   */
+  getCompressOutbound?: (endpoint: string) => CompressOutboundOptions | undefined;
+  /**
    * WR-349: revise one endpoint's live failover thresholds at runtime
    * (`failureThreshold` / `autoFailback` / `failbackIntervalMs`,
    * partial — omitted fields keep their live values). The new values
@@ -10832,9 +10870,27 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       },
     ])
   );
+  // WR-439: the live outbound gzip compression record, same shape as
+  // the WR-435 response-compression record above. `createDefaultSender`
+  // captures this record by reference (read per attempt on the HTTP/1.1
+  // and HTTP/2 paths), so the server holds the SAME object and hands
+  // it to both the main and the shadow sender; `reviseCompressOutbound`
+  // mutates it in place — never replaces it — or the senders would
+  // keep reading a stale record. Each entry is copied at construction
+  // so a caller mutating their config object afterwards cannot move
+  // the live values. When unconfigured, the empty record behaves
+  // exactly like `undefined` (no compression), so revise can opt a
+  // brand-new endpoint in without a restart.
+  const liveCompressOutbound: Record<string, CompressOutboundOptions> =
+    Object.fromEntries(
+      Object.entries(opts.compressOutbound ?? {}).map(([endpoint, cfg]) => [
+        endpoint,
+        { ...cfg },
+      ])
+    );
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, onHttp2Fallback, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, liveTlsSniOverrides, liveResponseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallback, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, liveAwsSigV4Configs, opts.awsSecretResolver, opts.outboundSchemas, liveOauth2Configs, undefined, opts.compressBrotli, opts.phaseTimeouts, opts.tlsCa, opts.chaos, onChaosInjectedAudit, liveResponseGuard, opts.doh, onDohFallback, proxyHealthMonitor, opts.outboundCredentials, opts.dnsPin, onDnsPinMismatch, opts.cloudEvents, opts.outboundSsrfGuard, onOutboundSsrfBlocked, onOutboundSsrfAllowlisted, onOutboundSsrfProxySkipped, opts.egressResidency, onEgressResidencyBlocked)
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, liveCompressOutbound, opts.outboundHttp2, onHttp2Fallback, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, liveTlsSniOverrides, liveResponseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallback, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, liveAwsSigV4Configs, opts.awsSecretResolver, opts.outboundSchemas, liveOauth2Configs, undefined, opts.compressBrotli, opts.phaseTimeouts, opts.tlsCa, opts.chaos, onChaosInjectedAudit, liveResponseGuard, opts.doh, onDohFallback, proxyHealthMonitor, opts.outboundCredentials, opts.dnsPin, onDnsPinMismatch, opts.cloudEvents, opts.outboundSsrfGuard, onOutboundSsrfBlocked, onOutboundSsrfAllowlisted, onOutboundSsrfProxySkipped, opts.egressResidency, onEgressResidencyBlocked)
       : undefined;
   // WR-146: tail-latency hedging for outbound attempts (opt-in). The
   // wrapper sits around whichever sender the queue uses — the default
@@ -10967,7 +11023,10 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
                   opts.outboundSigning,
                   opts.proxies,
                   t.tlsClientCert !== undefined ? { [t.targetUrl]: t.tlsClientCert } : undefined,
-                  opts.compressOutbound,
+                  // WR-439: the same live record as the main sender, so
+                  // a revision governs shadow mirrors from the next
+                  // attempt too.
+                  liveCompressOutbound,
                   opts.outboundHttp2,
                   onHttp2Fallback,
                   opts.outboundIdempotencyKey,
@@ -12436,7 +12495,17 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         return [endpoint, { configured: true, hasCredentials }];
       })
     ),
-    compression: { ...(opts.compressOutbound ?? {}) },
+    // WR-439: the inventory reads the LIVE compression record, not
+    // the construction record — a snapshot taken after a revision
+    // must record the revised thresholds, or the drift comparison
+    // would report false drift against the live server (WR-429's
+    // pin-whitelist rule, applied to the compression inventory).
+    compression: Object.fromEntries(
+      Object.entries(liveCompressOutbound).map(([endpoint, cfg]) => [
+        endpoint,
+        { ...cfg },
+      ])
+    ),
     tenants: [
       ...new Set(
         queue
@@ -21193,6 +21262,70 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
         : {}),
       ...(entry.dpop !== undefined ? { dpop: { ...entry.dpop } } : {}),
     };
+  };
+
+  // WR-439: live revision of one endpoint's outbound gzip compression
+  // threshold. Same contract as `reviseResponseCompression` above:
+  // partial patch, `thresholdBytes: null` clears the field back to
+  // its 1024 default — and since it is the entry's only field,
+  // clearing it deletes the entry (the endpoint stops compressing).
+  // `null` deletes the whole entry. A brand-new endpoint opts in
+  // only with a `thresholdBytes` in the patch. Validate-then-apply
+  // through `reviseCompressOutboundMap` (which runs the same
+  // per-value validator as startup), so an illegal patch throws
+  // RangeError and the live record is left completely intact. A real
+  // revision is audited as `compress_outbound_revised` with the
+  // endpoint plus previous / current (snapshots; `undefined` when the
+  // entry did not exist or was just deleted); an empty or same-value
+  // patch is a silent no-op. The sender reads the live record per
+  // attempt, so the next delivery compresses under the new threshold
+  // while a delivery already in flight keeps the wire bytes it was
+  // built with.
+  server.reviseCompressOutbound = (
+    endpoint: string,
+    patch: CompressOutboundRevision | null
+  ): CompressOutboundOptions | undefined => {
+    if (typeof endpoint !== "string" || endpoint.length === 0) {
+      throw new RangeError("reviseCompressOutbound: endpoint must be a non-empty string");
+    }
+    if (patch !== null && (typeof patch !== "object" || Array.isArray(patch))) {
+      throw new RangeError("reviseCompressOutbound: patch must be an object or null");
+    }
+    const copy = (entry: CompressOutboundOptions | undefined): CompressOutboundOptions | undefined =>
+      entry === undefined ? undefined : { ...entry };
+    const prev = copy(liveCompressOutbound[endpoint]);
+    const change = reviseCompressOutboundMap(
+      new Map(Object.entries(liveCompressOutbound)),
+      endpoint,
+      patch,
+      `reviseCompressOutbound[${endpoint}]`
+    );
+    if (!change.changed) {
+      return prev;
+    }
+    // Mutate the live record in place — never replace the record
+    // object itself, or the senders' captured reference would go stale.
+    if (change.entry === undefined) {
+      delete liveCompressOutbound[endpoint];
+    } else {
+      liveCompressOutbound[endpoint] = change.entry;
+    }
+    const current = copy(change.entry);
+    opts.auditLog.append({
+      event: "compress_outbound_revised",
+      endpoint,
+      previous: prev,
+      current,
+    });
+    return current;
+  };
+
+  // WR-439: live per-endpoint outbound gzip compression config.
+  // Always set; returns a copy so callers cannot mutate the live
+  // record through it.
+  server.getCompressOutbound = (endpoint: string): CompressOutboundOptions | undefined => {
+    const entry = liveCompressOutbound[endpoint];
+    return entry === undefined ? undefined : { ...entry };
   };
 
   // WR-349: live per-endpoint failover threshold revision. The method
