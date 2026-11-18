@@ -286,6 +286,133 @@ export function resolveOAuth2ClientConfig(
 }
 
 /**
+ * WR-438: a partial revision of one endpoint's OAuth2
+ * `client_credentials` config — the fields the operator may change
+ * live (`token_endpoint` / `client_id` / `client_secret` / `scope`).
+ * `private_key_jwt` / `dpop` are not revisable here: switching the
+ * client-authentication method or the proof key is a restart-time
+ * change. Fields present in the patch overwrite the live entry;
+ * omitted fields keep their live values.
+ */
+export interface Oauth2Revision {
+  /** New token endpoint URL. */
+  token_endpoint?: string;
+  /** New OAuth2 `client_id`. */
+  client_id?: string;
+  /**
+   * New OAuth2 `client_secret` — memory-only, never audited, and
+   * never part of the same-value comparison: a patch that carries it
+   * is always treated as a real change.
+   */
+  client_secret?: string;
+  /** New space-delimited `scope`. */
+  scope?: string;
+}
+
+/**
+ * WR-438: the outcome of merging an {@link Oauth2Revision} onto the
+ * live entry for one endpoint.
+ */
+export interface Oauth2RevisionChange {
+  /**
+   * The entry to store for the endpoint, or `undefined` to delete it
+   * (the patch was `null`). `undefined` with `changed: false` means
+   * there was no entry and the patch changed nothing.
+   */
+  entry: OAuth2ClientCredentialsConfig | undefined;
+  /** False when the patch leaves the live entry exactly as it was. */
+  changed: boolean;
+}
+
+function sameOauth2Visible(
+  a: OAuth2ClientCredentialsConfig,
+  b: OAuth2ClientCredentialsConfig
+): boolean {
+  return (
+    a.token_endpoint === b.token_endpoint &&
+    a.client_id === b.client_id &&
+    a.scope === b.scope
+  );
+}
+
+/**
+ * WR-438: merge one live revision patch onto the stored entry for an
+ * endpoint. Pure and unit-testable: the caller owns the live map and
+ * only applies the returned `entry` when `changed` is true — the map
+ * itself is never mutated here. Validate-first-then-apply — the
+ * candidate entry is built and run through
+ * {@link resolveOAuth2ClientConfig} before anything is returned, so
+ * an illegal patch (a missing required field on opt-in, a bad token
+ * endpoint, a `null` field, an empty patch) throws `RangeError` and
+ * the live record is untouched. A `null` patch deletes the entry (the
+ * endpoint stops fetching tokens); a same-value patch is a silent
+ * no-op — except a patch that carries `client_secret`, which is
+ * always treated as a real change: the secret never participates in
+ * the same-value comparison (it is never displayed), so rotating it
+ * is always audited.
+ */
+export function reviseOauth2Map(
+  map: ReadonlyMap<string, OAuth2ClientCredentialsConfig>,
+  endpoint: string,
+  patch: Oauth2Revision | null,
+  label = `oauth2[${endpoint}]`
+): Oauth2RevisionChange {
+  const prev = map.get(endpoint);
+  if (patch === null) {
+    return { entry: undefined, changed: prev !== undefined };
+  }
+  if (typeof patch !== "object" || Array.isArray(patch)) {
+    throw new RangeError(`${label}: patch must be an object`);
+  }
+  const p = patch as Record<string, unknown>;
+  for (const field of ["token_endpoint", "client_id", "client_secret", "scope"]) {
+    if (p[field] === null) {
+      throw new RangeError(
+        `${label}: \`${field}\` must not be null (clearing is whole-entry deletion only)`
+      );
+    }
+  }
+  if (
+    p.token_endpoint === undefined &&
+    p.client_id === undefined &&
+    p.client_secret === undefined &&
+    p.scope === undefined
+  ) {
+    throw new RangeError(`${label}: empty patch — nothing to revise`);
+  }
+  const candidate: OAuth2ClientCredentialsConfig = {
+    ...(prev ?? {}),
+    ...(p.token_endpoint !== undefined ? { token_endpoint: p.token_endpoint as string } : {}),
+    ...(p.client_id !== undefined ? { client_id: p.client_id as string } : {}),
+    ...(p.client_secret !== undefined ? { client_secret: p.client_secret as string } : {}),
+    ...(p.scope !== undefined ? { scope: p.scope as string } : {}),
+  } as OAuth2ClientCredentialsConfig;
+  // Opt-in needs all four fields at once; a partial patch on an
+  // unconfigured endpoint fails here, before anything is applied.
+  if (prev === undefined) {
+    for (const field of ["token_endpoint", "client_id", "client_secret", "scope"] as const) {
+      if (candidate[field] === undefined) {
+        throw new RangeError(
+          `${label}: opting in requires \`${field}\` — all four fields at once`
+        );
+      }
+    }
+  }
+  // The same per-value validator as startup: a bad token endpoint, an
+  // empty client_id/secret/scope, or a secret-plus-assertion clash
+  // throws RangeError and the live record is untouched.
+  resolveOAuth2ClientConfig(candidate, label);
+  // Same-value comparison covers only the visible fields — the secret
+  // never participates. A patch that carries `client_secret` is
+  // always a real change (rotating the secret is always audited),
+  // even when the visible fields are unchanged.
+  if (prev !== undefined && p.client_secret === undefined && sameOauth2Visible(prev, candidate)) {
+    return { entry: prev, changed: false };
+  }
+  return { entry: candidate, changed: true };
+}
+
+/**
  * WR-189: validate a `private_key_jwt` config and parse the private key
  * once at startup. Ed25519 keys reuse the outbound-Ed25519 key
  * management (`compileEd25519OutboundKey` — WR-124); RS256 keys are
@@ -1002,6 +1129,20 @@ export class OAuth2TokenCache {
     const key = this.keyFor(resolved);
     this.entries.delete(key);
     return this.fetchOnce(key, resolved);
+  }
+
+  /**
+   * WR-438: drop the cached token minted under `cfg` — the revision
+   * path's invalidation. Deletes the entry keyed by `cfg` (resolved
+   * the same way `tokenFor` keys it: `(token_endpoint, scope)` plus
+   * the client-identity dimensions) without fetching a replacement;
+   * the next delivery lazily fetches under the new config. In-flight
+   * fetches are untouched — a delivery already holding its token
+   * keeps it.
+   */
+  invalidateFor(cfg: OAuth2ClientCredentialsConfig): void {
+    const resolved = resolveOAuth2ClientConfig(cfg, "OAuth2TokenCache.invalidateFor");
+    this.entries.delete(this.keyFor(resolved));
   }
 
   /** Number of cached token entries (introspection for tests/ops; no secrets). */

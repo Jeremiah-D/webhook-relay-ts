@@ -123,6 +123,8 @@ import {
   DPOP_PROOF_HEADER,
   OAuth2TokenCache,
   resolveOAuth2ClientConfig,
+  reviseOauth2Map,
+  type Oauth2Revision,
   type OAuth2ClientCredentialsConfig,
   type ResolvedOAuth2ClientConfig,
 } from "./oauth-client.ts";
@@ -1867,6 +1869,9 @@ export interface RelayServerOptions {
    * stamp, and `awsSigV4`: any combination may be enabled for one
    * endpoint (downstream picks either or requires both). Applies to the
    * default sender only. Invalid values throw `RangeError` at startup.
+   * Live-revisable at runtime via
+   * `server.reviseOauth2(endpoint, patch)` (WR-438) — partial
+   * patch, `null` deletes the entry; see `reviseOauth2`.
    */
   oauth2?: Record<string, OAuth2ClientCredentialsConfig>;
   /**
@@ -2946,6 +2951,26 @@ export interface PooledSender extends Sender {
    */
   liveForwardHeaders: Map<string, CompiledForwardHeadersRule> | undefined;
   /**
+   * WR-438: the resolved OAuth2 client configs themselves — revised at
+   * runtime via `RelayServer.reviseOauth2` (which owns the
+   * `oauth2_revised` audit). The same `Map` created once in
+   * `createDefaultSender` (seeded from the construction `oauth2`) and
+   * never replaced — revisions mutate it in place, so the sender
+   * (which reads the compiled DPoP key on every attempt) picks a
+   * revision up from the next attempt, while an attempt already in
+   * flight keeps the resolved config it read.
+   */
+  liveOauth2Resolved: Map<string, ResolvedOAuth2ClientConfig>;
+  /**
+   * WR-438: the OAuth2 access-token cache backing `oauth2` — revised
+   * at runtime via `RelayServer.reviseOauth2`, which drops the cached
+   * token minted under the previous config on revision (no proactive
+   * re-fetch: the next delivery lazily fetches under the new config).
+   * Always created in `createDefaultSender`, even when `oauth2` was
+   * never configured, so a later opt-in has a cache to fetch into.
+   */
+  oauthTokenCache: OAuth2TokenCache;
+  /**
    * WR-89: take-and-clear the id of the rotation client certificate most
    * recently used in a handshake attempt for the delivery `deliveryId`
    * (the queue's item id) — the primary's id, or a fallback's id when an
@@ -3176,12 +3201,16 @@ export function createDefaultSender(
    * Validated at startup (`RangeError`); `undefined` keeps the exact
    * pre-WR-129 wire shape. Orthogonal to the WR-26/WR-124/WR-116
    * request signatures: all stamps may coexist on one delivery.
+   * WR-438: a live `Map` is used by reference (never copied, never
+   * replaced) so `RelayServer.reviseOauth2` revisions govern the next
+   * attempt; a plain record is copied into a fresh map, as before.
    */
-  oauth2?: Record<string, OAuth2ClientCredentialsConfig>,
+  oauth2?: Record<string, OAuth2ClientCredentialsConfig> | Map<string, OAuth2ClientCredentialsConfig>,
   /**
    * WR-129: the token cache backing `oauth2` — injectable for tests.
-   * When `oauth2` is set but no cache is passed, one is created
-   * internally. Ignored when `oauth2` is unset.
+   * When no cache is passed, one is created internally; it is always
+   * created, even when `oauth2` is unset, so a later `reviseOauth2`
+   * opt-in (WR-438) has a cache to fetch into.
    */
   oauth2TokenCache?: OAuth2TokenCache,
   /**
@@ -3409,14 +3438,23 @@ export function createDefaultSender(
   // WR-205: keep the resolved configs — the DPoP proof key rides each
   // delivery's resource proof, so the wire path needs the compiled key,
   // not just the validated shape.
+  // WR-438: a live `Map` is used by reference (never copied, never
+  // replaced) so `reviseOauth2` revisions govern the next attempt; a
+  // plain record is copied into a fresh map, as before.
+  const oauth2Configs: Map<string, OAuth2ClientCredentialsConfig> =
+    oauth2 instanceof Map ? oauth2 : new Map<string, OAuth2ClientCredentialsConfig>();
   const resolvedOauth2 = new Map<string, ResolvedOAuth2ClientConfig>();
   if (oauth2 !== undefined) {
-    if (oauth2 === null || typeof oauth2 !== "object" || Array.isArray(oauth2)) {
-      throw new RangeError(
-        "createDefaultSender: `oauth2` must be a Record<targetUrl, OAuth2ClientCredentialsConfig>"
-      );
+    if (!(oauth2 instanceof Map)) {
+      if (oauth2 === null || typeof oauth2 !== "object" || Array.isArray(oauth2)) {
+        throw new RangeError(
+          "createDefaultSender: `oauth2` must be a Record<targetUrl, OAuth2ClientCredentialsConfig>"
+        );
+      }
     }
-    for (const [endpoint, cfg] of Object.entries(oauth2)) {
+    const seed: Iterable<[string, OAuth2ClientCredentialsConfig]> =
+      oauth2 instanceof Map ? oauth2 : Object.entries(oauth2);
+    for (const [endpoint, cfg] of seed) {
       if (endpoint === "") {
         throw new RangeError(
           "createDefaultSender: `oauth2` keys must be non-empty endpoint strings"
@@ -3426,9 +3464,14 @@ export function createDefaultSender(
         endpoint,
         resolveOAuth2ClientConfig(cfg, `createDefaultSender: \`oauth2["${endpoint}"]\``)
       );
+      if (!(oauth2 instanceof Map)) oauth2Configs.set(endpoint, cfg);
     }
   }
-  const oauthTokenCache = oauth2 !== undefined ? (oauth2TokenCache ?? new OAuth2TokenCache()) : undefined;
+  // WR-438: the token cache is always created — even when `oauth2` was
+  // never configured — so a later `reviseOauth2` opt-in has a cache to
+  // fetch into. It sits empty (and is never consulted) until an entry
+  // exists.
+  const oauthTokenCache = oauth2TokenCache ?? new OAuth2TokenCache();
   // WR-192: fail fast on a misconfigured credential — a bad header, a
   // duplicate id/header, or an unresolvable `secretRef` must refuse to
   // boot, never surface as a delivery that stamps nothing.
@@ -5663,9 +5706,12 @@ export function createDefaultSender(
     // match, http/https only — the WS upgrade path keeps its
     // `x-relay-*` header contract). `undefined` for endpoints without
     // an entry keeps the exact pre-WR-129 wire shape.
+    // WR-438: read from the live map — a `reviseOauth2` revision
+    // governs the next attempt, while an attempt already built keeps
+    // the config it read.
     const oauthCfg =
       url.protocol === "http:" || url.protocol === "https:"
-        ? oauth2?.[item.targetUrl]
+        ? oauth2Configs.get(item.targetUrl)
         : undefined;
     // WR-205: the resolved config for this endpoint — `undefined`
     // unless the endpoint has an `oauth2` entry, in which case the
@@ -5742,7 +5788,7 @@ export function createDefaultSender(
     // attempt alongside the token — the second of the two proofs, with
     // `ath` binding it to this attempt's token.
     const attemptWithOAuth = (forceRefresh: boolean): Promise<DownstreamResponse | void> => {
-      if (oauthCfg === undefined || oauthTokenCache === undefined) return dispatch(undefined);
+      if (oauthCfg === undefined) return dispatch(undefined);
       const tokenP = forceRefresh
         ? oauthTokenCache.refreshFor(oauthCfg)
         : oauthTokenCache.tokenFor(oauthCfg);
@@ -5867,6 +5913,13 @@ export function createDefaultSender(
   // WR-433: the live header forwarding rules themselves — revised at
   // runtime via `RelayServer.reviseForwardHeaders`.
   sender.liveForwardHeaders = forwardHeadersRules;
+  // WR-438: the resolved OAuth2 configs themselves — revised at
+  // runtime via `RelayServer.reviseOauth2`.
+  sender.liveOauth2Resolved = resolvedOauth2;
+  // WR-438: the token cache itself — `RelayServer.reviseOauth2`
+  // drops the cached token minted under the previous config on
+  // revision (no proactive re-fetch).
+  sender.oauthTokenCache = oauthTokenCache;
   // WR-92: the shared DNS cache instance (undefined when the feature is
   // off) — operators read counters via `sender.dnsCache.getStats()`.
   sender.dnsCache = resolvedDnsCache;
@@ -7711,6 +7764,47 @@ export interface RelayServer extends Server {
    * no SigV4 entry. Always set.
    */
   getAwsSigV4?: (endpoint: string) => AwsSigV4EndpointConfig | undefined;
+  /**
+   * WR-438: revise one endpoint's live OAuth2 `client_credentials`
+   * config at runtime (`token_endpoint` / `client_id` / `client_secret`
+   * / `scope`, partial — omitted fields keep their live values). The
+   * new values govern the next token fetch: rotating `client_secret`
+   * (or changing `scope` / `token_endpoint` / `client_id`) drops the
+   * cached token minted under the previous config at once (no
+   * proactive re-fetch — the next delivery lazily fetches under the
+   * new config), while a delivery already in flight keeps the token
+   * it started with. A brand-new endpoint can be opted in without a
+   * restart, but only with all four fields at once — otherwise
+   * `RangeError`. `null` deletes the whole entry (the endpoint stops
+   * fetching tokens and falls back to the no-OAuth2 path). A
+   * single-field `null` is rejected (the required fields have no
+   * "clear back to a default" semantics); an empty patch is a
+   * `RangeError`; an illegal patch throws `RangeError` and the live
+   * record is untouched; a same-value revision is a silent no-op with
+   * no audit event — except a patch that carries `client_secret`,
+   * which is always treated as a real change (the secret value never
+   * participates in the same-value comparison). A real revision is
+   * audited as `oauth2_revised` with `endpoint` plus `previous` /
+   * `current` (the construction values as first `previous`;
+   * `undefined` when the entry did not exist or was just deleted) —
+   * both carry only `token_endpoint` / `client_id` / `scope`, never
+   * `client_secret`. Returns the live config for the endpoint
+   * (`undefined` when the entry was deleted). Always set. Throws
+   * `Error` when the default sender is not in use. Orthogonal to
+   * WR-129 (which owns the OAuth2 mechanism itself) and WR-428
+   * (generic outbound credential bindings — a different credential
+   * layer).
+   */
+  reviseOauth2?: (
+    endpoint: string,
+    patch: Oauth2Revision | null
+  ) => OAuth2ClientCredentialsConfig | undefined;
+  /**
+   * WR-438: live per-endpoint OAuth2 `client_credentials` config — a
+   * copy of the entry for `endpoint`, or `undefined` when the endpoint
+   * has no OAuth2 entry. Always set.
+   */
+  getOauth2?: (endpoint: string) => OAuth2ClientCredentialsConfig | undefined;
   /**
    * WR-349: revise one endpoint's live failover thresholds at runtime
    * (`failureThreshold` / `autoFailback` / `failbackIntervalMs`,
@@ -10715,9 +10809,32 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       },
     ])
   );
+  // WR-438: the live OAuth2 client_credentials config holder, same
+  // shape as the WR-437 SigV4 map above. `createDefaultSender`
+  // captures this map by reference, so the server holds the SAME map
+  // and hands it to the main sender; `reviseOauth2` mutates it in
+  // place — never replaces it — or the sender would keep reading a
+  // stale map. Each entry is copied at construction (including its
+  // `private_key_jwt` / `dpop` objects) so a caller mutating their
+  // config object afterwards cannot move the live values. When
+  // unconfigured, the empty map behaves exactly like `undefined` (no
+  // token fetching), so revise can opt a brand-new endpoint in
+  // without a restart.
+  const liveOauth2Configs: Map<string, OAuth2ClientCredentialsConfig> = new Map(
+    Object.entries(opts.oauth2 ?? {}).map(([endpoint, cfg]) => [
+      endpoint,
+      {
+        ...cfg,
+        ...(cfg.private_key_jwt !== undefined
+          ? { private_key_jwt: { ...cfg.private_key_jwt } }
+          : {}),
+        ...(cfg.dpop !== undefined ? { dpop: { ...cfg.dpop } } : {}),
+      },
+    ])
+  );
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, onHttp2Fallback, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, liveTlsSniOverrides, liveResponseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallback, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, liveAwsSigV4Configs, opts.awsSecretResolver, opts.outboundSchemas, opts.oauth2, undefined, opts.compressBrotli, opts.phaseTimeouts, opts.tlsCa, opts.chaos, onChaosInjectedAudit, liveResponseGuard, opts.doh, onDohFallback, proxyHealthMonitor, opts.outboundCredentials, opts.dnsPin, onDnsPinMismatch, opts.cloudEvents, opts.outboundSsrfGuard, onOutboundSsrfBlocked, onOutboundSsrfAllowlisted, onOutboundSsrfProxySkipped, opts.egressResidency, onEgressResidencyBlocked)
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, opts.compressOutbound, opts.outboundHttp2, onHttp2Fallback, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, liveTlsSniOverrides, liveResponseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallback, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, liveAwsSigV4Configs, opts.awsSecretResolver, opts.outboundSchemas, liveOauth2Configs, undefined, opts.compressBrotli, opts.phaseTimeouts, opts.tlsCa, opts.chaos, onChaosInjectedAudit, liveResponseGuard, opts.doh, onDohFallback, proxyHealthMonitor, opts.outboundCredentials, opts.dnsPin, onDnsPinMismatch, opts.cloudEvents, opts.outboundSsrfGuard, onOutboundSsrfBlocked, onOutboundSsrfAllowlisted, onOutboundSsrfProxySkipped, opts.egressResidency, onEgressResidencyBlocked)
       : undefined;
   // WR-146: tail-latency hedging for outbound attempts (opt-in). The
   // wrapper sits around whichever sender the queue uses — the default
@@ -20967,6 +21084,114 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       ...(entry.additionalSignedHeaders !== undefined
         ? { additionalSignedHeaders: [...entry.additionalSignedHeaders] }
         : {}),
+    };
+  };
+
+  // WR-438: live revision of one endpoint's OAuth2 client_credentials
+  // config. Same contract as `reviseAwsSigV4` above: partial patch,
+  // `null` deletes the whole entry (the endpoint stops fetching
+  // tokens), a brand-new endpoint opts in only with all four fields
+  // at once. Validate-then-apply through `reviseOauth2Map` (which
+  // runs the same per-value validator as startup), so an illegal
+  // patch throws RangeError and the live record is left completely
+  // intact. A real revision drops the cached token minted under the
+  // previous config (`OAuth2TokenCache.invalidateFor`, by the
+  // previous (token_endpoint, scope) key — no proactive re-fetch)
+  // and refreshes the compiled config the sender reads per attempt,
+  // so the next delivery fetches under the new credentials while a
+  // delivery already in flight keeps the token it started with. A
+  // same-value patch is a silent no-op — except a patch carrying
+  // `client_secret`, which is always a real change. Audited as
+  // `oauth2_revised` with the endpoint plus previous / current
+  // snapshots carrying only token_endpoint / client_id / scope — the
+  // secret never enters the audit.
+  server.reviseOauth2 = (
+    endpoint: string,
+    patch: Oauth2Revision | null
+  ): OAuth2ClientCredentialsConfig | undefined => {
+    if (typeof endpoint !== "string" || endpoint.length === 0) {
+      throw new RangeError("reviseOauth2: endpoint must be a non-empty string");
+    }
+    if (patch !== null && (typeof patch !== "object" || Array.isArray(patch))) {
+      throw new RangeError("reviseOauth2: patch must be an object or null");
+    }
+    if (defaultSender === undefined) {
+      throw new Error(
+        "reviseOauth2: the default sender is not in use — oauth2 revision requires the default sender"
+      );
+    }
+    const copy = (
+      entry: OAuth2ClientCredentialsConfig | undefined
+    ): OAuth2ClientCredentialsConfig | undefined =>
+      entry === undefined
+        ? undefined
+        : {
+            ...entry,
+            ...(entry.private_key_jwt !== undefined
+              ? { private_key_jwt: { ...entry.private_key_jwt } }
+              : {}),
+            ...(entry.dpop !== undefined ? { dpop: { ...entry.dpop } } : {}),
+          };
+    // Audit snapshots carry only the visible fields — never the
+    // secret (nor the private_key_jwt / dpop key material).
+    const snapshot = (entry: OAuth2ClientCredentialsConfig | undefined) =>
+      entry === undefined
+        ? undefined
+        : {
+            token_endpoint: entry.token_endpoint,
+            client_id: entry.client_id,
+            ...(entry.scope !== undefined ? { scope: entry.scope } : {}),
+          };
+    const prev = liveOauth2Configs.get(endpoint);
+    const change = reviseOauth2Map(
+      liveOauth2Configs,
+      endpoint,
+      patch,
+      `reviseOauth2[${endpoint}]`
+    );
+    if (!change.changed) {
+      return copy(prev);
+    }
+    // Drop the token minted under the previous config before the live
+    // record moves — entries.delete by the previous key, no proactive
+    // re-fetch.
+    if (prev !== undefined) {
+      defaultSender.oauthTokenCache.invalidateFor(prev);
+    }
+    // Mutate the live holders in place — never replace the maps
+    // themselves, or the sender's captured references would go stale.
+    if (change.entry === undefined) {
+      liveOauth2Configs.delete(endpoint);
+      defaultSender.liveOauth2Resolved.delete(endpoint);
+    } else {
+      liveOauth2Configs.set(endpoint, change.entry);
+      defaultSender.liveOauth2Resolved.set(
+        endpoint,
+        resolveOAuth2ClientConfig(change.entry, `reviseOauth2[${endpoint}]`)
+      );
+    }
+    const current = copy(change.entry);
+    opts.auditLog.append({
+      event: "oauth2_revised",
+      endpoint,
+      previous: snapshot(prev),
+      current: snapshot(change.entry),
+    });
+    return current;
+  };
+
+  // WR-438: live per-endpoint OAuth2 client_credentials config. Always
+  // set; returns a copy so callers cannot mutate the live record
+  // through it (including the `private_key_jwt` / `dpop` objects).
+  server.getOauth2 = (endpoint: string): OAuth2ClientCredentialsConfig | undefined => {
+    const entry = liveOauth2Configs.get(endpoint);
+    if (entry === undefined) return undefined;
+    return {
+      ...entry,
+      ...(entry.private_key_jwt !== undefined
+        ? { private_key_jwt: { ...entry.private_key_jwt } }
+        : {}),
+      ...(entry.dpop !== undefined ? { dpop: { ...entry.dpop } } : {}),
     };
   };
 

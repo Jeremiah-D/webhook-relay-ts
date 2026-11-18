@@ -6076,6 +6076,22 @@ the normal retry / dead-letter path.
 - **Secret handling** — `client_secret` lives in memory only: it is
   never logged, never audited, and `OAuth2TokenError` messages never
   carry it (only the endpoint host and status).
+- **Live revision (WR-438)** — `server.reviseOauth2(endpoint, patch)`
+  revises one endpoint's config at runtime (partial — omitted fields
+  keep their live values; `null` deletes the entry and the endpoint
+  stops fetching tokens; a brand-new endpoint opts in only with all
+  four fields — `token_endpoint` / `client_id` / `client_secret` /
+  `scope` — at once). A revision drops the cached token minted under
+  the previous config at once (no proactive re-fetch — the next
+  delivery lazily fetches under the new credentials), while a delivery
+  already in flight keeps the token it started with. An illegal or
+  empty patch throws `RangeError` with the live record untouched; a
+  same-value revision is a silent no-op — except a patch carrying
+  `client_secret`, which is always audited. A real revision is audited
+  as `oauth2_revised` (`endpoint` plus `previous` / `current`,
+  carrying only `token_endpoint` / `client_id` / `scope` — never the
+  secret); `server.getOauth2(endpoint)` returns a copy of the live
+  entry.
 - **Orthogonal to WR-26/WR-124/WR-116** — HMAC, Ed25519, SigV4, and the
   bearer token may all coexist on one delivery (the downstream picks
   either or requires several). Inbound `authorization` headers are
