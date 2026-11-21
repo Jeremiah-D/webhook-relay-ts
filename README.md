@@ -3320,12 +3320,28 @@ createRelayServer({
   `budgetErrorRate` on the next render. A same-value revision is a
   silent no-op; a real revision is audited as `error_budget_revised`
   with `previous` / `current`. An illegal patch throws `RangeError`
-  and leaves the live values untouched. A monitor that was never
-  configured cannot be switched on at runtime — enabling it requires
-  a restart. Unlike WR-341 (which revises the delivery deadline —
-  the total time a delivery may take), this revises the burn-rate
-  alert thresholds: it only changes when the relay pages, never
-  whether a delivery proceeds.
+  and leaves the live values untouched. Unlike WR-341 (which revises
+  the delivery deadline — the total time a delivery may take), this
+  revises the burn-rate alert thresholds: it only changes when the
+  relay pages, never whether a delivery proceeds.
+- **Live enable (WR-443)** — a relay that started without an error
+  budget can switch one on at runtime with the same
+  `server.reviseErrorBudget(patch)`: omitted fields resolve to the
+  construction defaults (1h / 6h / 0.01 / 2 / 10) and a fresh monitor
+  with an empty sample table is built — outcomes recorded before the
+  enable are never evaluated, so no alert can fire on history, and
+  the `relay_error_budget_burn_ratio` gauge appears only after the
+  first post-enable outcome (still activity-gated). The enable is
+  audited as `error_budget_revised` with `previous: null` and the full
+  five-knob config as `current`, and `server.getErrorBudgetConfig()`
+  is mounted at the same time. Enabling also unlocks
+  `server.reviseErrorBudgetAlertCallback(cb)` — the callback gate opens
+  the moment the monitor exists, and alerts after the enable are
+  audited as `error_budget_burn` exactly like construction-time ones.
+  An empty patch is a `RangeError` (there is nothing to enable with);
+  an illegal patch throws `RangeError` and leaves the relay
+  unconfigured. The enable is live-only: a restart returns to
+  unconfigured.
 - **Live callback replacement (WR-353)** —
   `server.reviseErrorBudgetAlertCallback(cb)` swaps the alert
   recipient at runtime, no restart (`undefined` clears it back to

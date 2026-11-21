@@ -195,13 +195,30 @@ describe("ErrorBudgetMonitor.replaceAlertCallback (WR-353)", () => {
 });
 
 describe("RetryQueue.reviseErrorBudgetAlertCallback (WR-353)", () => {
-  it("unconfigured queue throws the must-restart Error", async () => {
+  it("the callback gate stays closed until the budget is enabled, then opens", async () => {
     const q = new RetryQueue({ sender: async () => {} });
     try {
+      // No monitor yet: the gate is still fail-closed.
       assert.throws(() => q.reviseErrorBudgetAlertCallback(() => {}), {
         name: "Error",
         message: MUST_RESTART,
       });
+      // WR-443: enabling the budget unlocks the gate — the callback
+      // replacement then works on the fresh monitor.
+      q.reviseErrorBudget({
+        fastWindowMs: HOUR,
+        slowWindowMs: 6 * HOUR,
+        budgetErrorRate: 0.5,
+        alertThreshold: 1.5,
+        minEvents: 2,
+      });
+      const alerts: BurnRateAlertInfo[] = [];
+      q.reviseErrorBudgetAlertCallback((info) => alerts.push(info));
+      const mon = q.getErrorBudgetMonitor()!;
+      mon.recordOutcome(EP_A, false);
+      mon.recordOutcome(EP_A, false);
+      assert.equal(alerts.length, 1);
+      assert.equal(alerts[0].endpoint, EP_A);
     } finally {
       await q.shutdown();
     }
@@ -414,14 +431,25 @@ describe("RelayServer error-budget callback revision (WR-353)", () => {
     assert.equal(newAlerts[0].endpoint, URL_A);
   });
 
-  it("unconfigured server throws must-restart and the method is always set", async () => {
-    const { relay } = makeRelay();
+  it("the callback gate opens once the budget is enabled", async () => {
+    const { relay, audit } = makeRelay();
     await listen(relay);
     assert.equal(relay.getErrorBudgetConfig, undefined);
     assert.equal(typeof relay.reviseErrorBudgetAlertCallback, "function");
+    // No monitor yet: the gate is still fail-closed.
     assert.throws(() => relay.reviseErrorBudgetAlertCallback!(() => {}), {
       name: "Error",
       message: MUST_RESTART,
     });
+    // WR-443: enabling the budget unlocks the gate — the replacement
+    // then works and audits exactly like the configured case.
+    relay.reviseErrorBudget!(budget);
+    const alerts: BurnRateAlertInfo[] = [];
+    relay.reviseErrorBudgetAlertCallback!((info) => alerts.push(info));
+    const replaced = eventsOf(audit, "error_budget_alert_callback_replaced");
+    assert.equal(replaced.length, 1);
+    assert.equal(replaced[0].previous, "unset");
+    assert.equal(replaced[0].current, "set");
+    assert.ok(relay.getErrorBudgetConfig !== undefined, "enable mounts the getter");
   });
 });

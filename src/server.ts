@@ -7295,8 +7295,12 @@ export interface RelayServer extends Server {
    * `error_budget_revised` with `previous` / `current` (the
    * construction values as first `previous` — the defaults 1h / 6h /
    * 0.01 / 2 / 10 when unset), and returns the live config. Always
-   * set; throws `Error` when `errorBudget` was never configured —
-   * enabling it needs a restart. This revises the burn-rate alert
+   * set. WR-443: when the monitor was never configured, the same call
+   * *enables* it — the patch is resolved against the construction
+   * defaults, a fresh monitor with an empty sample table is built
+   * (outcomes recorded before the enable are never evaluated), the
+   * enable is audited with `previous: null`, and the getter is mounted
+   * at the same time. This revises the burn-rate alert
    * thresholds; WR-341 revises the delivery deadline, WR-147 is the
    * alert mechanism itself, and WR-10 the circuit breaker that
    * *does* gate dispatches (this only alerts).
@@ -7317,8 +7321,9 @@ export interface RelayServer extends Server {
    * A real replacement is audited as
    * `error_budget_alert_callback_replaced` with `previous` /
    * `current` recording only `'set'` / `'unset'` presence — never a
-   * function body. Always set; throws `Error` when `errorBudget` was
-   * never configured — enabling it needs a restart.
+   * function body. Always set; throws `Error` while `errorBudget` was
+   * never configured — enable it first with `reviseErrorBudget`
+   * (WR-443), which opens this gate the moment the monitor exists.
    */
   reviseErrorBudgetAlertCallback?: (cb?: (info: BurnRateAlertInfo) => void) => void;
   /**
@@ -7593,8 +7598,8 @@ export interface RelayServer extends Server {
   getForwardHeaders?: () => Record<string, ForwardHeadersRuleConfig>;
   /**
    * WR-346: live error-budget burn-rate config — the five knobs.
-   * Only set when `errorBudget` was configured; `undefined`
-   * otherwise.
+   * Set when the monitor exists — configured at construction or
+   * enabled at runtime (WR-443); `undefined` otherwise.
    */
   getErrorBudgetConfig?: () => ErrorBudgetConfig | undefined;
   /**
@@ -11292,6 +11297,16 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // cannot bypass the `error_budget_burn` audit.
   let operatorAlertCallback: ((info: BurnRateAlertInfo) => void) | undefined =
     opts.retry?.errorBudget?.onBurnRateAlert;
+  // WR-443: the burn-rate alert audit wrapper, shared by the
+  // construction wiring below and the runtime enable path in
+  // `server.reviseErrorBudget` — every fired alert is audited as
+  // `error_budget_burn` and forwarded to the operator cell, whichever
+  // way the monitor came to exist. The monitor swallows a throwing
+  // callback, so alerting can never break the delivery path.
+  const burnRateAlertAuditWrapper = (info: BurnRateAlertInfo): void => {
+    opts.auditLog.append(errorBudgetBurnAuditEvent(info));
+    operatorAlertCallback?.(info);
+  };
   // WR-365: the operator's circuit state-change callback, held in a
   // mutable cell so `server.reviseCircuitStateChangeCallback` can
   // replace it at runtime. The audit wrapper below reads this cell —
@@ -11650,16 +11665,14 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // the delivery path. WR-353: the wrapper reads the mutable
     // `operatorAlertCallback` cell — the monitor's callback is never
     // swapped, so a runtime callback replacement cannot bypass this
-    // audit.
+    // audit. WR-443: the same wrapper is installed by the runtime
+    // enable path, so alerts after an enable are audited identically.
     ...(opts.retry?.errorBudget === undefined
       ? {}
       : {
           errorBudget: {
             ...opts.retry.errorBudget,
-            onBurnRateAlert: (info: BurnRateAlertInfo) => {
-              opts.auditLog.append(errorBudgetBurnAuditEvent(info));
-              operatorAlertCallback?.(info);
-            },
+            onBurnRateAlert: burnRateAlertAuditWrapper,
           },
         }),
     // WR-201: wrap the caller's `onWeightsRetuned` so every applied
@@ -20467,21 +20480,40 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   }
 
   // WR-346: error-budget burn-rate knob runtime revision. The method is
-  // always set (like reviseReplayEgress above); with the monitor
-  // unconfigured the queue throws Error — enabling it needs a restart.
-  // A real revision is audited as `error_budget_revised` with the
-  // previous and current five-knob config (the construction values as
-  // first `previous` — the defaults 1h / 6h / 0.01 / 2 / 10 when
-  // unset); an empty or same-value patch is a silent no-op. The
-  // revision takes effect on the next `recordOutcome`: a tightened
-  // slow window prunes older samples on the next record, a widened
-  // window never resurrects pruned samples, and an open alert episode
-  // is untouched until the next outcome re-evaluates it.
+  // always set (like reviseReplayEgress above). WR-443: with the monitor
+  // unconfigured the same call *enables* it — the queue builds a fresh
+  // monitor (empty sample table, no retroactive evaluation) and the
+  // enable is audited as `error_budget_revised` with `previous: null`
+  // and the full five-knob config as `current`; the getter is mounted
+  // at the same time. A real revision is audited as
+  // `error_budget_revised` with the previous and current five-knob
+  // config (the construction values as first `previous` — the defaults
+  // 1h / 6h / 0.01 / 2 / 10 when unset); an empty or same-value patch
+  // is a silent no-op. The revision takes effect on the next
+  // `recordOutcome`: a tightened slow window prunes older samples on
+  // the next record, a widened window never resurrects pruned samples,
+  // and an open alert episode is untouched until the next outcome
+  // re-evaluates it.
   server.reviseErrorBudget = (patch: ErrorBudgetRevision): ErrorBudgetConfig => {
     const prev = queue.getErrorBudgetConfig();
     if (prev === undefined) {
-      // Delegates to the queue for the canonical "must restart" Error.
-      return queue.reviseErrorBudget(patch);
+      // WR-443: enable — the queue builds the fresh monitor (an empty
+      // or illegal patch still throws RangeError there, leaving the
+      // server unconfigured). Install the audit wrapper so alerts after
+      // the enable are still audited as `error_budget_burn` and still
+      // reach the operator callback — without it the monitor would
+      // alert into the void and `reviseErrorBudgetAlertCallback` would
+      // swap a cell nobody reads. Then mount the getter and audit the
+      // enable with `previous: null`.
+      const next = queue.reviseErrorBudget(patch);
+      queue.reviseErrorBudgetAlertCallback(burnRateAlertAuditWrapper);
+      server.getErrorBudgetConfig = (): ErrorBudgetConfig => queue.getErrorBudgetConfig()!;
+      opts.auditLog.append({
+        event: "error_budget_revised",
+        previous: null,
+        current: next,
+      });
+      return next;
     }
     // Validate-then-apply inside retune: an illegal patch throws
     // RangeError and the live values are left completely intact.
@@ -20504,7 +20536,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   };
 
   // WR-346: live error-budget burn-rate config. Only set when
-  // `errorBudget` was configured.
+  // `errorBudget` was configured — WR-443 mounts it from the enable
+  // path when the monitor is enabled at runtime.
   if (queue.getErrorBudgetConfig() !== undefined) {
     server.getErrorBudgetConfig = (): ErrorBudgetConfig => queue.getErrorBudgetConfig()!;
   }
@@ -20597,8 +20630,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
 
   // WR-353: live error-budget alert-callback replacement. The method
   // is always set (like reviseErrorBudget above); with the monitor
-  // unconfigured the queue throws Error — enabling it needs a restart.
-  // Only the server-side operator-callback cell moves — the monitor's
+  // unconfigured the queue throws Error — enable it first with
+  // `reviseErrorBudget` (WR-443). Only the server-side operator-callback cell moves — the monitor's
   // own callback (the `error_budget_burn` audit wrapper) is never
   // touched, so a replacement cannot bypass the audit. A non-function
   // callback throws `RangeError` and the live cell is untouched; a

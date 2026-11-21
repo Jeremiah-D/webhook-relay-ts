@@ -4436,8 +4436,10 @@ export class RetryQueue {
    * WR-147: the per-endpoint error-budget burn-rate monitor. `undefined`
    * when the feature is off — the hot path then has one extra branch,
    * nothing more.
+   * WR-443: deliberately *not* readonly — `reviseErrorBudget` enables
+   * the monitor at runtime on a queue that started without one.
    */
-  private readonly errorBudget?: ErrorBudgetMonitor;
+  private errorBudget?: ErrorBudgetMonitor;
   // WR-365: deliberately *not* readonly — `reviseCircuitStateChangeCallback`
   // replaces the live state-change observer at runtime. The server's
   // audit closure (which forwards to the operator callback) is held
@@ -6812,15 +6814,38 @@ export class RetryQueue {
    * nor closed early by a retune — the next outcome re-evaluates the
    * latch under the new threshold. An illegal patch throws `RangeError`
    * and the live values are untouched; an empty patch is a `RangeError`;
-   * revising to the live values is a no-op. Throws `Error` when the
-   * error budget was never configured — enabling it needs a restart.
+   * revising to the live values is a no-op.
+   *
+   * WR-443: when the monitor was never configured, the same call
+   * *enables* it instead of throwing: the patch is resolved against
+   * the construction defaults (1h / 6h / 0.01 / 2 / 10) through the
+   * same resolver as construction, and a fresh monitor with an empty
+   * sample table is built — outcomes recorded before the enable are
+   * never evaluated, and no alert episode can be open. An empty patch
+   * is a `RangeError` (there is nothing to enable with) and an illegal
+   * patch throws `RangeError` with the queue left unconfigured.
+   * Enabling also unlocks `reviseErrorBudgetAlertCallback`: the
+   * callback gate opens the moment the monitor exists. No persistence:
+   * a restart returns to unconfigured — the enable is live-only.
    * Returns the live config.
    */
   reviseErrorBudget(patch: ErrorBudgetRevision): ErrorBudgetConfig {
     if (this.errorBudget === undefined) {
-      throw new Error(
-        "reviseErrorBudget: error budget is not configured — enabling it requires a restart"
-      );
+      // WR-443: enable — the same patch guards as `retune`, then a
+      // fresh monitor from the construction resolver (missing fields
+      // take the defaults, `now` defaults to `Date.now`). Validation
+      // throws before anything is assigned, so an illegal patch leaves
+      // the queue unconfigured.
+      if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+        throw new RangeError(
+          `errorBudget revision must be an object, got ${JSON.stringify(patch)}`
+        );
+      }
+      if (Object.keys(patch).length === 0) {
+        throw new RangeError("errorBudget revision must not be empty");
+      }
+      this.errorBudget = new ErrorBudgetMonitor(patch);
+      return this.errorBudget.config();
     }
     return this.errorBudget.retune(patch);
   }
@@ -6833,8 +6858,9 @@ export class RetryQueue {
    * already unset) is a no-op. Only the callback moves: the five
    * knobs, the clock, the accumulated outcomes, and the open-episode
    * latches are untouched, and the new callback takes effect from the
-   * next episode open. Throws `Error` when the error budget was never
-   * configured — enabling it needs a restart.
+   * next episode open. Throws `Error` while the error budget was never
+   * configured — enable it first with `reviseErrorBudget` (WR-443),
+   * which opens this gate the moment the monitor exists.
    */
   reviseErrorBudgetAlertCallback(cb?: (info: BurnRateAlertInfo) => void): void {
     if (this.errorBudget === undefined) {

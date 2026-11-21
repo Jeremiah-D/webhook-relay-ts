@@ -16,9 +16,6 @@ const opToken = "error-budget-revision-op-token";
 const URL_A = "http://localhost:9999/a";
 const EP_A = "http://a.example/hook";
 
-const MUST_RESTART =
-  "reviseErrorBudget: error budget is not configured — enabling it requires a restart";
-
 /** Steppable clock for deterministic windows. */
 function clock() {
   let now = 1_000_000;
@@ -333,14 +330,28 @@ describe("RetryQueue.reviseErrorBudget (WR-346)", () => {
     }
   });
 
-  it("unconfigured queue throws must-restart and the getter returns undefined", async () => {
+  it("an unconfigured queue enables on first revision; the getter returns the full config", async () => {
     const q = new RetryQueue({ sender: async () => {} });
     try {
       assert.equal(q.getErrorBudgetConfig(), undefined);
-      assert.throws(() => q.reviseErrorBudget({ alertThreshold: 1.5 }), {
-        name: "Error",
-        message: MUST_RESTART,
+      assert.equal(q.getErrorBudgetMonitor(), undefined);
+      // WR-443: the same call that used to throw must-restart now
+      // enables the monitor, resolving missing fields to the defaults.
+      assert.deepEqual(q.reviseErrorBudget({ alertThreshold: 1.5 }), {
+        fastWindowMs: HOUR,
+        slowWindowMs: 6 * HOUR,
+        budgetErrorRate: 0.01,
+        alertThreshold: 1.5,
+        minEvents: 10,
       });
+      assert.deepEqual(q.getErrorBudgetConfig(), {
+        fastWindowMs: HOUR,
+        slowWindowMs: 6 * HOUR,
+        budgetErrorRate: 0.01,
+        alertThreshold: 1.5,
+        minEvents: 10,
+      });
+      assert.ok(q.getErrorBudgetMonitor() !== undefined);
     } finally {
       await q.shutdown();
     }
@@ -468,14 +479,28 @@ describe("RelayServer error-budget revision (WR-346)", () => {
     assert.deepEqual(revised[0].current, { ...defaults, alertThreshold: 1.5 });
   });
 
-  it("unconfigured server throws must-restart and mounts no getter", async () => {
-    const { relay } = makeRelay(undefined);
+  it("an unconfigured server enables on first revision and mounts the getter", async () => {
+    const { relay, audit } = makeRelay(undefined);
     await listen(relay);
     assert.equal(relay.getErrorBudgetConfig, undefined);
     assert.equal(typeof relay.reviseErrorBudget, "function", "revise is always set");
-    assert.throws(() => relay.reviseErrorBudget!({ alertThreshold: 1.5 }), {
-      name: "Error",
-      message: MUST_RESTART,
+    // WR-443: the same call that used to throw must-restart now enables
+    // the monitor; the enable audits `previous: null`.
+    const defaults = {
+      fastWindowMs: HOUR,
+      slowWindowMs: 6 * HOUR,
+      budgetErrorRate: 0.01,
+      alertThreshold: 2,
+      minEvents: 10,
+    };
+    assert.deepEqual(relay.reviseErrorBudget!({ alertThreshold: 1.5 }), {
+      ...defaults,
+      alertThreshold: 1.5,
     });
+    assert.deepEqual(relay.getErrorBudgetConfig!(), { ...defaults, alertThreshold: 1.5 });
+    const revised = eventsOf(audit, "error_budget_revised");
+    assert.equal(revised.length, 1);
+    assert.equal(revised[0].previous, null);
+    assert.deepEqual(revised[0].current, { ...defaults, alertThreshold: 1.5 });
   });
 });
