@@ -6112,6 +6112,37 @@ export interface LiveOutboundSigning {
   compiledEd25519: CompiledEd25519OutboundKey | undefined;
 }
 
+/**
+ * WR-442: describe live endpoint verifier rules for audit and getter
+ * snapshots — pattern + verifier-name pairs only, never a verifier
+ * object or key material. `null` when no rules are live (audit JSON
+ * has no `undefined`).
+ */
+function describeEndpointVerifierRules(
+  rules: EndpointVerifierRule[] | undefined
+): Array<{ pattern: string; verifier: string }> | null {
+  if (rules === undefined) return null;
+  return rules.map((rule) => ({ pattern: rule.pattern, verifier: rule.verifier.name }));
+}
+
+/**
+ * WR-442: same-rules comparison for the live endpoint verifier table —
+ * the same pattern list in the same order and the same verifier
+ * objects. Names alone are not compared: every `Ed25519Verifier` is
+ * named `"ed25519"` (and every `HmacSha256Verifier` `"hmac-sha256"`),
+ * so a key rollover ships a new verifier object under the same name
+ * and must be a real revision, never a silent no-op.
+ */
+function sameEndpointVerifierRules(
+  a: EndpointVerifierRule[] | undefined,
+  b: EndpointVerifierRule[] | undefined
+): boolean {
+  if (a === b) return true;
+  if (a === undefined || b === undefined) return false;
+  if (a.length !== b.length) return false;
+  return a.every((rule, i) => rule.pattern === b[i].pattern && rule.verifier === b[i].verifier);
+}
+
 function sameEd25519Config(
   a: Ed25519OutboundKeyConfig | undefined,
   b: Ed25519OutboundKeyConfig | undefined
@@ -7420,6 +7451,43 @@ export interface RelayServer extends Server {
    * `undefined` when a custom sender is in use.
    */
   getOutboundSigning?: () => OutboundSigningConfig | undefined;
+  /**
+   * WR-442: live-revise the per-endpoint inbound signature verifier
+   * rules — replace the whole rule table at runtime, no restart.
+   * The argument is the full new table in first-match-wins order
+   * (the config order is the match order); `null` (or `[]`) clears
+   * every rule so all paths fall back to the global verifier. The
+   * whole table is validated first (an illegal pattern or a verifier
+   * without a usable name/verify throws `RangeError` and the live
+   * rules are untouched — zero partial application). A revision
+   * identical to the live rules is a silent no-op with no audit
+   * event — identical means the same pattern list in order and the
+   * same verifier objects (names alone are not enough: every
+   * `Ed25519Verifier` is named `"ed25519"`, so a key rollover that
+   * ships a new verifier object under the same name is always a real
+   * revision, never swallowed as a no-op). The revision takes effect
+   * from the next request — single-ingest and batch-envelope
+   * verification both read the live table per request — and a request
+   * already verified keeps the verifier it started with. No
+   * must-restart gate: rules are optional at construction, so
+   * revision can also enable rules that were never configured. A real
+   * revision is audited as `endpoint_verifiers_revised` with
+   * `previous` / `current` recording only `{ pattern, verifier }`
+   * name pairs — never a verifier object or key material. This only
+   * swaps the rule table — the global verifier, the
+   * `signatureAlgorithms` allowlist, `secretRotation`, and
+   * `toleranceSec` are untouched, and there is no persistence: a
+   * restart returns to the construction `endpointVerifiers`. Always
+   * set.
+   */
+  reviseEndpointVerifiers?: (rules: EndpointVerifierRule[] | null) => void;
+  /**
+   * WR-442: the live per-endpoint verifier rules — a snapshot of
+   * `{ pattern, verifier }` name pairs in first-match-wins order
+   * (`undefined` when no rules are live). Always set; mutating the
+   * returned snapshot never touches the live rules.
+   */
+  getEndpointVerifiers?: () => Array<{ pattern: string; verifier: string }> | undefined;
   /**
    * WR-431: live-revise the chaos drill rules — set a new fault rule
    * for an endpoint, replace one, or clear one (`null`), no restart.
@@ -12706,6 +12774,17 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // Per-endpoint verifier rules are validated once at startup so a bad
   // pattern or verifier can never fail a request mid-flight.
   assertValidEndpointVerifierRules(opts.endpointVerifiers);
+  // WR-442: the live per-endpoint verifier rules — a holder created once
+  // here and never replaced, so a revision mutates it in place and the
+  // next request reads the new rules while a request already verified
+  // keeps the verifier it started with. Construction takes a shallow
+  // copy of the array (the verifier objects themselves are not copied —
+  // the caller must not mutate a verifier after handing it over).
+  // `undefined` means no rules are live and every path falls back to
+  // the global verifier.
+  const liveEndpointVerifiers: { rules: EndpointVerifierRule[] | undefined } = {
+    rules: opts.endpointVerifiers === undefined ? undefined : [...opts.endpointVerifiers],
+  };
   // WR-203: per-tenant body budgets are validated once at startup so a
   // bad tenant id or byte budget can never fail a request mid-flight.
   if (opts.tenantBodyLimits !== undefined) {
@@ -16029,7 +16108,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // trusted verifier; anything unmatched falls back to the global one.
     // A mismatch here is answered 401 below and never enqueues, so it can
     // never trip the downstream circuit breaker.
-    let activeVerifier = selectEndpointVerifier(pathname, opts.endpointVerifiers) ?? verifier;
+    let activeVerifier = selectEndpointVerifier(pathname, liveEndpointVerifiers.rules) ?? verifier;
     // Per-tenant inbound HMAC keys (WR-195): when the request claims a
     // tenant whose key the operator configured, that tenant's key set
     // replaces the global verifier for this request — including its
@@ -17122,7 +17201,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // before splitting, so dropping, reordering, or tampering with items
     // invalidates the batch.
     const envelopeVerifier =
-      selectEndpointVerifier("/ingest/batch", opts.endpointVerifiers) ?? verifier;
+      selectEndpointVerifier("/ingest/batch", liveEndpointVerifiers.rules) ?? verifier;
     const envelopeKeyIdHeader = req.headers["x-key-id"];
     const envelopeKeyIdHint = Array.isArray(envelopeKeyIdHeader)
       ? envelopeKeyIdHeader[0]
@@ -20742,6 +20821,38 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     const copy: OutboundSigningConfig = { ...config };
     if (config.ed25519 !== undefined) copy.ed25519 = { ...config.ed25519 };
     return copy;
+  };
+
+  // WR-442: live per-endpoint verifier rule revision — full-table
+  // replacement, validated before anything is applied (an illegal
+  // table throws `RangeError` and the live rules are left completely
+  // intact). A same-rules revision is a silent no-op; a real revision
+  // is audited as `endpoint_verifiers_revised` with `previous` /
+  // `current` recording only pattern + verifier-name pairs. The
+  // holder is mutated in place, never replaced, so a request already
+  // verified keeps the verifier it started with and the next request
+  // reads the new table. No persistence: a restart returns to the
+  // construction `endpointVerifiers`.
+  server.reviseEndpointVerifiers = (rules: EndpointVerifierRule[] | null): void => {
+    if (rules !== null) assertValidEndpointVerifierRules(rules);
+    const next = rules === null || rules.length === 0 ? undefined : [...rules];
+    const previous = liveEndpointVerifiers.rules;
+    if (sameEndpointVerifierRules(previous, next)) return; // Same-value: silent no-op.
+    liveEndpointVerifiers.rules = next;
+    opts.auditLog.append({
+      event: "endpoint_verifiers_revised",
+      previous: describeEndpointVerifierRules(previous),
+      current: describeEndpointVerifierRules(next),
+    });
+  };
+
+  // WR-442: live per-endpoint verifier rules — a fresh snapshot of
+  // `{ pattern, verifier }` name pairs (`undefined` when no rules are
+  // live), so callers can neither mutate the live rules nor observe
+  // a half-applied revision.
+  server.getEndpointVerifiers = (): Array<{ pattern: string; verifier: string }> | undefined => {
+    const snapshot = describeEndpointVerifierRules(liveEndpointVerifiers.rules);
+    return snapshot === null ? undefined : snapshot;
   };
 
   // WR-431: live chaos drill rule revision. The map owns the rules

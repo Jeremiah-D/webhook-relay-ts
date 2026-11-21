@@ -49,6 +49,13 @@ reliability primitives that matter for any signed-payload pipeline.
   verifier }` rules (exact `/hooks/stripe` or prefix `/hooks/*`, first
   match wins, unmatched paths fall back to the global verifier), so one
   relay can trust Ed25519 for one upstream and HMAC-SHA256 for another.
+  The rule table is live-revisable at runtime (WR-442):
+  `relay.reviseEndpointVerifiers(rules)` replaces the whole table —
+  `null` (or `[]`) clears it back to the global verifier — and
+  `relay.getEndpointVerifiers()` reads a snapshot of `{ pattern,
+  verifier }` name pairs; a same-rules revision is a silent no-op and
+  a real revision is audited as `endpoint_verifiers_revised` with only
+  pattern + verifier names, never key material.
 - `src/secret-rotation.ts` — inbound HMAC secret dual-version
   zero-downtime rotation (`RotatingEndpointSecret`, WR-67): one endpoint
   carries `currentSecret` + `previousSecret` in parallel while the
@@ -5163,6 +5170,14 @@ const server = createRelayServer({
 - Invalid rules (non-array, pattern not starting with `/`,
   non-positive-integer `maxBodyBytes`) throw `RangeError` at startup, so
   a bad config can never fail a request mid-flight.
+- **Live verifier-rule revision (WR-442)** — the verifier rules
+  themselves are revisable at runtime with no restart:
+  `relay.reviseEndpointVerifiers(rules)` replaces the whole table
+  (`null` clears it, so all paths fall back to the global verifier)
+  and `relay.getEndpointVerifiers()` reads the live table as
+  `{ pattern, verifier }` name pairs. A same-rules revision is a silent
+  no-op; a real revision is audited as `endpoint_verifiers_revised`
+  with only pattern + verifier names, never key material.
 - **Live-revisable (WR-381)** — `reviseEndpointBodyLimits(rules)`
   replaces the whole ruleset at runtime: the next HTTP request's intake
   and the next WS handshake are sized by the new rules, while in-flight
