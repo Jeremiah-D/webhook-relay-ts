@@ -28,7 +28,7 @@ import {
   selectSignatureAlgorithmVerifier,
   type SignatureAlgorithmRule,
 } from "./signature-alg.ts";
-import { RetryQueue, errorBudgetBurnAuditEvent, type AssertionFailureInfo, type AttemptFailedInfo, type BatchInfo, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutEvent, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeadLetterEscalationCallbacksRevision, type DeliveryDeadlineConfig, type DeliveryDeadlineExceededInfo, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type DownstreamResponseSummary, type EndpointAutoDisableRevision, type EndpointPauseCallbacksRevision, type EndpointPauseInfo, type ErrorBudgetConfig, type ErrorBudgetRevision, type EscalationConfig, type EscalationRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type FailureClass, type QuorumCallbacksRevision, type QuorumRetention, type QuorumRetentionRevision, type ReplayCallbacksRevision, type ReplayForcedInfo, type ReplaySkippedInfo, type ResponseAssertionRule, type ResponseAssertionsRevision, type RetryItem, type RetryBudgetDepletedInfo, type ScheduledFiredEvent, type Sender, type SenderCallOptions, type SemanticFailureInfo, type ShadowCallbacksRevision, type MaintenanceWindowTransition, type SloMissInfo, type SloRiskConfig, type SloRiskInfo, type SloRiskRevision, type StarvationGuardAuditEvent, type TenantBudgetAuditEvent, type UrgentDowngradedEvent, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
+import { RetryQueue, errorBudgetBurnAuditEvent, type AssertionFailureInfo, type AttemptFailedInfo, type BatchInfo, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutEvent, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeadLetterEscalationCallbacksRevision, type DeliveryDeadlineConfig, type DeliveryDeadlineExceededInfo, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type DownstreamResponseSummary, type EndpointAutoDisableRevision, type EndpointPauseCallbacksRevision, type EndpointPauseInfo, type ErrorBudgetConfig, type ErrorBudgetRevision, type EscalationConfig, type EscalationRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type FailureClass, type QuorumCallbacksRevision, type QuorumRetention, type QuorumRetentionRevision, type ReplayCallbacksRevision, type ReplayForcedInfo, type ReplayIdempotencyConfig, type ReplayIdempotencyRevision, type ReplaySkippedInfo, type ResponseAssertionRule, type ResponseAssertionsRevision, type RetryItem, type RetryBudgetDepletedInfo, type ScheduledFiredEvent, type Sender, type SenderCallOptions, type SemanticFailureInfo, type ShadowCallbacksRevision, type MaintenanceWindowTransition, type SloMissInfo, type SloRiskConfig, type SloRiskInfo, type SloRiskRevision, type StarvationGuardAuditEvent, type TenantBudgetAuditEvent, type UrgentDowngradedEvent, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
 import { parseDeliverAtHeader, DELIVER_AT_HEADER } from "./retry.ts";
 import type { ShadowDeliveredInfo, ShadowFailedInfo, ShadowTargetConfig, ShadowTargetsConfig } from "./retry.ts";
 import type {
@@ -7985,6 +7985,34 @@ export interface RelayServer extends Server {
    * delivered records are untouched.
    */
   reviseReplayCallbacks?: (patch: ReplayCallbacksRevision) => void;
+  /**
+   * WR-441: revise the live replay-idempotency guard tuning at runtime
+   * (`windowMs` / `maxEntries`, partial — omitted fields keep their
+   * live values). Widening the window revives delivered records that
+   * expired under the old window but were never evicted, so the next
+   * replay of those pairs is suppressed again; narrowing it drops old
+   * records from suppression at once; lowering `maxEntries` evicts
+   * the oldest records immediately. An illegal patch throws
+   * `RangeError` and the live values are untouched; an empty patch is
+   * a `RangeError`; a same-value revision is a no-op with no audit
+   * event. A real revision is audited as `replay_idempotency_revised`
+   * with `previous` / `current` (plain numbers, no payloads), and
+   * returns the live config. Always set; throws `Error` when replay
+   * idempotency was never configured — enabling it needs a restart.
+   * The one config is shared by all tenants: every live per-tenant
+   * guard is retuned in place, and tenants born later start from the
+   * revised values. Replays already decided (suppressed or replayed)
+   * are unaffected — only later replay decisions see the new tuning.
+   * WR-149 is the guard itself; WR-368 revises its skip/force
+   * observers, a different layer of the same guard.
+   */
+  reviseReplayIdempotency?: (patch: ReplayIdempotencyRevision) => ReplayIdempotencyConfig;
+  /**
+   * WR-441: live replay-idempotency guard tuning — the suppression
+   * window and the index cap shared by all tenants. Only set when
+   * `replayIdempotency` was configured; `undefined` otherwise.
+   */
+  getReplayIdempotencyConfig?: () => ReplayIdempotencyConfig | undefined;
   /**
    * WR-394: live-redirect the dead-letter storm escalation observers at
    * runtime — no restart. Replaces the operator callbacks the server
@@ -21723,6 +21751,43 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     operatorReplayForcedCallback = nextForced;
     opts.auditLog.append({ event: "replay_callbacks_revised", ...payload });
   };
+
+  // WR-441: live replay-idempotency guard tuning revision. The method
+  // is always set (like reviseSlowStart above); with the guard
+  // unconfigured the queue throws Error — enabling it needs a
+  // restart. A real revision is audited as `replay_idempotency_revised`
+  // with the previous and current config (plain numbers, no payloads);
+  // an empty, illegal, or same-value patch is a silent no-op with no
+  // audit event (illegal patches still throw RangeError from the
+  // queue, leaving the live values untouched).
+  server.reviseReplayIdempotency = (
+    patch: ReplayIdempotencyRevision
+  ): ReplayIdempotencyConfig => {
+    const prev = queue.getReplayIdempotencyConfig();
+    if (prev === undefined) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseReplayIdempotency(patch);
+    }
+    // Validate-then-apply inside the queue: an illegal patch throws
+    // RangeError and the live values are left completely intact.
+    const next = queue.reviseReplayIdempotency(patch);
+    if (next.windowMs === prev.windowMs && next.maxEntries === prev.maxEntries) {
+      return next;
+    }
+    opts.auditLog.append({
+      event: "replay_idempotency_revised",
+      previous: prev,
+      current: next,
+    });
+    return next;
+  };
+
+  // WR-441: live replay-idempotency guard tuning. Only set when
+  // `retry.replayIdempotency` was configured.
+  if (queue.getReplayIdempotencyConfig() !== undefined) {
+    server.getReplayIdempotencyConfig = (): ReplayIdempotencyConfig =>
+      queue.getReplayIdempotencyConfig()!;
+  }
 
   // WR-394: live dead-letter storm escalation callback replacement.
   // Only the server-side operator-callback cells move — the queue's

@@ -65,6 +65,47 @@ export interface ReplayIdempotencyStats {
   tenant?: string;
 }
 
+/**
+ * WR-441: the live tuning of a {@link ReplayIdempotencyGuard} — the
+ * suppression window and the index cap. Returned by `current()` /
+ * `retune()` and by the queue/server getters.
+ */
+export interface ReplayIdempotencyConfig {
+  /** How long (ms) a delivered record suppresses a later replay. */
+  windowMs: number;
+  /** Maximum tracked (endpoint, payload-hash) pairs. */
+  maxEntries: number;
+}
+
+/**
+ * WR-441: patch for `ReplayIdempotencyGuard.retune` /
+ * `RetryQueue.reviseReplayIdempotency` /
+ * `RelayServer.reviseReplayIdempotency`. Each field is optional — an
+ * omitted field keeps its live value. At least one field must be
+ * present, else the patch throws `RangeError` and the live values are
+ * untouched.
+ */
+export interface ReplayIdempotencyRevision {
+  windowMs?: number;
+  maxEntries?: number;
+}
+
+/**
+ * Validate resolved (windowMs, maxEntries) — shared by the constructor
+ * and `retune()` so both enforce the same gate. Throws `RangeError`
+ * on a non-positive window or a non-integer cap below 1.
+ */
+export function assertReplayIdempotencyValues(windowMs: number, maxEntries: number): void {
+  if (!Number.isFinite(windowMs) || windowMs <= 0) {
+    throw new RangeError(`replayIdempotency.windowMs must be > 0, got ${windowMs}`);
+  }
+  if (!Number.isInteger(maxEntries) || maxEntries < 1) {
+    throw new RangeError(
+      `replayIdempotency.maxEntries must be an integer >= 1, got ${maxEntries}`
+    );
+  }
+}
+
 /** SHA-256 hex digest of the payload bytes (string or Buffer). */
 export function sha256Hex(input: Buffer | string): string {
   return createHash("sha256").update(input).digest("hex");
@@ -78,8 +119,11 @@ export function sha256Hex(input: Buffer | string): string {
  * (`maxEntries`).
  */
 export class ReplayIdempotencyGuard {
-  private readonly windowMs: number;
-  private readonly maxEntries: number;
+  // WR-441: deliberately *not* readonly — `retune()` replaces the
+  // live tuning at runtime; `deliveredAtMs` / `evict` already read
+  // these fields, so no other method changes.
+  private windowMs: number;
+  private maxEntries: number;
   private readonly now: () => number;
   /**
    * Composite key `${endpoint}\n${sha256Hex(payload)}` -> delivered-at
@@ -91,18 +135,63 @@ export class ReplayIdempotencyGuard {
 
   constructor(opts: ReplayIdempotencyOptions = {}) {
     const windowMs = opts.windowMs ?? DEFAULT_REPLAY_IDEMPOTENCY_WINDOW_MS;
-    if (!Number.isFinite(windowMs) || windowMs <= 0) {
-      throw new RangeError(`replayIdempotency.windowMs must be > 0, got ${opts.windowMs}`);
-    }
     const maxEntries = opts.maxEntries ?? DEFAULT_REPLAY_IDEMPOTENCY_MAX_ENTRIES;
-    if (!Number.isInteger(maxEntries) || maxEntries < 1) {
-      throw new RangeError(
-        `replayIdempotency.maxEntries must be an integer >= 1, got ${opts.maxEntries}`
-      );
-    }
+    assertReplayIdempotencyValues(windowMs, maxEntries);
     this.windowMs = windowMs;
     this.maxEntries = maxEntries;
     this.now = opts.now ?? Date.now;
+  }
+
+  /** The live tuning (WR-441). */
+  current(): ReplayIdempotencyConfig {
+    return { windowMs: this.windowMs, maxEntries: this.maxEntries };
+  }
+
+  /**
+   * WR-441: retune the guard in place (partial — omitted fields keep
+   * their live values). An empty or non-object patch throws
+   * `RangeError`, as does an illegal value, and the live values and
+   * the index are left completely intact (validate-then-apply: the
+   * merged values are checked before anything moves). A patch
+   * identical to the live values is a no-op returning the live config.
+   *
+   * The window is a read-time judgement, not a record TTL: widening
+   * it revives records that expired under the old window but were
+   * never evicted (eviction only runs on insert), so the next replay
+   * decision suppresses those pairs again; narrowing it drops old
+   * records from suppression at once. Lowering `maxEntries` evicts
+   * the oldest records immediately (a tightened cap takes effect at
+   * once, not at the next insert); raising it never restores records
+   * already evicted. Replays already decided (suppressed or replayed)
+   * are never revisited — only later replay decisions see the new
+   * tuning.
+   */
+  retune(patch: ReplayIdempotencyRevision): ReplayIdempotencyConfig {
+    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new RangeError(
+        `replayIdempotency revision must be an object, got ${JSON.stringify(patch)}`
+      );
+    }
+    const hasWindow = patch.windowMs !== undefined;
+    const hasEntries = patch.maxEntries !== undefined;
+    if (!hasWindow && !hasEntries) {
+      throw new RangeError(
+        "replayIdempotency revision must set at least one of windowMs / maxEntries"
+      );
+    }
+    const nextWindow = patch.windowMs ?? this.windowMs;
+    const nextEntries = patch.maxEntries ?? this.maxEntries;
+    assertReplayIdempotencyValues(nextWindow, nextEntries);
+    if (nextWindow === this.windowMs && nextEntries === this.maxEntries) {
+      return this.current();
+    }
+    this.windowMs = nextWindow;
+    this.maxEntries = nextEntries;
+    // A lowered cap evicts the oldest records at once; a widened
+    // window keeps not-yet-evicted records (evict only drops records
+    // older than the *new* cutoff).
+    this.evict(this.now());
+    return this.current();
   }
 
   /**

@@ -61,7 +61,10 @@ import {
 } from "./slowstart.ts";
 import {
   ReplayIdempotencyGuard,
+  assertReplayIdempotencyValues,
+  type ReplayIdempotencyConfig,
   type ReplayIdempotencyOptions,
+  type ReplayIdempotencyRevision,
   type ReplayIdempotencyStats,
 } from "./replay-idempotency.ts";
 import {
@@ -603,7 +606,7 @@ export { DownstreamProber } from "./downstream-probe.ts";
 export type { EndpointDependencyOptions } from "./endpoint-dependencies.ts";
 export { EndpointDependencyGraph } from "./endpoint-dependencies.ts";
 export type { SlowStartConfig, SlowStartOptions, SlowStartEndpointStats, SlowStartRevision };
-export type { ReplayIdempotencyOptions, ReplayIdempotencyStats };
+export type { ReplayIdempotencyConfig, ReplayIdempotencyOptions, ReplayIdempotencyRevision, ReplayIdempotencyStats };
 export type {
   BurnRateAlertInfo,
   ErrorBudgetBurnAuditEvent,
@@ -2171,8 +2174,9 @@ export interface RetryQueueOptions {
    * repeating the business action (the classic lost-response payment
    * callback). An explicit `force` replays anyway. The index is
    * in-memory and bounded (`maxEntries` / `windowMs`); a restart clears
-   * it, so the guard degrades to plain replay after a crash. Disabled
-   * by default.
+   * it, so the guard degrades to plain replay after a crash. The two
+   * tunables are live-revisable via `reviseReplayIdempotency` (WR-441).
+   * Disabled by default.
    */
   replayIdempotency?: ReplayIdempotencyOptions;
   /**
@@ -4414,8 +4418,11 @@ export class RetryQueue {
   /**
    * WR-149: per-tenant replay-idempotency guards, keyed by tenant
    * instance key; `undefined` options mean the feature is off.
+   * WR-441: live-revisable — `reviseReplayIdempotency` replaces this
+   * with the merged options so tenants born later start from the
+   * revised values.
    */
-  private readonly replayIdempotencyOpts?: ReplayIdempotencyOptions;
+  private replayIdempotencyOpts?: ReplayIdempotencyOptions;
   private readonly replayIdempotencyGuards = new Map<string, ReplayIdempotencyGuard>();
   /** WR-149: replay-idempotency guard decision hooks (audited by the server). */
   // WR-368: deliberately *not* readonly — `reviseReplayCallbacks`
@@ -13806,6 +13813,79 @@ export class RetryQueue {
     if (nextSkipped === this.onReplaySkipped && nextForced === this.onReplayForced) return;
     this.onReplaySkipped = nextSkipped;
     this.onReplayForced = nextForced;
+  }
+
+  /**
+   * WR-441: revise the live replay-idempotency guard tuning (partial
+   * — omitted fields keep their live values). Widening `windowMs`
+   * revives delivered records that expired under the old window but
+   * were never evicted, so the next replay of those pairs is
+   * suppressed again; narrowing it drops old records from suppression
+   * at once; lowering `maxEntries` evicts the oldest records
+   * immediately; raising it never restores records already evicted.
+   * An illegal patch throws `RangeError` and the live values and the
+   * index are untouched; an empty patch is a `RangeError`; revising
+   * to the live values is a no-op. Throws `Error` when replay
+   * idempotency was never configured — enabling it needs a restart.
+   * The one config is shared by all tenants: every live per-tenant
+   * guard is retuned in place, and tenants born later start from the
+   * revised values. Returns the live config. Replays already decided
+   * (suppressed or replayed) are never revisited — only later replay
+   * decisions see the new tuning. The queue itself holds no audit log
+   * — the server audits a real revision as
+   * `replay_idempotency_revised`.
+   */
+  reviseReplayIdempotency(patch: ReplayIdempotencyRevision): ReplayIdempotencyConfig {
+    if (this.replayIdempotencyOpts === undefined) {
+      throw new Error(
+        "reviseReplayIdempotency: replay idempotency is not configured — enabling it requires a restart"
+      );
+    }
+    if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+      throw new RangeError(
+        "reviseReplayIdempotency: patch must be an object with at least one of windowMs / maxEntries"
+      );
+    }
+    const hasWindow = patch.windowMs !== undefined;
+    const hasEntries = patch.maxEntries !== undefined;
+    if (!hasWindow && !hasEntries) {
+      throw new RangeError(
+        "reviseReplayIdempotency: patch must set at least one of windowMs / maxEntries"
+      );
+    }
+    // Validate-then-apply across every live per-tenant guard: an
+    // illegal patch must leave all of them untouched, so the merged
+    // values are checked against each guard's own live values before
+    // any retune runs.
+    for (const guard of this.replayIdempotencyGuards.values()) {
+      const live = guard.current();
+      assertReplayIdempotencyValues(
+        patch.windowMs ?? live.windowMs,
+        patch.maxEntries ?? live.maxEntries
+      );
+    }
+    // The default guard always exists once the feature is on (created
+    // eagerly at construction); retune it first so the returned config
+    // is the live one.
+    const primary = this.replayIdempotencyFor(undefined)!;
+    const next = primary.retune(patch);
+    for (const guard of this.replayIdempotencyGuards.values()) {
+      if (guard !== primary) guard.retune(patch);
+    }
+    // Tenants born later start from the revised values.
+    this.replayIdempotencyOpts = { ...this.replayIdempotencyOpts, ...patch };
+    return next;
+  }
+
+  /**
+   * WR-441: live replay-idempotency guard tuning — the suppression
+   * window and the index cap shared by all tenants. `undefined` when
+   * the guard was never configured. Reads the live values, so a
+   * runtime revision is visible immediately.
+   */
+  getReplayIdempotencyConfig(): ReplayIdempotencyConfig | undefined {
+    if (this.replayIdempotencyOpts === undefined) return undefined;
+    return this.replayIdempotencyFor(undefined)!.current();
   }
 
   /**

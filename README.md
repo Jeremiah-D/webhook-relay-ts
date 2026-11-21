@@ -13713,6 +13713,26 @@ const queue = new RetryQueue({
   family for the endpoint pause/resume hooks; WR-365 for the
   circuit-breaker state-change hook; WR-366 for the failover-switch
   hook.
+- **Live window/cap revision (WR-441)** — `relay.reviseReplayIdempotency({ windowMs, maxEntries })`
+  / `queue.reviseReplayIdempotency(patch)` retunes the guard's
+  suppression window and index cap at runtime, no restart: the patch
+  is partial, an omitted field keeps its live value, and the one
+  config is shared by all tenants (every live guard retunes in place
+  and tenants born later start from the revised values). Widening the
+  window revives delivered records that expired under the old window
+  but were never evicted, so the next replay of those pairs is
+  suppressed again; narrowing it drops old records from suppression
+  at once; lowering `maxEntries` evicts the oldest records
+  immediately. An empty or non-object patch throws `RangeError`, as
+  does an illegal value, and the live values and the index are
+  untouched; a patch identical to the live values is a silent no-op.
+  A real revision is audited as `replay_idempotency_revised` with
+  `previous` / `current` (plain numbers, no payloads). Revising when
+  replay idempotency was never configured throws `Error` (enabling it
+  needs a restart). Replays already decided (suppressed or replayed)
+  are never revisited — only later replay decisions see the new
+  tuning. `getReplayIdempotencyConfig()` reads the live values
+  (`undefined` when unconfigured).
 - **Observability** — `getReplayIdempotencyStats()` exposes each
   tenant's indexed pair count and oldest record (activity-gated; absent
   rows never delivered anything).
