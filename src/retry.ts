@@ -4711,8 +4711,8 @@ export class RetryQueue {
   private readonly deliveryWindowStats = new Map<string, Map<string, number>>();
   /** WR-127: per-(tenant, endpoint) in-window park counts. */
   private readonly maintenanceWindowStats = new Map<string, Map<string, number>>();
-  /** WR-76: per-endpoint delivery deadline in ms (exact logical `targetUrl` match); undefined when disabled. WR-341: live-revisable — `reviseDeliveryDeadline` clears and refills this map in place, so the field stays readonly. */
-  private readonly deliveryDeadlines?: Map<string, number>;
+  /** WR-76: per-endpoint delivery deadline in ms (exact logical `targetUrl` match); undefined when disabled. WR-341: live-revisable — `reviseDeliveryDeadline` clears and refills this map in place on a configured queue. WR-444: deliberately *not* readonly — `reviseDeliveryDeadline` installs a fresh map here when the feature is enabled at runtime (it was undefined before, so there is nothing to refill in place). */
+  private deliveryDeadlines?: Map<string, number>;
   /** WR-76: clock for the deadline; defaults to `Date.now`. Injectable for deterministic tests. */
   private readonly deadlineNow: () => number;
   /**
@@ -11674,21 +11674,78 @@ export class RetryQueue {
    * (per-endpoint finite > 0, `assertValidDeadlineBudgetOptions` for
    * the two knobs); an illegal patch throws `RangeError` and the live
    * values are untouched. An empty patch is a `RangeError`; revising
-   * to the live values is a no-op. Throws `Error` when delivery
-   * deadlines were never configured — enabling them needs a restart.
+   * to the live values is a no-op.
+   *
+   * WR-444: when deadlines were never configured, the same call
+   * *enables* them instead of throwing: the patch must carry at least
+   * one deadline (a knobs-only patch cannot enable — with no deadline
+   * there is no SLO to enforce, and construction-time `undefined`
+   * means off), the deadlines are validated with the construction-time
+   * rules, the knobs fall back to the construction defaults
+   * (`propagateBudget` true, `minAttemptBudgetMs` 0), and a fresh map
+   * is installed. The clock stays the construction clock (`Date.now`
+   * by default when deadlines were never configured), so an item
+   * admitted before the enable keeps its elapsed from admission — the
+   * enable never resets it — and a budget already stamped on an
+   * in-flight wire copy is unaffected. No persistence: a restart
+   * returns to unconfigured — the enable is live-only. Returns the
+   * live config.
+   *
    * A new deadline governs the next dispatch (elapsed still counts
    * from queue admission — lengthening can revive a delivery about to
-   * expire, shortening can expire it at the next dispatch); a budget
-   * already stamped on an in-flight wire copy is unaffected. Deleting
+   * expire, shortening can expire it at the next dispatch). Deleting
    * the last endpoint leaves an empty map — the feature stays
    * configured. Returns the live config.
    */
   reviseDeliveryDeadline(patch: DeliveryDeadlineRevision): DeliveryDeadlineConfig {
     if (this.deliveryDeadlines === undefined) {
-      throw new Error(
-        "reviseDeliveryDeadline: delivery deadlines are not configured — enabling it requires a restart: " +
-          "the per-endpoint deadlines are created at startup and a running relay cannot start enforcing SLOs without them"
-      );
+      // WR-444: enable — validate with the construction-time rules,
+      // then install a fresh map. Validation throws before anything
+      // is assigned, so an illegal patch leaves the queue unconfigured.
+      if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+        throw new RangeError(`deliveryDeadline revision must be an object, got ${JSON.stringify(patch)}`);
+      }
+      if (
+        patch.deadlines === undefined ||
+        patch.deadlines === null ||
+        typeof patch.deadlines !== "object" ||
+        Array.isArray(patch.deadlines) ||
+        Object.keys(patch.deadlines).length === 0
+      ) {
+        throw new RangeError(
+          "deliveryDeadline revision must set at least one deadline to enable delivery deadlines"
+        );
+      }
+      const deadlines = new Map<string, number>();
+      for (const [endpoint, ms] of Object.entries(patch.deadlines)) {
+        if (endpoint.length === 0) {
+          throw new RangeError("deliveryDeadline.deadlines keys must be non-empty endpoint URLs");
+        }
+        if (ms === null) {
+          // Construction rejects a null value outright (only numbers
+          // are valid there); on enable there is nothing to delete,
+          // so a null entry is equally invalid.
+          throw new RangeError(
+            `deliveryDeadline.deadlines[${JSON.stringify(endpoint)}] must be a finite number > 0, got null`
+          );
+        }
+        if (typeof ms !== "number" || !Number.isFinite(ms) || ms <= 0) {
+          throw new RangeError(
+            `deliveryDeadline.deadlines[${JSON.stringify(endpoint)}] must be a finite number > 0, got ${String(ms)}`
+          );
+        }
+        deadlines.set(endpoint, ms);
+      }
+      const nextPropagateBudget = patch.propagateBudget ?? true;
+      const nextMinAttemptBudgetMs = patch.minAttemptBudgetMs ?? DEFAULT_MIN_ATTEMPT_BUDGET_MS;
+      assertValidDeadlineBudgetOptions({
+        propagateBudget: nextPropagateBudget,
+        minAttemptBudgetMs: nextMinAttemptBudgetMs,
+      });
+      this.deliveryDeadlines = deadlines;
+      this.deadlinePropagateBudget = nextPropagateBudget;
+      this.deadlineMinAttemptBudgetMs = nextMinAttemptBudgetMs;
+      return this.getDeliveryDeadlineConfig()!;
     }
     if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
       throw new RangeError(`deliveryDeadline revision must be an object, got ${JSON.stringify(patch)}`);
@@ -13582,7 +13639,8 @@ export class RetryQueue {
    * callback is untouched; replacing with the same reference (or
    * clearing when already unset) is a no-op. Throws `Error` when no
    * delivery deadline is configured — expirations can only happen with
-   * the table in place, so enabling observation needs a restart. Under
+   * the table in place, so enable deadlines first with
+   * `reviseDeliveryDeadline` (WR-444). Under
    * `RelayServer` the field holds the server's audit closure, so direct
    * calls here would replace the audit wrapper; server users must go
    * through `RelayServer.reviseDeliveryDeadlineExceededCallback`, which

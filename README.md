@@ -14002,8 +14002,15 @@ on an in-flight wire copy is unaffected. Deleting the last endpoint
 leaves an empty deadlines map — the feature stays configured, it does
 not switch off. An illegal patch throws `RangeError` and leaves the live
 values untouched; an empty patch is a `RangeError`; a same-value revision
-is a silent no-op. A relay started without `deliveryDeadline` cannot
-enable it at runtime — that still needs a restart. This revises the
+is a silent no-op. WR-444: a relay started without `deliveryDeadline`
+can enable it at runtime with the same call — the patch must carry at
+least one deadline (a knobs-only patch cannot enable, since with no
+deadline there is no SLO to enforce), omitted knobs take the
+construction defaults (`propagateBudget` `true`, `minAttemptBudgetMs`
+`0`), and the enable is audited as `delivery_deadline_revised` with
+`previous: null`; an item admitted before the enable keeps its elapsed
+from admission, and the enable is live-only (a restart returns to
+unconfigured). This revises the
 deadline *configuration*; WR-76 is the deadline mechanism itself and
 WR-99 the budget propagation it tunes.
 

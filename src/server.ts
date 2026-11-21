@@ -6868,8 +6868,12 @@ export interface RelayServer extends Server {
    * same-value revision is a no-op with no audit event. A real revision
    * is audited as `delivery_deadline_revised` with `previous` /
    * `current` (the construction values as first `previous`), and returns
-   * the live config. Always set; throws `Error` when delivery deadlines
-   * were never configured — enabling them needs a restart. This revises
+   * the live config. WR-444: when delivery deadlines were never
+   * configured, the same call *enables* them — the patch must carry at
+   * least one deadline, the knobs fall back to the construction
+   * defaults, and the enable is audited with `previous: null`; the
+   * getter is mounted at the same time. Always set; the enable is
+   * live-only (a restart returns to unconfigured). This revises
    * the deadline configuration; WR-76 is the deadline mechanism itself,
    * WR-99 the budget propagation it tunes, and WR-143 the per-attempt
    * phase budgets inside one attempt.
@@ -6878,7 +6882,9 @@ export interface RelayServer extends Server {
   /**
    * WR-341: live delivery-deadline config — the per-endpoint deadlines
    * as a snapshot record plus the two WR-99 knobs. Only set when
-   * `deliveryDeadline` was configured; `undefined` otherwise.
+   * `deliveryDeadline` was configured; `undefined` otherwise. WR-444
+   * mounts it from the enable path when deadlines are enabled at
+   * runtime.
    */
   getDeliveryDeadlineConfig?: () => DeliveryDeadlineConfig | undefined;
   /**
@@ -9516,7 +9522,8 @@ export interface RelayServer extends Server {
    * is audited as `delivery_deadline_exceeded_callback_revised` with
    * `previous` / `current` recording only 'set' / 'cleared' presence,
    * never a function body. Always set; throws `Error` when no delivery
-   * deadline was configured — enabling it needs a restart. The new
+   * deadline was configured — enable deadlines first with
+   * `reviseDeliveryDeadline` (WR-444). The new
    * callback takes effect from the next expiry; expirations already
    * reported are never re-delivered, and the deadline values, stamped
    * budgets, and expire-and-dead-letter path are untouched — this only
@@ -19638,16 +19645,32 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   }
 
   // WR-341: delivery-deadline config runtime revision. The method is
-  // always set (like reviseWeightTuning above); with deadlines
-  // unconfigured the queue throws Error — enabling them needs a restart.
-  // A real revision is audited as `delivery_deadline_revised` with the
-  // previous and current config (the construction values as first
-  // `previous`); an empty or same-value patch is a silent no-op.
+  // always set (like reviseWeightTuning above). WR-444: with deadlines
+  // unconfigured the same call *enables* them — the queue installs a
+  // fresh map (an empty, knobs-only, or illegal patch still throws
+  // RangeError there, leaving the server unconfigured), the getter is
+  // mounted at the same time, and the enable is audited as
+  // `delivery_deadline_revised` with `previous: null`. A real revision
+  // is audited as `delivery_deadline_revised` with the previous and
+  // current config (the construction values as first `previous`); an
+  // empty or same-value patch is a silent no-op.
   server.reviseDeliveryDeadline = (patch: DeliveryDeadlineRevision): DeliveryDeadlineConfig => {
     const prev = queue.getDeliveryDeadlineConfig();
     if (prev === undefined) {
-      // Delegates to the queue for the canonical "must restart" Error.
-      return queue.reviseDeliveryDeadline(patch);
+      // WR-444: enable — the queue installs the fresh map (an empty or
+      // illegal patch still throws RangeError there, leaving the server
+      // unconfigured). Mount the getter and audit the enable with
+      // `previous: null`. No callback wiring is needed here: the server
+      // already wires `onDeliveryDeadlineExceeded` at construction, so
+      // expiries after the enable are audited like any other.
+      const next = queue.reviseDeliveryDeadline(patch);
+      server.getDeliveryDeadlineConfig = (): DeliveryDeadlineConfig => queue.getDeliveryDeadlineConfig()!;
+      opts.auditLog.append({
+        event: "delivery_deadline_revised",
+        previous: null,
+        current: next,
+      });
+      return next;
     }
     // Validate-then-apply inside reviseDeliveryDeadline: an illegal patch
     // throws RangeError and the live values are left completely intact.
@@ -19671,7 +19694,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   };
 
   // WR-341: live delivery-deadline config. Only set when
-  // `retry.deliveryDeadline` was configured.
+  // `retry.deliveryDeadline` was configured — WR-444 mounts it from
+  // the enable path when deadlines are enabled at runtime.
   if (queue.getDeliveryDeadlineConfig() !== undefined) {
     server.getDeliveryDeadlineConfig = (): DeliveryDeadlineConfig => queue.getDeliveryDeadlineConfig()!;
   }

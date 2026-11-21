@@ -278,18 +278,27 @@ describe("RetryQueue.reviseDeliveryDeadline (WR-341)", () => {
     }
   });
 
-  it("an unconfigured queue throws the must-restart Error and the getter returns undefined", () => {
+  it("an unconfigured queue enables on a deadlines patch; a knobs-only patch cannot enable", () => {
     const q = new RetryQueue({});
     assert.equal(q.getDeliveryDeadlineConfig(), undefined);
+    // A knobs-only patch cannot enable — with no deadline there is no
+    // SLO to enforce — and leaves the queue unconfigured.
     assert.throws(
       () => q.reviseDeliveryDeadline({ propagateBudget: false }),
-      /not configured — enabling it requires a restart/
-    );
-    assert.throws(
-      () => q.reviseDeliveryDeadline({ deadlines: { [URL]: 100 } }),
-      /not configured — enabling it requires a restart/
+      /must set at least one deadline to enable delivery deadlines/
     );
     assert.equal(q.getDeliveryDeadlineConfig(), undefined);
+    // A deadlines patch enables with the construction knob defaults.
+    assert.deepEqual(q.reviseDeliveryDeadline({ deadlines: { [URL]: 100 } }), {
+      deadlines: { [URL]: 100 },
+      propagateBudget: true,
+      minAttemptBudgetMs: 0,
+    });
+    assert.deepEqual(q.getDeliveryDeadlineConfig(), {
+      deadlines: { [URL]: 100 },
+      propagateBudget: true,
+      minAttemptBudgetMs: 0,
+    });
   });
 
   it("getDeliveryDeadlineConfig returns a snapshot, not the live map", () => {
@@ -514,13 +523,33 @@ describe("RelayServer delivery-deadline revision (WR-341)", () => {
     });
   });
 
-  it("unconfigured relay: revise throws the must-restart Error and the getter is not mounted", async () => {
-    const { relay } = makeRelay();
+  it("unconfigured relay: a knobs-only patch cannot enable, a deadlines patch enables and audits previous null", async () => {
+    const { relay, audit } = makeRelay();
     await listen(relay);
     assert.equal(relay.getDeliveryDeadlineConfig, undefined);
     assert.throws(
       () => relay.reviseDeliveryDeadline!({ propagateBudget: false }),
-      /not configured — enabling it requires a restart/
+      /must set at least one deadline to enable delivery deadlines/
     );
+    assert.equal(relay.getDeliveryDeadlineConfig, undefined);
+    assert.equal(eventsOf(audit, "delivery_deadline_revised").length, 0);
+    assert.deepEqual(relay.reviseDeliveryDeadline!({ deadlines: { [URL_A]: 250 } }), {
+      deadlines: { [URL_A]: 250 },
+      propagateBudget: true,
+      minAttemptBudgetMs: 0,
+    });
+    assert.deepEqual(relay.getDeliveryDeadlineConfig!(), {
+      deadlines: { [URL_A]: 250 },
+      propagateBudget: true,
+      minAttemptBudgetMs: 0,
+    });
+    const revised = eventsOf(audit, "delivery_deadline_revised");
+    assert.equal(revised.length, 1);
+    assert.equal(revised[0].previous, null);
+    assert.deepEqual(revised[0].current, {
+      deadlines: { [URL_A]: 250 },
+      propagateBudget: true,
+      minAttemptBudgetMs: 0,
+    });
   });
 });
