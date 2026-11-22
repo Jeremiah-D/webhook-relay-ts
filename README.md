@@ -13403,8 +13403,12 @@ size. Urgent items skip batching entirely (the fast lane must not wait).
 one immediate attempt before draining in-flight deliveries. The merge
 config is revisable live via `setBatchConfig({ windowMs?, maxBatchSize? })`
 (`getBatchConfig()` reads the live values, returning `undefined` when
-batching was never configured; `setBatchConfig` throws a must-restart
-`Error` in that case): a window change only affects the next buffer — a
+batching was never configured; calling `setBatchConfig` on an
+unconfigured relay *enables* batching instead — missing fields resolve
+to the construction defaults, 250 ms / 50 items — and the enable is
+audited as `batch_config_revised` with `previous: null`, while an empty
+or illegal patch throws `RangeError` and leaves the relay
+unconfigured): a window change only affects the next buffer — a
 timer already armed runs out on the old window — while tightening
 `maxBatchSize` flushes any buffer already over the new cap at once
 (loosening never flushes early). An illegal patch throws `RangeError` and

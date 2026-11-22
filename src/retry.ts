@@ -4846,8 +4846,12 @@ export class RetryQueue {
    * exhausted, per tenant key (`""` = the default tenant-less tenant).
    */
   private readonly tenantRetryBudgetDepletedByTenant = new Map<string, number>();
-  private readonly batcher?: BatchCollector;
-  private readonly batchResolved?: ResolvedBatchOptions;
+  // WR-450: deliberately *not* readonly — `setBatchConfig` installs a
+  // fresh collector here when batching is enabled at runtime (it was
+  // undefined before, so there is nothing to retune in place).
+  private batcher?: BatchCollector;
+  // WR-450: deliberately *not* readonly — same enable path as `batcher`.
+  private batchResolved?: ResolvedBatchOptions;
   // WR-400: deliberately *not* readonly — `reviseBatchCallback` swaps
   // this field live (see `reviseDeadLetterPurgedCallback`, WR-397).
   // It holds the *caller's* callback; `flushBatch` reads this field
@@ -6767,16 +6771,46 @@ export class RetryQueue {
    * buffer already over the new cap at once (see
    * `BatchCollector.retune`). An illegal patch throws `RangeError` and
    * the live config is untouched; revising to the current values is a
-   * no-op. Throws `Error` when batching was never configured —
-   * enabling it needs a restart. Returns the live values after the
-   * revision.
+   * no-op. Returns the live values after the revision.
+   *
+   * WR-450: when batching was never configured, the same call *enables*
+   * it instead of throwing: the patch is resolved against the
+   * construction defaults (250 ms / 50 items) through the same resolver
+   * as construction, and a fresh empty collector is built — items
+   * enqueued before the enable were already delivered directly and are
+   * never retroactively batched, and only items enqueued after the
+   * enable (non-urgent) are merged. An empty patch is a `RangeError`
+   * (there is nothing to enable with) and an illegal patch throws
+   * `RangeError` with the queue left unconfigured. The collector uses
+   * the construction flush callback and the default envelope; the clock
+   * defaults to `Date.now` and the timers are the queue's injected
+   * ones, exactly as at construction. No persistence: a restart returns
+   * to unconfigured — the enable is live-only.
    */
   setBatchConfig(patch: BatchConfigRevision): { windowMs: number; maxBatchSize: number } {
     if (this.batcher === undefined) {
-      throw new Error(
-        "setBatchConfig: batching is not configured — enabling it requires a restart: " +
-          "the collector is created at startup and a running relay cannot start batching without one"
+      // WR-450: enable — validate with the construction-time rules,
+      // then install a fresh collector. Validation throws before
+      // anything is assigned, so an illegal patch leaves the queue
+      // unconfigured. `retune`'s own guards are mirrored here
+      // (non-object and empty patches are `RangeError`) because the
+      // enable path cannot delegate to it — there is no collector to
+      // retune yet.
+      if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+        throw new RangeError(`batchConfig revision must be an object, got ${JSON.stringify(patch)}`);
+      }
+      if (patch.windowMs === undefined && patch.maxBatchSize === undefined) {
+        throw new RangeError("batchConfig revision must set windowMs or maxBatchSize");
+      }
+      const resolved = resolveBatchOptions(patch, {
+        setTimer: this.setTimer,
+        clearTimer: this.clearTimer,
+      });
+      this.batchResolved = resolved;
+      this.batcher = new BatchCollector(resolved, (endpoint, items) =>
+        this.flushBatch(endpoint, items)
       );
+      return this.batcher.current();
     }
     return this.batcher.retune(patch);
   }

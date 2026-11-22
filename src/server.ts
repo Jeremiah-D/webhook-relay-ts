@@ -6353,9 +6353,12 @@ export interface RelayServer extends Server {
    * live values are untouched; an empty patch (or values equal to the
    * live ones) is a no-op with no audit event. A real revision is
    * audited as `batch_config_revised` with `previous` / `current`
-   * `{ windowMs, maxBatchSize }`, and returns the live values. Always
-   * set; throws `Error` when batching was never configured — enabling
-   * it needs a restart.
+   * `{ windowMs, maxBatchSize }`, and returns the live values.
+   * WR-450: with batching never configured the same call *enables* it
+   * instead of throwing — missing fields resolve to the construction
+   * defaults (250 ms / 50 items) and the enable is audited with
+   * `previous: null`; an empty or illegal patch throws `RangeError`
+   * and leaves the relay unconfigured. Always set.
    */
   setBatchConfig?: (patch: BatchConfigRevision) => { windowMs: number; maxBatchSize: number };
   /**
@@ -18941,16 +18944,27 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   };
 
   // WR-333: batch-merge config runtime revision. The method is always
-  // set (like setDedupWindow above); with batching unconfigured the
-  // queue throws Error — enabling batching needs a restart. A real
-  // revision is audited as `batch_config_revised` with the previous and
+  // set (like setDedupWindow above); WR-450: with batching unconfigured
+  // the same call *enables* it — the queue installs a fresh collector
+  // (an empty or illegal patch still throws RangeError there, leaving
+  // the server unconfigured) and the enable is audited as
+  // `batch_config_revised` with `previous: null`. `getBatchConfig` is
+  // already always set, so no getter needs mounting. A real revision
+  // is audited as `batch_config_revised` with the previous and
   // current window / cap (the construction values as first `previous`);
   // an empty or same-value patch is a silent no-op.
   server.setBatchConfig = (patch: BatchConfigRevision): { windowMs: number; maxBatchSize: number } => {
     const prev = queue.getBatchConfig();
     if (prev === undefined) {
-      // Delegates to the queue for the canonical "must restart" Error.
-      return queue.setBatchConfig(patch);
+      // WR-450: enable — the queue installs the fresh collector and
+      // resolves missing fields to the construction defaults.
+      const next = queue.setBatchConfig(patch);
+      opts.auditLog.append({
+        event: "batch_config_revised",
+        previous: null,
+        current: next,
+      });
+      return next;
     }
     const previous = { windowMs: prev.windowMs, maxBatchSize: prev.maxBatchSize };
     // Validate-then-apply inside retune: an illegal patch throws

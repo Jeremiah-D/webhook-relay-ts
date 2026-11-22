@@ -239,13 +239,13 @@ describe("batch config live revision (WR-333)", () => {
     q.stop();
   });
 
-  it("an unconfigured queue throws must-restart on set and returns undefined on get", () => {
+  it("an unconfigured queue enables on first revision; the getter returns the live values", () => {
     const q = new RetryQueue();
-    assert.throws(() => q.setBatchConfig({ windowMs: 100 }), {
-      name: "Error",
-      message: /setBatchConfig: batching is not configured — enabling it requires a restart/,
-    });
     assert.equal(q.getBatchConfig(), undefined);
+    // WR-450: the same call that used to throw must-restart now
+    // enables batching, resolving missing fields to the defaults.
+    assert.deepEqual(q.setBatchConfig({ windowMs: 100 }), { windowMs: 100, maxBatchSize: 50 });
+    assert.deepEqual(q.getBatchConfig(), { windowMs: 100, maxBatchSize: 50 });
     q.stop();
   });
 });
@@ -348,13 +348,18 @@ describe("server setBatchConfig / getBatchConfig (WR-333)", () => {
     assert.equal(eventsOf(auditLog, "batch_config_revised").length, 0);
   });
 
-  it("throws must-restart on set and returns undefined on get when batching is not configured", () => {
-    const { relay } = makeServer();
-    assert.throws(() => relay.setBatchConfig!({ windowMs: 100 }), {
-      name: "Error",
-      message: /setBatchConfig: batching is not configured — enabling it requires a restart/,
-    });
+  it("an unconfigured server enables on first revision and audits previous null", () => {
+    const { relay, auditLog } = makeServer();
     assert.equal(relay.getBatchConfig!(), undefined);
+    // WR-450: the same call that used to throw must-restart now
+    // enables batching, resolving missing fields to the defaults.
+    const next = relay.setBatchConfig!({ windowMs: 100 });
+    assert.deepEqual(next, { windowMs: 100, maxBatchSize: 50 });
+    assert.deepEqual(relay.getBatchConfig!(), { windowMs: 100, maxBatchSize: 50 });
+    const revised = eventsOf(auditLog, "batch_config_revised");
+    assert.equal(revised.length, 1);
+    assert.equal(revised[0].previous, null);
+    assert.deepEqual(revised[0].current, { windowMs: 100, maxBatchSize: 50 });
   });
 
   it("tightening maxBatchSize flushes a buffered batch end to end", async () => {
