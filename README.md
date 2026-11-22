@@ -13920,9 +13920,15 @@ rate. Entries already replayed are unaffected, the cumulative
 `throttled` counter is never reset, and the single-id
 `replayDeadLetter(id)` escape hatch stays ungated. Revising to the live
 value is a silent no-op; a real revision audits
-`replay_egress_revised` with `previous` / `current`. Enabling the gate
-itself still needs a restart: on a relay where it was never configured,
-revising throws and the getter is not mounted. This revises the
+`replay_egress_revised` with `previous` / `current`. On a relay where
+the gate was never configured, the same call *enables* it instead of
+throwing (WR-446): the patch must set `replaysPerSecond` (an empty or
+illegal patch is a `RangeError` and leaves the relay unconfigured), a
+fresh gate is installed, the getter is mounted at the same time, and
+the enable audits `replay_egress_revised` with `previous: null`.
+Replays admitted before the enable stay admitted; the gate only
+governs replays after it. The enable is live-only — a restart returns
+to unconfigured. This revises the
 re-queue admission rate only — the WR-31 auto-replay round cadence is
 WR-344, a separate control on the same replay path.
 

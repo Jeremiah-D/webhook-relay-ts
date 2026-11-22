@@ -7273,9 +7273,13 @@ export interface RelayServer extends Server {
    * revision is a silent no-op with no audit event. A real revision is
    * audited as `replay_egress_revised` with `previous` / `current`
    * (the construction values as first `previous` — the default 10 when
-   * unset), and returns the live config. Always set; throws `Error`
-   * when replay egress was never configured — enabling it needs a
-   * restart. This revises the re-queue admission rate; WR-344 revises
+   * unset), and returns the live config. Always set. WR-446: when
+   * replay egress was never configured, the same call *enables* it
+   * instead of throwing — the queue installs a fresh gate (an empty or
+   * illegal patch still throws `RangeError` there, leaving the server
+   * unconfigured), the getter is mounted at the same time, and the
+   * enable is audited as `replay_egress_revised` with `previous: null`.
+   * This revises the re-queue admission rate; WR-344 revises
    * the auto-replay round cadence, WR-68 is the gate mechanism itself,
    * and WR-31 the auto-replayer that shares it.
    */
@@ -7283,7 +7287,8 @@ export interface RelayServer extends Server {
   /**
    * WR-345: live replay egress rate — the single shared per-second
    * budget. Only set when `replayEgress` was configured; `undefined`
-   * otherwise.
+   * otherwise. WR-446 mounts it from the enable path when replay
+   * egress is enabled at runtime.
    */
   getReplayEgressConfig?: () => ReplayEgressConfig | undefined;
   /**
@@ -20476,17 +20481,33 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     defaultSender?.egressResidencyGate?.allowedCountries(tenant);
 
   // WR-345: replay egress rate runtime revision. The method is always
-  // set (like reviseAdaptiveBackoff above); with the gate unconfigured
-  // the queue throws Error — enabling it needs a restart. A real
-  // revision is audited as `replay_egress_revised` with the previous
-  // and current config (the construction values as first `previous` —
-  // the default 10 when unset); an empty or same-value patch is a
-  // silent no-op.
+  // set (like reviseAdaptiveBackoff above). WR-446: with the gate
+  // unconfigured the same call *enables* it — the queue installs a
+  // fresh gate (an empty or illegal patch still throws RangeError
+  // there, leaving the server unconfigured), the getter is mounted at
+  // the same time, and the enable is audited as
+  // `replay_egress_revised` with `previous: null`. A real revision is
+  // audited as `replay_egress_revised` with the previous and current
+  // config (the construction values as first `previous` — the default
+  // 10 when unset); an empty or same-value patch is a silent no-op.
+  // No callback wiring is needed here: the gate is read live inside
+  // `replayDeadLetters`, so replays after the enable are throttled
+  // like any other.
   server.reviseReplayEgress = (patch: ReplayEgressRevision): ReplayEgressConfig => {
     const prev = queue.getReplayEgressConfig();
     if (prev === undefined) {
-      // Delegates to the queue for the canonical "must restart" Error.
-      return queue.reviseReplayEgress(patch);
+      // WR-446: enable — the queue installs the fresh gate (an empty
+      // or illegal patch still throws RangeError there, leaving the
+      // server unconfigured). Mount the getter and audit the enable
+      // with `previous: null`.
+      const next = queue.reviseReplayEgress(patch);
+      server.getReplayEgressConfig = (): ReplayEgressConfig => queue.getReplayEgressConfig()!;
+      opts.auditLog.append({
+        event: "replay_egress_revised",
+        previous: null,
+        current: next,
+      });
+      return next;
     }
     // Validate-then-apply inside retune: an illegal patch throws
     // RangeError and the live values are left completely intact.
@@ -20503,7 +20524,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   };
 
   // WR-345: live replay egress rate. Only set when `replayEgress`
-  // was configured.
+  // was configured — WR-446 mounts it from the enable path when the
+  // gate is enabled at runtime.
   if (queue.getReplayEgressConfig() !== undefined) {
     server.getReplayEgressConfig = (): ReplayEgressConfig => queue.getReplayEgressConfig()!;
   }

@@ -16,9 +16,6 @@ const opToken = "replay-egress-revision-op-token";
 const URL_A = "http://localhost:9999/a";
 const EP_A = "http://a.example/hook";
 
-const MUST_RESTART =
-  "reviseReplayEgress: replay egress is not configured — enabling it requires a restart";
-
 /** Deterministic timer: `run()` executes pending callbacks immediately. */
 function manualTimer() {
   const pending: Array<{ fn: () => void; ms: number }> = [];
@@ -213,7 +210,7 @@ describe("RetryQueue.reviseReplayEgress (WR-345)", () => {
     q.stop();
   });
 
-  it("unconfigured queue throws must-restart and the getter returns undefined", () => {
+  it("unconfigured queue enables on first revise (WR-446)", () => {
     const q = new RetryQueue({
       sender: async () => {
         throw new Error("downstream 500");
@@ -224,7 +221,9 @@ describe("RetryQueue.reviseReplayEgress (WR-345)", () => {
     });
     assert.equal(q.getReplayEgressConfig(), undefined);
     assert.equal(q.getReplayEgressGate(), undefined);
-    assert.throws(() => q.reviseReplayEgress({ replaysPerSecond: 3 }), { name: "Error", message: MUST_RESTART });
+    assert.deepEqual(q.reviseReplayEgress({ replaysPerSecond: 3 }), { replaysPerSecond: 3 });
+    assert.deepEqual(q.getReplayEgressConfig(), { replaysPerSecond: 3 });
+    assert.equal(q.getReplayEgressGate()?.limit(), 3);
     q.stop();
   });
 
@@ -394,13 +393,15 @@ describe("RelayServer replay egress revision (WR-345)", () => {
     assert.deepEqual(revised[0].current, { replaysPerSecond: 4 });
   });
 
-  it("unconfigured server throws must-restart and mounts no getter", async () => {
-    const { relay } = makeRelay({});
+  it("unconfigured server enables on first revise and mounts the getter (WR-446)", async () => {
+    const { relay, audit } = makeRelay({});
     await listen(relay);
     assert.equal(relay.getReplayEgressConfig, undefined);
-    assert.throws(() => relay.reviseReplayEgress!({ replaysPerSecond: 3 }), {
-      name: "Error",
-      message: MUST_RESTART,
-    });
+    assert.deepEqual(relay.reviseReplayEgress!({ replaysPerSecond: 3 }), { replaysPerSecond: 3 });
+    assert.deepEqual(relay.getReplayEgressConfig!(), { replaysPerSecond: 3 });
+    const revised = eventsOf(audit, "replay_egress_revised");
+    assert.equal(revised.length, 1);
+    assert.equal(revised[0].previous, null);
+    assert.deepEqual(revised[0].current, { replaysPerSecond: 3 });
   });
 });

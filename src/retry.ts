@@ -4964,8 +4964,8 @@ export class RetryQueue {
   // sweeper's `onPurged` owner closure already reads this field live,
   // so no extra indirection is needed.
   private onDeadLetterPurged?: (event: DeadLetterPurgedEvent) => void;
-  /** WR-68: shared replay egress gate; undefined when not configured. */
-  private readonly replayEgress?: ReplayEgressGate;
+  /** WR-68: shared replay egress gate; undefined when not configured. WR-446: deliberately *not* readonly — `reviseReplayEgress` installs a fresh gate here when the feature is enabled at runtime (it was undefined before, so there is nothing to retune in place). */
+  private replayEgress?: ReplayEgressGate;
   /** WR-135: two-phase replay approval store; undefined when not configured. */
   private readonly replayApproval?: ReplayApprovalStore;
   /** WR-68: cumulative entries held back by the egress gate. */
@@ -7951,14 +7951,39 @@ export class RetryQueue {
    * `replayDeadLetter(id)` escape hatch stays ungated. An illegal
    * patch throws `RangeError` and the live value is untouched; an
    * empty patch is a `RangeError`; revising to the live value is a
-   * no-op. Throws `Error` when replay egress was never configured —
-   * enabling it needs a restart. Returns the live config.
+   * no-op.
+   *
+   * WR-446: when replay egress was never configured, the same call
+   * *enables* it instead of throwing: the patch must set
+   * `replaysPerSecond` (an empty patch is a `RangeError`, exactly as
+   * on the configured path — a single-knob feature has no partial
+   * patch to resolve against defaults), the rate is validated with
+   * the construction-time rules, and a fresh gate is installed. The
+   * gate starts with empty buckets — a new endpoint's first bucket
+   * still starts full at the new rate on first `take()`, exactly as
+   * at construction — and replays admitted before the enable stay
+   * admitted: the enable never retroactively throttles. The clock is
+   * `Date.now`: the feature was never configured, so no injected
+   * clock exists to reuse (WR-443 precedent). No persistence: a
+   * restart returns to unconfigured — the enable is live-only.
+   * Returns the live config.
    */
   reviseReplayEgress(patch: ReplayEgressRevision): ReplayEgressConfig {
     if (this.replayEgress === undefined) {
-      throw new Error(
-        "reviseReplayEgress: replay egress is not configured — enabling it requires a restart"
-      );
+      // WR-446: enable — validate with the construction-time rules,
+      // then install a fresh gate. Validation throws before anything
+      // is assigned, so an illegal patch leaves the queue unconfigured.
+      // `retune`'s own guards are mirrored here (non-object and empty
+      // patches are `RangeError`) because the enable path cannot
+      // delegate to it — there is no gate to retune yet.
+      if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+        throw new RangeError(`replayEgress revision must be an object, got ${JSON.stringify(patch)}`);
+      }
+      if (patch.replaysPerSecond === undefined) {
+        throw new RangeError("replayEgress revision must set replaysPerSecond");
+      }
+      this.replayEgress = new ReplayEgressGate({ replaysPerSecond: patch.replaysPerSecond });
+      return this.replayEgress.config();
     }
     return this.replayEgress.retune(patch);
   }
