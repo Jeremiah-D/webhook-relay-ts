@@ -213,14 +213,20 @@ describe("UsageMeter", () => {
 describe("usage operator surface", () => {
   const AUTH = { authorization: "Bearer op-token" };
 
-  async function waitForDelivered(port: number, tenant: string): Promise<TenantUsage[]> {
+  async function waitForDelivered(port: number, tenant: string, minDelivered = 1): Promise<TenantUsage[]> {
     const deadline = Date.now() + 5000;
     for (;;) {
       const res = await get(port, `/usage?tenant=${tenant}`, AUTH);
       assert.equal(res.status, 200);
       const rows = JSON.parse(res.text) as TenantUsage[];
-      if (rows.length > 0 && rows[0].delivered >= 1) return rows;
-      if (Date.now() > deadline) throw new Error(`timed out waiting for ${tenant} usage`);
+      // Wait for the count the caller is about to assert, not just the
+      // first delivery: under parallel CI load the second delivery can
+      // still be in flight when the first one lands, and returning early
+      // turns a slow second delivery into a spurious `1 !== 2` failure
+      // (CI run 44987676478 on 2574a93). The 5 s deadline still fails
+      // loudly if a delivery never arrives — nothing is relaxed.
+      if (rows.length > 0 && rows[0].delivered >= minDelivered) return rows;
+      if (Date.now() > deadline) throw new Error(`timed out waiting for ${minDelivered} ${tenant} deliveries`);
       await new Promise((r) => setTimeout(r, 25));
     }
   }
@@ -231,7 +237,7 @@ describe("usage operator surface", () => {
     try {
       assert.equal(await postHook(port, { "x-tenant-id": "acme" }), 202);
       assert.equal(await postHook(port, { "x-tenant-id": "acme", "x-priority": "urgent" }), 202);
-      const rows = await waitForDelivered(port, "acme");
+      const rows = await waitForDelivered(port, "acme", 2);
       assert.equal(rows.length, 1);
       const row = rows[0];
       assert.equal(row.tenant, "acme");
