@@ -8622,10 +8622,13 @@ export interface RelayServer extends Server {
    * `auto_replay_schedule_revised` with `previous` / `current` (the
    * construction values as first `previous` — the defaults
    * 60_000/10/3_600_000 when unset), and returns the live config.
-   * Always set; throws `Error` when auto replay was never configured
-   * — enabling it needs a restart. This revises the round cadence;
-   * WR-345 revises the replay-egress rate instead, and WR-31 is the
-   * scheduler mechanism itself.
+   * WR-447: with auto replay unconfigured the same call *enables* it —
+   * the queue installs a fresh scheduler (an empty or illegal patch
+   * still throws RangeError there, leaving the server unconfigured),
+   * the getter is mounted at the same time, and the enable is audited
+   * as `auto_replay_schedule_revised` with `previous: null`. This
+   * revises the round cadence; WR-345 revises the replay-egress rate
+   * instead, and WR-31 is the scheduler mechanism itself.
    */
   reviseAutoReplaySchedule: (patch: AutoReplayScheduleRevision) => AutoReplayScheduleConfig;
   /**
@@ -8642,12 +8645,12 @@ export interface RelayServer extends Server {
    * `auto_replay_audit_callback_revised` with `previous` / `current`
    * recording only 'set' / 'cleared' presence, never a function body.
    * Always set; throws `Error` when auto replay was never configured —
-   * enabling it needs a restart. The new callback takes effect from
-   * the next exhaustion stop; stops already reported are never
-   * re-delivered, and the round cadence, the counters, the `stopped`
-   * latch, and `retune` are untouched. Direct queue users use
-   * `RetryQueue.reviseAutoReplayAuditCallback` instead — calling the
-   * queue method on a server-owned queue would replace the audit
+   * enable it first with `reviseAutoReplaySchedule` (WR-447). The new
+   * callback takes effect from the next exhaustion stop; stops already
+   * reported are never re-delivered, and the round cadence, the
+   * counters, the `stopped` latch, and `retune` are untouched. Direct
+   * queue users use `RetryQueue.reviseAutoReplayAuditCallback` instead
+   * — calling the queue method on a server-owned queue would replace the audit
    * wrapper. This moves only the exhaustion observer; WR-344 revises
    * the round cadence, and WR-399 revises the scheduled-fired observer.
    */
@@ -8679,7 +8682,8 @@ export interface RelayServer extends Server {
   /**
    * WR-344: live dead-letter auto-replay schedule cadence — the three
    * round-rhythm inputs. Only set when `autoReplay` was configured;
-   * `undefined` otherwise.
+   * `undefined` otherwise. WR-447 mounts it from the enable path when
+   * the feature is enabled at runtime.
    */
   getAutoReplayScheduleConfig?: () => AutoReplayScheduleConfig | undefined;
   /**
@@ -23067,11 +23071,14 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     queue.getCanaryRollout(endpoint);
 
   // WR-344: dead-letter auto-replay schedule cadence runtime revision.
-  // The method is always set (like reviseAdaptiveBackoff above); with
-  // auto replay unconfigured the queue throws Error — enabling it
-  // needs a restart. A real revision is audited as
-  // `auto_replay_schedule_revised` with the previous and current
-  // config (the construction values as first `previous` — the
+  // The method is always set (like reviseAdaptiveBackoff above). WR-447:
+  // with auto replay unconfigured the same call *enables* it — the queue
+  // installs a fresh scheduler (an empty or illegal patch still throws
+  // RangeError there, leaving the server unconfigured), the getter is
+  // mounted at the same time, and the enable is audited as
+  // `auto_replay_schedule_revised` with `previous: null`. A real revision
+  // is audited as `auto_replay_schedule_revised` with the previous and
+  // current config (the construction values as first `previous` — the
   // defaults 60_000/10/3_600_000 when unset); an empty or same-value
   // patch is a silent no-op.
   server.reviseAutoReplaySchedule = (
@@ -23079,8 +23086,23 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   ): AutoReplayScheduleConfig => {
     const prev = queue.getAutoReplayScheduleConfig();
     if (prev === undefined) {
-      // Delegates to the queue for the canonical "must restart" Error.
-      return queue.reviseAutoReplaySchedule(patch);
+      // WR-447: enable — the queue installs the fresh scheduler (an
+      // empty or illegal patch still throws RangeError there, leaving
+      // the server unconfigured). Mount the getter and audit the
+      // enable with `previous: null`. No callback wiring is needed
+      // here: the queue owns the `onAutoReplayAudit` hook, so rounds
+      // exhaustion after the enable is audited as
+      // `dead_letter_auto_replay` like any other; the operator
+      // callback cell stays unset until the operator sets it (WR-411).
+      const next = queue.reviseAutoReplaySchedule(patch);
+      server.getAutoReplayScheduleConfig = (): AutoReplayScheduleConfig =>
+        queue.getAutoReplayScheduleConfig()!;
+      opts.auditLog.append({
+        event: "auto_replay_schedule_revised",
+        previous: null,
+        current: next,
+      });
+      return next;
     }
     // Validate-then-apply inside retune: an illegal patch throws
     // RangeError and the live values are left completely intact.
@@ -23105,8 +23127,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // queue's audit wrapper (which appends `dead_letter_auto_replay`
   // first, then forwards to the cell) is never touched, so a replacement
   // cannot bypass the audit. With auto replay unconfigured the queue
-  // throws the canonical "must restart" Error (delegated below, exactly
-  // like WR-344's schedule gate). A non-function callback throws
+  // throws Error — enable it first with `reviseAutoReplaySchedule`
+  // (WR-447). A non-function callback throws
   // `RangeError` and the live cell is untouched; a same-reference
   // replacement (or clearing when already unset) is a silent no-op. A
   // real replacement is audited as `auto_replay_audit_callback_revised`
@@ -23179,7 +23201,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   };
 
   // WR-344: live dead-letter auto-replay schedule cadence. Only set
-  // when `autoReplay` was configured.
+  // when `autoReplay` was configured — WR-447 mounts it from the enable
+  // path when the feature is enabled at runtime.
   if (queue.getAutoReplayScheduleConfig() !== undefined) {
     server.getAutoReplayScheduleConfig = (): AutoReplayScheduleConfig =>
       queue.getAutoReplayScheduleConfig()!;

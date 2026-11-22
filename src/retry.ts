@@ -4895,8 +4895,8 @@ export class RetryQueue {
     Map<string, { counts: number[]; sumMs: number; count: number }>
   >();
   private readonly deliveryEventListeners = new Set<(e: DeliveryEvent) => void>();
-  /** Opt-in dead-letter auto-replay scheduler; undefined when disabled. */
-  private readonly autoReplayer?: DeadLetterAutoReplayer;
+  /** Opt-in dead-letter auto-replay scheduler; undefined when disabled. WR-447: deliberately *not* readonly — `reviseAutoReplaySchedule` constructs it live when the feature is enabled at runtime. */
+  private autoReplayer?: DeadLetterAutoReplayer;
   /** WR-64: opt-in dead-letter retention sweeper; undefined when disabled. */
   private readonly retentionSweeper?: DeadLetterRetentionSweeper;
   /** WR-100: opt-in stale-endpoint auto-pause sweeper; undefined when disabled. WR-445: deliberately *not* readonly — `reviseStalePause` constructs it live when the feature is enabled at runtime. */
@@ -4964,6 +4964,14 @@ export class RetryQueue {
   // sweeper's `onPurged` owner closure already reads this field live,
   // so no extra indirection is needed.
   private onDeadLetterPurged?: (event: DeadLetterPurgedEvent) => void;
+  // WR-447: the rounds-exhaustion audit observer, retained from
+  // construction so `reviseAutoReplaySchedule` can wire it into a
+  // live-enabled replayer exactly as construction does. The server's
+  // audit closure (which appends `dead_letter_auto_replay` first, then
+  // forwards to the operator cell) is held here when the queue runs
+  // under `RelayServer`; direct queue users hold their own callback in
+  // the same field.
+  private readonly onAutoReplayAudit?: (event: DeadLetterAutoReplayAuditEvent) => void;
   /** WR-68: shared replay egress gate; undefined when not configured. WR-446: deliberately *not* readonly — `reviseReplayEgress` installs a fresh gate here when the feature is enabled at runtime (it was undefined before, so there is nothing to retune in place). */
   private replayEgress?: ReplayEgressGate;
   /** WR-135: two-phase replay approval store; undefined when not configured. */
@@ -5257,6 +5265,7 @@ export class RetryQueue {
     this.clearTimer = opts.clearTimer ?? ((h) => h.clear());
     this.onDeadLetter = opts.onDeadLetter;
     this.onDeadLetterPurged = opts.onDeadLetterPurged;
+    this.onAutoReplayAudit = opts.onAutoReplayAudit;
     this.onStalePauseAudit = opts.onStalePauseAudit;
     // WR-100: the activity stamps (first-seen, success, resume) and the
     // sweep share one clock so a test-injected `now` stays consistent
@@ -5953,7 +5962,7 @@ export class RetryQueue {
         // configuration — the operator explicitly armed it — so rounds
         // use the explicit escape hatch instead of per-round tokens.
         replayAll: () => this.replayDeadLetters({}, { bypassApproval: true }),
-        onAudit: opts.onAutoReplayAudit,
+        onAudit: this.onAutoReplayAudit,
       });
     }
     if (opts.deadLetterRetention !== undefined) {
@@ -7143,15 +7152,52 @@ export class RetryQueue {
    * or rounds-exhausted scheduler only stores the values until
    * `resume()`. An illegal patch throws `RangeError` and the live
    * values are untouched; an empty patch is a `RangeError`; revising
-   * to the live values is a no-op. Throws `Error` when auto replay
-   * was never configured — enabling it needs a restart. Returns the
-   * live config.
+   * to the live values is a no-op. Returns the live config.
+   *
+   * WR-447: when auto replay was never configured, the same call
+   * *enables* it instead of throwing: the patch is validated with
+   * the construction-time rules (an empty or non-object patch is a
+   * `RangeError`, same as `retune`), missing fields take the
+   * construction defaults (60_000/10/3_600_000), and a fresh
+   * scheduler is built with the same `replayAll` / `onAudit` wiring
+   * as construction — enabled, because the operator explicitly armed
+   * it, so rounds use the WR-135 bypassApproval escape hatch. The
+   * state starts empty — rounds before the enable never happened and
+   * are never evaluated retroactively. When the queue is already
+   * running the schedule arms immediately, otherwise it arms at the
+   * next `start()`. No persistence: a restart returns to unconfigured
+   * — the enable is live-only.
    */
   reviseAutoReplaySchedule(patch: AutoReplayScheduleRevision): AutoReplayScheduleConfig {
     if (this.autoReplayer === undefined) {
-      throw new Error(
-        "reviseAutoReplaySchedule: auto replay is not configured — enabling it requires a restart"
-      );
+      // WR-447: enable — the same patch guards as `retune`, then a
+      // fresh scheduler from the construction defaults (missing fields
+      // take the defaults, `enabled` is true because the operator
+      // explicitly armed it). The constructor validates before anything
+      // is assigned, so an illegal patch leaves the queue unconfigured.
+      if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+        throw new RangeError(`autoReplay schedule revision must be an object, got ${JSON.stringify(patch)}`);
+      }
+      if (patch.intervalMs === undefined && patch.maxRounds === undefined && patch.maxIntervalMs === undefined) {
+        throw new RangeError(
+          "autoReplay schedule revision must set at least one of intervalMs, maxRounds, maxIntervalMs"
+        );
+      }
+      this.autoReplayer = new DeadLetterAutoReplayer({
+        ...patch,
+        enabled: true,
+        // WR-135: the auto-replay schedule is pre-authorized by
+        // configuration — the operator explicitly armed it — so rounds
+        // use the explicit escape hatch instead of per-round tokens.
+        replayAll: () => this.replayDeadLetters({}, { bypassApproval: true }),
+        onAudit: this.onAutoReplayAudit,
+      });
+      if (this.running) {
+        // The queue is already started: arm the schedule now —
+        // otherwise the first round would wait for the next start().
+        this.autoReplayer.start();
+      }
+      return this.autoReplayer.config();
     }
     return this.autoReplayer.retune(patch);
   }
@@ -7178,7 +7224,7 @@ export class RetryQueue {
    * value throws `RangeError` and the live callback is untouched;
    * replacing with the same reference (or clearing when already unset)
    * is a no-op. Throws `Error` when auto replay was never configured —
-   * enabling it needs a restart. Under `RelayServer` the replayer holds
+   * enable it first with `reviseAutoReplaySchedule` (WR-447). Under `RelayServer` the replayer holds
    * the server's audit closure, so direct calls here would replace the
    * audit wrapper; server users must go through
    * `RelayServer.reviseAutoReplayAuditCallback`, which swaps only the

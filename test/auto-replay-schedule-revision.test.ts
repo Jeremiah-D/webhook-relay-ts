@@ -371,16 +371,21 @@ describe("auto-replay schedule revision (WR-344)", () => {
     return q.shutdown(1000);
   });
 
-  it("unconfigured queue: revise throws the must-restart Error and get returns undefined", () => {
+  it("unconfigured queue: the first revise enables it with the construction defaults (WR-447)", () => {
     const q = new RetryQueue();
     assert.equal(q.getAutoReplayScheduleConfig(), undefined);
-    assert.throws(
-      () => q.reviseAutoReplaySchedule({ intervalMs: 1000 }),
-      (err: unknown) =>
-        err instanceof Error &&
-        err.message ===
-          "reviseAutoReplaySchedule: auto replay is not configured — enabling it requires a restart"
-    );
+    assert.deepEqual(q.reviseAutoReplaySchedule({ intervalMs: 1000 }), {
+      intervalMs: 1000,
+      maxRounds: 10,
+      maxIntervalMs: 3_600_000,
+    });
+    assert.deepEqual(q.getAutoReplayScheduleConfig(), {
+      intervalMs: 1000,
+      maxRounds: 10,
+      maxIntervalMs: 3_600_000,
+    });
+    assert.ok(q.getAutoReplayer(), "the scheduler exists after the enable");
+    assert.equal(q.getAutoReplayer()!.isEnabled(), true, "the enable arms the scheduler");
   });
 });
 
@@ -448,17 +453,28 @@ describe("auto-replay schedule revision via the server (WR-344)", () => {
     assert.deepEqual(relay.getAutoReplayScheduleConfig!(), { ...construction, intervalMs: 10_000 });
   });
 
-  it("unconfigured relay: revise throws the must-restart Error and the getter is not mounted", async () => {
-    const { relay } = makeRelay(undefined);
+  it("unconfigured relay: the first revise enables it, mounts the getter, and audits previous null (WR-447)", async () => {
+    const { relay, audit } = makeRelay(undefined);
     await listen(relay);
     assert.equal(relay.getAutoReplayScheduleConfig, undefined);
-    assert.throws(
-      () => relay.reviseAutoReplaySchedule({ intervalMs: 10_000 }),
-      (err: unknown) =>
-        err instanceof Error &&
-        err.message ===
-          "reviseAutoReplaySchedule: auto replay is not configured — enabling it requires a restart"
-    );
+    assert.deepEqual(relay.reviseAutoReplaySchedule({ intervalMs: 10_000 }), {
+      intervalMs: 10_000,
+      maxRounds: 10,
+      maxIntervalMs: 3_600_000,
+    });
+    assert.deepEqual(relay.getAutoReplayScheduleConfig!(), {
+      intervalMs: 10_000,
+      maxRounds: 10,
+      maxIntervalMs: 3_600_000,
+    });
+    const revised = eventsOf(audit, "auto_replay_schedule_revised");
+    assert.equal(revised.length, 1);
+    assert.equal(revised[0].previous, null);
+    assert.deepEqual(revised[0].current, {
+      intervalMs: 10_000,
+      maxRounds: 10,
+      maxIntervalMs: 3_600_000,
+    });
   });
 
   it("server getter reflects revisions made through the server", async () => {

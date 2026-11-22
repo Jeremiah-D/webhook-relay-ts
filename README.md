@@ -13650,11 +13650,21 @@ revision. A paused scheduler only stores the values until `resume()`,
 and a rounds-exhausted scheduler only stores them until `resume()`
 resets the counters and re-arms. Revising to the live values is a
 silent no-op; a real revision audits `auto_replay_schedule_revised`
-with `previous` / `current`. Enabling auto-replay itself still needs a
-restart: on a relay where it was never configured, revising throws and
-the getter is not mounted. This revises the round cadence only — the
-replay-egress rate (WR-345) is a separate control on the same replay
-path.
+with `previous` / `current`.
+
+**Live enable (WR-447).** On a relay where auto-replay was never
+configured, the same call *enables* it instead of throwing:
+`relay.reviseAutoReplaySchedule({ intervalMs: 10_000 })` installs a
+fresh scheduler — omitted knobs take the construction defaults
+(60_000/10/3_600_000) — mounts the getter, and audits
+`auto_replay_schedule_revised` with `previous: null`. The scheduler
+starts enabled, so on a running relay the first round is scheduled
+immediately; a stopped relay arms at the next start. The state starts
+empty — nothing before the enable is evaluated retroactively — and a
+restart returns to unconfigured. An empty or illegal patch still throws
+`RangeError` and leaves the relay unconfigured. This revises the round
+cadence only — the replay-egress rate (WR-345) is a separate control on
+the same replay path.
 
 **Live exhaustion-audit callback revision (WR-411).** Only the observer
 of the rounds-exhaustion stop is revisable at runtime —
@@ -13669,9 +13679,9 @@ untouched; replacing with the same reference (or clearing when already
 unset) is a silent no-op. A real revision audits
 `auto_replay_audit_callback_revised` with `previous` / `current`
 recording only 'set' / 'cleared' presence, never a function body.
-Enabling auto-replay itself still needs a restart: on a relay where it
-was never configured, revising throws. This moves only the exhaustion
-observer — the round cadence still goes through
+Enable it first with `reviseAutoReplaySchedule` (WR-447): on a relay
+where it was never configured, revising the callback throws. This moves
+only the exhaustion observer — the round cadence still goes through
 `reviseAutoReplaySchedule` (WR-344).
 
 The round timer is unref'd, so a configured scheduler never pins the
