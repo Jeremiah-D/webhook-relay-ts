@@ -215,8 +215,12 @@ export type EndpointHealthRevision = Partial<EndpointHealthConfig>;
 
 export interface EndpointHealthRevisedAuditEvent {
   event: "endpoint_health_revised";
-  /** The live config before the revision. */
-  previous: EndpointHealthConfig;
+  /**
+   * The live config before the revision. `null` when the revision
+   * *enabled* scoring on a queue that never configured it (WR-448) —
+   * there was no previous config.
+   */
+  previous: EndpointHealthConfig | null;
   /** The live config after the revision. */
   current: EndpointHealthConfig;
 }

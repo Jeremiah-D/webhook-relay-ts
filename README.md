@@ -690,8 +690,21 @@ reliability primitives that matter for any signed-payload pipeline.
   illegal patch throws `RangeError` and leaves the live values
   untouched; an empty or same-value patch is a silent no-op. A real
   revision is audited exactly once as `endpoint_health_revised` with
-  `previous` / `current`. Enabling scoring when it was never configured
-  still requires a restart. Live callback revision (WR-372):
+  `previous` / `current`. WR-448: a relay started without
+  `endpointHealth` can enable scoring at runtime with the same call —
+  explicit knobs win, the rest fall back to the construction defaults
+  (ewmaAlpha 0.2 / maxLatencySamples 256 / sloMs 5000 / successWeight
+  0.7 / latencyWeight 0.3 / circuitOpenPenalty 100 / degradeThreshold
+  40 / recoverThreshold 70), the enable is audited as
+  `endpoint_health_revised` with `previous: null`, and the getter is
+  mounted at the same time; an empty or illegal patch throws
+  `RangeError` and leaves the relay unconfigured. Per-tenant trackers
+  stay lazy — none exists before the enable, so verdicts delivered
+  before it are never scored retroactively — and the degrade/recover
+  callbacks start empty (revisable in afterwards via
+  `reviseEndpointDegradedCallbacks`, whose gate opens with the
+  enable). The enable is live-only (a restart returns to
+  unconfigured). Live callback revision (WR-372):
   `server.reviseEndpointDegradedCallbacks(patch)` swaps the
   degrade/recover observers without a restart (partial — omitted
   fields keep their live values; `null` clears a hook back to
@@ -703,7 +716,13 @@ reliability primitives that matter for any signed-payload pipeline.
   by `test/endpoint-health.test.ts` and
   `test/endpoint-health-revision.test.ts` (14 tests: threshold and
   weight flips, SLO and sample-window effects, multi-tenant fan-out,
-  late-born tenants, no-op and must-restart cases, server audit), plus
+  late-born tenants, no-op and enable cases, server audit), plus
+  `test/endpoint-health-enable.test.ts` (11 tests: defaults on first
+  enable, per-field default fill, rejected patches, lazy tracker with
+  no retroactive scoring, post-enable merge, post-enable callback
+  revision, restart returns to unconfigured, server audit with
+  `previous: null`, server rejected patches, audit-callback gate
+  opening, server restart), plus
   `test/endpoint-degraded-callbacks-revision.test.ts` (12 tests: live
   swaps on built and late-born trackers, clearing, partial patches,
   no-op and must-restart cases, server audit). Live audit-channel

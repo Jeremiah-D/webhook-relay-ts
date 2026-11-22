@@ -4628,7 +4628,7 @@ export class RetryQueue {
   /** WR-71: SLO-risk options; undefined when disabled. WR-347: live-revisable — `reviseSloRisk` replaces this with the merged options so tenants born later start from the revised values. */
   private sloRiskOpts?: SloRiskOptions;
   private readonly endpointHealths = new Map<string, EndpointHealthTracker>();
-  /** WR-179: endpoint-health options; undefined when disabled. WR-359: live-revisable — `reviseEndpointHealth` replaces this with the merged options so tenants born later start from the revised values. */
+  /** WR-179: endpoint-health options; undefined when disabled. WR-359: live-revisable — `reviseEndpointHealth` replaces this with the merged options so tenants born later start from the revised values. WR-448: deliberately *not* readonly — `reviseEndpointHealth` installs the options here when scoring is enabled at runtime (it was undefined before, so there is nothing to merge in place). */
   private endpointHealthOpts?: EndpointHealthOptions;
   // WR-372: deliberately *not* readonly — `reviseEndpointDegradedCallbacks`
   // replaces the live degrade/recover observers at runtime. The server's
@@ -7307,18 +7307,68 @@ export class RetryQueue {
    * `maxLatencySamples` truncates every rolling sample window at once.
    * The revision is audited exactly once as
    * `endpoint_health_revised` with `previous` / `current` (all eight
-   * knobs), via the `onEndpointHealthAudit` channel. Throws `Error`
-   * when health scoring was never configured — enabling it needs a
-   * restart. The degrade / recover callbacks are revised separately
+   * knobs), via the `onEndpointHealthAudit` channel.
+   *
+   * WR-448: when health scoring was never configured, the same call
+   * *enables* it instead of throwing: the patch is resolved through
+   * `endpointHealthConfigOf` — explicit knobs win, the rest fall back
+   * to the construction defaults (ewmaAlpha 0.2 / maxLatencySamples
+   * 256 / sloMs 5000 / successWeight 0.7 / latencyWeight 0.3 /
+   * circuitOpenPenalty 100 / degradeThreshold 40 / recoverThreshold
+   * 70) — and the resolved config must pass the construction gates
+   * (`assertValidEndpointHealthOptions`) before anything is stored,
+   * so an illegal patch throws `RangeError` and the queue stays
+   * unconfigured; an empty or non-object patch is a `RangeError` too.
+   * The enable stores the resolved options, audits exactly once as
+   * `endpoint_health_revised` with `previous: null`, and returns the
+   * live config. Per-tenant trackers stay lazy: none exists before the
+   * enable, so the next scoring builds a fresh tracker with empty
+   * statistics — verdicts delivered before the enable are never scored
+   * retroactively. The degrade / recover callbacks are empty at the
+   * enable (no construction-time `opts` carried them); they can be
+   * revised in afterwards via `reviseEndpointDegradedCallbacks`, whose
+   * unconfigured gate opens with the enable. A callback passed at
+   * construction as `onEndpointHealthAudit` receives the enable audit
+   * through the same channel as any later revision. No persistence: a
+   * restart returns to unconfigured — the enable is live-only.
+   * The degrade / recover callbacks are revised separately
    * (not part of this patch); the circuit-state provider is never
    * rebound. Returns the live config.
    */
   reviseEndpointHealth(patch: EndpointHealthRevision): EndpointHealthConfig {
     if (this.endpointHealthOpts === undefined) {
-      throw new Error(
-        "reviseEndpointHealth: endpoint health scoring is not configured — enabling it requires a restart: " +
-          "the trackers are created at startup and a running relay cannot start scoring endpoints without one"
-      );
+      // WR-448: enable — validate with the construction-time rules,
+      // then install the resolved options. Validation throws before
+      // anything is assigned, so an illegal patch leaves the queue
+      // unconfigured.
+      if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+        throw new RangeError(
+          `endpoint health revision must be an object, got ${JSON.stringify(patch)}`
+        );
+      }
+      if (
+        patch.ewmaAlpha === undefined &&
+        patch.maxLatencySamples === undefined &&
+        patch.sloMs === undefined &&
+        patch.successWeight === undefined &&
+        patch.latencyWeight === undefined &&
+        patch.circuitOpenPenalty === undefined &&
+        patch.degradeThreshold === undefined &&
+        patch.recoverThreshold === undefined
+      ) {
+        throw new RangeError(
+          "endpoint health revision must set at least one of ewmaAlpha, maxLatencySamples, sloMs, successWeight, latencyWeight, circuitOpenPenalty, degradeThreshold, recoverThreshold to enable endpoint health scoring"
+        );
+      }
+      const next: EndpointHealthConfig = endpointHealthConfigOf(patch);
+      assertValidEndpointHealthOptions(next);
+      this.endpointHealthOpts = { ...next };
+      this.onEndpointHealthAudit?.({
+        event: "endpoint_health_revised",
+        previous: null,
+        current: { ...next },
+      });
+      return { ...next };
     }
     if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
       throw new RangeError(
@@ -7393,7 +7443,7 @@ export class RetryQueue {
    * `RangeError` and the live callback is untouched; replacing with
    * the same reference (or clearing when already unset) is a silent
    * no-op. Throws `Error` when health scoring was never configured —
-   * enabling it needs a restart. Under `RelayServer` the field holds
+   * enable it first with `reviseEndpointHealth` (WR-448). Under `RelayServer` the field holds
    * the server's audit closure, so direct calls here would replace the
    * audit wrapper; server users must go through
    * `RelayServer.reviseEndpointHealthAuditCallback`, which swaps only
@@ -7434,8 +7484,8 @@ export class RetryQueue {
    * thresholds, hysteresis, degraded state, and
    * `consecutiveLowScores` are untouched. Throws `Error` when health
    * scoring was never configured — the degrade / recover transitions
-   * only ever fire when scoring is set, so enabling it needs a
-   * restart. The per-tenant trackers read these fields live at fire
+   * only ever fire when scoring is set, so enable it first with
+   * `reviseEndpointHealth` (WR-448). The per-tenant trackers read these fields live at fire
    * time (see `endpointHealthFor`), so a revision reaches trackers
    * built before it — including tenants born earlier — with no fan-out
    * pass. Under `RelayServer` the fields hold the server's audit

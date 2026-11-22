@@ -291,13 +291,14 @@ describe("RetryQueue.reviseEndpointHealth (WR-359)", () => {
     q.stop();
   });
 
-  it("unconfigured queue: revise throws the must-restart Error and the getter is undefined", () => {
+  it("unconfigured queue: the first revise enables it with the construction defaults (WR-448)", () => {
     const q = new RetryQueue({ sender: async () => {} });
     assert.equal(q.getEndpointHealthConfig(), undefined);
-    assert.throws(
-      () => q.reviseEndpointHealth({ sloMs: 1000 }),
-      (err: unknown) => err instanceof Error && /requires a restart/.test((err as Error).message)
-    );
+    assert.deepEqual(q.reviseEndpointHealth({ sloMs: 1000 }), {
+      ...defaults,
+      sloMs: 1000,
+    });
+    assert.deepEqual(q.getEndpointHealthConfig(), { ...defaults, sloMs: 1000 });
   });
 });
 
@@ -362,13 +363,18 @@ describe("RelayServer endpoint health revision (WR-359)", () => {
     });
   });
 
-  it("unconfigured relay: revise throws the must-restart Error and the getter is not mounted", async () => {
-    const { relay } = makeRelay();
+  it("unconfigured relay: the first revise enables it, mounts the getter, and audits previous null (WR-448)", async () => {
+    const { relay, audit } = makeRelay();
     await listen(relay);
     assert.equal(relay.getEndpointHealthConfig, undefined);
-    assert.throws(
-      () => relay.reviseEndpointHealth!({ sloMs: 1000 }),
-      (err: unknown) => err instanceof Error && /requires a restart/.test((err as Error).message)
-    );
+    assert.deepEqual(relay.reviseEndpointHealth!({ sloMs: 1000 }), {
+      ...defaults,
+      sloMs: 1000,
+    });
+    assert.deepEqual(relay.getEndpointHealthConfig!(), { ...defaults, sloMs: 1000 });
+    const revised = eventsOf(audit, "endpoint_health_revised");
+    assert.equal(revised.length, 1);
+    assert.equal(revised[0].previous, null);
+    assert.deepEqual(revised[0].current, { ...defaults, sloMs: 1000 });
   });
 });

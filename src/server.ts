@@ -6610,9 +6610,17 @@ export interface RelayServer extends Server {
    * is a no-op with no audit event. A real revision is audited as
    * `endpoint_health_revised` with `previous` / `current` (all eight
    * knobs), via the queue's `onEndpointHealthAudit` → audit-log
-   * channel, and returns the live config. Always set; throws `Error`
-   * when `endpointHealth` was never configured — enabling it needs a
-   * restart. The degrade / recover callbacks are not part of this
+   * channel, and returns the live config. Always set. WR-448: when
+   * `endpointHealth` was never configured, the same call *enables*
+   * scoring — explicit knobs win, the rest fall back to the
+   * construction defaults (ewmaAlpha 0.2 / maxLatencySamples 256 /
+   * sloMs 5000 / successWeight 0.7 / latencyWeight 0.3 /
+   * circuitOpenPenalty 100 / degradeThreshold 40 / recoverThreshold
+   * 70); the enable is audited as `endpoint_health_revised` with
+   * `previous: null`, the getter is mounted at the same time, and the
+   * enable is live-only (a restart returns to unconfigured). An empty
+   * or illegal patch throws `RangeError` and leaves the server
+   * unconfigured. The degrade / recover callbacks are not part of this
    * patch, and the circuit-state provider is never rebound. Orthogonal
    * to WR-179 (which owns the scoring mechanism itself), WR-201 (which
    * reads scores to tune weights — this tunes the scores themselves),
@@ -6633,7 +6641,8 @@ export interface RelayServer extends Server {
    * `endpoint_health_audit_callback_revised` with `previous` /
    * `current` recording only 'set' / 'cleared' presence, never a
    * function body. Always set; throws `Error` when `endpointHealth`
-   * was never configured — enabling it needs a restart. The new
+   * was never configured — enable scoring first with
+   * `reviseEndpointHealth` (WR-448). The new
    * callback takes effect from the next real revision; revisions
    * already reported are never re-delivered, and the eight knobs, the
    * thresholds, the hysteresis, and the scoring logic are untouched.
@@ -6670,7 +6679,8 @@ export interface RelayServer extends Server {
   /**
    * WR-359: live outbound endpoint health config — the eight scoring
    * knobs. Only set when `endpointHealth` was configured; `undefined`
-   * otherwise.
+   * otherwise. WR-448 mounts it from the enable path when scoring is
+   * enabled at runtime.
    */
   getEndpointHealthConfig?: () => EndpointHealthConfig | undefined;
   /**
@@ -6718,7 +6728,8 @@ export interface RelayServer extends Server {
    * 'unchanged') and `oldOnEndpointDegraded` /
    * `oldOnEndpointRecovered` ('set' / 'absent') presence, never a
    * function body. Always set; throws `Error` when health scoring was
-   * never configured — enabling it needs a restart. The new callbacks
+   * never configured — enable scoring first with
+   * `reviseEndpointHealth` (WR-448). The new callbacks
    * take effect from the next transition; the scores, thresholds,
    * hysteresis, degraded state, and `consecutiveLowScores` are
    * untouched.
@@ -19250,16 +19261,31 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   }
 
   // WR-359: outbound endpoint health scoring knob runtime revision.
-  // The method is always set (like reviseProxyHealth above); with
-  // endpointHealth unconfigured the queue throws the canonical
-  // must-restart Error — enabling it needs a restart. The audit event
-  // `endpoint_health_revised` (with the previous and current config,
-  // all eight knobs) is emitted by the queue via the
+  // The method is always set (like reviseProxyHealth above). WR-448:
+  // with endpointHealth unconfigured the same call *enables* scoring
+  // — the queue installs the resolved options (an empty or illegal
+  // patch still throws RangeError there, leaving the server
+  // unconfigured) and audits the enable as `endpoint_health_revised`
+  // with `previous: null` through the `onEndpointHealthAudit` →
+  // audit-log channel, so the server must not append a second audit
+  // here; the getter is mounted at the same time. A real revision is
+  // audited as `endpoint_health_revised` (with the previous and
+  // current config, all eight knobs) by the queue via the
   // `onEndpointHealthAudit` → audit-log channel, so a real revision
   // is audited exactly once; an empty or same-value patch is a silent
   // no-op.
-  server.reviseEndpointHealth = (patch: EndpointHealthRevision): EndpointHealthConfig =>
-    queue.reviseEndpointHealth(patch);
+  server.reviseEndpointHealth = (patch: EndpointHealthRevision): EndpointHealthConfig => {
+    if (queue.getEndpointHealthConfig() === undefined) {
+      // WR-448: enable — the queue installs the resolved options and
+      // audits the enable with `previous: null` (see above). Mount the
+      // getter at the same time.
+      const next = queue.reviseEndpointHealth(patch);
+      server.getEndpointHealthConfig = (): EndpointHealthConfig =>
+        queue.getEndpointHealthConfig()!;
+      return next;
+    }
+    return queue.reviseEndpointHealth(patch);
+  };
 
   // WR-408: live endpoint-health revision audit observer replacement.
   // Only the server-side operator-callback cell moves — the queue's
@@ -19267,7 +19293,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // forwards to the cell) is never touched, so a replacement cannot
   // bypass the audit. With endpoint health unconfigured the queue
   // throws the canonical "must restart" Error (delegated below,
-  // exactly like WR-404's probe gate). A non-function callback throws
+  // exactly like WR-404's probe gate) — enable scoring first with
+  // `reviseEndpointHealth` (WR-448). A non-function callback throws
   // `RangeError` and the live cell is untouched; a same-reference
   // replacement (or clearing when already unset) is a silent no-op. A
   // real replacement is audited as
@@ -19336,7 +19363,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   };
 
   // WR-359: live outbound endpoint health config. Only set when
-  // `endpointHealth` was configured.
+  // `endpointHealth` was configured — WR-448 mounts it from the
+  // enable path when scoring is enabled at runtime.
   if (queue.getEndpointHealthConfig() !== undefined) {
     server.getEndpointHealthConfig = (): EndpointHealthConfig =>
       queue.getEndpointHealthConfig()!;
@@ -19388,7 +19416,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // WR-372: live endpoint degrade/recover observer revision. The
   // method is always set (like reviseEndpointDependencyCallbacks
   // above); with health scoring unconfigured the queue throws the
-  // canonical "must restart" Error. The audit wrappers read the
+  // canonical "must restart" Error — enable scoring first with
+  // `reviseEndpointHealth` (WR-448). The audit wrappers read the
   // operator cells, never the operator callbacks directly, so a
   // replacement cannot bypass the `endpoint_degraded` /
   // `endpoint_recovered` audit. The patch is partial: an omitted
