@@ -8346,8 +8346,8 @@ export interface RelayServer extends Server {
    * replacement is audited as `dead_letter_purged_callback_revised`
    * with `previous` / `current` recording only 'set' / 'cleared'
    * presence, never a function body. Always set; throws `Error` when
-   * dead-letter retention was never configured — enabling it needs a
-   * restart. The new callback takes effect from the next purge;
+   * dead-letter retention was never configured — enable it first with
+   * `setDeadLetterRetention` (WR-449). The new callback takes effect from the next purge;
    * purges already reported are never re-delivered, and the TTL
    * judgement, the sweep interval, the replay-claim skip, and the
    * WR-49 journal are untouched. Direct queue users use
@@ -9102,14 +9102,18 @@ export interface RelayServer extends Server {
    * untouched; an empty patch (or values equal to the live ones) is a
    * no-op with no audit event. A real revision is audited as
    * `dead_letter_retention_revised` with `previous` / `current`
-   * snapshots, and returns the live values. Always set; throws `Error`
-   * when retention was never configured — enabling it needs a restart.
+   * snapshots, and returns the live values. Always set; WR-449: on a
+   * relay where retention was never configured the same call
+   * *enables* it instead — `retentionMs` is mandatory, the enable
+   * is audited with `previous: null`, and the getter is mounted.
    */
   setDeadLetterRetention?: (patch: DeadLetterRetentionRevision) => DeadLetterRetentionSnapshot;
   /**
    * WR-315: live dead-letter retention snapshot (the live TTL — a
    * global number or a per-endpoint record — and the sweep interval).
-   * Set only when `deadLetterRetention` was configured.
+   * Set only when `deadLetterRetention` was configured — WR-449
+   * mounts it from the enable path when the feature is enabled at
+   * runtime.
    */
   getDeadLetterRetention?: () => DeadLetterRetentionSnapshot;
   /**
@@ -22680,7 +22684,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // WR-397: live dead-letter-purged observer revision. The method is
   // always set; with dead-letter retention unconfigured the queue
   // throws the canonical "must restart" Error (delegated below,
-  // exactly like WR-393's canary gate). Only the operator cell moves:
+  // exactly like WR-393's canary gate) — enable it first with
+  // `setDeadLetterRetention` (WR-449). Only the operator cell moves:
   // the queue's audit wrapper (which appends `dead_letter_purged`
   // first, then forwards to the cell) is never touched, so a
   // replacement cannot bypass the audit. A non-function callback
@@ -23912,15 +23917,33 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
 
   // WR-315: dead-letter retention TTL / sweep-interval runtime
   // revision. The method is always set (like setDedupWindow above);
-  // with retention unconfigured the queue throws Error — enabling
-  // retention needs a restart. A real revision is audited as
+  // WR-449: with retention unconfigured the same call *enables* it —
+  // the queue builds a fresh sweeper (an empty or illegal patch still
+  // throws RangeError there, leaving the server unconfigured), the
+  // getter is mounted at the same time, and the enable is audited as
+  // `dead_letter_retention_revised` with `previous: null`. No callback
+  // wiring is needed here: the queue owns the `onDeadLetterPurged`
+  // hook, so purges after the enable are audited as
+  // `dead_letter_purged` like any other; the operator callback cell
+  // stays unset until the operator sets it (WR-397), and the enable
+  // opens that gate. A real revision is audited as
   // `dead_letter_retention_revised` with the previous and current
   // snapshots; an empty or same-value patch is a silent no-op.
   server.setDeadLetterRetention = (patch: DeadLetterRetentionRevision): DeadLetterRetentionSnapshot => {
     const previous = queue.getDeadLetterRetention();
     if (previous === undefined) {
-      // Delegates to the queue for the canonical "must restart" Error.
-      return queue.setDeadLetterRetention(patch);
+      // WR-449: enable — the queue builds the fresh sweeper (an empty
+      // or illegal patch still throws RangeError there, leaving the
+      // server unconfigured). Mount the getter and audit the enable
+      // with `previous: null`.
+      const next = queue.setDeadLetterRetention(patch);
+      server.getDeadLetterRetention = (): DeadLetterRetentionSnapshot => queue.getDeadLetterRetention()!;
+      opts.auditLog.append({
+        event: "dead_letter_retention_revised",
+        previous: null,
+        current: next,
+      });
+      return next;
     }
     // Validate-then-apply inside retune: an illegal patch throws
     // RangeError and the live values are left completely intact.
@@ -23937,7 +23960,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   };
 
   // WR-315: live dead-letter retention snapshot. Only set when
-  // `deadLetterRetention` was configured.
+  // `deadLetterRetention` was configured — WR-449 mounts it from the
+  // enable path when the feature is enabled at runtime.
   if (queue.getDeadLetterRetention() !== undefined) {
     server.getDeadLetterRetention = (): DeadLetterRetentionSnapshot => queue.getDeadLetterRetention()!;
   }

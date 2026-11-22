@@ -13851,8 +13851,21 @@ revised interval re-arms the schedule when the sweeper is running.
 patch throws `RangeError` and leaves the live values and the armed timer
 untouched; an empty or same-value patch is a silent no-op; a real revision
 is audited as `dead_letter_retention_revised` with `previous` / `current`.
-Revising when retention was never configured throws `Error` (enabling it
-needs a restart), and entries already purged never come back.
+Entries already purged never come back.
+
+WR-449: on a relay where retention was never configured, the same call
+*enables* it instead: `retentionMs` is mandatory (a sweeper with no TTL
+is inert, so there is nothing to enable — an empty patch, a patch
+without it, or an illegal value still throws `RangeError` and leaves the
+relay unconfigured), `sweepIntervalMs` defaults to 60 s, and a fresh
+sweeper is built with the same owner wiring as construction. Dead-letter
+timestamps already exist, so the TTL judges by age: entries already past
+it at enable time are purged on the next sweep, the rest when they age
+out. When the relay is already running the sweep schedule arms
+immediately, otherwise it arms at the next start; the enable is audited
+as `dead_letter_retention_revised` with `previous: null`, the getter is
+mounted, and the WR-397 purge-callback gate opens. A restart returns to
+unconfigured — the enable is live-only.
 
 WR-397: the purge observer is revisable live via
 `server.reviseDeadLetterPurgedCallback(cb)` (and
@@ -13866,7 +13879,7 @@ same reference (or clearing when already unset) is a silent no-op. A real
 revision is audited as `dead_letter_purged_callback_revised` with
 `previous` / `current` recording only 'set' / 'cleared' presence, never a
 function body. Revising when retention was never configured throws `Error`
-(enabling it needs a restart). This only moves the observer; the TTL and
+(enable it first with `setDeadLetterRetention`, WR-449). This only moves the observer; the TTL and
 sweep interval still go through `setDeadLetterRetention` (WR-315).
 
 **Operator surface** (same Bearer <redacted>, fail closed to 404 without

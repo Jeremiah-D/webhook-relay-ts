@@ -11,6 +11,7 @@ import {
   type DeadLetterPurgeResult,
   type DeadLetterPurgedEvent,
   type DeadLetterRetentionOptions,
+  type DeadLetterRetentionOwner,
   type DeadLetterRetentionRevision,
   type DeadLetterRetentionSnapshot,
 } from "./deadletter-retention.ts";
@@ -4897,8 +4898,8 @@ export class RetryQueue {
   private readonly deliveryEventListeners = new Set<(e: DeliveryEvent) => void>();
   /** Opt-in dead-letter auto-replay scheduler; undefined when disabled. WR-447: deliberately *not* readonly — `reviseAutoReplaySchedule` constructs it live when the feature is enabled at runtime. */
   private autoReplayer?: DeadLetterAutoReplayer;
-  /** WR-64: opt-in dead-letter retention sweeper; undefined when disabled. */
-  private readonly retentionSweeper?: DeadLetterRetentionSweeper;
+  /** WR-64: opt-in dead-letter retention sweeper; undefined when disabled. WR-449: deliberately *not* readonly — `setDeadLetterRetention` constructs it live when the feature is enabled at runtime. */
+  private retentionSweeper?: DeadLetterRetentionSweeper;
   /** WR-100: opt-in stale-endpoint auto-pause sweeper; undefined when disabled. WR-445: deliberately *not* readonly — `reviseStalePause` constructs it live when the feature is enabled at runtime. */
   private stalePauser?: StalePauseSweeper;
   /**
@@ -5970,12 +5971,7 @@ export class RetryQueue {
       // but only arms when a TTL is actually configured.
       this.retentionSweeper = new DeadLetterRetentionSweeper({
         ...opts.deadLetterRetention,
-        owner: {
-          listEntries: () => this.deadLetter,
-          removeEntry: (id) => this.removeDeadLetterEntry(id),
-          isClaimedByReplay: (id) => this.isClaimedByReplay(id),
-          onPurged: (event) => this.onDeadLetterPurged?.(event),
-        },
+        owner: this.retentionOwner(),
       });
     }
     if (opts.stalePause !== undefined) {
@@ -7825,17 +7821,59 @@ export class RetryQueue {
    * manual `purgeExpiredDeadLetters`) judges by the new TTL; entries
    * already purged never come back. An illegal patch throws `RangeError`
    * and the live values are untouched; an empty patch (or values equal
-   * to the live ones) is a no-op. Throws `Error` when retention was
-   * never configured — enabling it needs a restart. The sweeper
-   * instance is created at startup and never replaced; only its
-   * internals are revised.
+   * to the live ones) is a no-op.
+   *
+   * WR-449: when retention was never configured, the same call
+   * *enables* it instead of throwing: the patch is validated with
+   * the construction-time rules (`resolveRetentionTtl` — an empty,
+   * non-object, or illegal patch is a `RangeError`), `retentionMs`
+   * is mandatory (a sweeper with no TTL is inert, so there is
+   * nothing to enable), `sweepIntervalMs` defaults to 60 s, and a
+   * fresh sweeper is built with the same owner wiring as
+   * construction. Dead-letter timestamps already exist,
+   * so the TTL judges by age: entries already past it at enable
+   * time are purged on the next sweep, the rest when they age out.
+   * When the queue is already running the sweep schedule arms
+   * immediately, otherwise it arms at the next `start()`. No
+   * persistence: a restart returns to unconfigured — the enable is
+   * live-only. Returns the live config.
    */
   setDeadLetterRetention(patch: DeadLetterRetentionRevision): DeadLetterRetentionSnapshot {
     if (this.retentionSweeper === undefined) {
-      throw new Error(
-        "setDeadLetterRetention: dead-letter retention is not configured — enabling it requires a restart: " +
-          "the sweeper is created at startup and a running relay cannot start retaining without one"
-      );
+      // WR-449: enable — the same patch guards as `retune`, then a
+      // fresh sweeper from the construction resolver. `retentionMs`
+      // is mandatory here (unlike WR-445, there is no meaningful
+      // default TTL — an inert sweeper is nothing to enable).
+      // Validation throws before anything is assigned, so an illegal
+      // patch leaves the queue unconfigured.
+      if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+        throw new RangeError(
+          `deadLetterRetention revision must be an object, got ${JSON.stringify(patch)}`
+        );
+      }
+      if (Object.keys(patch).length === 0) {
+        throw new RangeError("deadLetterRetention revision must not be empty");
+      }
+      if (patch.retentionMs === undefined) {
+        throw new RangeError("deadLetterRetention revision must set retentionMs to enable retention");
+      }
+      // The constructor re-validates every value through
+      // `resolveRetentionTtl` (a null TTL inside a record, a
+      // non-finite number, or an illegal interval throws RangeError
+      // there, before anything is assigned), so this narrowing cast
+      // is safe: only values the constructor itself accepts ever
+      // reach the sweeper.
+      this.retentionSweeper = new DeadLetterRetentionSweeper({
+        ...patch,
+        retentionMs: patch.retentionMs as number | Record<string, number>,
+        owner: this.retentionOwner(),
+      });
+      if (this.running) {
+        // The queue is already started: arm the sweep schedule now —
+        // otherwise the first sweep would wait for the next start().
+        this.retentionSweeper.start();
+      }
+      return this.retentionSweeper.current();
     }
     return this.retentionSweeper.retune(patch);
   }
@@ -14622,9 +14660,8 @@ export class RetryQueue {
    * the forwarding stops). A non-function value throws `RangeError`
    * and the live callback is untouched; replacing with the same
    * reference (or clearing when already unset) is a no-op. Throws
-   * `Error` when dead-letter retention was never configured — the
-   * sweeper only ever exists with `deadLetterRetention` in place, so
-   * enabling observation needs a restart. Under `RelayServer` the
+   * `Error` when dead-letter retention was never configured —
+   * enable it first with `setDeadLetterRetention` (WR-449). Under `RelayServer` the
    * field holds the server's audit closure, so direct calls here
    * would replace the audit wrapper; server users must go through
    * `RelayServer.reviseDeadLetterPurgedCallback`, which swaps only
@@ -15722,6 +15759,21 @@ export class RetryQueue {
       }
     }
     return rows;
+  }
+
+  /**
+   * WR-64: the sweeper's owner contract — all state mutations stay in
+   * this queue; the sweeper only decides *which* entries are expired
+   * and calls back to remove/audit them. Shared by construction and
+   * the WR-449 runtime enable so both paths wire the identical owner.
+   */
+  private retentionOwner(): DeadLetterRetentionOwner {
+    return {
+      listEntries: () => this.deadLetter,
+      removeEntry: (id) => this.removeDeadLetterEntry(id),
+      isClaimedByReplay: (id) => this.isClaimedByReplay(id),
+      onPurged: (event) => this.onDeadLetterPurged?.(event),
+    };
   }
 
   /**

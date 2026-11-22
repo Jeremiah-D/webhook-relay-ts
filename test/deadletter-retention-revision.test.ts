@@ -421,11 +421,27 @@ describe("RetryQueue.setDeadLetterRetention (WR-315)", () => {
     }
   });
 
-  it("throws Error when retention was never configured", () => {
+  it("unconfigured queue enables on first set, resolving the sweep interval to the default (WR-449)", () => {
     const q = new RetryQueue({ sender: async () => {}, maxAttempts: 1 });
     try {
       assert.equal(q.getDeadLetterRetention(), undefined);
-      assert.throws(() => q.setDeadLetterRetention({ retentionMs: 1000 }), /not configured/);
+      assert.equal(q.retentionConfigured(), false);
+      assert.equal(q.getRetentionSweeper(), undefined);
+      assert.deepEqual(q.setDeadLetterRetention({ retentionMs: 1000 }), {
+        retentionMs: 1000,
+        sweepIntervalMs: 60_000,
+      });
+      assert.deepEqual(q.getDeadLetterRetention(), {
+        retentionMs: 1000,
+        sweepIntervalMs: 60_000,
+      });
+      assert.ok(q.getRetentionSweeper() !== undefined);
+      assert.equal(q.retentionConfigured(), true);
+      // A revision after the enable merges against the live values.
+      assert.deepEqual(q.setDeadLetterRetention({ sweepIntervalMs: 10_000 }), {
+        retentionMs: 1000,
+        sweepIntervalMs: 10_000,
+      });
     } finally {
       q.stop();
     }
@@ -631,12 +647,25 @@ describe("RelayServer.setDeadLetterRetention (WR-315)", () => {
     });
   });
 
-  it("throws Error when retention was never configured; the getter is unset", async () => {
+  it("unconfigured relay enables on first set, audited with previous null (WR-449)", async () => {
     const { relay, auditLog } = makeServer({});
     await listen(relay);
     assert.equal(typeof relay.setDeadLetterRetention, "function");
     assert.equal(relay.getDeadLetterRetention, undefined);
-    assert.throws(() => relay.setDeadLetterRetention!({ retentionMs: 1000 }), /not configured/);
-    assert.equal(eventsOf(auditLog, "dead_letter_retention_revised").length, 0);
+    assert.deepEqual(relay.setDeadLetterRetention!({ retentionMs: 1000 }), {
+      retentionMs: 1000,
+      sweepIntervalMs: 60_000,
+    });
+    assert.deepEqual(relay.getDeadLetterRetention!(), {
+      retentionMs: 1000,
+      sweepIntervalMs: 60_000,
+    });
+    const revised = eventsOf(auditLog, "dead_letter_retention_revised");
+    assert.equal(revised.length, 1);
+    assert.equal(revised[0].previous, null);
+    assert.deepEqual(revised[0].current, { retentionMs: 1000, sweepIntervalMs: 60_000 });
+    // A same-value revision after the enable is a silent no-op.
+    relay.setDeadLetterRetention!({ retentionMs: 1000 });
+    assert.equal(eventsOf(auditLog, "dead_letter_retention_revised").length, 1);
   });
 });
