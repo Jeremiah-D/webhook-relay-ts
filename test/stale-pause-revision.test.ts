@@ -17,8 +17,6 @@ const URL = "http://localhost:9999/hook";
 const BODY = Buffer.from(JSON.stringify({ hello: "webhook" }));
 const DAY_MS = 86_400_000;
 
-const MUST_RESTART =
-  "reviseStalePause: stalePause is not configured — enabling it requires a restart";
 const DEFAULTS = { staleAfterDays: 30, sweepIntervalMs: 60_000 };
 
 /** Controllable clock shared by the queue stamps and the sweep. */
@@ -179,13 +177,23 @@ describe("StalePauseSweeper.retune (WR-378)", () => {
 });
 
 describe("RetryQueue.reviseStalePause (WR-378)", () => {
-  it("unconfigured queue throws must-restart Error and the getter returns undefined", async () => {
+  it("unconfigured queue enables on first revise, resolving missing fields to the defaults (WR-445)", async () => {
     const q = new RetryQueue({ sender: async () => {} });
     try {
       assert.equal(q.getStalePauseConfig(), undefined);
-      assert.throws(() => q.reviseStalePause({ staleAfterDays: 7 }), {
-        name: "Error",
-        message: MUST_RESTART,
+      assert.deepEqual(q.reviseStalePause({ staleAfterDays: 7 }), {
+        staleAfterDays: 7,
+        sweepIntervalMs: 60_000,
+      });
+      assert.deepEqual(q.getStalePauseConfig(), {
+        staleAfterDays: 7,
+        sweepIntervalMs: 60_000,
+      });
+      assert.ok(q.getStalePauseSweeper() !== undefined);
+      // A revision after the enable merges against the live values.
+      assert.deepEqual(q.reviseStalePause({ sweepIntervalMs: 10_000 }), {
+        staleAfterDays: 7,
+        sweepIntervalMs: 10_000,
       });
     } finally {
       await q.shutdown();
@@ -392,13 +400,21 @@ describe("RelayServer.reviseStalePause (WR-378)", () => {
     assert.deepEqual(revised[0].current, { ...DEFAULTS, sweepIntervalMs: 10_000 });
   });
 
-  it("unconfigured relay throws must-restart Error and the getter is undefined", async () => {
-    const { relay } = makeRelay(undefined);
+  it("unconfigured relay enables on first revise, audited with previous null (WR-445)", async () => {
+    const { relay, audit } = makeRelay(undefined);
     await listen(relay);
     assert.equal(relay.getStalePauseConfig, undefined);
-    assert.throws(() => relay.reviseStalePause!({ staleAfterDays: 7 }), {
-      name: "Error",
-      message: MUST_RESTART,
+    assert.deepEqual(relay.reviseStalePause!({ staleAfterDays: 7 }), {
+      staleAfterDays: 7,
+      sweepIntervalMs: 60_000,
     });
+    assert.deepEqual(relay.getStalePauseConfig!(), {
+      staleAfterDays: 7,
+      sweepIntervalMs: 60_000,
+    });
+    const revised = eventsOf(audit, "stale_pause_revised");
+    assert.equal(revised.length, 1);
+    assert.equal(revised[0].previous, null);
+    assert.deepEqual(revised[0].current, { staleAfterDays: 7, sweepIntervalMs: 60_000 });
   });
 });

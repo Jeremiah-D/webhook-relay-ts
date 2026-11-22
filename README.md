@@ -3495,8 +3495,14 @@ ordinary `resumeEndpoint` path — and the idle baselines are never
 recomputed. A real revision is audited as `stale_pause_revised` with
 `previous` / `current`; an empty or same-value patch is a silent no-op,
 and an illegal value throws `RangeError` leaving the live values
-untouched. On a relay where `stalePause` was never configured, revision
-throws `Error` — enabling the feature needs a restart.
+untouched. On a relay where `stalePause` was never configured, the
+same call *enables* it instead (WR-445): missing fields take the
+defaults (30 days / 60 s), the activity state starts empty — endpoints
+seen before the enable have no baseline and are never evaluated
+retroactively — and the enable is audited as `stale_pause_revised`
+with `previous: null`. An empty or illegal patch still throws
+`RangeError` and leaves the relay unconfigured, and a restart returns
+to unconfigured — the enable is live-only.
 
 - **Idle means idle** — the clock is stamped on every genuinely
   successful delivery (`delivered`). A validator-rejected response

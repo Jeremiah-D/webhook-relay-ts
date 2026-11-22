@@ -21,6 +21,7 @@ import {
   type StaleEndpointPausedEvent,
   type StalePauseConfig,
   type StalePauseOptions,
+  type StalePauseOwner,
   type StalePauseRevision,
   type StalePauseSweepResult,
 } from "./stale-pause.ts";
@@ -4898,8 +4899,8 @@ export class RetryQueue {
   private readonly autoReplayer?: DeadLetterAutoReplayer;
   /** WR-64: opt-in dead-letter retention sweeper; undefined when disabled. */
   private readonly retentionSweeper?: DeadLetterRetentionSweeper;
-  /** WR-100: opt-in stale-endpoint auto-pause sweeper; undefined when disabled. */
-  private readonly stalePauser?: StalePauseSweeper;
+  /** WR-100: opt-in stale-endpoint auto-pause sweeper; undefined when disabled. WR-445: deliberately *not* readonly — `reviseStalePause` constructs it live when the feature is enabled at runtime. */
+  private stalePauser?: StalePauseSweeper;
   /**
    * WR-100: per-endpoint idle activity, keyed by logical `targetUrl`.
    * `firstSeenAt` is stamped on first sighting (enqueue) and reset on
@@ -4911,8 +4912,8 @@ export class RetryQueue {
   private readonly endpointActivity = new Map<string, { firstSeenAt: number; lastSuccessAt?: number }>();
   /** WR-100: clock shared by the activity stamps and the stale sweep. */
   private readonly stalePauseNow: () => number;
-  /** WR-100: whether stale-endpoint auto-pause is configured (gates activity stamping). */
-  private readonly stalePauseEnabled: boolean;
+  /** WR-100: whether stale-endpoint auto-pause is configured (gates activity stamping). WR-445: deliberately *not* readonly — `reviseStalePause` flips it when the feature is enabled at runtime, so activity from the enable onward is stamped; activity before the enable was never recorded and is never evaluated retroactively. */
+  private stalePauseEnabled: boolean;
   /** WR-100: cumulative auto-pauses per logical endpoint (metric source). */
   private readonly autoPauseCounts = new Map<string, number>();
   // WR-402: deliberately *not* readonly — `reviseStalePauseAuditCallback`
@@ -5975,16 +5976,7 @@ export class RetryQueue {
       // enabled; absent = the exact pre-WR-100 behavior.
       this.stalePauser = new StalePauseSweeper({
         ...opts.stalePause,
-        owner: {
-          knownEndpoints: () => [...this.endpointActivity.keys()],
-          idleBaselineMs: (endpoint) => {
-            const a = this.endpointActivity.get(endpoint);
-            return a === undefined ? undefined : (a.lastSuccessAt ?? a.firstSeenAt);
-          },
-          pendingCount: (endpoint) => this.pendingForEndpoint(endpoint),
-          isPaused: (endpoint) => this.pausedEndpoints.has(endpoint),
-          autoPauseStale: (endpoint, idleMs) => this.autoPauseStaleEndpoint(endpoint, idleMs),
-        },
+        owner: this.stalePauseOwner(),
       });
     }
     if (opts.replayEgress !== undefined) {
@@ -7812,15 +7804,48 @@ export class RetryQueue {
    * applies at the next `start()`. Idle baselines are never
    * recomputed. An illegal patch throws `RangeError` and the live
    * values are untouched; an empty patch is a `RangeError`; revising
-   * to the live values is a no-op. Throws `Error` when stale-endpoint
-   * auto-pause was never configured — enabling it needs a restart.
-   * Returns the live config.
+   * to the live values is a no-op.
+   *
+   * WR-445: when the sweeper was never configured, the same call
+   * *enables* it instead of throwing: the patch is validated with
+   * the construction-time rules (an empty or non-object patch is a
+   * `RangeError`, same as `retune`), missing fields take the
+   * construction defaults (30 days / 60 s), and a fresh sweeper is
+   * built on the queue's clock with the same owner wiring as
+   * construction. Activity stamping switches on at the enable, so
+   * the state starts empty — endpoints seen before the enable have
+   * no baseline and are never evaluated retroactively; an endpoint
+   * first seen after the enable pauses on the next sweep once past
+   * the threshold. When the queue is already running the sweep
+   * schedule arms immediately, otherwise it arms at the next
+   * `start()`. No persistence: a restart returns to unconfigured —
+   * the enable is live-only. Returns the live config.
    */
   reviseStalePause(patch: StalePauseRevision): StalePauseConfig {
     if (this.stalePauser === undefined) {
-      throw new Error(
-        "reviseStalePause: stalePause is not configured — enabling it requires a restart"
-      );
+      // WR-445: enable — the same patch guards as `retune`, then a
+      // fresh sweeper from the construction resolver (missing fields
+      // take the defaults, `now` is the queue's shared clock).
+      // Validation throws before anything is assigned, so an illegal
+      // patch leaves the queue unconfigured.
+      if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+        throw new RangeError(`stalePause revision must be an object, got ${JSON.stringify(patch)}`);
+      }
+      if (Object.keys(patch).length === 0) {
+        throw new RangeError("stalePause revision must not be empty");
+      }
+      this.stalePauser = new StalePauseSweeper({
+        ...patch,
+        owner: this.stalePauseOwner(),
+        now: this.stalePauseNow,
+      });
+      this.stalePauseEnabled = true;
+      if (this.running) {
+        // The queue is already started: arm the sweep schedule now —
+        // otherwise the first sweep would wait for the next start().
+        this.stalePauser.start();
+      }
+      return this.stalePauser.config();
     }
     return this.stalePauser.retune(patch);
   }
@@ -15576,6 +15601,25 @@ export class RetryQueue {
       }
     }
     return rows;
+  }
+
+  /**
+   * WR-100: the sweeper's owner contract — all state mutations stay in
+   * this queue; the sweeper only decides *which* endpoints are stale
+   * and calls back to pause them. Shared by construction and the
+   * WR-445 runtime enable so both paths wire the identical owner.
+   */
+  private stalePauseOwner(): StalePauseOwner {
+    return {
+      knownEndpoints: () => [...this.endpointActivity.keys()],
+      idleBaselineMs: (endpoint) => {
+        const a = this.endpointActivity.get(endpoint);
+        return a === undefined ? undefined : (a.lastSuccessAt ?? a.firstSeenAt);
+      },
+      pendingCount: (endpoint) => this.pendingForEndpoint(endpoint),
+      isPaused: (endpoint) => this.pausedEndpoints.has(endpoint),
+      autoPauseStale: (endpoint, idleMs) => this.autoPauseStaleEndpoint(endpoint, idleMs),
+    };
   }
 
   /**

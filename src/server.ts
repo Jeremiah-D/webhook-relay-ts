@@ -7650,16 +7650,21 @@ export interface RelayServer extends Server {
    * audit event. A real revision is audited as
    * `stale_pause_revised` with `previous` / `current` (the
    * construction values as first `previous` — the defaults 30 days /
-   * 60 s when unset), and returns the live config. Always set; throws
-   * `Error` when `stalePause` was never configured — enabling it
-   * needs a restart. This revises the auto-pause threshold; WR-100 is
+   * 60 s when unset), and returns the live config. Always set.
+   * WR-445: with `stalePause` never configured the same call
+   * *enables* it — the queue builds a fresh sweeper with an empty
+   * activity state (no retroactive evaluation) and the enable is
+   * audited as `stale_pause_revised` with `previous: null`; an empty
+   * or illegal patch still throws `RangeError` there, leaving the
+   * server unconfigured. This revises the auto-pause threshold; WR-100 is
    * the auto-pause mechanism itself, WR-50 the manual pause/resume
    * operator switch, and WR-150 the failure-threshold auto-disable.
    */
   reviseStalePause?: (patch: StalePauseRevision) => StalePauseConfig;
   /**
    * WR-378: live stale-endpoint auto-pause config — the two knobs.
-   * Only set when `stalePause` was configured; `undefined`
+   * Only set when `stalePause` was configured — WR-445 mounts it from
+   * the enable path when the feature is enabled at runtime; `undefined`
    * otherwise.
    */
   getStalePauseConfig?: () => StalePauseConfig | undefined;
@@ -20612,22 +20617,39 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   }
 
   // WR-378: stale-endpoint auto-pause knob runtime revision. The
-  // method is always set (like reviseErrorBudget above); with the
-  // sweeper unconfigured the queue throws Error — enabling it needs
-  // a restart. A real revision is audited as `stale_pause_revised`
-  // with the previous and current two-knob config (the construction
-  // values as first `previous` — the defaults 30 days / 60 s when
-  // unset); an empty or same-value patch is a silent no-op. The
-  // revision takes effect on the next sweep: a tightened threshold
-  // pauses endpoints already past it on the next sweep, a widened
-  // one leaves them unpaused, an already-paused endpoint is never
-  // resumed, and a revised sweep interval re-arms the pending timer
-  // immediately.
+  // method is always set (like reviseErrorBudget above). WR-445: with
+  // the sweeper unconfigured the same call *enables* it — the queue
+  // builds a fresh sweeper (an empty or illegal patch still throws
+  // RangeError there, leaving the server unconfigured), the getter is
+  // mounted at the same time, and the enable is audited as
+  // `stale_pause_revised` with `previous: null`. No callback wiring is
+  // needed here: the queue owns the `onStalePauseAudit` hook, so
+  // auto-pauses after the enable are audited as `endpoint_auto_paused`
+  // like any other; the operator callback cell stays unset until the
+  // operator sets it (WR-402). A real revision is audited as
+  // `stale_pause_revised` with the previous and current two-knob
+  // config (the construction values as first `previous` — the
+  // defaults 30 days / 60 s when unset); an empty or same-value patch
+  // is a silent no-op. The revision takes effect on the next sweep: a
+  // tightened threshold pauses endpoints already past it on the next
+  // sweep, a widened one leaves them unpaused, an already-paused
+  // endpoint is never resumed, and a revised sweep interval re-arms
+  // the pending timer immediately.
   server.reviseStalePause = (patch: StalePauseRevision): StalePauseConfig => {
     const prev = queue.getStalePauseConfig();
     if (prev === undefined) {
-      // Delegates to the queue for the canonical "must restart" Error.
-      return queue.reviseStalePause(patch);
+      // WR-445: enable — the queue builds the fresh sweeper (an empty
+      // or illegal patch still throws RangeError there, leaving the
+      // server unconfigured). Mount the getter and audit the enable
+      // with `previous: null`.
+      const next = queue.reviseStalePause(patch);
+      server.getStalePauseConfig = (): StalePauseConfig => queue.getStalePauseConfig()!;
+      opts.auditLog.append({
+        event: "stale_pause_revised",
+        previous: null,
+        current: next,
+      });
+      return next;
     }
     // Validate-then-apply inside retune: an illegal patch throws
     // RangeError and the live values are left completely intact.
@@ -20647,7 +20669,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   };
 
   // WR-378: live stale-endpoint auto-pause config. Only set when
-  // `stalePause` was configured.
+  // `stalePause` was configured — WR-445 mounts it from the enable
+  // path when the feature is enabled at runtime.
   if (queue.getStalePauseConfig() !== undefined) {
     server.getStalePauseConfig = (): StalePauseConfig => queue.getStalePauseConfig()!;
   }
