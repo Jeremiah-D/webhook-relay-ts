@@ -179,11 +179,18 @@ function auditEvents(audit: AuditLog, event: string): Array<Record<string, unkno
 
 describe("ReplayApprovalStore (unit)", () => {
   it("issues unique one-shot tokens consumed exactly once", () => {
-    const store = new ReplayApprovalStore();
+    // Frozen clock: two back-to-back issues must share one expiry,
+    // and a wall-clock tick between them is not part of the behavior
+    // under test — CI run 45096767544 failed this assertion on a 1ms
+    // boundary (1795399077935 vs 1795399077936). The equality
+    // assertion itself is unchanged; only the clock is deterministic.
+    const clock = fakeClock(1_700_000_000_000);
+    const store = new ReplayApprovalStore({ now: clock.now });
     const a = store.issue({});
     const b = store.issue({});
     assert.notEqual(a.approvalToken, b.approvalToken);
     assert.equal(a.expiresAt, b.expiresAt);
+    assert.equal(a.expiresAt, 1_700_000_000_000 + store.tokenTtlMs());
     assert.deepEqual(store.consume(a.approvalToken, {}), { ok: true });
     assert.deepEqual(store.consume(a.approvalToken, {}), { ok: false, reason: "reused" });
     assert.deepEqual(store.consume(b.approvalToken, {}), { ok: true });

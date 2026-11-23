@@ -136,16 +136,22 @@ export class ReplayApprovalStore {
     while (this.tokens.has(approvalToken)) {
       approvalToken = randomBytes(24).toString("hex");
     }
+    // One clock read per issue: the stored record and the returned
+    // grant must carry the same expiry — two reads can straddle a
+    // millisecond tick, leaving the operator-facing expiry 1ms off
+    // the expiry the store enforces (CI run 45096767544 failed the
+    // two-issue equality assertion on exactly that boundary).
+    const expiresAt = this.now() + this.ttlMs;
     this.tokens.set(approvalToken, {
       scope: {
         ...(scope.endpoint !== undefined ? { endpoint: scope.endpoint } : {}),
         ...(scope.tenant !== undefined ? { tenant: scope.tenant } : {}),
         ...(scope.ids !== undefined ? { ids: [...scope.ids] } : {}),
       },
-      expiresAt: this.now() + this.ttlMs,
+      expiresAt,
       used: false,
     });
-    return { approvalToken, expiresAt: this.now() + this.ttlMs };
+    return { approvalToken, expiresAt };
   }
 
   /**
