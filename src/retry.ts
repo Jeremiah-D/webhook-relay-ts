@@ -13533,16 +13533,32 @@ export class RetryQueue {
    * endpoint keeps its state and wakes on its already-scheduled
    * recheck (the new cooldown applies from the next trip); in-flight
    * probes settle under the old half-open slot (probe knobs are not
-   * in this revision's scope — WR-331 owns those). Throws `Error`
-   * when the circuit breaker was never configured — enabling it
-   * needs a restart. Returns the live resolved defaults.
+   * in this revision's scope — WR-331 owns those). When the circuit
+   * breaker was never configured the same call *enables* it
+   * (WR-455): the patch is resolved over the built-in defaults and
+   * installed as the live options — an illegal patch still throws
+   * `RangeError` and the breaker stays unconfigured. No breaker
+   * exists yet at enable time, so there is nothing to retune; the
+   * next dispatch builds the first tenant breaker from the enabled
+   * defaults. Returns the live resolved defaults.
    */
   reviseCircuitBreakerDefaults(patch: CircuitThresholdPatch): ResolvedCircuitThresholds {
     if (this.circuitBreakerOpts === undefined) {
-      throw new Error(
-        "reviseCircuitBreakerDefaults: circuit breaker is not configured — enabling it requires a restart: " +
-          "the breaker is created at startup and a running relay cannot start breaking without one"
+      // WR-455: enable — resolve the patch over the built-in defaults
+      // (validation first: an illegal patch throws RangeError and the
+      // breaker stays unconfigured) and install the resolved set as
+      // the live options. No breaker exists yet — `breakerFor`
+      // returns undefined while unconfigured, so the `breakers` map
+      // is empty and there is nothing to retune. The probe / callback
+      // / per-endpoint gates (WR-364 / WR-365 / WR-319 / WR-331) read
+      // this same live field, so enabling the breaker opens them too.
+      const enabled = resolveCircuitThresholds(
+        patch,
+        "reviseCircuitBreakerDefaults",
+        resolveCircuitBreakerOptions({})
       );
+      this.circuitBreakerOpts = { ...enabled };
+      return enabled;
     }
     const current = resolveCircuitBreakerOptions(this.circuitBreakerOpts);
     const next = resolveCircuitThresholds(patch, "reviseCircuitBreakerDefaults", current);

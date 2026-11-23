@@ -1261,7 +1261,16 @@ reliability primitives that matter for any signed-payload pipeline.
   same-value revision is a silent no-op) and audits
   `circuit_breaker_defaults_revised` with the `previous` / `current`
   six-field sets; `getCircuitBreakerDefaults()` reports the live
-  defaults (only set when the breaker was configured). A revision
+  defaults (only set when the breaker was configured at construction,
+  or after a live enable). WR-455 lets the same call enable the breaker
+  on a relay that started without one: the patch resolves over the
+  built-in defaults (5 / 30000ms / consecutive-failures / 20 / 0.5 / 10),
+  the enable is audited with `previous: null`, and the getter is mounted
+  — no restart, and dispatches before the enable leave no breaker behind,
+  so the first trip after enabling needs a full fresh threshold of
+  failures. Enabling the breaker also opens the probe-defaults (WR-364),
+  callback (WR-365), and per-endpoint (WR-319 / WR-331) gates, which all
+  read the same live options. A revision
   retunes every already-built tenant breaker in place and tenants
   born later start from the new defaults; per-endpoint overrides
   (WR-319) keep winning and are fully unaffected, and the half-open

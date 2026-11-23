@@ -9303,14 +9303,15 @@ export interface RelayServer extends Server {
    * same-value revision is a no-op with no audit event. A real
    * revision is audited as `circuit_breaker_defaults_revised` with
    * the `previous` / `current` six-field sets, and returns the live
-   * defaults. Always set; throws `Error` when the circuit breaker was
-   * never configured — enabling it needs a restart. Per-endpoint
-   * overrides (WR-319) keep winning and are fully unaffected; the
-   * half-open probe knobs are not in this revision's scope (WR-331
-   * owns those). An already-open endpoint keeps its state /
-   * `openedAtMs` / trips and wakes on its already-scheduled recheck;
-   * the new cooldown applies from the next trip; a window shrink
-   * trims the stored outcomes at once.
+   * defaults. Always set; with the breaker unconfigured the same
+   * call *enables* it (WR-455): the patch resolves over the built-in
+   * defaults, the getter is mounted, and the enable is audited with
+   * `previous: null`. Per-endpoint overrides (WR-319) keep winning
+   * and are fully unaffected; the half-open probe knobs are not in
+   * this revision's scope (WR-331 owns those). An already-open
+   * endpoint keeps its state / `openedAtMs` / trips and wakes on its
+   * already-scheduled recheck; the new cooldown applies from the next
+   * trip; a window shrink trims the stored outcomes at once.
    */
   reviseCircuitBreakerDefaults: (
     patch: CircuitThresholdPatch
@@ -9319,7 +9320,8 @@ export interface RelayServer extends Server {
    * WR-363: the live fleet-wide circuit-breaker defaults — the
    * constructor options resolved against the built-in defaults, with
    * any runtime revision applied. Only set when the circuit breaker
-   * was configured; `undefined` otherwise.
+   * was configured at construction, or after a live enable (WR-455);
+   * `undefined` otherwise.
    */
   getCircuitBreakerDefaults?: () => ResolvedCircuitThresholds | undefined;
   /**
@@ -24258,21 +24260,33 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // WR-363: live fleet-wide circuit-breaker defaults revision. The
   // queue does the validate-then-apply work (RangeError on an illegal
   // merged patch, live defaults untouched); this layer only owns the
-  // "must restart" Error (the queue throws it when the feature was
-  // never configured) and the audit: a real revision appends
-  // `circuit_breaker_defaults_revised` with the previous / current
-  // six-field sets, a same-value revision is a silent no-op. The
-  // breaker re-reads the live defaults on every trip decision and
-  // cooldown check, so no timer is re-armed here — an already-open
-  // endpoint keeps its `openedAtMs` and wakes on its
+  // audit: a real revision appends `circuit_breaker_defaults_revised`
+  // with the previous / current six-field sets, a same-value revision
+  // is a silent no-op. WR-455: with the breaker unconfigured the same
+  // call *enables* it — the queue installs the resolved defaults, the
+  // getter is mounted here, and the enable is audited with
+  // `previous: null`. The breaker re-reads the live defaults on every
+  // trip decision and cooldown check, so no timer is re-armed here —
+  // an already-open endpoint keeps its `openedAtMs` and wakes on its
   // already-scheduled recheck.
   server.reviseCircuitBreakerDefaults = (
     patch: CircuitThresholdPatch
   ): ResolvedCircuitThresholds => {
     const previous = queue.getCircuitBreakerDefaults();
     if (previous === undefined) {
-      // Delegates to the queue for the canonical "must restart" Error.
-      return queue.reviseCircuitBreakerDefaults(patch);
+      // WR-455: enable — the queue installs the resolved defaults
+      // (an illegal patch throws RangeError there, leaving the
+      // breaker unconfigured). Mount the getter and audit the enable
+      // with `previous: null`.
+      const next = queue.reviseCircuitBreakerDefaults(patch);
+      server.getCircuitBreakerDefaults = (): ResolvedCircuitThresholds | undefined =>
+        queue.getCircuitBreakerDefaults();
+      opts.auditLog.append({
+        event: "circuit_breaker_defaults_revised",
+        previous: null,
+        current: next,
+      });
+      return next;
     }
     const next = queue.reviseCircuitBreakerDefaults(patch);
     if (sameCircuitThresholds(previous, next)) {
@@ -24287,7 +24301,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   };
 
   // WR-363: live fleet-wide circuit-breaker defaults reads. Only set
-  // when `retry.circuitBreaker` was configured.
+  // when `retry.circuitBreaker` was configured — WR-455 mounts it
+  // from the enable path when the breaker is enabled at runtime.
   if (queue.circuitBreakerConfigured()) {
     server.getCircuitBreakerDefaults = (): ResolvedCircuitThresholds | undefined =>
       queue.getCircuitBreakerDefaults();

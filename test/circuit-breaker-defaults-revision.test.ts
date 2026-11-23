@@ -125,27 +125,33 @@ describe("RetryQueue circuit-breaker defaults revision (WR-363)", () => {
     return { q, timer, f, advance: (ms: number) => (now += ms) };
   }
 
-  it("getCircuitBreakerDefaults reports live defaults, undefined when unconfigured, and revise throws must-restart Error", () => {
+  it("getCircuitBreakerDefaults reports live defaults, undefined when unconfigured, and revise enables it (WR-455)", () => {
     const { q } = makeQueue();
     try {
       assert.deepEqual(q.getCircuitBreakerDefaults(), { ...QUEUE_DEFAULTS });
     } finally {
       q.stop();
     }
-    // Feature disabled: the getter is undefined and revise throws the
-    // must-restart Error (not a RangeError).
+    // Feature disabled: the getter is undefined until the first revise
+    // enables it (WR-455) — no restart, no Error.
     const q2 = new RetryQueue({ sender: async () => {} });
     try {
       assert.equal(q2.getCircuitBreakerDefaults(), undefined);
-      assert.throws(
-        () => q2.reviseCircuitBreakerDefaults({ failureThreshold: 3 }),
-        (err: unknown) => {
-          assert.ok(err instanceof Error);
-          assert.ok(!(err instanceof RangeError), "must be Error, not RangeError");
-          assert.match((err as Error).message, /requires a restart/);
-          return true;
-        }
-      );
+      assert.deepEqual(q2.reviseCircuitBreakerDefaults({ failureThreshold: 3 }), {
+        ...DEFAULTS,
+        failureThreshold: 3,
+      });
+      assert.deepEqual(q2.getCircuitBreakerDefaults(), {
+        ...DEFAULTS,
+        failureThreshold: 3,
+      });
+      // A second patch merges over the live (enabled) values.
+      q2.reviseCircuitBreakerDefaults({ cooldownMs: 1000 });
+      assert.deepEqual(q2.getCircuitBreakerDefaults(), {
+        ...DEFAULTS,
+        failureThreshold: 3,
+        cooldownMs: 1000,
+      });
     } finally {
       q2.stop();
     }
@@ -499,20 +505,32 @@ describe("RelayServer circuit-breaker defaults revision (WR-363)", () => {
     assert.equal(eventsOf(auditLog, "circuit_breaker_defaults_revised").length, 0);
   });
 
-  it("an unconfigured breaker throws Error on revise and leaves the getter unset", async () => {
+  it("an unconfigured breaker enables on revise, audits previous null, and mounts the getter (WR-455)", async () => {
     const { relay, auditLog } = makeServer();
     await listen(relay);
-    assert.throws(
-      () => relay.reviseCircuitBreakerDefaults({ failureThreshold: 3 }),
-      (err: unknown) => {
-        assert.ok(err instanceof Error);
-        assert.ok(!(err instanceof RangeError), "must be Error, not RangeError");
-        assert.match((err as Error).message, /requires a restart/);
-        return true;
-      }
-    );
     assert.equal(relay.getCircuitBreakerDefaults, undefined);
-    assert.equal(eventsOf(auditLog, "circuit_breaker_defaults_revised").length, 0);
+    const current = relay.reviseCircuitBreakerDefaults({ failureThreshold: 3 });
+    assert.deepEqual(current, { ...DEFAULTS, failureThreshold: 3 });
+    assert.ok(relay.getCircuitBreakerDefaults);
+    assert.deepEqual(relay.getCircuitBreakerDefaults!(), {
+      ...DEFAULTS,
+      failureThreshold: 3,
+    });
+    const revised = eventsOf(auditLog, "circuit_breaker_defaults_revised");
+    assert.equal(revised.length, 1);
+    assert.equal(revised[0].previous, null);
+    assert.deepEqual(revised[0].current, { ...DEFAULTS, failureThreshold: 3 });
+    // A same-value revision after the enable is still a silent no-op.
+    relay.reviseCircuitBreakerDefaults({ failureThreshold: 3 });
+    assert.equal(eventsOf(auditLog, "circuit_breaker_defaults_revised").length, 1);
+    // An illegal patch is still rejected and leaves the enabled
+    // defaults untouched.
+    assert.throws(() => relay.reviseCircuitBreakerDefaults({ failureThreshold: 0 }), RangeError);
+    assert.deepEqual(relay.getCircuitBreakerDefaults!(), {
+      ...DEFAULTS,
+      failureThreshold: 3,
+    });
+    assert.equal(eventsOf(auditLog, "circuit_breaker_defaults_revised").length, 1);
   });
 
   it("the getter matches live state and uncovered endpoints read the revised defaults", async () => {
