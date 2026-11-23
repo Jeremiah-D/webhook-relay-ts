@@ -220,14 +220,22 @@ describe("AdaptiveTimeout window revision (WR-354)", () => {
 describe("RetryQueue adaptive timeout window revision (WR-354)", () => {
   const okSender: Sender = async () => ({ statusCode: 200, body: Buffer.alloc(0) });
 
-  it("unconfigured: a window-only revise throws the must-restart Error, getter returns undefined", () => {
+  it("unconfigured: a window-only revise throws RangeError (no base to enable with); with a base it enables (WR-452)", () => {
     const q = new RetryQueue({ sender: okSender, baseDelayMs: 100, maxDelayMs: 60000 });
     assert.equal(q.getAdaptiveTimeoutConfig(), undefined);
-    assert.throws(
-      () => q.reviseAdaptiveTimeout({ maxSamplesPerEndpoint: 10 }),
-      /not configured — enabling it requires a restart/
-    );
+    assert.throws(() => q.reviseAdaptiveTimeout({ maxSamplesPerEndpoint: 10 }), RangeError);
     assert.equal(q.getAdaptiveTimeoutConfig(), undefined);
+    assert.deepEqual(
+      q.reviseAdaptiveTimeout({ baseTimeoutMs: 1000, maxSamplesPerEndpoint: 10 }),
+      {
+        baseTimeoutMs: 1000,
+        marginRatio: 0.5,
+        minTimeoutMs: 100,
+        maxTimeoutMs: 4000,
+        minSamples: 10,
+        maxSamplesPerEndpoint: 10,
+      }
+    );
     q.stop();
   });
 

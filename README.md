@@ -14221,7 +14221,7 @@ config at runtime (`baseTimeoutMs` / `marginRatio` / `minTimeoutMs` /
 `maxTimeoutMs` / `minSamples` / `maxSamplesPerEndpoint`, partial — omitted
 fields keep their live values); `server.getAdaptiveTimeoutConfig()`
 returns the live config (the getter is only mounted when the feature was
-configured). A revision affects only the next dispatch — the cap is
+configured, or when it is enabled at runtime — see below). A revision affects only the next dispatch — the cap is
 recomputed per dispatch — while an in-flight attempt keeps the cap
 stamped on it at dispatch. Since WR-354 the sample window is revisable
 too: narrowing `maxSamplesPerEndpoint` evicts the oldest samples from the
@@ -14232,8 +14232,15 @@ keeps every sample and never restores samples a shrink already evicted.
 An illegal patch throws `RangeError` and leaves the live config
 untouched; an empty or same-value patch is a silent no-op. A real
 revision is audited as `adaptive_timeout_revised` with `previous` /
-`current`. Enabling the feature when it was never configured still
-requires a restart.
+`current`. Live enable (WR-452): with the feature never configured the
+same call *enables* it instead of throwing — `baseTimeoutMs` must be
+present (the other five knobs fall back to the construction defaults),
+a fresh tracker is built with no samples (dispatches before the enable
+were never capped and are not retroactively sampled; cold endpoints fall
+back to the new `baseTimeoutMs`), the getter is mounted at the same
+time, and the enable is audited as `adaptive_timeout_revised` with
+`previous: null`. A restart returns to unconfigured — the enable is
+live-only.
 
 The timeout for an endpoint is `clamp(p99 * (1 + marginRatio), minTimeoutMs, maxTimeoutMs)` —
 slow endpoints get headroom against false kills, stable fast endpoints get

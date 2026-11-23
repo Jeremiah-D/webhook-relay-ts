@@ -6451,8 +6451,12 @@ export interface RelayServer extends Server {
    * same-value revision is a no-op with no audit event. A real
    * revision is audited as `adaptive_timeout_revised` with `previous`
    * / `current` (the construction values as first `previous`), and
-   * returns the live config. Always set; throws `Error` when the
-   * timeout was never configured — enabling it needs a restart. The
+   * returns the live config. WR-452: with the timeout unconfigured
+   * the same call *enables* it — `baseTimeoutMs` must be present
+   * (the other five knobs fall back to the construction defaults),
+   * the getter is mounted at the same time, and the enable is
+   * audited as `adaptive_timeout_revised` with `previous: null`.
+   * Always set. The
    * one config is shared by all endpoints: there is no per-endpoint
    * override.
    */
@@ -6460,7 +6464,9 @@ export interface RelayServer extends Server {
   /**
    * WR-334: live adaptive timeout config — the five formula inputs
    * plus the sample window, shared by all endpoints. Only set when
-   * `adaptiveTimeout` was configured; `undefined` otherwise.
+   * `adaptiveTimeout` was configured — WR-452 mounts it from the
+   * enable path when the timeout is enabled at runtime;
+   * `undefined` otherwise.
    */
   getAdaptiveTimeoutConfig?: () => AdaptiveTimeoutConfig | undefined;
   /**
@@ -19098,20 +19104,35 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   }
 
   // WR-334: adaptive timeout config runtime revision. The method is
-  // always set (like setGlobalRateLimit above); with the timeout
-  // unconfigured the queue throws Error — enabling it needs a
-  // restart. A real revision is audited as `adaptive_timeout_revised`
-  // with the previous and current config (the construction values as
-  // first `previous`); an empty or same-value patch is a silent
-  // no-op. Since WR-354 the config carries six fields — a window-only
-  // revision resizes the tracker in place and is audited the same way.
+  // always set (like setGlobalRateLimit above); WR-452: with the
+  // timeout unconfigured the same call *enables* it — the queue
+  // installs a fresh tracker (an empty or illegal patch still throws
+  // RangeError there, leaving the server unconfigured), the getter
+  // is mounted at the same time, and the enable is audited as
+  // `adaptive_timeout_revised` with `previous: null`. A real revision
+  // is audited as `adaptive_timeout_revised` with the previous and
+  // current config (the construction values as first `previous`); an
+  // empty or same-value patch is a silent no-op. Since WR-354 the
+  // config carries six fields — a window-only revision resizes the
+  // tracker in place and is audited the same way.
   server.reviseAdaptiveTimeout = (
     patch: AdaptiveTimeoutRevision
   ): AdaptiveTimeoutConfig => {
     const prev = queue.getAdaptiveTimeoutConfig();
     if (prev === undefined) {
-      // Delegates to the queue for the canonical "must restart" Error.
-      return queue.reviseAdaptiveTimeout(patch);
+      // WR-452: enable — the queue installs the fresh tracker and
+      // resolves the five omitted knobs to the construction
+      // defaults. Mount the getter and audit the enable with
+      // `previous: null`.
+      const next = queue.reviseAdaptiveTimeout(patch);
+      server.getAdaptiveTimeoutConfig = (): AdaptiveTimeoutConfig =>
+        queue.getAdaptiveTimeoutConfig()!;
+      opts.auditLog.append({
+        event: "adaptive_timeout_revised",
+        previous: null,
+        current: next,
+      });
+      return next;
     }
     // Validate-then-apply inside retune: an illegal patch throws
     // RangeError and the live values are left completely intact.
@@ -19135,7 +19156,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   };
 
   // WR-334: live adaptive timeout config. Only set when
-  // `retry.adaptiveTimeout` was configured.
+  // `retry.adaptiveTimeout` was configured — WR-452 mounts it from
+  // the enable path when the timeout is enabled at runtime.
   if (queue.getAdaptiveTimeoutConfig() !== undefined) {
     server.getAdaptiveTimeoutConfig = (): AdaptiveTimeoutConfig =>
       queue.getAdaptiveTimeoutConfig()!;

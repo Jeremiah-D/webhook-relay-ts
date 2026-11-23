@@ -5128,7 +5128,11 @@ export class RetryQueue {
    * point and the dispatch stamp no-op, so unconfigured behavior is
    * byte-for-byte the pre-WR-166 behavior.
    */
-  private readonly adaptiveTimeout?: AdaptiveTimeout;
+  // WR-452: deliberately *not* readonly — `reviseAdaptiveTimeout`
+  // installs a fresh tracker here when the timeout is enabled at
+  // runtime (it was undefined before, so there is nothing to
+  // retune in place).
+  private adaptiveTimeout?: AdaptiveTimeout;
   /**
    * WR-196: adaptive retry-backoff cap (one instance, per-endpoint
    * windows inside). `undefined` when the feature is off — every feed
@@ -11490,17 +11494,50 @@ export class RetryQueue {
    * their original cap, and in-flight attempts are unaffected. An
    * illegal patch throws `RangeError` and the live values are
    * untouched; an empty patch is a `RangeError`; revising to the live
-   * values is a no-op. Throws `Error` when the timeout was never
-   * configured — enabling it needs a restart. The one config is
-   * shared by all endpoints. Returns the live config.
+   * values is a no-op. The one config is shared by all endpoints.
+   * Returns the live config.
+   *
+   * WR-452: when the timeout was never configured, the same call
+   * *enables* it instead of throwing: `baseTimeoutMs` must be
+   * present and finite > 0 (validated first, through the same
+   * construction gate as `assertValidAdaptiveTimeoutOptions` — the
+   * other five knobs fall back to the construction defaults
+   * `marginRatio` 0.5 / `minTimeoutMs` 100 / `maxTimeoutMs` 4x the
+   * base / `minSamples` 10 / `maxSamplesPerEndpoint` 1024), and a
+   * fresh tracker is built with no samples — dispatches before the
+   * enable were never capped and are not retroactively sampled, cold
+   * endpoints fall back to the new `baseTimeoutMs`, and only
+   * dispatches after the enable feed the p99 window. An empty,
+   * non-object, or illegal patch throws `RangeError` and the queue
+   * stays unconfigured. The new tracker runs on the default wall
+   * clock — the queue has no injected clock to offer (exactly the
+   * clock a construction-time tracker would have been handed when
+   * no `now` was passed through the options). No persistence: a
+   * restart returns to unconfigured — the enable is live-only. Once
+   * enabled, later calls revise per WR-334/WR-354.
    */
   reviseAdaptiveTimeout(patch: AdaptiveTimeoutRevision): AdaptiveTimeoutConfig {
     const adaptive = this.adaptiveTimeout;
     if (adaptive === undefined) {
-      throw new Error(
-        "reviseAdaptiveTimeout: adaptive timeout is not configured — enabling it requires a restart: " +
-          "the timeout is created at startup and a running relay cannot start deriving p99 caps without one"
-      );
+      // WR-452: enable — validate with the construction-time rules,
+      // then install a fresh tracker. Validation throws before
+      // anything is assigned, so an illegal patch leaves the queue
+      // unconfigured. `assertValidAdaptiveTimeoutOptions` itself
+      // rejects non-object patches and requires `baseTimeoutMs`
+      // present and finite > 0, so an empty patch is a `RangeError`
+      // here (there is nothing to enable with) — unlike the revise
+      // path, where an empty patch is a `RangeError` against live
+      // values for a different reason (nothing to revise).
+      assertValidAdaptiveTimeoutOptions(patch);
+      this.adaptiveTimeout = new AdaptiveTimeout({
+        baseTimeoutMs: patch.baseTimeoutMs as number,
+        marginRatio: patch.marginRatio,
+        minTimeoutMs: patch.minTimeoutMs,
+        maxTimeoutMs: patch.maxTimeoutMs,
+        minSamples: patch.minSamples,
+        maxSamplesPerEndpoint: patch.maxSamplesPerEndpoint,
+      });
+      return this.adaptiveTimeout.snapshot();
     }
     return adaptive.retune(patch);
   }

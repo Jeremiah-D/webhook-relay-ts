@@ -282,18 +282,34 @@ describe("AdaptiveTimeout.retune (WR-334)", () => {
 });
 
 describe("RetryQueue adaptive timeout revision (WR-334)", () => {
-  it("unconfigured: revise throws the must-restart Error, getter returns undefined", () => {
+  it("unconfigured: revise without baseTimeoutMs throws RangeError; with it, it enables (WR-452)", () => {
     const q = new RetryQueue({ sender: async () => {} });
     assert.equal(q.getAdaptiveTimeoutConfig(), undefined);
-    assert.throws(
-      () => q.reviseAdaptiveTimeout({ marginRatio: 1 }),
-      /not configured — enabling it requires a restart/
-    );
-    assert.throws(
-      () => q.reviseAdaptiveTimeout({ marginRatio: 1 }),
-      /cannot start deriving p99 caps without one/
-    );
+    // No base to enable with: a base-less patch is a RangeError and
+    // the queue stays unconfigured — the old must-restart Error is
+    // gone (WR-452 turns this setter into the enable path).
+    assert.throws(() => q.reviseAdaptiveTimeout({ marginRatio: 1 }), RangeError);
+    assert.throws(() => q.reviseAdaptiveTimeout({}), RangeError);
+    assert.throws(() => q.reviseAdaptiveTimeout(null as never), RangeError);
     assert.equal(q.getAdaptiveTimeoutConfig(), undefined);
+    // A base-carrying patch enables: the other five knobs take the
+    // construction defaults.
+    assert.deepEqual(q.reviseAdaptiveTimeout({ baseTimeoutMs: 1000 }), {
+      baseTimeoutMs: 1000,
+      marginRatio: 0.5,
+      minTimeoutMs: 100,
+      maxTimeoutMs: 4000,
+      minSamples: 10,
+      maxSamplesPerEndpoint: 1024,
+    });
+    assert.deepEqual(q.getAdaptiveTimeoutConfig(), {
+      baseTimeoutMs: 1000,
+      marginRatio: 0.5,
+      minTimeoutMs: 100,
+      maxTimeoutMs: 4000,
+      minSamples: 10,
+      maxSamplesPerEndpoint: 1024,
+    });
   });
 
   it("getter tracks revisions", () => {
@@ -472,14 +488,41 @@ describe("RelayServer adaptive timeout revision (WR-334)", () => {
     assert.deepEqual(relay.getAdaptiveTimeoutConfig!(), { ...construction, marginRatio: 1 });
   });
 
-  it("unconfigured relay: revise throws the must-restart Error and the getter is not mounted", async () => {
-    const { relay } = makeRelay();
+  it("unconfigured relay: revise without baseTimeoutMs throws RangeError; with it, it enables and mounts the getter (WR-452)", async () => {
+    const { relay, audit } = makeRelay();
     await listen(relay);
     assert.equal(relay.getAdaptiveTimeoutConfig, undefined);
-    assert.throws(
-      () => relay.reviseAdaptiveTimeout!({ marginRatio: 1 }),
-      /not configured — enabling it requires a restart/
-    );
+    assert.throws(() => relay.reviseAdaptiveTimeout!({ marginRatio: 1 }), RangeError);
+    assert.equal(relay.getAdaptiveTimeoutConfig, undefined);
+    assert.equal(eventsOf(audit, "adaptive_timeout_revised").length, 0);
+    assert.deepEqual(relay.reviseAdaptiveTimeout!({ baseTimeoutMs: 1000 }), {
+      baseTimeoutMs: 1000,
+      marginRatio: 0.5,
+      minTimeoutMs: 100,
+      maxTimeoutMs: 4000,
+      minSamples: 10,
+      maxSamplesPerEndpoint: 1024,
+    });
+    assert.notEqual(relay.getAdaptiveTimeoutConfig, undefined);
+    assert.deepEqual(relay.getAdaptiveTimeoutConfig!(), {
+      baseTimeoutMs: 1000,
+      marginRatio: 0.5,
+      minTimeoutMs: 100,
+      maxTimeoutMs: 4000,
+      minSamples: 10,
+      maxSamplesPerEndpoint: 1024,
+    });
+    const revised = eventsOf(audit, "adaptive_timeout_revised");
+    assert.equal(revised.length, 1);
+    assert.equal(revised[0].previous, null);
+    assert.deepEqual(revised[0].current, {
+      baseTimeoutMs: 1000,
+      marginRatio: 0.5,
+      minTimeoutMs: 100,
+      maxTimeoutMs: 4000,
+      minSamples: 10,
+      maxSamplesPerEndpoint: 1024,
+    });
   });
 
   it("server getter reflects revisions made through the server", async () => {
