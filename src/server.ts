@@ -8964,12 +8964,16 @@ export interface RelayServer extends Server {
    * `RangeError` and the live budget is untouched; a same-value
    * revision is a no-op with no audit event. A real revision is
    * audited as `retry_budget_revised` with `previous` / `current`
-   * budgets, and returns the live budget. Always set; throws `Error`
-   * when the budget was never configured — enabling it needs a
-   * restart. Endpoint overrides (WR-125) and the per-tenant budget
-   * (WR-200) are untouched.
+   * budgets, and returns the live budget. Always set; when the
+   * budget was never configured the same call *enables* it (WR-453):
+   * a fresh full bucket is installed — `undefined` takes the
+   * construction default of 6000 retries/minute — and the enable is
+   * audited with `previous: null`. An illegal value throws
+   * `RangeError` and the relay stays unconfigured. Endpoint
+   * overrides (WR-125) and the per-tenant budget (WR-200) are
+   * untouched.
    */
-  setRetryBudget?: (retriesPerMinute: number) => number;
+  setRetryBudget?: (retriesPerMinute?: number) => number;
   /**
    * WR-326: revise the per-tenant retry budget at runtime (retries
    * per minute). With `tenant` omitted the default domain moves —
@@ -9437,7 +9441,8 @@ export interface RelayServer extends Server {
    * `retry_budget_depleted_callback_revised` with `previous` / `current`
    * recording only 'set' / 'cleared' presence, never a function body.
    * Always set; throws `Error` when no retry budget was configured at
-   * any layer — enabling it needs a restart. The new callback takes
+   * any layer — enabling the global budget live via `setRetryBudget`
+   * (WR-453) opens the gate without a restart. The new callback takes
    * effect from the next parked retry; parks already reported are never
    * re-delivered, and the park schedule, counters, and refill rhythm
    * are untouched. Direct queue users use
@@ -23748,15 +23753,25 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
 
   // WR-314: relay-level global retry-budget runtime revision. The
   // method is always set (like setGlobalRateLimit above); with the
-  // budget unconfigured the queue throws Error — enabling the budget
-  // needs a restart. A real revision is audited as
-  // `retry_budget_revised` with the previous and current budget; a
-  // same-value revision is a silent no-op.
-  server.setRetryBudget = (retriesPerMinute: number): number => {
+  // budget unconfigured the same call *enables* it (WR-453): the
+  // queue validates (RangeError on an illegal value, stays
+  // unconfigured) and installs a fresh full bucket — `undefined`
+  // takes the 6000 construction default — and the enable is audited
+  // as `retry_budget_revised` with `previous: null`. A real revision
+  // is audited as `retry_budget_revised` with the previous and
+  // current budget; a same-value revision is a silent no-op.
+  server.setRetryBudget = (retriesPerMinute?: number): number => {
     const prevStats = queue.getRetryBudgetStats();
     if (prevStats === undefined) {
-      // Delegates to the queue for the canonical "must restart" Error.
-      return queue.setRetryBudget(retriesPerMinute);
+      // WR-453: enable — the queue installs the fresh bucket; audit
+      // the enable with `previous: null`.
+      const next = queue.setRetryBudget(retriesPerMinute);
+      opts.auditLog.append({
+        event: "retry_budget_revised",
+        previous: null,
+        current: next,
+      });
+      return next;
     }
     const previous = prevStats.retriesPerMinute;
     // Validate-then-apply inside retune: an illegal value throws

@@ -4767,8 +4767,8 @@ export class RetryQueue {
   private onAssertionFailure?: (info: AssertionFailureInfo) => void;
   /** WR-118: cumulative assertion failures per (tenant, endpoint) — see `getDeliveryStats` / `renderMetrics`. */
   private readonly assertionFailureCounts = new Map<string, Map<string, number>>();
-  /** WR-38: global retry budget; undefined when disabled. */
-  private readonly retryBudget?: RetryBudget;
+  /** WR-38: global retry budget; undefined when disabled. WR-453: deliberately *not* readonly — `setRetryBudget` installs it live on a never-configured queue (see WR-451). */
+  private retryBudget?: RetryBudget;
   /**
    * WR-327: clock shared by the global and per-endpoint retry budgets
    * (injected for deterministic tests); a runtime-created endpoint
@@ -12140,19 +12140,38 @@ export class RetryQueue {
    * never touching the circuit breaker). Tightening clamps the token
    * bucket to the new cap at once; widening never tops the bucket up.
    * An illegal value throws `RangeError` and the live budget is
-   * untouched; revising to the current value is a no-op. Throws
-   * `Error` when the budget was never configured — enabling it needs
-   * a restart. Endpoint overrides (WR-125) and the per-tenant budget
-   * (WR-200) are untouched: only the global bucket is revised.
+   * untouched; revising to the current value is a no-op. Endpoint
+   * overrides (WR-125) and the per-tenant budget (WR-200) are
+   * untouched: only the global bucket is revised.
+   *
+   * WR-453: when the budget was never configured, the same call
+   * *enables* it instead of throwing: a fresh bucket is built on the
+   * queue's shared retry-budget clock (`retryBudgetNow`, the same
+   * clock a construction-time budget would have read) and starts
+   * full, so the next scheduled retry is judged by the new bucket
+   * at once. `undefined` enables with the construction default
+   * (`DEFAULT_RETRY_BUDGET_PER_MINUTE`, 6000 — the same default the
+   * `RetryBudget` constructor applies to a present-but-empty
+   * `retryBudget` option, WR-38); an illegal value throws
+   * `RangeError` and the queue stays unconfigured, so a later valid
+   * call can still enable it. Retries scheduled before the enable
+   * are not retroactively gated — they were never parked against a
+   * bucket that did not exist — and no restart is involved: a
+   * restart returns to unconfigured. Enabling also opens the
+   * WR-387 depleted-callback gate (`anyRetryBudgetConfigured`
+   * reads the live field). Once enabled, later calls revise per
+   * WR-314.
    */
-  setRetryBudget(retriesPerMinute: number): number {
+  setRetryBudget(retriesPerMinute?: number): number {
     if (this.retryBudget === undefined) {
-      throw new Error(
-        "setRetryBudget: retry budget is not configured — enabling it requires a restart: " +
-          "the budget is created at startup and a running relay cannot start budgeting without one"
-      );
+      // WR-453: enable — validate-then-install through the same
+      // construction gate. The constructor throws RangeError on an
+      // illegal value before anything is assigned, so the queue stays
+      // unconfigured; `undefined` takes the constructor default.
+      this.retryBudget = new RetryBudget(retriesPerMinute, this.retryBudgetNow);
+      return this.retryBudget.limit();
     }
-    return this.retryBudget.retune(retriesPerMinute);
+    return this.retryBudget.retune(retriesPerMinute as number);
   }
 
   /**
@@ -13722,7 +13741,8 @@ export class RetryQueue {
    * already unset) is a no-op. Throws `Error` when no retry budget is
    * configured at any of the three layers (global, per-endpoint,
    * per-tenant) — parks can only happen with a budget in place, so
-   * enabling observation needs a restart. (A per-endpoint override
+   * enabling the global budget live via `setRetryBudget` (WR-453)
+   * opens this gate without a restart. (A per-endpoint override
    * alone passes the gate — the bucket exists — even though the park
    * path only consults endpoint buckets when a global or tenant budget
    * is also present.) Under `RelayServer` the field holds the server's

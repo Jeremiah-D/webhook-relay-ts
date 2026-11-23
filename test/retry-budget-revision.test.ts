@@ -141,10 +141,11 @@ describe("RetryQueue.setRetryBudget (WR-314)", () => {
     }
   });
 
-  it("throws Error when the budget was never configured", () => {
+  it("enables the budget on a never-configured queue instead of throwing (WR-453)", () => {
     const q = new RetryQueue({ sender: async () => {}, maxAttempts: 1 });
-    assert.throws(() => q.setRetryBudget(100), /not configured/);
     assert.equal(q.getRetryBudgetStats(), undefined);
+    assert.equal(q.setRetryBudget(100), 100);
+    assert.equal(q.getRetryBudgetStats()?.retriesPerMinute, 100);
     q.stop();
   });
 
@@ -278,11 +279,14 @@ describe("RelayServer.setRetryBudget (WR-314)", () => {
     assert.equal(eventsOf(auditLog, "retry_budget_revised").length, 0);
   });
 
-  it("throws Error when the budget was never configured", async () => {
+  it("enables the budget on a never-configured relay and audits previous: null (WR-453)", async () => {
     const { relay, auditLog } = makeServer({});
     await listen(relay);
     assert.equal(typeof relay.setRetryBudget, "function");
-    assert.throws(() => relay.setRetryBudget!(100), /not configured/);
-    assert.equal(eventsOf(auditLog, "retry_budget_revised").length, 0);
+    assert.equal(relay.setRetryBudget!(100), 100);
+    const revised = eventsOf(auditLog, "retry_budget_revised");
+    assert.equal(revised.length, 1);
+    assert.equal(revised[0].previous, null);
+    assert.equal(revised[0].current, 100);
   });
 });

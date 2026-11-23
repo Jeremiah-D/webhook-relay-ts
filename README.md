@@ -341,9 +341,14 @@ reliability primitives that matter for any signed-payload pipeline.
   up (tokens refill lazily against the new cap), a same-value revision
   is a silent no-op, and a real revision is audited as
   `retry_budget_revised` with `previous` / `current`. Illegal values
-  throw `RangeError` and leave the live budget untouched; revising
-  when the budget was never configured throws `Error` (enabling it
-  needs a restart). Endpoint overrides and the per-tenant budget are
+  throw `RangeError` and leave the live budget untouched; WR-453:
+  calling it when the budget was never configured *enables* it
+  instead of throwing — a fresh full bucket is installed on the
+  queue's shared retry-budget clock, `undefined` takes the 6000
+  construction default, the enable is audited with `previous: null`,
+  retries scheduled before the enable are not retroactively gated,
+  and enabling opens the WR-387 depleted-callback gate. Endpoint
+  overrides and the per-tenant budget are
   untouched — only the global bucket is revised. Runtime revision
   (WR-327) covers the third dimension: `reviseEndpointRetryBudget(endpoint,
   retriesPerMinute)` retunes one endpoint's override in place (an
@@ -380,8 +385,9 @@ reliability primitives that matter for any signed-payload pipeline.
   `retry_budget_depleted_callback_revised` with `previous` / `current`
   ('set' / 'cleared' presence, never a function body) — and the audit can
   never be bypassed by a replacement. With no retry budget configured at
-  any layer (global, per-endpoint, per-tenant), revision throws `Error` —
-  enabling observation needs a restart. Only the observer moves: the park
+  any layer (global, per-endpoint, per-tenant), revision throws `Error`;
+  enabling the global budget live via `setRetryBudget` (WR-453) opens
+  the gate without a restart. Only the observer moves: the park
   schedule, the park counters, and the refill rhythm are untouched.
 - `src/tenant-retry-budget.ts` — *per-tenant* retry budget
   (`TenantRetryBudget`, WR-200): one lazily-created token bucket per
