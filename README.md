@@ -413,12 +413,18 @@ reliability primitives that matter for any signed-payload pipeline.
   tenant's override (recorded live, its bucket retuned in place when one
   exists); `getTenantRetryBudget(tenant?)` reads the live rate and the
   override flag without creating a bucket (only set when the budget was
-  configured); `removeTenantRetryBudget(tenant)` drops an override so the
+  configured, or enabled at runtime by WR-454); `removeTenantRetryBudget(tenant)` drops an override so the
   tenant falls back to the live default (its bucket retuned in place,
   token state kept). Check order is tenant id, then rate, then apply —
   an illegal value throws `RangeError` and the live budget is untouched;
-  a same-value revision is a silent no-op; revising when the budget was
-  never configured throws `Error` (enabling it needs a restart); the
+  a same-value revision is a silent no-op; WR-454: calling it when the
+  budget was never configured *enables* it instead of throwing — a fresh
+  budget is installed at the given rate (`undefined` takes the 6000
+  construction default; a tenant given with a rate records that tenant's
+  override, a tenant given without one just enables at the default), the
+  enable is audited with `previous: null`, the getter is mounted at the
+  same time, retries scheduled before the enable are not retroactively
+  gated, and enabling opens the WR-387 depleted-callback gate; the
   default rate cannot be removed, only revised. Real revisions audit
   `tenant_retry_budget_revised` with `tenant` (omitted for the default
   domain) / `scope` / `previous` / `current`, removals audit

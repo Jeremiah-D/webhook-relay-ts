@@ -8988,20 +8988,24 @@ export interface RelayServer extends Server {
    * event. A real revision is audited as
    * `tenant_retry_budget_revised` with `tenant` (omitted for the
    * default domain) / `scope` / `previous` / `current` rates, and
-   * returns the live revision. Always set; throws `Error` when the
-   * per-tenant budget was never configured — enabling it needs a
-   * restart. Other tenants, the global budget (WR-38/WR-314) and the
-   * endpoint overrides (WR-125) are untouched.
+   * returns the live revision. Always set; WR-454: with the budget
+   * never configured the same call *enables* it — the queue installs
+   * a fresh budget (`undefined` takes the 6000 construction default),
+   * the getter is mounted at the same time, and the enable is audited
+   * with `previous: null`. Other tenants, the global budget
+   * (WR-38/WR-314) and the endpoint overrides (WR-125) are untouched.
    */
   reviseTenantRetryBudget: (
     tenant: string | undefined,
-    retriesPerMinute: number
+    retriesPerMinute?: number
   ) => TenantRetryBudgetRevision;
   /**
    * WR-326: live per-tenant retry-budget read — the effective rate
    * for `tenant` (or the default domain when omitted) and whether the
    * tenant carries an explicit override. Only set when the
-   * per-tenant budget was configured; `undefined` otherwise.
+   * per-tenant budget was configured; `undefined` otherwise. WR-454
+   * mounts it from the enable path when the budget is enabled at
+   * runtime.
    */
   getTenantRetryBudget?: (tenant?: string) => TenantRetryBudgetRevision | undefined;
   /**
@@ -23789,21 +23793,36 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   };
 
   // WR-326: per-tenant retry-budget runtime revision. The method is
-  // always set (like setRetryBudget above); with the budget
-  // unconfigured the queue throws Error — enabling the budget needs
-  // a restart. A real revision is audited as
-  // `tenant_retry_budget_revised` with the tenant (omitted for the
-  // default domain) / scope / previous / current rates (the
-  // constructor default on a first default-domain revision); a
-  // same-value revision is a silent no-op.
+  // always set (like setRetryBudget above); WR-454: with the budget
+  // unconfigured the same call *enables* it — the queue installs the
+  // fresh budget (an illegal tenant id or rate still throws there,
+  // leaving the server unconfigured), the getter is mounted at the
+  // same time, and the enable is audited as
+  // `tenant_retry_budget_revised` with `previous: null`. A real
+  // revision is audited as `tenant_retry_budget_revised` with the
+  // tenant (omitted for the default domain) / scope / previous /
+  // current rates (the constructor default on a first default-domain
+  // revision); a same-value revision is a silent no-op.
   server.reviseTenantRetryBudget = (
     tenant: string | undefined,
-    retriesPerMinute: number
+    retriesPerMinute?: number
   ): TenantRetryBudgetRevision => {
     const prevStats = queue.getTenantRetryBudgetStats();
     if (prevStats === undefined) {
-      // Delegates to the queue for the canonical "must restart" Error.
-      return queue.reviseTenantRetryBudget(tenant, retriesPerMinute);
+      // WR-454: enable — the queue installs the fresh budget; mount
+      // the getter and audit the enable with `previous: null`.
+      const next = queue.reviseTenantRetryBudget(tenant, retriesPerMinute);
+      server.getTenantRetryBudget = (
+        tenant?: string
+      ): TenantRetryBudgetRevision | undefined => queue.getTenantRetryBudget(tenant);
+      opts.auditLog.append({
+        event: "tenant_retry_budget_revised",
+        ...(tenant === undefined ? {} : { tenant }),
+        scope: next.scope,
+        previous: null,
+        current: next.retriesPerMinute,
+      });
+      return next;
     }
     const previous = queue.getTenantRetryBudget(tenant)!;
     // Validate-then-apply inside the queue revision: an illegal
@@ -23841,7 +23860,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   };
 
   // WR-326: live per-tenant retry-budget reads. Only set when the
-  // per-tenant budget was configured.
+  // per-tenant budget was configured — WR-454 mounts it from the
+  // enable path when the budget is enabled at runtime.
   if (queue.getTenantRetryBudgetStats() !== undefined) {
     server.getTenantRetryBudget = (
       tenant?: string

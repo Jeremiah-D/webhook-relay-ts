@@ -254,6 +254,7 @@ import {
 import { RetryBudget, type EndpointRetryBudgetSnapshot, type RetryBudgetOptions } from "./retry-budget.ts";
 import {
   TenantRetryBudget,
+  DEFAULT_TENANT_RETRY_BUDGET_PER_MINUTE,
   type TenantRetryBudgetOptions,
 } from "./tenant-retry-budget.ts";
 import {
@@ -4839,8 +4840,8 @@ export class RetryQueue {
   private readonly dryRunCounters = new Map<string, Map<string, Map<DryRunOutcome, number>>>();
   /** Retries parked because the global retry budget was exhausted. */
   private retryBudgetDepleted = 0;
-  /** WR-200: per-tenant retry budget; undefined when unconfigured. */
-  private readonly tenantRetryBudget?: TenantRetryBudget;
+  /** WR-200: per-tenant retry budget; undefined when unconfigured. WR-454: deliberately *not* readonly — `reviseTenantRetryBudget` installs it live on a never-configured queue (see WR-453). */
+  private tenantRetryBudget?: TenantRetryBudget;
   /**
    * WR-200: retries parked because the tenant's own budget was
    * exhausted, per tenant key (`""` = the default tenant-less tenant).
@@ -12188,29 +12189,82 @@ export class RetryQueue {
    * rate, then apply — an illegal tenant id (`TypeError`/`RangeError`)
    * or rate (`RangeError`) leaves the live budget completely
    * untouched; revising to the effective current rate is a no-op.
-   * Throws `Error` when the per-tenant budget was never configured —
-   * enabling it needs a restart. Other tenants, the global budget
-   * (WR-38/WR-314) and the endpoint overrides (WR-125) are untouched.
-   * Returns the live revision (previous = effective rate before).
+   * Other tenants, the global budget (WR-38/WR-314) and the endpoint
+   * overrides (WR-125) are untouched. Returns the live revision
+   * (previous = effective rate before).
+   *
+   * WR-454: when the budget was never configured, the same call
+   * *enables* it instead of throwing: a fresh budget is built on the
+   * construction defaults (`retriesPerMinute` when given, else the
+   * 6000 construction default — the same default the `TenantRetryBudget`
+   * constructor applies to a present-but-empty option, WR-200), and
+   * a tenant given with a rate records that tenant's override on the
+   * fresh budget (a tenant given without a rate just enables at the
+   * default). The fresh buckets start full, so the next scheduled
+   * retry is judged by the new budget at once. An illegal tenant id
+   * or rate throws `TypeError`/`RangeError` and the queue stays
+   * unconfigured, so a later valid call can still enable it. Retries
+   * scheduled before the enable are not retroactively gated — they
+   * were never parked against a budget that did not exist — and no
+   * restart is involved: a restart returns to unconfigured. Enabling
+   * also opens the WR-387 depleted-callback gate
+   * (`anyRetryBudgetConfigured` reads the live field). Once enabled,
+   * later calls revise per WR-326. The returned `previous` is the
+   * construction default (6000): the rate the tenant (or the default
+   * domain) would have gated on had the budget existed with defaults
+   * — the same convention as a first override revision on a
+   * configured budget, where `previous` is the default.
    */
   reviseTenantRetryBudget(
     tenant: string | undefined,
-    retriesPerMinute: number
+    retriesPerMinute?: number
   ): TenantRetryBudgetRevision {
     const budget = this.tenantRetryBudget;
     if (budget === undefined) {
-      throw new Error(
-        "reviseTenantRetryBudget: tenant retry budget is not configured — enabling it requires a restart: " +
-          "the budget is created at startup and a running relay cannot start budgeting without one"
+      // WR-454: enable — validate-then-install through the same
+      // construction gate. The tenant id is checked first (the WR-326
+      // check order) so a non-string id throws `TypeError` instead of
+      // being coerced into an object key; the constructor then throws
+      // `RangeError` on an illegal rate before anything is assigned,
+      // so the queue stays unconfigured. `undefined` takes the
+      // constructor default.
+      if (tenant !== undefined) assertValidTenantId(tenant);
+      this.tenantRetryBudget = new TenantRetryBudget(
+        tenant === undefined
+          ? retriesPerMinute === undefined
+            ? {}
+            : { retriesPerMinute }
+          : retriesPerMinute === undefined
+            ? {}
+            : { perTenantRetriesPerMinute: { [tenant]: retriesPerMinute } }
       );
+      const enabled = this.tenantRetryBudget;
+      if (tenant === undefined) {
+        return {
+          retriesPerMinute: enabled.defaultLimit(),
+          previous: DEFAULT_TENANT_RETRY_BUDGET_PER_MINUTE,
+          scope: "default",
+          overridden: false,
+        };
+      }
+      return {
+        tenant,
+        retriesPerMinute: enabled.limitFor(tenant),
+        previous: DEFAULT_TENANT_RETRY_BUDGET_PER_MINUTE,
+        scope: "tenant",
+        overridden: enabled.hasOverride(tenant),
+      };
     }
     if (tenant === undefined) {
       const previous = budget.defaultLimit();
-      const current = budget.reviseDefault(retriesPerMinute);
+      // WR-454: the rate is optional only on the enable path above; a
+      // configured queue still needs a rate — `undefined` falls through
+      // to `reviseDefault`'s own RangeError (as in WR-453's cast).
+      const current = budget.reviseDefault(retriesPerMinute as number);
       return { retriesPerMinute: current, previous, scope: "default", overridden: false };
     }
     const previous = budget.limitFor(tenant);
-    const current = budget.reviseTenant(tenant, retriesPerMinute);
+    const current = budget.reviseTenant(tenant, retriesPerMinute as number);
     // A same-value revision is a no-op that records no override, so
     // read the flag live instead of assuming the revision set one.
     return { tenant, retriesPerMinute: current, previous, scope: "tenant", overridden: budget.hasOverride(tenant) };

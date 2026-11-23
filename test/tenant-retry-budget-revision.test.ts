@@ -187,20 +187,20 @@ describe("RetryQueue tenant retry budget revision (WR-326)", () => {
     }
   });
 
-  it("an unconfigured queue throws the must-restart Error on revise and reports nothing on get/remove", () => {
+  it("an unconfigured queue enables on revise and reports nothing on get/remove before that", () => {
     const q = new RetryQueue({ sender: (async () => {}) as Sender });
     try {
-      assert.throws(
-        () => q.reviseTenantRetryBudget(undefined, 30),
-        /tenant retry budget is not configured — enabling it requires a restart/
-      );
-      assert.throws(
-        () => q.reviseTenantRetryBudget("acme", 5),
-        /tenant retry budget is not configured — enabling it requires a restart/
-      );
       assert.equal(q.getTenantRetryBudget(), undefined);
       assert.equal(q.getTenantRetryBudget("acme"), undefined);
       assert.equal(q.removeTenantRetryBudget("acme"), false);
+      // WR-454: the same call enables instead of throwing.
+      assert.deepEqual(q.reviseTenantRetryBudget(undefined, 30), {
+        retriesPerMinute: 30,
+        previous: 6000,
+        scope: "default",
+        overridden: false,
+      });
+      assert.equal(q.getTenantRetryBudget()!.retriesPerMinute, 30);
     } finally {
       q.stop();
     }
@@ -361,10 +361,15 @@ describe("RelayServer tenant retry budget revision (WR-326)", () => {
     const unconfigured = makeServer({});
     await listen(unconfigured.relay);
     assert.equal(unconfigured.relay.getTenantRetryBudget, undefined);
-    assert.throws(
-      () => unconfigured.relay.reviseTenantRetryBudget(undefined, 30),
-      /tenant retry budget is not configured — enabling it requires a restart/
-    );
+    // WR-454: the same call enables instead of throwing, and mounts
+    // the getter.
+    assert.deepEqual(unconfigured.relay.reviseTenantRetryBudget(undefined, 30), {
+      retriesPerMinute: 30,
+      previous: 6000,
+      scope: "default",
+      overridden: false,
+    });
+    assert.equal(unconfigured.relay.getTenantRetryBudget!("acme").retriesPerMinute, 30);
     assert.equal(unconfigured.relay.removeTenantRetryBudget("acme"), false);
   });
 });
