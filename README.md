@@ -3797,11 +3797,15 @@ in the Prometheus exposition (only when the limit is configured).
   `global_rate_revised` with `previous` / `current`
   `{ messagesPerSec, maxBurst }`. Tightening clamps the unspent bucket to
   the new cap (already-granted tokens are not revoked); waiters parked on
-  the gate are re-armed at the new rate. When the limit was never
-  configured the method throws `Error` — enabling the cap needs a
-  restart. `server.getGlobalRateLimitStats()` (set only when configured)
-  reports the live rate and burst, the bucket level, the waiter depth,
-  and the cumulative delayed count.
+  the gate are re-armed at the new rate. On a relay where the limit was
+  never configured, calling `setGlobalRateLimit` *enables* it instead
+  (WR-451) — `messagesPerSec` is mandatory, `maxBurst` defaults to it,
+  the new bucket starts full, and the enable is audited with
+  `previous: null`, while an empty or illegal patch throws `RangeError`
+  and leaves the relay unconfigured. `server.getGlobalRateLimitStats()`
+  (set only when configured — mounted by the enable when the limit is
+  enabled at runtime) reports the live rate and burst, the bucket level,
+  the waiter depth, and the cumulative delayed count.
 
 ## Per-tenant outbound concurrency cap
 

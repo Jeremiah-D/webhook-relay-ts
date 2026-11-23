@@ -6397,8 +6397,12 @@ export interface RelayServer extends Server {
    * no-op with no audit event. A real revision is audited as
    * `global_rate_revised` with `previous` / `current`
    * `{ messagesPerSec, maxBurst }`, and returns the live values.
-   * Always set; throws `Error` when the limit was never configured —
-   * enabling the cap needs a restart.
+   * WR-451: with the limit never configured the same call *enables*
+   * it instead of throwing — `messagesPerSec` must be present and
+   * finite > 0, `maxBurst` defaults to `messagesPerSec`, the getter
+   * is mounted, and the enable is audited with `previous: null`; an
+   * empty or illegal patch throws `RangeError` and leaves the relay
+   * unconfigured. Always set.
    */
   setGlobalRateLimit?: (patch: GlobalRateLimitRevision) => { messagesPerSec: number; maxBurst: number };
   /**
@@ -10046,7 +10050,8 @@ export interface RelayServer extends Server {
    * WR-310: relay-level global rate-limit snapshot (the live rate and
    * burst cap, current bucket level, FIFO waiter depth, and cumulative
    * delayed dispatch count). Set only when `retry.globalRateLimit`
-   * was configured.
+   * was configured — WR-451 mounts it from the enable path when the
+   * limit is enabled at runtime.
    */
   getGlobalRateLimitStats?: () => GlobalRateLimitStats;
   /**
@@ -19018,16 +19023,28 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   };
 
   // WR-310: relay-level global outbound rate-limit runtime revision.
-  // The method is always set (like setDedupWindow above); with the
-  // limit unconfigured the queue throws Error — enabling the cap needs
-  // a restart. A real revision is audited as `global_rate_revised`
-  // with the previous and current rate/burst; an empty or same-value
-  // patch is a silent no-op.
+  // The method is always set (like setDedupWindow above); WR-451:
+  // with the limit unconfigured the same call *enables* it — the
+  // queue installs a fresh limiter (an empty or illegal patch still
+  // throws RangeError there, leaving the server unconfigured), the
+  // getter is mounted at the same time, and the enable is audited as
+  // `global_rate_revised` with `previous: null`. A real revision is
+  // audited as `global_rate_revised` with the previous and current
+  // rate/burst; an empty or same-value patch is a silent no-op.
   server.setGlobalRateLimit = (patch: GlobalRateLimitRevision): { messagesPerSec: number; maxBurst: number } => {
     const prevStats = queue.getGlobalRateLimitStats();
     if (prevStats === undefined) {
-      // Delegates to the queue for the canonical "must restart" Error.
-      return queue.setGlobalRateLimit(patch);
+      // WR-451: enable — the queue installs the fresh limiter and
+      // resolves a missing maxBurst to messagesPerSec. Mount the
+      // getter and audit the enable with `previous: null`.
+      const next = queue.setGlobalRateLimit(patch);
+      server.getGlobalRateLimitStats = (): GlobalRateLimitStats => queue.getGlobalRateLimitStats()!;
+      opts.auditLog.append({
+        event: "global_rate_revised",
+        previous: null,
+        current: next,
+      });
+      return next;
     }
     const previous = { messagesPerSec: prevStats.messagesPerSec, maxBurst: prevStats.maxBurst };
     // Validate-then-apply inside retune: an illegal patch throws
@@ -23529,7 +23546,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   server.getMaxJsonDepth = (): number => maxJsonDepth;
 
   // WR-310: relay-level global rate-limit snapshot. Only set when
-  // `retry.globalRateLimit` was configured.
+  // `retry.globalRateLimit` was configured — WR-451 mounts it from
+  // the enable path when the limit is enabled at runtime.
   if (queue.getGlobalRateLimitStats() !== undefined) {
     server.getGlobalRateLimitStats = (): GlobalRateLimitStats => queue.getGlobalRateLimitStats()!;
   }

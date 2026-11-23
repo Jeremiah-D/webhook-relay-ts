@@ -207,11 +207,18 @@ describe("GlobalRateLimiter.retune (WR-310)", () => {
 });
 
 describe("RetryQueue.setGlobalRateLimit (WR-310)", () => {
-  it("throws Error when the limit was never configured", () => {
+  it("an unconfigured queue enables on first set; the getter returns the live values", () => {
     const sender: Sender = async () => {};
     const q = new RetryQueue({ sender, maxAttempts: 1 });
     assert.equal(q.getGlobalRateLimitStats(), undefined);
-    assert.throws(() => q.setGlobalRateLimit({ messagesPerSec: 5 }), /requires a restart/);
+    // WR-451: the same call that used to throw must-restart now
+    // enables the cap, defaulting maxBurst to messagesPerSec.
+    assert.deepEqual(q.setGlobalRateLimit({ messagesPerSec: 5 }), {
+      messagesPerSec: 5,
+      maxBurst: 5,
+    });
+    assert.equal(q.getGlobalRateLimitStats()?.messagesPerSec, 5);
+    assert.equal(q.getGlobalRateLimitStats()?.maxBurst, 5);
     q.stop();
   });
 
@@ -390,10 +397,19 @@ describe("RelayServer.setGlobalRateLimit (WR-310)", () => {
     assert.equal(relay.getGlobalRateLimitStats!().messagesPerSec, 10);
   });
 
-  it("throws Error when unconfigured and the stats delegate is absent", async () => {
-    const { relay } = makeServer({});
+  it("an unconfigured server enables on first set and audits previous null", async () => {
+    const { relay, auditLog } = makeServer({});
     await listen(relay);
-    assert.throws(() => relay.setGlobalRateLimit!({ messagesPerSec: 5 }), /requires a restart/);
     assert.equal(relay.getGlobalRateLimitStats, undefined);
+    // WR-451: the same call that used to throw must-restart now
+    // enables the cap, defaulting maxBurst to messagesPerSec.
+    const next = relay.setGlobalRateLimit!({ messagesPerSec: 5 });
+    assert.deepEqual(next, { messagesPerSec: 5, maxBurst: 5 });
+    assert.equal(relay.getGlobalRateLimitStats!().messagesPerSec, 5);
+    assert.equal(relay.getGlobalRateLimitStats!().maxBurst, 5);
+    const revised = eventsOf(auditLog, "global_rate_revised");
+    assert.equal(revised.length, 1);
+    assert.equal(revised[0].previous, null);
+    assert.deepEqual(revised[0].current, { messagesPerSec: 5, maxBurst: 5 });
   });
 });

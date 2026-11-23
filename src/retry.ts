@@ -5142,7 +5142,11 @@ export class RetryQueue {
    * feature is off — dispatches never wait on it, so unconfigured
    * behavior is byte-for-byte the pre-WR-167 behavior.
    */
-  private readonly globalRateLimiter?: GlobalRateLimiter;
+  // WR-451: deliberately *not* readonly — `setGlobalRateLimit`
+  // installs a fresh limiter here when the cap is enabled at
+  // runtime (it was undefined before, so there is nothing to
+  // retune in place).
+  private globalRateLimiter?: GlobalRateLimiter;
   /**
    * WR-140: per-tenant dispatch gates (one independent gate per tenant,
    * created lazily). Always constructed; with the default `Infinity` cap
@@ -12051,15 +12055,42 @@ export class RetryQueue {
    * values; waiters parked on the gate are re-armed at the new rate.
    * An illegal patch throws `RangeError` and the live values are
    * untouched; an empty patch (or values equal to the live ones) is a
-   * no-op. Throws `Error` when the limit was never configured —
-   * enabling the cap needs a restart.
+   * no-op. Returns the live values after the revision.
+   *
+   * WR-451: when the limit was never configured, the same call
+   * *enables* it instead of throwing: `messagesPerSec` must be
+   * present and finite > 0 (validated first, through the same
+   * construction gate as `assertValidGlobalRateLimit`), `maxBurst`
+   * defaults to `messagesPerSec`, and a fresh limiter is built whose
+   * bucket starts full — dispatches before the enable were never
+   * limited and are not retroactively capped, and only dispatches
+   * after the enable are governed by the new bucket. An empty,
+   * non-object, or illegal patch throws `RangeError` and the queue
+   * stays unconfigured. The new limiter runs on the queue's injected
+   * timers (exactly the timers a construction-time limiter would
+   * have been handed through the options); the clock stays the
+   * default wall clock — the queue has no injected clock to offer.
+   * No persistence: a restart returns to unconfigured — the enable
+   * is live-only. Once enabled, later calls revise per WR-310.
    */
   setGlobalRateLimit(patch: GlobalRateLimitRevision): { messagesPerSec: number; maxBurst: number } {
     if (this.globalRateLimiter === undefined) {
-      throw new Error(
-        "setGlobalRateLimit: global rate limit is not configured — enabling it requires a restart: " +
-          "the limiter is created at startup and a running relay cannot start capping without one"
-      );
+      // WR-451: enable — validate with the construction-time rules,
+      // then install a fresh limiter. Validation throws before
+      // anything is assigned, so an illegal patch leaves the queue
+      // unconfigured. `assertValidGlobalRateLimit` itself rejects
+      // non-object patches and requires `messagesPerSec` present and
+      // finite > 0, so an empty patch is a `RangeError` here (there
+      // is nothing to enable with) — unlike the revise path, where
+      // an empty patch is a no-op against live values.
+      assertValidGlobalRateLimit(patch);
+      this.globalRateLimiter = new GlobalRateLimiter({
+        messagesPerSec: patch.messagesPerSec as number,
+        maxBurst: patch.maxBurst,
+        setTimer: this.setTimer,
+        clearTimer: (handle: unknown) => this.clearTimer(handle as { clear(): void }),
+      });
+      return this.globalRateLimiter.current();
     }
     return this.globalRateLimiter.retune(patch);
   }
