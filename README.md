@@ -14313,7 +14313,8 @@ Live revision (WR-335): `server.reviseAdaptiveMaxDelay(patch)` revises the
 config at runtime (`marginRatio` / `floorMs` / `ceilMs` / `minSamples` /
 `maxSamplesPerEndpoint` / `tightenFactor`, partial — omitted fields keep their live values);
 `server.getAdaptiveMaxDelayConfig()` returns the live config (the getter
-is only mounted when the feature was configured). A revision clears the
+is only mounted when the feature was configured, or when it is enabled at
+runtime — see below). A revision clears the
 adapted caps, so the next retry wait is bounded by the cap recomputed from
 the new formula — waits already scheduled keep the cap computed when they
 were armed, and the rolling samples (hence p99) are untouched. Since
@@ -14324,8 +14325,18 @@ surviving samples on the next read; widening keeps every sample and never
 restores samples a shrink already evicted. An illegal
 patch throws `RangeError` and leaves the live config untouched; an empty
 or same-value patch is a silent no-op. A real revision is audited as
-`adaptive_max_delay_revised` with `previous` / `current`. Enabling the
-feature when it was never configured still requires a restart. Unlike
+`adaptive_max_delay_revised` with `previous` / `current`. Live enable
+(WR-456): with the feature never configured the same call *enables* it
+instead of throwing — every knob has a construction default, so an empty
+patch enables with all defaults (`marginRatio` 0.5 / `floorMs` 1000 /
+`ceilMs` 4x the live `maxDelayMs`, snapshotted at enable time /
+`minSamples` 10 / `maxSamplesPerEndpoint` 1024 / `tightenFactor` 0.8),
+a fresh tracker is built with no samples (dispatches before the enable
+were never sampled and are not retroactively sampled; cold endpoints fall
+back to the live `maxDelayMs`), the getter is mounted at the same time,
+and the enable is audited as `adaptive_max_delay_revised` with
+`previous: null`. A restart returns to unconfigured — the enable is
+live-only. Unlike
 WR-334, which revises the per-attempt timeout cap, this revises the cap
 on the wait *between* attempts.
 

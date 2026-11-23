@@ -5140,7 +5140,11 @@ export class RetryQueue {
    * point and the cap lookup no-op, so unconfigured behavior is
    * byte-for-byte the pre-WR-196 behavior.
    */
-  private readonly adaptiveMaxDelay?: AdaptiveMaxDelay;
+  // WR-456: deliberately *not* readonly — `reviseAdaptiveMaxDelay`
+  // installs a fresh tracker here when the cap is enabled at
+  // runtime (it was undefined before, so there is nothing to
+  // retune in place).
+  private adaptiveMaxDelay?: AdaptiveMaxDelay;
   /**
    * WR-167: relay-level outbound rate gate (one instance — the rate is
    * relay-wide, across endpoints and tenants). `undefined` when the
@@ -11568,18 +11572,46 @@ export class RetryQueue {
    * bounded by the recomputed caps; waits already scheduled keep the
    * cap computed when they were armed. An illegal patch throws
    * `RangeError` and the live values are untouched; an empty patch is
-   * a `RangeError`; revising to the live values is a no-op. Throws
-   * `Error` when the cap was never configured — enabling it needs a
-   * restart. The one config is shared by all endpoints. Returns the
-   * live config.
+   * a `RangeError`; revising to the live values is a no-op. The one
+   * config is shared by all endpoints. Returns the live config.
+   *
+   * WR-456: when the cap was never configured, the same call
+   * *enables* it instead of throwing: every knob has a construction
+   * default (`marginRatio` 0.5 / `floorMs` 1000 / `ceilMs` 4x the
+   * live `maxDelayMs`, snapshotted at enable time / `minSamples` 10
+   * / `maxSamplesPerEndpoint` 1024 / `tightenFactor` 0.8), so an
+   * empty patch enables with all defaults, and a fresh tracker is
+   * built with no samples — dispatches before the enable were never
+   * sampled and are not retroactively sampled, cold endpoints fall
+   * back to the live `maxDelayMs`, and only dispatches after the
+   * enable feed the p99 window. A non-object or illegal patch throws
+   * `RangeError` and the queue stays unconfigured (validated first,
+   * through the same construction gate as
+   * `assertValidAdaptiveMaxDelayOptions`). The new tracker runs on
+   * the default wall clock — the queue has no injected clock to
+   * offer (exactly the clock a construction-time tracker would have
+   * been handed when no `now` was passed through the options). No
+   * persistence: a restart returns to unconfigured — the enable is
+   * live-only. Once enabled, later calls revise per WR-335/WR-352.
    */
   reviseAdaptiveMaxDelay(patch: AdaptiveMaxDelayRevision): AdaptiveMaxDelayConfig {
     const adaptive = this.adaptiveMaxDelay;
     if (adaptive === undefined) {
-      throw new Error(
-        "reviseAdaptiveMaxDelay: adaptive max delay is not configured — enabling it requires a restart: " +
-          "the cap is created at startup and a running relay cannot start deriving p99 caps without one"
-      );
+      // WR-456: enable — validate with the construction-time rules,
+      // then install a fresh tracker. Validation throws before
+      // anything is assigned, so an illegal patch leaves the queue
+      // unconfigured. `assertValidAdaptiveMaxDelayOptions` itself
+      // rejects non-object patches, and every knob has a
+      // construction default, so an empty patch enables with all
+      // defaults — unlike the revise path, where an empty patch is
+      // a `RangeError` because there is nothing to revise. The
+      // ceiling defaults to 4x the live `maxDelayMs`, snapshotted at
+      // enable time: a later WR-32 hot-reload of `maxDelayMs` moves
+      // only the cold-endpoint resting cap, never the ceiling
+      // (construction-time behavior, retry.ts:5332-5333).
+      assertValidAdaptiveMaxDelayOptions(this.maxDelayMs, patch);
+      this.adaptiveMaxDelay = new AdaptiveMaxDelay(() => this.maxDelayMs, patch);
+      return this.adaptiveMaxDelay.snapshot();
     }
     return adaptive.retune(patch);
   }

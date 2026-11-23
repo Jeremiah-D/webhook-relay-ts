@@ -295,18 +295,27 @@ describe("AdaptiveMaxDelay.retune (WR-335)", () => {
 describe("RetryQueue adaptive max-delay revision (WR-335)", () => {
   const okSender: Sender = async () => ({ statusCode: 200, body: Buffer.alloc(0) });
 
-  it("unconfigured: revise throws the must-restart Error, getter returns undefined", () => {
+  it("unconfigured: revise enables with the construction defaults, getter returns the new config (WR-456)", () => {
     const q = new RetryQueue({ sender: okSender, baseDelayMs: 100, maxDelayMs: 60000 });
     assert.equal(q.getAdaptiveMaxDelayConfig(), undefined);
-    assert.throws(
-      () => q.reviseAdaptiveMaxDelay({ marginRatio: 1 }),
-      /not configured — enabling it requires a restart/
-    );
-    assert.throws(
-      () => q.reviseAdaptiveMaxDelay({ marginRatio: 1 }),
-      /cannot start deriving p99 caps without one/
-    );
-    assert.equal(q.getAdaptiveMaxDelayConfig(), undefined);
+    assert.deepEqual(q.reviseAdaptiveMaxDelay({ marginRatio: 1 }), {
+      marginRatio: 1,
+      floorMs: 1000,
+      ceilMs: 240000,
+      minSamples: 10,
+      maxSamplesPerEndpoint: 1024,
+      tightenFactor: 0.8,
+    });
+    assert.deepEqual(q.getAdaptiveMaxDelayConfig(), {
+      marginRatio: 1,
+      floorMs: 1000,
+      ceilMs: 240000,
+      minSamples: 10,
+      maxSamplesPerEndpoint: 1024,
+      tightenFactor: 0.8,
+    });
+    // A fresh tracker has no samples yet.
+    assert.deepEqual(q.getAdaptiveMaxDelayStats(), []);
     q.stop();
   });
 
@@ -501,14 +510,20 @@ describe("RelayServer adaptive max-delay revision (WR-335)", () => {
     assert.deepEqual(relay.getAdaptiveMaxDelayConfig!(), { ...construction, marginRatio: 1 });
   });
 
-  it("unconfigured relay: revise throws the must-restart Error and the getter is not mounted", async () => {
-    const { relay } = makeRelay();
+  it("unconfigured relay: revise enables, mounts the getter, and audits previous: null (WR-456)", async () => {
+    const { relay, audit } = makeRelay();
     await listen(relay);
     assert.equal(relay.getAdaptiveMaxDelayConfig, undefined);
-    assert.throws(
-      () => relay.reviseAdaptiveMaxDelay!({ marginRatio: 1 }),
-      /not configured — enabling it requires a restart/
-    );
+    assert.deepEqual(relay.reviseAdaptiveMaxDelay!({ marginRatio: 1 }), {
+      ...construction,
+      marginRatio: 1,
+    });
+    assert.notEqual(relay.getAdaptiveMaxDelayConfig, undefined);
+    assert.deepEqual(relay.getAdaptiveMaxDelayConfig!(), { ...construction, marginRatio: 1 });
+    const revised = eventsOf(audit, "adaptive_max_delay_revised");
+    assert.equal(revised.length, 1);
+    assert.equal(revised[0].previous, null);
+    assert.deepEqual(revised[0].current, { ...construction, marginRatio: 1 });
   });
 
   it("server getter reflects revisions made through the server", async () => {

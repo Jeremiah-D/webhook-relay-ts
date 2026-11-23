@@ -276,14 +276,25 @@ describe("AdaptiveMaxDelay window revision (WR-352)", () => {
 describe("RetryQueue adaptive max-delay window revision (WR-352)", () => {
   const okSender: Sender = async () => ({ statusCode: 200, body: Buffer.alloc(0) });
 
-  it("unconfigured: a window-only revise throws the must-restart Error, getter returns undefined", () => {
+  it("unconfigured: a window-only revise enables with the construction defaults (WR-456)", () => {
     const q = new RetryQueue({ sender: okSender, baseDelayMs: 100, maxDelayMs: 60000 });
     assert.equal(q.getAdaptiveMaxDelayConfig(), undefined);
-    assert.throws(
-      () => q.reviseAdaptiveMaxDelay({ maxSamplesPerEndpoint: 10 }),
-      /not configured — enabling it requires a restart/
-    );
-    assert.equal(q.getAdaptiveMaxDelayConfig(), undefined);
+    assert.deepEqual(q.reviseAdaptiveMaxDelay({ maxSamplesPerEndpoint: 10 }), {
+      marginRatio: 0.5,
+      floorMs: 1000,
+      ceilMs: 240000,
+      minSamples: 10,
+      maxSamplesPerEndpoint: 10,
+      tightenFactor: 0.8,
+    });
+    assert.deepEqual(q.getAdaptiveMaxDelayConfig(), {
+      marginRatio: 0.5,
+      floorMs: 1000,
+      ceilMs: 240000,
+      minSamples: 10,
+      maxSamplesPerEndpoint: 10,
+      tightenFactor: 0.8,
+    });
     q.stop();
   });
 

@@ -6486,9 +6486,18 @@ export interface RelayServer extends Server {
    * revision is a no-op with no audit event. A real revision is
    * audited as `adaptive_max_delay_revised` with `previous` /
    * `current` (the construction values as first `previous`), and
-   * returns the live config. Always set; throws `Error` when the cap
-   * was never configured — enabling it needs a restart. The one config
-   * is shared by all endpoints: there is no per-endpoint override.
+   * returns the live config. Always set. WR-456: with the cap never
+   * configured the same call *enables* it instead of throwing — an
+   * empty patch enables with all six knobs at their construction
+   * defaults (the ceiling defaults to 4x the live `maxDelayMs`,
+   * snapshotted at enable time), a fresh tracker is built with no
+   * samples (dispatches before the enable were never sampled and
+   * are not retroactively sampled; cold endpoints fall back to the
+   * live `maxDelayMs`), the getter is mounted at the same time, and
+   * the enable is audited as `adaptive_max_delay_revised` with
+   * `previous: null`. A restart returns to unconfigured — the
+   * enable is live-only. The one config is shared by all endpoints:
+   * there is no per-endpoint override.
    * This caps the wait *between* attempts; WR-334 revises the
    * per-attempt timeout cap instead.
    */
@@ -6496,7 +6505,9 @@ export interface RelayServer extends Server {
   /**
    * WR-335: live adaptive max-delay config — the five formula inputs
    * plus the sample window, shared by all endpoints. Only set when
-   * `adaptiveMaxDelay` was configured; `undefined` otherwise.
+   * `adaptiveMaxDelay` was configured, or when it is enabled at
+   * runtime (WR-456 mounts it from the enable path);
+   * `undefined` otherwise.
    */
   getAdaptiveMaxDelayConfig?: () => AdaptiveMaxDelayConfig | undefined;
   /**
@@ -19176,19 +19187,33 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
 
   // WR-335: adaptive max-delay config runtime revision. The method is
   // always set (like reviseAdaptiveTimeout above); with the cap
-  // unconfigured the queue throws Error — enabling it needs a
-  // restart. A real revision is audited as `adaptive_max_delay_revised`
-  // with the previous and current config (the construction values as
-  // first `previous`); an empty or same-value patch is a silent
-  // no-op. Since WR-352 the config carries six fields — a window-only
-  // revision resizes the tracker in place and is audited the same way.
+  // unconfigured the queue installs a fresh tracker (an empty or
+  // illegal patch still throws RangeError there, leaving the server
+  // unconfigured), the getter is mounted at the same time, and the
+  // enable is audited as `adaptive_max_delay_revised` with
+  // `previous: null`. A real revision is audited as
+  // `adaptive_max_delay_revised` with the previous and current config
+  // (the construction values as first `previous`); an empty or
+  // same-value patch is a silent no-op. Since WR-352 the config
+  // carries six fields — a window-only revision resizes the tracker
+  // in place and is audited the same way.
   server.reviseAdaptiveMaxDelay = (
     patch: AdaptiveMaxDelayRevision
   ): AdaptiveMaxDelayConfig => {
     const prev = queue.getAdaptiveMaxDelayConfig();
     if (prev === undefined) {
-      // Delegates to the queue for the canonical "must restart" Error.
-      return queue.reviseAdaptiveMaxDelay(patch);
+      // WR-456: enable — the queue installs the fresh tracker and
+      // resolves the six omitted knobs to the construction defaults.
+      // Mount the getter and audit the enable with `previous: null`.
+      const next = queue.reviseAdaptiveMaxDelay(patch);
+      server.getAdaptiveMaxDelayConfig = (): AdaptiveMaxDelayConfig =>
+        queue.getAdaptiveMaxDelayConfig()!;
+      opts.auditLog.append({
+        event: "adaptive_max_delay_revised",
+        previous: null,
+        current: next,
+      });
+      return next;
     }
     // Validate-then-apply inside retune: an illegal patch throws
     // RangeError and the live values are left completely intact.
@@ -19212,7 +19237,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   };
 
   // WR-335: live adaptive max-delay config. Only set when
-  // `retry.adaptiveMaxDelay` was configured.
+  // `retry.adaptiveMaxDelay` was configured — WR-456 mounts it from
+  // the enable path when the cap is enabled at runtime.
   if (queue.getAdaptiveMaxDelayConfig() !== undefined) {
     server.getAdaptiveMaxDelayConfig = (): AdaptiveMaxDelayConfig =>
       queue.getAdaptiveMaxDelayConfig()!;
