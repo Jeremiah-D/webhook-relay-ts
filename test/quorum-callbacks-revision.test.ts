@@ -568,6 +568,12 @@ describe("RelayServer quorum callbacks revision (WR-396)", () => {
     const { relay, auditLog } = quorumServer({ hooks: first });
     const port = await listen(relay);
     await driveFanout(port, auditLog, "quorum_satisfied");
+    // The satisfied verdict only guarantees the quorum (2 of 3) acks; the
+    // third member may still be in flight — a late ack is recorded but
+    // never changes the settled state (see src/quorum.ts). Wait for all
+    // three acks before revising: a late ack after the revision would
+    // route to the new callbacks, not the old bucket.
+    await waitFor(() => first.acknowledged.length === 3, "first fan-out all acknowledged");
     assert.equal(first.dispatched.length, 1);
     assert.equal(first.satisfied.length, 1);
     relay.reviseQuorumCallbacks!({
@@ -576,6 +582,8 @@ describe("RelayServer quorum callbacks revision (WR-396)", () => {
       onQuorumSatisfied: second.onQuorumSatisfied,
     });
     await driveFanout(port, auditLog, "quorum_satisfied");
+    // Same wait for the second fan-out: its verdict only guarantees 2 acks.
+    await waitFor(() => second.acknowledged.length === 3, "second fan-out all acknowledged");
     assert.equal(first.dispatched.length, 1);
     assert.equal(first.acknowledged.length, 3);
     assert.equal(first.satisfied.length, 1);
@@ -637,6 +645,10 @@ describe("RelayServer quorum callbacks revision (WR-396)", () => {
     relay.reviseQuorumCallbacks!({ onQuorumSatisfied: null });
     await driveFanout(port, auditLog, "quorum_satisfied");
     assert.equal(first.dispatched.length, 2);
+    // The satisfied verdict only guarantees the quorum (2 of 3) acks per
+    // fan-out; a member may still be in flight (see src/quorum.ts). Wait
+    // for all six acks before asserting the count.
+    await waitFor(() => first.acknowledged.length === 6, "both fan-outs all acknowledged");
     assert.equal(first.acknowledged.length, 6);
     assert.equal(first.satisfied.length, 1, "cleared hook stays silent");
     assert.equal(eventsOf(auditLog, "quorum_satisfied").length, 2);
