@@ -4799,8 +4799,8 @@ export class RetryQueue {
   private adaptiveConcurrencyOpts?: AdaptiveConcurrencyOptions;
   /** WR-97: the shared per-(tenant, endpoint) outbound rate limiter; undefined when disabled. */
   private readonly tenantRateLimiter?: TenantRateLimiter;
-  /** WR-154: the shared per-endpoint outbound token-bucket rate limiter; undefined when disabled. */
-  private readonly outboundRateLimiter?: OutboundRateLimiter;
+  /** WR-154: the shared per-endpoint outbound token-bucket rate limiter; undefined when disabled. WR-462: deliberately *not* readonly — `reviseOutboundRateLimit` installs a fresh limiter at runtime when the option was never configured, so the cap can be enabled live instead of needing a restart. */
+  private outboundRateLimiter?: OutboundRateLimiter;
   /** WR-155: the structured delivery-receipt log; undefined when disabled. */
   private readonly deliveryReceipts?: DeliveryReceiptStore;
   /** WR-155: receipt callbacks and clock; undefined when receipts are disabled. */
@@ -16515,9 +16515,29 @@ export class RetryQueue {
    * unspent balance to the new burst at once; widening never tops a
    * bucket up. An illegal patch throws `RangeError` and the live
    * values are untouched; an empty patch is a `RangeError`; revising
-   * to the live values is a no-op. Throws `Error` when the limit was
-   * never configured — enabling it needs a restart. The one pair of
-   * values is shared by all endpoints. Returns the live values.
+   * to the live values is a no-op. The one pair of values is shared
+   * by all endpoints. Returns the live values.
+   *
+   * WR-462: when the limit was never configured, the same call
+   * *enables* it instead of throwing — but unlike the revise path,
+   * both knobs are required: there is no construction default to
+   * fall back on, so an empty patch, a single-field patch, or a
+   * non-object patch throws `RangeError` and the queue stays
+   * unconfigured (and can still be enabled afterwards). The values
+   * pass through the same construction gates as
+   `new OutboundRateLimiter`, so an illegal value throws `RangeError`
+   * before anything is assigned — no half-built limiter is left
+   * behind. The fresh limiter starts with an empty bucket table: a
+   * new endpoint starts with a full bucket, so the first burst after
+   * the enable is available immediately, and deliveries made before
+   * the enable are never retroactively charged — an endpoint hammered
+   * before the enable is not back-charged. The next `take()` judges
+   * by the new limiter; deliveries already rescheduled keep their
+   * original schedule. No persistence: a restart returns to
+   * unconfigured — the enable is live-only. Once enabled, later
+   * calls revise per WR-330. The queue itself holds no audit log —
+   * the server audits the enable as `outbound_rate_limit_revised`
+   * (`previous: null`, `current` the two values).
    */
   reviseOutboundRateLimit(patch: OutboundRateLimitRevision): {
     refillRps: number;
@@ -16525,10 +16545,28 @@ export class RetryQueue {
   } {
     const limiter = this.outboundRateLimiter;
     if (limiter === undefined) {
-      throw new Error(
-        "reviseOutboundRateLimit: outbound rate limit is not configured — enabling it requires a restart: " +
-          "the limiter is created at startup and a running relay cannot start capping without one"
-      );
+      // WR-462: enable — both knobs are required (no construction
+      // default exists for either), validated before anything is
+      // assigned so an illegal patch leaves the queue unconfigured.
+      // The constructor re-validates the values through the same
+      // gates and throws before the field is assigned, so a bad
+      // patch can never leave a half-built limiter behind.
+      if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+        throw new RangeError(
+          `reviseOutboundRateLimit: patch must be an object, got ${JSON.stringify(patch)}`
+        );
+      }
+      if (patch.refillRps === undefined || patch.burst === undefined) {
+        throw new RangeError(
+          "reviseOutboundRateLimit: enabling the outbound rate limit requires both refillRps and burst — an empty or single-field patch cannot enable it"
+        );
+      }
+      this.outboundRateLimiter = new OutboundRateLimiter({
+        refillRps: patch.refillRps,
+        burst: patch.burst,
+      });
+      const installed = this.outboundRateLimiter;
+      return { refillRps: installed.refillPerSecond(), burst: installed.burstSize() };
     }
     return limiter.retune(patch);
   }

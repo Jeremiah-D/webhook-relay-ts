@@ -6423,9 +6423,13 @@ export interface RelayServer extends Server {
    * same-value revision is a no-op with no audit event. A real
    * revision is audited as `outbound_rate_limit_revised` with
    * `previous` / `current` `{ refillRps, burst }` (the construction
-   * values as first `previous`), and returns the live values. Always
-   * set; throws `Error` when the limit was never configured —
-   * enabling the cap needs a restart. The one pair of values is
+   * values as first `previous`), and returns the live values. WR-462:
+   * with the limit never configured the same call *enables* it
+   * instead of throwing — both knobs are required (no construction
+   * default exists for either), so an empty, single-field, or
+   * non-object patch throws `RangeError` and leaves the relay
+   * unconfigured; the getter is mounted and the enable is audited
+   * with `previous: null`. Always set. The one pair of values is
    * shared by all endpoints: there is no per-endpoint override on
    * this limiter (endpoint differentiation is WR-97's
    * endpointOverrides, a different limiter).
@@ -6434,7 +6438,9 @@ export interface RelayServer extends Server {
   /**
    * WR-330: live per-endpoint outbound rate-limit values — the single
    * `refillRps` / `burst` pair shared by all endpoints. Only set
-   * when `outboundRateLimit` was configured; `undefined` otherwise.
+   * when `outboundRateLimit` was configured — or once it has been
+   * enabled live via `reviseOutboundRateLimit` (WR-462); `undefined`
+   * otherwise.
    */
   getOutboundRateLimit?: () => { refillRps: number; burst: number } | undefined;
   /**
@@ -19147,19 +19153,31 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   };
 
   // WR-330: per-endpoint outbound rate-limit runtime revision. The
-  // method is always set (like setGlobalRateLimit above); with the
-  // limit unconfigured the queue throws Error — enabling the cap
-  // needs a restart. A real revision is audited as
-  // `outbound_rate_limit_revised` with the previous and current
-  // refillRps / burst (the construction values as first `previous`);
-  // an empty or same-value patch is a silent no-op.
+  // method is always set (like setGlobalRateLimit above). WR-462:
+  // with the limit unconfigured the same call *enables* it instead
+  // of throwing — both knobs are required, the getter is mounted,
+  // and the enable is audited with `previous: null`. A real revision
+  // is audited as `outbound_rate_limit_revised` with the previous
+  // and current refillRps / burst (the construction values as first
+  // `previous`); an empty or same-value patch is a silent no-op.
   server.reviseOutboundRateLimit = (
     patch: OutboundRateLimitRevision
   ): { refillRps: number; burst: number } => {
     const prev = queue.getOutboundRateLimit();
     if (prev === undefined) {
-      // Delegates to the queue for the canonical "must restart" Error.
-      return queue.reviseOutboundRateLimit(patch);
+      // WR-462: enable — the queue installs a fresh limiter with an
+      // empty bucket table. Audit the enable with `previous: null`
+      // and mount the getter, exactly once; an illegal patch throws
+      // RangeError in the queue before either happens.
+      const next = queue.reviseOutboundRateLimit(patch);
+      opts.auditLog.append({
+        event: "outbound_rate_limit_revised",
+        previous: null,
+        current: next,
+      });
+      server.getOutboundRateLimit = (): { refillRps: number; burst: number } =>
+        queue.getOutboundRateLimit()!;
+      return next;
     }
     // Validate-then-apply inside retune: an illegal patch throws
     // RangeError and the live values are left completely intact.
@@ -19176,7 +19194,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   };
 
   // WR-330: live per-endpoint outbound rate-limit values. Only set
-  // when `retry.outboundRateLimit` was configured.
+  // when `retry.outboundRateLimit` was configured — or once it has
+  // been enabled live (WR-462 mounts it in the enable branch above).
   if (queue.getOutboundRateLimit() !== undefined) {
     server.getOutboundRateLimit = (): { refillRps: number; burst: number } =>
       queue.getOutboundRateLimit()!;

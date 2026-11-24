@@ -144,14 +144,17 @@ describe("OutboundRateLimiter.retune (WR-330)", () => {
 });
 
 describe("RetryQueue outbound rate-limit revision (WR-330)", () => {
-  it("unconfigured: revise throws the must-restart Error, getter returns undefined", () => {
+  it("unconfigured: revise enables with both values given and the getter reports them at once (WR-462)", () => {
     const q = new RetryQueue({ sender: async () => {} });
     assert.equal(q.getOutboundRateLimit(), undefined);
-    assert.throws(
-      () => q.reviseOutboundRateLimit({ burst: 1 }),
-      /not configured — enabling it requires a restart/
-    );
     assert.equal(q.getOutboundRateLimitStats(), undefined);
+    assert.deepEqual(q.reviseOutboundRateLimit({ refillRps: 10, burst: 50 }), {
+      refillRps: 10,
+      burst: 50,
+    });
+    assert.deepEqual(q.getOutboundRateLimit(), { refillRps: 10, burst: 50 });
+    assert.deepEqual(q.getOutboundRateLimitStats(), []);
+    q.stop();
   });
 
   it("getter tracks revisions and stats rows follow the live values", () => {
@@ -294,14 +297,19 @@ describe("RelayServer outbound rate-limit revision (WR-330)", () => {
     assert.equal(relay.getOutboundRateLimit!().burst, 20);
   });
 
-  it("unconfigured relay: revise throws the must-restart Error and the getter is not mounted", async () => {
-    const { relay } = makeRelay();
+  it("unconfigured relay: revise enables, audits previous: null, and mounts the getter (WR-462)", async () => {
+    const { relay, audit } = makeRelay();
     await listen(relay);
     assert.equal(relay.getOutboundRateLimit, undefined);
-    assert.throws(
-      () => relay.reviseOutboundRateLimit!({ burst: 1 }),
-      /not configured — enabling it requires a restart/
-    );
+    assert.deepEqual(relay.reviseOutboundRateLimit!({ refillRps: 10, burst: 50 }), {
+      refillRps: 10,
+      burst: 50,
+    });
+    assert.deepEqual(relay.getOutboundRateLimit!(), { refillRps: 10, burst: 50 });
+    const enabled = eventsOf(audit, "outbound_rate_limit_revised");
+    assert.equal(enabled.length, 1);
+    assert.equal(enabled[0]!.previous, null);
+    assert.deepEqual(enabled[0]!.current, { refillRps: 10, burst: 50 });
   });
 
   it("server getter reflects revisions made through the server", async () => {

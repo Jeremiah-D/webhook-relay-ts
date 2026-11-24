@@ -4289,9 +4289,17 @@ const queue = new RetryQueue({
   and are re-judged at the new rate on their next attempt, and
   in-flight attempts are unaffected. A real revision is audited as
   `outbound_rate_limit_revised` with `previous` / `current`
-  `{ refillRps, burst }`. Revising a relay that never configured the
-  limit throws `Error` — first enabling it still needs a restart. No
-  new Prometheus series. Three-way contrast: WR-310 revises the
+  `{ refillRps, burst }`. Live enable (WR-462): with the limit never
+  configured the same call *enables* it instead of throwing — both
+  knobs are required (there is no construction default for either),
+  so an empty, single-field, or non-object patch throws `RangeError`
+  and leaves the relay unconfigured; the enable is audited as
+  `outbound_rate_limit_revised` with `previous: null`, the
+  `getOutboundRateLimit()` getter is mounted, and the fresh limiter
+  starts with an empty bucket table — a new endpoint starts with a
+  full bucket, and deliveries made before the enable are never
+  retroactively charged. A restart returns to unconfigured — the
+  enable is live-only. No new Prometheus series. Three-way contrast: WR-310 revises the
   relay-level *global* rate, WR-329 revises the *tenant-level*
   outbound rate, and WR-330 revises this *endpoint-shared* outbound
   rate — three different gates.
