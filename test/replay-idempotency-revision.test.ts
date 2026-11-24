@@ -273,14 +273,17 @@ describe("RetryQueue reviseReplayIdempotency (WR-441)", () => {
     assert.deepEqual(q.getReplayIdempotencyConfig(), { windowMs: 1000, maxEntries: 10_000 });
   });
 
-  it("revising with the guard unconfigured throws Error and the getter stays undefined", () => {
+  it("revising with the guard unconfigured enables it (WR-460)", () => {
     const { q } = makeQueue();
     assert.equal(q.getReplayIdempotencyConfig(), undefined);
-    assert.throws(
-      () => q.reviseReplayIdempotency({ windowMs: 1000 }),
-      /replay idempotency is not configured — enabling it requires a restart/
-    );
-    assert.equal(q.getReplayIdempotencyConfig(), undefined);
+    assert.deepEqual(q.reviseReplayIdempotency({ windowMs: 1000 }), {
+      windowMs: 1000,
+      maxEntries: 10_000,
+    });
+    assert.deepEqual(q.getReplayIdempotencyConfig(), {
+      windowMs: 1000,
+      maxEntries: 10_000,
+    });
   });
 
   it("the getter follows the live values and a same-value revision is a no-op", () => {
@@ -462,12 +465,20 @@ describe("RelayServer reviseReplayIdempotency (WR-441)", () => {
     });
   });
 
-  it("revising with the guard unconfigured throws Error and the getter is unset", () => {
-    const { relay } = makeServer();
+  it("revising with the guard unconfigured enables it and mounts the getter (WR-460)", () => {
+    const { relay, auditLog } = makeServer();
     assert.equal(relay.getReplayIdempotencyConfig, undefined);
-    assert.throws(
-      () => relay.reviseReplayIdempotency!({ windowMs: 1000 }),
-      /replay idempotency is not configured — enabling it requires a restart/
-    );
+    assert.deepEqual(relay.reviseReplayIdempotency!({ windowMs: 1000 }), {
+      windowMs: 1000,
+      maxEntries: 10_000,
+    });
+    assert.deepEqual(relay.getReplayIdempotencyConfig!(), {
+      windowMs: 1000,
+      maxEntries: 10_000,
+    });
+    const enabled = eventsOf(auditLog, "replay_idempotency_revised");
+    assert.equal(enabled.length, 1);
+    assert.equal(enabled[0].previous, null);
+    assert.deepEqual(enabled[0].current, { windowMs: 1000, maxEntries: 10_000 });
   });
 });

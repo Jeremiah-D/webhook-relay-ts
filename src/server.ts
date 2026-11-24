@@ -8135,10 +8135,11 @@ export interface RelayServer extends Server {
    * `onReplayForced` ('set' / 'cleared' / 'unchanged') and
    * `oldOnReplaySkipped` / `oldOnReplayForced` ('set' / 'absent')
    * presence, never a function body. Always set; throws `Error`
-   * when replay idempotency was never configured — enabling it needs
-   * a restart. The new callbacks take effect from the next guard
-   * decision; the guard index, the dead-letter list, and the
-   * delivered records are untouched.
+   * when replay idempotency was never configured — enable it first
+   * with `reviseReplayIdempotency` (WR-460), which opens this gate
+   * the moment the guard exists. The new callbacks take effect from
+   * the next guard decision; the guard index, the dead-letter list,
+   * and the delivered records are untouched.
    */
   reviseReplayCallbacks?: (patch: ReplayCallbacksRevision) => void;
   /**
@@ -8153,20 +8154,30 @@ export interface RelayServer extends Server {
    * a `RangeError`; a same-value revision is a no-op with no audit
    * event. A real revision is audited as `replay_idempotency_revised`
    * with `previous` / `current` (plain numbers, no payloads), and
-   * returns the live config. Always set; throws `Error` when replay
-   * idempotency was never configured — enabling it needs a restart.
-   * The one config is shared by all tenants: every live per-tenant
-   * guard is retuned in place, and tenants born later start from the
-   * revised values. Replays already decided (suppressed or replayed)
-   * are unaffected — only later replay decisions see the new tuning.
-   * WR-149 is the guard itself; WR-368 revises its skip/force
-   * observers, a different layer of the same guard.
+   * returns the live config. WR-460: when replay idempotency was
+   * never configured, the same call *enables* it instead of throwing
+   * — both knobs have construction defaults (`windowMs` 86400000 /
+   * `maxEntries` 10000), so an empty patch enables with all defaults;
+   * a non-object or illegal patch throws `RangeError` and the relay
+   * stays unconfigured. The enable is audited as
+   * `replay_idempotency_revised` with `previous: null`, and the
+   * getter is mounted at the same time. The fresh guard starts with
+   * an empty index: deliveries before the enable are not
+   * retroactively recorded. No persistence: a restart returns to
+   * unconfigured. The one config is shared by all tenants: every live
+   * per-tenant guard is retuned in place, and tenants born later
+   * start from the revised values. Replays already decided
+   * (suppressed or replayed) are unaffected — only later replay
+   * decisions see the new tuning. WR-149 is the guard itself; WR-368
+   * revises its skip/force observers, a different layer of the same
+   * guard.
    */
   reviseReplayIdempotency?: (patch: ReplayIdempotencyRevision) => ReplayIdempotencyConfig;
   /**
    * WR-441: live replay-idempotency guard tuning — the suppression
    * window and the index cap shared by all tenants. Only set when
-   * `replayIdempotency` was configured; `undefined` otherwise.
+   * `replayIdempotency` was configured — WR-460 mounts it from the
+   * enable path when the guard is enabled at runtime.
    */
   getReplayIdempotencyConfig?: () => ReplayIdempotencyConfig | undefined;
   /**
@@ -22138,7 +22149,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // / 'unchanged'; `oldOnReplaySkipped` / `oldOnReplayForced`:
   // 'set' / 'absent'), never a function body. With replay
   // idempotency unconfigured the queue throws the canonical "must
-  // restart" Error.
+  // restart" Error — enable it first with `reviseReplayIdempotency`
+  // (WR-460).
   server.reviseReplayCallbacks = (patch: ReplayCallbacksRevision): void => {
     if (!queue.replayIdempotencyConfigured()) {
       // Delegates to the queue for the canonical "must restart" Error.
@@ -22198,20 +22210,33 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   };
 
   // WR-441: live replay-idempotency guard tuning revision. The method
-  // is always set (like reviseSlowStart above); with the guard
-  // unconfigured the queue throws Error — enabling it needs a
-  // restart. A real revision is audited as `replay_idempotency_revised`
-  // with the previous and current config (plain numbers, no payloads);
-  // an empty, illegal, or same-value patch is a silent no-op with no
-  // audit event (illegal patches still throw RangeError from the
-  // queue, leaving the live values untouched).
+  // is always set (like reviseSlowStart above). A real revision is
+  // audited as `replay_idempotency_revised` with the previous and
+  // current config (plain numbers, no payloads); an empty, illegal,
+  // or same-value patch is a silent no-op with no audit event
+  // (illegal patches still throw RangeError from the queue, leaving
+  // the live values untouched). WR-460: with the guard unconfigured
+  // the same call *enables* it instead of throwing — the queue
+  // installs the config and builds the default tenant's guard
+  // eagerly; the getter is mounted at the same time and the enable
+  // is audited with `previous: null`.
   server.reviseReplayIdempotency = (
     patch: ReplayIdempotencyRevision
   ): ReplayIdempotencyConfig => {
     const prev = queue.getReplayIdempotencyConfig();
     if (prev === undefined) {
-      // Delegates to the queue for the canonical "must restart" Error.
-      return queue.reviseReplayIdempotency(patch);
+      // WR-460: enable — the queue installs the resolved config and
+      // builds the default tenant's guard eagerly. Mount the getter
+      // and audit the enable with `previous: null`.
+      const next = queue.reviseReplayIdempotency(patch);
+      server.getReplayIdempotencyConfig = (): ReplayIdempotencyConfig =>
+        queue.getReplayIdempotencyConfig()!;
+      opts.auditLog.append({
+        event: "replay_idempotency_revised",
+        previous: null,
+        current: next,
+      });
+      return next;
     }
     // Validate-then-apply inside the queue: an illegal patch throws
     // RangeError and the live values are left completely intact.
@@ -22228,7 +22253,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   };
 
   // WR-441: live replay-idempotency guard tuning. Only set when
-  // `retry.replayIdempotency` was configured.
+  // `retry.replayIdempotency` was configured — WR-460 mounts it from
+  // the enable path when the guard is enabled at runtime.
   if (queue.getReplayIdempotencyConfig() !== undefined) {
     server.getReplayIdempotencyConfig = (): ReplayIdempotencyConfig =>
       queue.getReplayIdempotencyConfig()!;

@@ -13833,13 +13833,14 @@ const queue = new RetryQueue({
   'unchanged') and `oldOnReplaySkipped` / `oldOnReplayForced`
   ('set' / 'absent') presence, never a function body — and the audit
   can never be bypassed by a replacement. Revising when replay
-  idempotency was never configured throws `Error` (enabling it needs
-  a restart): the skip/force events only ever fire when the guard is
-  set. Only the observers move: the guard index, the dead-letter
-  list, and the delivered records are untouched. WR-367 is the same
-  family for the endpoint pause/resume hooks; WR-365 for the
-  circuit-breaker state-change hook; WR-366 for the failover-switch
-  hook.
+  idempotency was never configured throws `Error`: enable it first
+  with `reviseReplayIdempotency` (WR-460), which opens this gate the
+  moment the guard exists — the skip/force events only ever fire
+  when the guard is set. Only the observers move: the guard index,
+  the dead-letter list, and the delivered records are untouched.
+  WR-367 is the same family for the endpoint pause/resume hooks;
+  WR-365 for the circuit-breaker state-change hook; WR-366 for the
+  failover-switch hook.
 - **Live window/cap revision (WR-441)** — `relay.reviseReplayIdempotency({ windowMs, maxEntries })`
   / `queue.reviseReplayIdempotency(patch)` retunes the guard's
   suppression window and index cap at runtime, no restart: the patch
@@ -13854,12 +13855,21 @@ const queue = new RetryQueue({
   does an illegal value, and the live values and the index are
   untouched; a patch identical to the live values is a silent no-op.
   A real revision is audited as `replay_idempotency_revised` with
-  `previous` / `current` (plain numbers, no payloads). Revising when
-  replay idempotency was never configured throws `Error` (enabling it
-  needs a restart). Replays already decided (suppressed or replayed)
-  are never revisited — only later replay decisions see the new
-  tuning. `getReplayIdempotencyConfig()` reads the live values
-  (`undefined` when unconfigured).
+  `previous` / `current` (plain numbers, no payloads). When replay
+  idempotency was never configured, the same call *enables* it
+  instead of throwing (WR-460): both knobs have construction
+  defaults (`windowMs` 86400000 / `maxEntries` 10000), so an empty
+  patch enables with all defaults, and the enable is audited with
+  `previous: null`; a non-object or illegal patch throws `RangeError`
+  and the relay stays unconfigured. The fresh guard starts with an
+  empty index: deliveries before the enable were never recorded and
+  are not retroactively recorded, so a pair delivered before the
+  enable is not suppressed until it is delivered again after the
+  enable. Enabling also unlocks `reviseReplayCallbacks` (WR-368).
+  No persistence: a restart returns to unconfigured. Replays already
+  decided (suppressed or replayed) are never revisited — only later
+  replay decisions see the new tuning. `getReplayIdempotencyConfig()`
+  reads the live values (`undefined` when unconfigured).
 - **Observability** — `getReplayIdempotencyStats()` exposes each
   tenant's indexed pair count and oldest record (activity-gated; absent
   rows never delivered anything).

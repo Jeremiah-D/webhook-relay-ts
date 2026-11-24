@@ -64,6 +64,8 @@ import {
 import {
   ReplayIdempotencyGuard,
   assertReplayIdempotencyValues,
+  DEFAULT_REPLAY_IDEMPOTENCY_MAX_ENTRIES,
+  DEFAULT_REPLAY_IDEMPOTENCY_WINDOW_MS,
   type ReplayIdempotencyConfig,
   type ReplayIdempotencyOptions,
   type ReplayIdempotencyRevision,
@@ -4423,7 +4425,8 @@ export class RetryQueue {
    * instance key; `undefined` options mean the feature is off.
    * WR-441: live-revisable — `reviseReplayIdempotency` replaces this
    * with the merged options so tenants born later start from the
-   * revised values.
+   * revised values. WR-460: live-enablable — `reviseReplayIdempotency`
+   * installs the resolved config on an unconfigured queue.
    */
   private replayIdempotencyOpts?: ReplayIdempotencyOptions;
   private readonly replayIdempotencyGuards = new Map<string, ReplayIdempotencyGuard>();
@@ -14316,9 +14319,10 @@ export class RetryQueue {
    * are left completely intact. A patch identical to the live values
    * is a no-op. Only the observers move: the guard index, the
    * dead-letter list, and the delivered records are untouched. Throws
-   * `Error` when replay idempotency was never configured — the
-   * skip/force events only ever fire when the guard is set, so
-   * enabling it needs a restart. Under `RelayServer` the fields hold
+   * `Error` when replay idempotency was never configured — enable it
+   * first with `reviseReplayIdempotency` (WR-460), which opens this
+   * gate the moment the guard exists. The skip/force events only ever
+   * fire when the guard is set. Under `RelayServer` the fields hold
    * the server's audit closures, so direct calls here would replace
    * the audit wrappers; server users must go through
    * `RelayServer.reviseReplayCallbacks`, which swaps only the
@@ -14379,21 +14383,55 @@ export class RetryQueue {
    * immediately; raising it never restores records already evicted.
    * An illegal patch throws `RangeError` and the live values and the
    * index are untouched; an empty patch is a `RangeError`; revising
-   * to the live values is a no-op. Throws `Error` when replay
-   * idempotency was never configured — enabling it needs a restart.
-   * The one config is shared by all tenants: every live per-tenant
-   * guard is retuned in place, and tenants born later start from the
-   * revised values. Returns the live config. Replays already decided
-   * (suppressed or replayed) are never revisited — only later replay
-   * decisions see the new tuning. The queue itself holds no audit log
-   * — the server audits a real revision as
-   * `replay_idempotency_revised`.
+   * to the live values is a no-op.
+   *
+   * WR-460: when replay idempotency was never configured, the same
+   * call *enables* it instead of throwing: both knobs have
+   * construction defaults (`windowMs` 86400000 / `maxEntries`
+   * 10000), so an empty patch enables with all defaults, and a fresh
+   * guard is built with an empty index — deliveries before the enable
+   * were never recorded and are not retroactively recorded, so a
+   * replay of a pair delivered before the enable is not suppressed
+   * until that pair is delivered again after the enable; replays
+   * already decided (suppressed or replayed) are never revisited. A
+   * non-object or illegal patch throws `RangeError` and the queue
+   * stays unconfigured (validated first, through the same
+   * construction gate as `assertReplayIdempotencyValues`). Enabling
+   * also unlocks `reviseReplayCallbacks`: the callback gate opens the
+   * moment the guard exists. No persistence: a restart returns to
+   * unconfigured — the enable is live-only. Once enabled, later calls
+   * revise per WR-441. The one config is shared by all tenants:
+   * every live per-tenant guard is retuned in place, and tenants born
+   * later start from the revised values. Returns the live config.
+   * Replays already decided (suppressed or replayed) are never
+   * revisited — only later replay decisions see the new tuning. The
+   * queue itself holds no audit log — the server audits a real
+   * revision as `replay_idempotency_revised`.
    */
   reviseReplayIdempotency(patch: ReplayIdempotencyRevision): ReplayIdempotencyConfig {
     if (this.replayIdempotencyOpts === undefined) {
-      throw new Error(
-        "reviseReplayIdempotency: replay idempotency is not configured — enabling it requires a restart"
-      );
+      // WR-460: enable — validate with the construction-time rules,
+      // then install the resolved config and build the default
+      // tenant's guard eagerly (mirroring construction,
+      // retry.ts:5447-5450). Validation throws before anything is
+      // assigned, so an illegal patch leaves the queue unconfigured.
+      // Both knobs have construction defaults, so an empty patch
+      // enables with all defaults — unlike the revise path, where an
+      // empty patch is a `RangeError` because there is nothing to
+      // revise. The fresh guard starts with an empty index: deliveries
+      // before the enable were never recorded and are not
+      // retroactively recorded.
+      if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+        throw new RangeError(
+          `replayIdempotency revision must be an object, got ${JSON.stringify(patch)}`
+        );
+      }
+      const nextWindow = patch.windowMs ?? DEFAULT_REPLAY_IDEMPOTENCY_WINDOW_MS;
+      const nextEntries = patch.maxEntries ?? DEFAULT_REPLAY_IDEMPOTENCY_MAX_ENTRIES;
+      assertReplayIdempotencyValues(nextWindow, nextEntries);
+      this.replayIdempotencyOpts = { windowMs: nextWindow, maxEntries: nextEntries };
+      const primary = this.replayIdempotencyFor(undefined)!;
+      return primary.current();
     }
     if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
       throw new RangeError(
