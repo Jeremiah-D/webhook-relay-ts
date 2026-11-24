@@ -216,18 +216,21 @@ describe("RetryQueue adaptive backoff revision (WR-339)", () => {
     return { q, timer };
   }
 
-  it("unconfigured: revise throws the must-restart Error, getter returns undefined", () => {
+  it("unconfigured: revise enables with the construction defaults (WR-458)", () => {
     const { q } = makeQueue();
     assert.equal(q.getAdaptiveBackoffConfig(), undefined);
-    assert.throws(
-      () => q.reviseAdaptiveBackoff({ upFactor: 3 }),
-      /not configured — enabling it requires a restart/
-    );
-    assert.throws(
-      () => q.reviseAdaptiveBackoff({ upFactor: 3 }),
-      /cannot start adapting bases without one/
-    );
-    assert.equal(q.getAdaptiveBackoffConfig(), undefined);
+    assert.deepEqual(q.reviseAdaptiveBackoff({ upFactor: 3 }), {
+      minBaseMs: 100,
+      maxBaseMs: 30_000,
+      upFactor: 3,
+      downFactor: 0.5,
+    });
+    assert.deepEqual(q.getAdaptiveBackoffConfig(), {
+      minBaseMs: 100,
+      maxBaseMs: 30_000,
+      upFactor: 3,
+      downFactor: 0.5,
+    });
     q.stop();
   });
 
@@ -374,14 +377,23 @@ describe("RelayServer adaptive backoff revision (WR-339)", () => {
     assert.deepEqual(relay.getAdaptiveBackoffConfig!(), { ...construction, upFactor: 3 });
   });
 
-  it("unconfigured relay: revise throws the must-restart Error and the getter is not mounted", async () => {
+  it("unconfigured relay: revise enables and mounts the getter (WR-458)", async () => {
     const { relay } = makeRelay();
     await listen(relay);
     assert.equal(relay.getAdaptiveBackoffConfig, undefined);
-    assert.throws(
-      () => relay.reviseAdaptiveBackoff!({ upFactor: 3 }),
-      /not configured — enabling it requires a restart/
-    );
+    assert.deepEqual(relay.reviseAdaptiveBackoff!({ upFactor: 3 }), {
+      minBaseMs: 100,
+      maxBaseMs: 30_000,
+      upFactor: 3,
+      downFactor: 0.5,
+    });
+    assert.notEqual(relay.getAdaptiveBackoffConfig, undefined);
+    assert.deepEqual(relay.getAdaptiveBackoffConfig!(), {
+      minBaseMs: 100,
+      maxBaseMs: 30_000,
+      upFactor: 3,
+      downFactor: 0.5,
+    });
   });
 
   it("server getter reflects revisions made through the server", async () => {

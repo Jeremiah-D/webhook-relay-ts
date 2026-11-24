@@ -4785,7 +4785,7 @@ export class RetryQueue {
   private readonly retryBudgetEndpoints = new Map<string, RetryBudget>();
   /** WR-125: retries parked because the budget was exhausted, per logical endpoint. */
   private readonly retryBudgetDepletedByEndpoint = new Map<string, number>();
-  /** WR-59: adaptive backoff options; undefined when disabled. WR-339: live-revisable — `reviseAdaptiveBackoff` replaces this with the merged options so tenants born later start from the revised values. */
+  /** WR-59: adaptive backoff options; undefined when disabled. WR-339: live-revisable — `reviseAdaptiveBackoff` replaces this with the merged options so tenants born later start from the revised values. WR-458: live-enablable — `reviseAdaptiveBackoff` installs the resolved config on an unconfigured queue. */
   private adaptiveBackoffOpts?: AdaptiveBackoffOptions;
   /** WR-59: per-tenant adaptive backoff controllers (WR-48 scoping). */
   private readonly adaptiveBackoffs = new Map<string, AdaptiveBackoffController>();
@@ -11815,18 +11815,48 @@ export class RetryQueue {
    * changed `upFactor`/`downFactor` only affects the next outcome's
    * step size. An illegal patch throws `RangeError` and the live
    * values are untouched; an empty patch is a `RangeError`; revising
-   * to the live values is a no-op. Throws `Error` when adaptive
-   * backoff was never configured — enabling it needs a restart. The
-   * one config is shared by all tenants: every per-tenant controller
-   * is retuned in place, and tenants born later start from the
-   * revised values. Returns the live config.
+   * to the live values is a no-op.
+   *
+   * WR-458: when adaptive backoff was never configured, the same call
+   * *enables* it instead of throwing: every knob has a construction
+   * default (`minBaseMs` 100 / `maxBaseMs` 30000 / `upFactor` 2 /
+   * `downFactor` 0.5), so an empty patch enables with all defaults,
+   * and a fresh controller is built with no outcomes — dispatches
+   * before the enable were never recorded and are not retroactively
+   * recorded, and the resting base is read live from `baseDelayMs`
+   * (WR-32). A non-object or illegal patch throws `RangeError` and
+   * the queue stays unconfigured (validated first, through the same
+   * construction gate as `assertAdaptiveBackoffOptions`). No
+   * persistence: a restart returns to unconfigured — the enable is
+   * live-only. Once enabled, later calls revise per WR-339. The one
+   * config is shared by all tenants: every per-tenant controller is
+   * retuned in place, and tenants born later start from the revised
+   * values. Returns the live config.
    */
   reviseAdaptiveBackoff(patch: AdaptiveBackoffRevision): AdaptiveBackoffConfig {
     if (this.adaptiveBackoffOpts === undefined) {
-      throw new Error(
-        "reviseAdaptiveBackoff: adaptive backoff is not configured — enabling it requires a restart: " +
-          "the controller is created at startup and a running relay cannot start adapting bases without one"
-      );
+      // WR-458: enable — validate with the construction-time rules,
+      // then install the resolved config and build the default
+      // tenant's controller eagerly (mirroring construction,
+      // retry.ts:5889-5891). Validation throws before anything is
+      // assigned, so an illegal patch leaves the queue unconfigured.
+      // `assertAdaptiveBackoffOptions` resolves every omitted knob
+      // to its construction default, so an empty patch enables with
+      // all defaults — unlike the revise path, where an empty patch
+      // is a `RangeError` because there is nothing to revise. The
+      // fresh controller starts with no outcomes: dispatches before
+      // the enable were never recorded and are not retroactively
+      // recorded, and endpoints with no outcomes keep using the
+      // resting base (`baseDelayMs`, hot-reload aware).
+      if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+        throw new RangeError(
+          `adaptiveBackoff revision must be an object, got ${JSON.stringify(patch)}`
+        );
+      }
+      const next = assertAdaptiveBackoffOptions(this.baseDelayMs, patch);
+      this.adaptiveBackoffOpts = next;
+      const primary = this.adaptiveBackoffFor(undefined)!;
+      return primary.snapshot();
     }
     if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
       throw new RangeError(

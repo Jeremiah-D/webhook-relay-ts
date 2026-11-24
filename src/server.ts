@@ -7024,8 +7024,14 @@ export interface RelayServer extends Server {
    * audit event. A real revision is audited as
    * `adaptive_backoff_revised` with `previous` / `current` (the
    * construction values as first `previous`), and returns the live
-   * config. Always set; throws `Error` when adaptive backoff was
-   * never configured — enabling it needs a restart. The one config is
+   * config. Always set. WR-458: when adaptive backoff was never
+   * configured, the same call *enables* it instead of throwing — an
+   * empty patch takes all four construction defaults (`minBaseMs`
+   * 100 / `maxBaseMs` 30000 / `upFactor` 2 / `downFactor` 0.5), the
+   * fresh controller starts with no outcomes (dispatches before the
+   * enable are never retroactively recorded), the enable is audited
+   * with `previous: null`, and the getter is mounted at the same
+   * time; a restart returns to unconfigured. The one config is
    * shared by all tenants: there is no per-tenant override. This
    * tunes the retry-wait base; WR-335 revises the wait cap formula
    * instead, WR-337 the steady-state AIMD concurrency cap, and
@@ -7035,7 +7041,8 @@ export interface RelayServer extends Server {
   /**
    * WR-339: live adaptive backoff config — the four backoff inputs
    * shared by all tenants. Only set when `adaptiveBackoff` was
-   * configured; `undefined` otherwise.
+   * configured, or once it is enabled at runtime (WR-458 mounts it
+   * from the enable path); `undefined` otherwise.
    */
   getAdaptiveBackoffConfig?: () => AdaptiveBackoffConfig | undefined;
   /**
@@ -20056,19 +20063,31 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   };
 
   // WR-339: adaptive backoff config runtime revision. The method is
-  // always set (like reviseSlowStart above); with the controller
-  // unconfigured the queue throws Error — enabling it needs a
-  // restart. A real revision is audited as `adaptive_backoff_revised`
-  // with the previous and current config (the construction values as
-  // first `previous`); an empty or same-value patch is a silent
-  // no-op.
+  // always set (like reviseSlowStart above). A real revision is
+  // audited as `adaptive_backoff_revised` with the previous and
+  // current config (the construction values as first `previous`); an
+  // empty or same-value patch is a silent no-op. WR-458: with the
+  // feature never configured the same call *enables* it instead of
+  // throwing — the queue installs the config and builds the default
+  // tenant's controller eagerly; the getter is mounted at the same
+  // time and the enable is audited with `previous: null`.
   server.reviseAdaptiveBackoff = (
     patch: AdaptiveBackoffRevision
   ): AdaptiveBackoffConfig => {
     const prev = queue.getAdaptiveBackoffConfig();
     if (prev === undefined) {
-      // Delegates to the queue for the canonical "must restart" Error.
-      return queue.reviseAdaptiveBackoff(patch);
+      // WR-458: enable — the queue installs the resolved config and
+      // builds the default tenant's controller eagerly. Mount the
+      // getter and audit the enable with `previous: null`.
+      const next = queue.reviseAdaptiveBackoff(patch);
+      server.getAdaptiveBackoffConfig = (): AdaptiveBackoffConfig =>
+        queue.getAdaptiveBackoffConfig()!;
+      opts.auditLog.append({
+        event: "adaptive_backoff_revised",
+        previous: null,
+        current: next,
+      });
+      return next;
     }
     // Validate-then-apply inside retune: an illegal patch throws
     // RangeError and the live values are left completely intact.
@@ -20090,7 +20109,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   };
 
   // WR-339: live adaptive backoff config. Only set when
-  // `retry.adaptiveBackoff` was configured.
+  // `retry.adaptiveBackoff` was configured — WR-458 mounts it from
+  // the enable path when the feature is enabled at runtime.
   if (queue.getAdaptiveBackoffConfig() !== undefined) {
     server.getAdaptiveBackoffConfig = (): AdaptiveBackoffConfig =>
       queue.getAdaptiveBackoffConfig()!;

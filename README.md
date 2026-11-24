@@ -196,9 +196,15 @@ reliability primitives that matter for any signed-payload pipeline.
   a silent no-op; a real revision is audited as
   `adaptive_backoff_revised` with `previous` / `current`. The one config
   is shared by all tenants (every per-tenant controller is retuned in
-  place; tenants born later start from the revised values). Revising the
-  feature when it was never configured throws `Error` — enabling it needs
-  a restart. This revises the retry-wait base; WR-335 revises the wait
+  place; tenants born later start from the revised values). When the
+  feature was never configured, the same call enables it live instead
+  (WR-458): the four knobs default to `minBaseMs` 100 / `maxBaseMs`
+  30000 / `upFactor` 2 / `downFactor` 0.5, so an empty patch enables
+  with all defaults; the fresh controller starts with no outcomes —
+  deliveries before the enable are never retroactively recorded — the
+  getter is mounted at the same time, and the enable is audited as
+  `adaptive_backoff_revised` with `previous: null`. A restart returns
+  to unconfigured. This revises the retry-wait base; WR-335 revises the wait
   cap formula instead, WR-337 the steady-state AIMD concurrency cap, and
   WR-338 the breaker-recovery ramp.
   The opt-in adaptive concurrency (`adaptiveConcurrency`, WR-94, off by
@@ -12994,9 +13000,11 @@ written to the audit log, so the log is the machine's trace.
   new `[minBaseMs, maxBaseMs]` at once, so the next retry wait is computed
   from the new bounds, while a changed `upFactor` / `downFactor` only
   affects the next outcome's step size; a real revision is audited as
-  `adaptive_backoff_revised` with `previous` / `current`, and revising
-  when adaptive backoff was never configured throws `Error` (enabling it
-  needs a restart). This revises the retry-wait base; WR-335 revises the
+  `adaptive_backoff_revised` with `previous` / `current`, and when
+  adaptive backoff was never configured the same call enables it live
+  (WR-458) with the construction defaults (`minBaseMs` 100 /
+  `maxBaseMs` 30000 / `upFactor` 2 / `downFactor` 0.5), audited with
+  `previous: null`. This revises the retry-wait base; WR-335 revises the
   wait cap formula instead. When the circuit breaker is enabled and
   the endpoint's circuit is open, the attempt is *parked* instead: it is
   rescheduled after the remaining cooldown without consuming the retry
