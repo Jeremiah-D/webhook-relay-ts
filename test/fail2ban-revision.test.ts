@@ -339,7 +339,7 @@ describe("RelayServer fail2ban revision (WR-357)", () => {
     assert.deepEqual(relay.getFail2BanConfig!(), { ...construction, banDurationMs: 600_000 });
   });
 
-  it("unconfigured relay: revise throws the must-restart Error and the getter is not mounted", async () => {
+  it("unconfigured relay: revise without both required knobs throws RangeError and stays unconfigured; with them, it enables and mounts the getter (WR-457)", async () => {
     const dir = mkdtempSync(join(tmpdir(), "fail2ban-revision-off-"));
     const audit = new AuditLog(join(dir, "audit.jsonl"));
     const relay = createRelayServer({
@@ -352,10 +352,41 @@ describe("RelayServer fail2ban revision (WR-357)", () => {
     servers.push(relay);
     await listen(relay);
     assert.equal(relay.getFail2BanConfig, undefined);
+    // Empty, missing-a-required-knob, and illegal patches all throw
+    // RangeError and leave the relay unconfigured — the old
+    // must-restart Error is gone (WR-457 enables instead).
+    assert.throws(() => relay.reviseFail2Ban!({}), RangeError);
     assert.throws(
       () => relay.reviseFail2Ban!({ maxConsecutiveFailures: 2 }),
-      /not configured — enabling it requires a restart/
+      RangeError
     );
+    assert.throws(() => relay.reviseFail2Ban!({ banDurationMs: 60_000 }), RangeError);
+    assert.throws(
+      () =>
+        relay.reviseFail2Ban!({ maxConsecutiveFailures: 0, banDurationMs: 60_000 }),
+      RangeError
+    );
+    assert.equal(relay.getFail2BanConfig, undefined);
+    assert.equal(eventsOf(audit, "fail2ban_revised").length, 0);
+    // With both required knobs the same call enables, mounts the
+    // getter, and audits previous: null.
+    assert.deepEqual(
+      relay.reviseFail2Ban!({ maxConsecutiveFailures: 2, banDurationMs: 60_000 }),
+      { maxConsecutiveFailures: 2, banDurationMs: 60_000, maxEntries: 10000 }
+    );
+    assert.deepEqual(relay.getFail2BanConfig!(), {
+      maxConsecutiveFailures: 2,
+      banDurationMs: 60_000,
+      maxEntries: 10000,
+    });
+    const revised = eventsOf(audit, "fail2ban_revised");
+    assert.equal(revised.length, 1);
+    assert.equal(revised[0].previous, null);
+    assert.deepEqual(revised[0].current, {
+      maxConsecutiveFailures: 2,
+      banDurationMs: 60_000,
+      maxEntries: 10000,
+    });
   });
 
   it("GET /bans bannedAt and expiresAt are stable across a banDurationMs revision", async () => {

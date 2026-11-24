@@ -296,6 +296,7 @@ import { InboundIpAcl, IpAclMetrics, type IpAclOptions } from "./ip-acl.ts";
 import {
   Fail2Ban,
   Fail2BanMetrics,
+  assertValidFail2BanOptions,
   type Fail2BanConfig,
   type Fail2BanOptions,
   type Fail2BanRevision,
@@ -2257,7 +2258,11 @@ export interface RelayServerOptions {
    * `RangeError` at startup. The three thresholds are live-revisable
    * at runtime via `server.reviseFail2Ban` (WR-357) — a revision takes
    * effect from the next failure assessment, and an in-flight ban
-   * keeps the expiry it was armed with.
+   * keeps the expiry it was armed with. WR-457: when fail2ban was
+   * never configured, the same call *enables* it — the patch must
+   * supply both `maxConsecutiveFailures` and `banDurationMs`;
+   * `maxEntries` defaults to 10000 and the fresh tracker starts empty
+   * (failures before the enable were never recorded).
    */
   fail2ban?: Fail2BanOptions;
   /**
@@ -6775,15 +6780,26 @@ export interface RelayServer extends Server {
    * a `RangeError`; a same-value revision is a no-op with no audit
    * event. A real revision is audited as `fail2ban_revised` with
    * `previous` / `current` (all three thresholds), and returns the
-   * live config. Always set; throws `Error` when fail2ban was never
-   * configured — enabling it needs a restart. Orthogonal to WR-182
-   * (which owns the banning mechanism itself) and to WR-53 (which
-   * owns the static-allow exemption, untouched here).
+   * live config. Always set. WR-457: when fail2ban was never
+   * configured, the same call *enables* it instead of throwing: the
+   * patch must supply both `maxConsecutiveFailures` and `banDurationMs`
+   * (neither has a construction default — an empty patch, a missing
+   * required knob, or an illegal value throws `RangeError` and the
+   * relay stays unconfigured); `maxEntries` falls back to the
+   * construction default 10000, `now` to the wall clock, and
+   * `isExempt` to the WR-53 static-allow wiring. The fresh tracker
+   * starts empty — failures before the enable were never recorded and
+   * are not retroactively counted — the getter is mounted at the same
+   * time, and the enable is audited as `fail2ban_revised` with
+   * `previous: null`. A restart returns to unconfigured. Orthogonal to
+   * WR-182 (which owns the banning mechanism itself) and to WR-53
+   * (which owns the static-allow exemption, untouched here).
    */
   reviseFail2Ban?: (patch: Fail2BanRevision) => Fail2BanConfig;
   /**
    * WR-357: live fail2ban config — the three thresholds. Only set
-   * when `fail2ban` was configured; `undefined` otherwise.
+   * when `fail2ban` was configured; `undefined` otherwise. WR-457
+   * mounts it from the enable path when fail2ban is enabled at runtime.
    */
   getFail2BanConfig?: () => Fail2BanConfig | undefined;
   /**
@@ -12967,7 +12983,11 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // unset = off, intake behavior is byte-identical to the legacy one.
   // The exemption hook wires the WR-53 static-allow rule: an IP that
   // hits an allow rule for the request's path is never banned.
-  const fail2ban =
+  // WR-457: `let` (was `const`) so `reviseFail2Ban` can install a fresh
+  // tracker when fail2ban was never configured — the intake gates, the
+  // operator /bans surface, and the config getter all read this
+  // binding live, so they see the new tracker at once.
+  let fail2ban =
     opts.fail2ban !== undefined
       ? new Fail2Ban({
           ...opts.fail2ban,
@@ -19592,17 +19612,57 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   };
 
   // WR-357: fail2ban threshold runtime revision. The method is always
-  // set; with fail2ban unconfigured the canonical must-restart Error
-  // is thrown — enabling it needs a restart. A real revision is
+  // set. WR-457: with fail2ban unconfigured the same call *enables*
+  // it — the patch must supply both knobs that have no construction
+  // default (`maxConsecutiveFailures` and `banDurationMs`); `maxEntries`
+  // falls back to the construction default 10000, `now` to the wall
+  // clock, and `isExempt` to the same WR-53 static-allow wiring
+  // construction uses. Validation runs first through the construction
+  // gate, so an empty, non-object, or illegal patch throws RangeError
+  // and the relay stays unconfigured (and can still enable afterwards).
+  // The fresh tracker starts empty — failures before the enable were
+  // never recorded and are not retroactively counted. The getter is
+  // mounted at the same time, and the enable is audited as
+  // `fail2ban_revised` with `previous: null`. A real revision is
   // audited as `fail2ban_revised` with the previous and current
   // config (the construction values as first `previous`); an empty or
   // same-value patch is a silent no-op.
   server.reviseFail2Ban = (patch: Fail2BanRevision): Fail2BanConfig => {
     if (fail2ban === undefined) {
-      throw new Error(
-        "reviseFail2Ban: fail2ban is not configured — enabling it requires a restart: " +
-          "the tracker is built at startup and a running relay cannot start banning IPs without one"
-      );
+      // WR-457: enable — validate with the construction-time rules,
+      // then install a fresh tracker. Validation throws before
+      // anything is assigned, so an illegal patch leaves the relay
+      // unconfigured. `assertValidFail2BanOptions` itself requires
+      // both `maxConsecutiveFailures` and `banDurationMs` present and
+      // valid, so an empty patch is a `RangeError` here (there is
+      // nothing to enable with) — unlike the revise path, where an
+      // empty patch is a `RangeError` against live values for a
+      // different reason (nothing to revise). A non-object patch is
+      // rejected up front for the same reason `retune` rejects it.
+      if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+        throw new RangeError(
+          `fail2ban revision must be an object, got ${JSON.stringify(patch)}`
+        );
+      }
+      const enableOpts: Fail2BanOptions = {
+        maxConsecutiveFailures: patch.maxConsecutiveFailures as number,
+        banDurationMs: patch.banDurationMs as number,
+        maxEntries: patch.maxEntries,
+        now: Date.now,
+        isExempt: (pathname, ip) =>
+          ipAcl !== undefined && ipAcl.allowedByStaticAllowRule(pathname, ip),
+      };
+      assertValidFail2BanOptions(enableOpts);
+      const tracker = new Fail2Ban(enableOpts);
+      fail2ban = tracker;
+      server.getFail2BanConfig = (): Fail2BanConfig => tracker.snapshot();
+      const next = tracker.snapshot();
+      opts.auditLog.append({
+        event: "fail2ban_revised",
+        previous: null,
+        current: next,
+      });
+      return next;
     }
     const prev = fail2ban.snapshot();
     // Validate-then-apply inside retune: an illegal patch throws
@@ -19624,9 +19684,12 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   };
 
   // WR-357: live fail2ban config. Only set when `fail2ban` was
-  // configured.
+  // configured — WR-457 mounts it from the enable path when fail2ban
+  // is enabled at runtime. The local `tracker` capture keeps the
+  // getter type-sound now that `fail2ban` is a `let` (WR-457).
   if (fail2ban !== undefined) {
-    server.getFail2BanConfig = (): Fail2BanConfig => fail2ban.snapshot();
+    const tracker = fail2ban;
+    server.getFail2BanConfig = (): Fail2BanConfig => tracker.snapshot();
   }
 
   // WR-337: adaptive concurrency config runtime revision. The method is
