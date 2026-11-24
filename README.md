@@ -216,7 +216,16 @@ reliability primitives that matter for any signed-payload pipeline.
   heat the controller; answering rejections (including non-retryable 4xx)
   cool it; `getAdaptiveConcurrencyStats()` exposes each endpoint's
   current limit, and `relay_adaptive_concurrency_limit{endpoint}` exports
-  it to Prometheus.
+  it to Prometheus. When the feature was never configured, the same
+  `reviseAdaptiveConcurrency` call enables it live instead (WR-459):
+  the seven knobs default to `minLimit` 1 / `maxLimit` the live fixed
+  cap / `initialLimit` the max limit / `increaseStep` 1 /
+  `decreaseFactor` 0.5 / `failureRateThreshold` 0.2 / `windowSize` 20,
+  so an empty patch enables with all defaults; the fresh controller
+  starts with no outcomes — deliveries before the enable are never
+  retroactively recorded — the getter is mounted at the same time, and
+  the enable is audited as `adaptive_concurrency_revised` with
+  `previous: null`. A restart returns to unconfigured.
   Dead-lettered items carry `attempts`, `lastError`, and
   `deadLetteredAt`, and can be re-queued with a fresh attempt budget via
   `replayDeadLetter(id)` / `replayAllDeadLetters()`. Per-endpoint concurrency
@@ -3957,7 +3966,12 @@ const queue = new RetryQueue({
   `initialLimit` needs both fields in one patch — or the whole patch is
   a `RangeError` and nothing moves. An empty patch is a `RangeError`;
   a same-value patch is a silent no-op; a real revision is audited as
-  `adaptive_concurrency_revised` with `previous` / `current`. The one
+  `adaptive_concurrency_revised` with `previous` / `current`. When
+  adaptive concurrency was never configured the same call enables it
+  live (WR-459) with the construction defaults (`minLimit` 1 /
+  `maxLimit` the live fixed cap / `initialLimit` the max limit /
+  `increaseStep` 1 / `decreaseFactor` 0.5 / `failureRateThreshold` 0.2 /
+  `windowSize` 20), audited with `previous: null`. The one
   config is shared by all tenants (every per-tenant controller is
   retuned in place; tenants born later start from the revised values).
   Revising the feature when it was never configured throws `Error` —

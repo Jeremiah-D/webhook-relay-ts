@@ -6816,17 +6816,26 @@ export interface RelayServer extends Server {
    * audit event. A real revision is audited as
    * `adaptive_concurrency_revised` with `previous` / `current` (the
    * construction values as first `previous`), and returns the live
-   * config. Always set; throws `Error` when adaptive concurrency was
-   * never configured — enabling it needs a restart. The one config is
-   * shared by all tenants: there is no per-tenant override. This tunes
-   * the steady-state AIMD cap; WR-321 revises the fixed cap instead,
-   * and WR-338 revises the breaker-recovery ramp.
+   * config. Always set. WR-459: when adaptive concurrency was never
+   * configured, the same call *enables* it instead of throwing — an
+   * empty patch takes all seven construction defaults (`minLimit`
+   * 1 / `maxLimit` the live fixed cap / `initialLimit` the max limit
+   * / `increaseStep` 1 / `decreaseFactor` 0.5 / `failureRateThreshold`
+   * 0.2 / `windowSize` 20), the fresh controller starts with no
+   * outcomes (dispatches before the enable are never retroactively
+   * recorded), the enable is audited with `previous: null`, and the
+   * getter is mounted at the same time; a restart returns to
+   * unconfigured. The one config is shared by all tenants: there is
+   * no per-tenant override. This tunes the steady-state AIMD cap;
+   * WR-321 revises the fixed cap instead, and WR-338 revises the
+   * breaker-recovery ramp.
    */
   reviseAdaptiveConcurrency?: (patch: AdaptiveConcurrencyRevision) => AdaptiveConcurrencyConfig;
   /**
    * WR-337: live adaptive concurrency config — the seven AIMD inputs
    * shared by all tenants. Only set when `adaptiveConcurrency` was
-   * configured; `undefined` otherwise.
+   * configured, or once it is enabled at runtime (WR-459 mounts it
+   * from the enable path); `undefined` otherwise.
    */
   getAdaptiveConcurrencyConfig?: () => AdaptiveConcurrencyConfig | undefined;
   /**
@@ -19700,19 +19709,31 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   }
 
   // WR-337: adaptive concurrency config runtime revision. The method is
-  // always set (like reviseAdaptiveMaxDelay above); with the controller
-  // unconfigured the queue throws Error — enabling it needs a
-  // restart. A real revision is audited as `adaptive_concurrency_revised`
-  // with the previous and current config (the construction values as
-  // first `previous`); an empty or same-value patch is a silent
-  // no-op.
+  // always set (like reviseAdaptiveMaxDelay above). A real revision is
+  // audited as `adaptive_concurrency_revised` with the previous and
+  // current config (the construction values as first `previous`); an
+  // empty or same-value patch is a silent no-op. WR-459: with the
+  // feature never configured the same call *enables* it instead of
+  // throwing — the queue installs the config and builds the default
+  // tenant's controller eagerly; the getter is mounted at the same
+  // time and the enable is audited with `previous: null`.
   server.reviseAdaptiveConcurrency = (
     patch: AdaptiveConcurrencyRevision
   ): AdaptiveConcurrencyConfig => {
     const prev = queue.getAdaptiveConcurrencyConfig();
     if (prev === undefined) {
-      // Delegates to the queue for the canonical "must restart" Error.
-      return queue.reviseAdaptiveConcurrency(patch);
+      // WR-459: enable — the queue installs the resolved config and
+      // builds the default tenant's controller eagerly. Mount the
+      // getter and audit the enable with `previous: null`.
+      const next = queue.reviseAdaptiveConcurrency(patch);
+      server.getAdaptiveConcurrencyConfig = (): AdaptiveConcurrencyConfig =>
+        queue.getAdaptiveConcurrencyConfig()!;
+      opts.auditLog.append({
+        event: "adaptive_concurrency_revised",
+        previous: null,
+        current: next,
+      });
+      return next;
     }
     // Validate-then-apply inside retune: an illegal patch throws
     // RangeError and the live values are left completely intact.
@@ -19737,7 +19758,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   };
 
   // WR-337: live adaptive concurrency config. Only set when
-  // `retry.adaptiveConcurrency` was configured.
+  // `retry.adaptiveConcurrency` was configured — WR-459 mounts it from
+  // the enable path when the feature is enabled at runtime.
   if (queue.getAdaptiveConcurrencyConfig() !== undefined) {
     server.getAdaptiveConcurrencyConfig = (): AdaptiveConcurrencyConfig =>
       queue.getAdaptiveConcurrencyConfig()!;

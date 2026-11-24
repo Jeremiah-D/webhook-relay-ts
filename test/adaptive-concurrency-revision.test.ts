@@ -298,18 +298,27 @@ describe("RetryQueue adaptive concurrency revision (WR-337)", () => {
     throw new Error("downstream down");
   };
 
-  it("unconfigured: revise throws the must-restart Error, getter returns undefined", () => {
+  it("unconfigured: revise enables with the construction defaults (WR-459)", () => {
     const q = new RetryQueue({ sender: alwaysFail, baseDelayMs: 100, maxDelayMs: 60000 });
     assert.equal(q.getAdaptiveConcurrencyConfig(), undefined);
-    assert.throws(
-      () => q.reviseAdaptiveConcurrency({ failureRateThreshold: 0.5 }),
-      /not configured — enabling it requires a restart/
-    );
-    assert.throws(
-      () => q.reviseAdaptiveConcurrency({ failureRateThreshold: 0.5 }),
-      /cannot start adapting limits without one/
-    );
-    assert.equal(q.getAdaptiveConcurrencyConfig(), undefined);
+    assert.deepEqual(q.reviseAdaptiveConcurrency({ failureRateThreshold: 0.5 }), {
+      minLimit: 1,
+      maxLimit: Infinity,
+      initialLimit: Infinity,
+      increaseStep: 1,
+      decreaseFactor: 0.5,
+      failureRateThreshold: 0.5,
+      windowSize: 20,
+    });
+    assert.deepEqual(q.getAdaptiveConcurrencyConfig(), {
+      minLimit: 1,
+      maxLimit: Infinity,
+      initialLimit: Infinity,
+      increaseStep: 1,
+      decreaseFactor: 0.5,
+      failureRateThreshold: 0.5,
+      windowSize: 20,
+    });
     q.stop();
   });
 
@@ -573,14 +582,29 @@ describe("RelayServer adaptive concurrency revision (WR-337)", () => {
     });
   });
 
-  it("unconfigured relay: revise throws the must-restart Error and the getter is not mounted", async () => {
+  it("unconfigured relay: revise enables and mounts the getter (WR-459)", async () => {
     const { relay } = makeRelay();
     await listen(relay);
     assert.equal(relay.getAdaptiveConcurrencyConfig, undefined);
-    assert.throws(
-      () => relay.reviseAdaptiveConcurrency!({ failureRateThreshold: 0.5 }),
-      /not configured — enabling it requires a restart/
-    );
+    assert.deepEqual(relay.reviseAdaptiveConcurrency!({ failureRateThreshold: 0.5 }), {
+      minLimit: 1,
+      maxLimit: Infinity,
+      initialLimit: Infinity,
+      increaseStep: 1,
+      decreaseFactor: 0.5,
+      failureRateThreshold: 0.5,
+      windowSize: 20,
+    });
+    assert.notEqual(relay.getAdaptiveConcurrencyConfig, undefined);
+    assert.deepEqual(relay.getAdaptiveConcurrencyConfig!(), {
+      minLimit: 1,
+      maxLimit: Infinity,
+      initialLimit: Infinity,
+      increaseStep: 1,
+      decreaseFactor: 0.5,
+      failureRateThreshold: 0.5,
+      windowSize: 20,
+    });
   });
 
   it("server getter reflects revisions made through the server", async () => {

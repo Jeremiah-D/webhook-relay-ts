@@ -4789,7 +4789,7 @@ export class RetryQueue {
   private adaptiveBackoffOpts?: AdaptiveBackoffOptions;
   /** WR-59: per-tenant adaptive backoff controllers (WR-48 scoping). */
   private readonly adaptiveBackoffs = new Map<string, AdaptiveBackoffController>();
-  /** WR-94: adaptive concurrency options; undefined when disabled. WR-337: live-revisable — `reviseAdaptiveConcurrency` replaces this with the merged options so tenants born later start from the revised values. */
+  /** WR-94: adaptive concurrency options; undefined when disabled. WR-337: live-revisable — `reviseAdaptiveConcurrency` replaces this with the merged options so tenants born later start from the revised values. WR-459: live-enablable — `reviseAdaptiveConcurrency` installs the resolved config on an unconfigured queue. */
   private adaptiveConcurrencyOpts?: AdaptiveConcurrencyOptions;
   /** WR-97: the shared per-(tenant, endpoint) outbound rate limiter; undefined when disabled. */
   private readonly tenantRateLimiter?: TenantRateLimiter;
@@ -11681,18 +11681,50 @@ export class RetryQueue {
    * the retuned limits; a lowered ceiling (or raised floor) clamps
    * already-adapted limits at once. An illegal patch throws
    * `RangeError` and the live values are untouched; an empty patch is
-   * a `RangeError`; revising to the live values is a no-op. Throws
-   * `Error` when adaptive concurrency was never configured — enabling
-   * it needs a restart. The one config is shared by all tenants:
-   * every per-tenant controller is retuned in place, and tenants born
-   * later start from the revised values. Returns the live config.
+   * a `RangeError`; revising to the live values is a no-op.
+   *
+   * WR-459: when adaptive concurrency was never configured, the same
+   * call *enables* it instead of throwing: every knob has a
+   * construction default (`minLimit` 1 / `maxLimit` the live fixed cap
+   * / `initialLimit` the max limit / `increaseStep` 1 /
+   * `decreaseFactor` 0.5 / `failureRateThreshold` 0.2 / `windowSize`
+   * 20), so an empty patch enables with all defaults, and a fresh
+   * controller is built with no outcomes — dispatches before the
+   * enable were never recorded and are not retroactively recorded,
+   * and endpoints with no outcomes keep using the initial limit. A
+   * non-object or illegal patch throws `RangeError` and the queue
+   * stays unconfigured (validated first, through the same
+   * construction gate as `assertAdaptiveConcurrencyOptions`). No
+   * persistence: a restart returns to unconfigured — the enable is
+   * live-only. Once enabled, later calls revise per WR-337. The one
+   * config is shared by all tenants: every per-tenant controller is
+   * retuned in place, and tenants born later start from the revised
+   * values. Returns the live config.
    */
   reviseAdaptiveConcurrency(patch: AdaptiveConcurrencyRevision): AdaptiveConcurrencyConfig {
     if (this.adaptiveConcurrencyOpts === undefined) {
-      throw new Error(
-        "reviseAdaptiveConcurrency: adaptive concurrency is not configured — enabling it requires a restart: " +
-          "the controller is created at startup and a running relay cannot start adapting limits without one"
-      );
+      // WR-459: enable — validate with the construction-time rules,
+      // then install the resolved config and build the default
+      // tenant's controller eagerly (mirroring construction,
+      // retry.ts:5899-5901). Validation throws before anything is
+      // assigned, so an illegal patch leaves the queue unconfigured.
+      // `assertAdaptiveConcurrencyOptions` resolves every omitted knob
+      // to its construction default, so an empty patch enables with
+      // all defaults — unlike the revise path, where an empty patch
+      // is a `RangeError` because there is nothing to revise. The
+      // fresh controller starts with no outcomes: dispatches before
+      // the enable were never recorded and are not retroactively
+      // recorded, and endpoints with no outcomes keep using the
+      // initial limit (the live fixed cap by default).
+      if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+        throw new RangeError(
+          `adaptiveConcurrency revision must be an object, got ${JSON.stringify(patch)}`
+        );
+      }
+      const next = assertAdaptiveConcurrencyOptions(patch, this.maxConcurrentPerEndpoint);
+      this.adaptiveConcurrencyOpts = next;
+      const primary = this.adaptiveConcurrencyFor(undefined)!;
+      return primary.snapshot();
     }
     if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
       throw new RangeError(
