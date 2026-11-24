@@ -2991,8 +2991,10 @@ curl -X POST http://127.0.0.1:PORT/endpoints/enable \
   `oldOnEndpointEnabled` ('set' / 'absent') presence, never a
   function body — and the audit can never be bypassed by a
   replacement. Throws `Error` when auto-disable was never configured
-  — enabling it needs a restart. Only the observers move: the disable
-  gate, the failure streaks, and the disabled set are untouched.
+  — enable it first with `reviseEndpointAutoDisable` (WR-461), which
+  opens this gate the moment the tracker exists. Only the observers
+  move: the disable gate, the failure streaks, and the disabled set
+  are untouched.
   WR-367 is the same family for the pause/resume hooks; WR-368 for
   the replay skip/force hooks.
 - **Live threshold/window revision (WR-415)** —
@@ -3014,8 +3016,17 @@ curl -X POST http://127.0.0.1:PORT/endpoints/enable \
   threshold never re-enables an already-disabled endpoint (re-enable
   still only goes through `enableEndpoint`), and
   `getEndpointDisableStats()` / `isEndpointDisabled()` are unchanged.
-  Throws `Error` when auto-disable was never configured — enabling
-  it needs a restart.
+  WR-461: when auto-disable was never configured, the same call
+  *enables* it instead of throwing — both knobs have construction
+  defaults (`failureThreshold` 5 / `windowMs` Infinity), so an empty
+  patch enables with all defaults. The fresh tracker starts with an
+  empty streak table: failures before the enable are not retroactively
+  counted, and deliveries already dead-lettered are never revisited.
+  A non-object or illegal patch throws `RangeError` and the relay
+  stays unconfigured. The enable is audited as
+  `endpoint_auto_disable_revised` with `previous: null`. Enabling
+  also unlocks `reviseEndpointAutoDisableCallbacks` (WR-369). No
+  persistence: a restart returns to unconfigured.
 - **Off by default** — without the option the tracker is never
   constructed: zero behavior change, zero hot-path cost.
 

@@ -205,7 +205,7 @@ describe("RetryQueue endpoint auto-disable revision (WR-415)", () => {
 
   const ITEM = (id: string) => ({ id, payload: Buffer.from("x"), targetUrl: URL, headers: {} });
 
-  it("unconfigured queue throws the must-restart Error and reports no config", () => {
+  it("unconfigured queue enables with the given values and reports them at once (WR-461)", () => {
     const timer = manualTimer();
     const f = failingSender();
     const q = new RetryQueue({
@@ -219,13 +219,14 @@ describe("RetryQueue endpoint auto-disable revision (WR-415)", () => {
     q.start();
     try {
       assert.equal(q.getEndpointAutoDisableConfig(), undefined);
-      assert.throws(
-        () => q.reviseEndpointAutoDisable({ failureThreshold: 2 }),
-        (err: unknown) =>
-          err instanceof Error &&
-          /requires a restart/.test(err.message) &&
-          /reviseEndpointAutoDisable/.test(err.message)
-      );
+      assert.deepEqual(q.reviseEndpointAutoDisable({ failureThreshold: 2 }), {
+        failureThreshold: 2,
+        windowMs: Infinity,
+      });
+      assert.deepEqual(q.getEndpointAutoDisableConfig(), {
+        failureThreshold: 2,
+        windowMs: Infinity,
+      });
     } finally {
       q.stop();
     }
@@ -338,15 +339,14 @@ describe("RelayServer endpoint auto-disable revision (WR-415)", () => {
     assert.equal(eventsOf(auditLog, name).length, target);
   }
 
-  it("unconfigured server throws the must-restart Error", () => {
-    const { relay } = makeServer();
-    assert.throws(
-      () => relay.reviseEndpointAutoDisable!({ failureThreshold: 2 }),
-      (err: unknown) =>
-        err instanceof Error &&
-        /requires a restart/.test(err.message) &&
-        /reviseEndpointAutoDisable/.test(err.message)
-    );
+  it("unconfigured server enables and audits previous: null with the exact current config (WR-461)", () => {
+    const { relay, auditLog } = makeServer();
+    const next = relay.reviseEndpointAutoDisable!({ failureThreshold: 2 });
+    assert.deepEqual(next, { failureThreshold: 2, windowMs: Infinity });
+    const enabled = eventsOf(auditLog, "endpoint_auto_disable_revised");
+    assert.equal(enabled.length, 1);
+    assert.equal(enabled[0]!.previous, null);
+    assert.deepEqual(enabled[0]!.current, { failureThreshold: 2, windowMs: "Infinity" });
   });
 
   it("a real revision audits endpoint_auto_disable_revised with exact previous/current", () => {

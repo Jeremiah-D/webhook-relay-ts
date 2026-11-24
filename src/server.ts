@@ -8246,7 +8246,9 @@ export interface RelayServer extends Server {
    * 'unchanged') and `oldOnEndpointAutoDisabled` /
    * `oldOnEndpointEnabled` ('set' / 'absent') presence, never a
    * function body. Always set; throws `Error` when auto-disable was
-   * never configured — enabling it needs a restart. The new callbacks
+   * never configured — enable it first with
+   * `reviseEndpointAutoDisable` (WR-461), which opens this gate the
+   * moment the tracker exists. The new callbacks
    * take effect from the next transition; the disable gate, the
    * failure streaks, and the disabled set are untouched.
    */
@@ -8266,10 +8268,18 @@ export interface RelayServer extends Server {
    * that endpoint (it disables on its next recorded failure), a
    * raised threshold never re-enables an already-disabled endpoint
    * (re-enable still only goes through `enableEndpoint`), and a
-   * tightened window only prunes on the next recorded failure. Always
-   * set; throws `Error` when auto-disable was never configured —
-   * enabling it needs a restart. Returns the resolved live
-   * configuration after the revision. Direct queue users use
+   * tightened window only prunes on the next recorded failure. WR-461:
+   * when auto-disable was never configured, the same call *enables*
+   * it instead of throwing — both knobs have construction defaults
+   * (`failureThreshold` 5 / `windowMs` Infinity), so an empty patch
+   * enables with all defaults; a non-object or illegal patch throws
+   * `RangeError` and the relay stays unconfigured. The enable is
+   * audited as `endpoint_auto_disable_revised` with `previous: null`,
+   * and the fresh tracker starts with an empty streak table:
+   * failures before the enable are not retroactively counted. No
+   * persistence: a restart returns to unconfigured. Always set.
+   * Returns the resolved live configuration after the revision.
+   * Direct queue users use
    * `RetryQueue.reviseEndpointAutoDisable` instead — calling the
    * queue method on a server-owned queue would skip the
    * `endpoint_auto_disable_revised` audit.
@@ -22438,7 +22448,9 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // `onEndpointEnabled`: 'set' / 'cleared' / 'unchanged';
   // `oldOnEndpointAutoDisabled` / `oldOnEndpointEnabled`:
   // 'set' / 'absent'), never a function body. With auto-disable
-  // unconfigured the queue throws the canonical "must restart" Error.
+  // unconfigured the queue throws the canonical "must restart" Error
+  // — enable it first with `reviseEndpointAutoDisable` (WR-461),
+  // which opens this gate the moment the tracker exists.
   server.reviseEndpointAutoDisableCallbacks = (patch: EndpointAutoDisableCallbacksRevision): void => {
     if (!queue.autoDisableConfigured()) {
       // Delegates to the queue for the canonical "must restart" Error.
@@ -22511,22 +22523,32 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // JSON-safe (JSON.stringify would otherwise turn it into `null`).
   // The live streaks, the disabled set, and `getEndpointDisableStats`
   // are untouched by this method — only the two knobs move.
+  // WR-461: with the gate unconfigured the same call *enables* it
+  // instead of throwing — the queue builds a fresh tracker with an
+  // empty streak table; the enable is audited with `previous: null`.
   server.reviseEndpointAutoDisable = (
     patch: EndpointAutoDisableRevision
   ): EndpointAutoDisableRevision => {
+    const forAudit = (c: EndpointAutoDisableRevision): { failureThreshold: number; windowMs: number | "Infinity" } => ({
+      failureThreshold: c.failureThreshold!,
+      windowMs: c.windowMs === Infinity ? "Infinity" : c.windowMs!,
+    });
     const prev = queue.getEndpointAutoDisableConfig();
     if (prev === undefined) {
-      // Delegates to the queue for the canonical "must restart" Error.
-      return queue.reviseEndpointAutoDisable(patch);
+      // WR-461: enable — the queue installs a fresh tracker with an
+      // empty streak table. Audit the enable with `previous: null`.
+      const next = queue.reviseEndpointAutoDisable(patch);
+      opts.auditLog.append({
+        event: "endpoint_auto_disable_revised",
+        previous: null,
+        current: forAudit(next),
+      });
+      return next;
     }
     const next = queue.reviseEndpointAutoDisable(patch);
     if (next.failureThreshold === prev.failureThreshold && next.windowMs === prev.windowMs) {
       return next; // Same-value: silent no-op.
     }
-    const forAudit = (c: EndpointAutoDisableRevision): { failureThreshold: number; windowMs: number | "Infinity" } => ({
-      failureThreshold: c.failureThreshold!,
-      windowMs: c.windowMs === Infinity ? "Infinity" : c.windowMs!,
-    });
     opts.auditLog.append({
       event: "endpoint_auto_disable_revised",
       previous: forAudit(prev),

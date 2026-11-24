@@ -4479,9 +4479,12 @@ export class RetryQueue {
    * WR-150: per-endpoint consecutive-failure tracker with the disable
    * gate. `undefined` when the `endpointAutoDisable` option is absent —
    * the gate, the streaks, and the series are all compiled out of the
-   * delivery path then.
+   * delivery path then. WR-461: deliberately *not* readonly —
+   * `reviseEndpointAutoDisable` installs a fresh tracker at runtime
+   * when the option was never configured, so the gate can be enabled
+   * live instead of needing a restart.
    */
-  private readonly autoDisable?: EndpointAutoDisable;
+  private autoDisable?: EndpointAutoDisable;
   /**
    * WR-153: per-endpoint queue-depth breach tracker. `undefined` when
    * the `queueDepthAlert` option is absent — the tracker, the edge
@@ -14607,8 +14610,10 @@ export class RetryQueue {
    * intact. A patch identical to the live values is a no-op. Only the
    * observers move: the disable gate, the failure streaks, and the
    * disabled set are untouched. Throws `Error` when auto-disable was
-   * never configured — the disable/enable events only ever fire when
-   * the gate is set, so enabling it needs a restart. Under
+   * never configured — enable it first with
+   * `reviseEndpointAutoDisable` (WR-461), which opens this gate the
+   * moment the tracker exists. The disable/enable events only ever
+   * fire when the gate is set. Under
    * `RelayServer` the fields hold the server's audit closures, so
    * direct calls here would replace the audit wrappers; server users
    * must go through `RelayServer.reviseEndpointAutoDisableCallbacks`,
@@ -14680,19 +14685,48 @@ export class RetryQueue {
    * disables on its next recorded failure), a raised threshold never
    * re-enables an already-disabled endpoint (re-enable still only
    * goes through `enableEndpoint`), and `getEndpointDisableStats()` /
-   * `isEndpointDisabled()` semantics are unchanged. Throws `Error`
-   * when auto-disable was never configured — enabling it needs a
-   * restart. The queue itself holds no audit log — the server audits a
-   * real revision as `endpoint_auto_disable_revised` (`previous` /
-   * `current`, both `{ failureThreshold, windowMs }`). Direct queue
-   * users call this method; server users must go through
+   * `isEndpointDisabled()` semantics are unchanged.
+   *
+   * WR-461: when auto-disable was never configured, the same call
+   * *enables* it instead of throwing: both knobs have construction
+   * defaults (`failureThreshold` 5 / `windowMs` Infinity), so an empty
+   * patch enables with all defaults, and a fresh tracker is built
+   * with an empty streak table — failures before the enable were never
+   * recorded and are not retroactively counted, so an endpoint that
+   * failed four times before the enable counts its next failure as 1,
+   * not 5; deliveries already dead-lettered are never revisited.
+   * A non-object or illegal patch throws `RangeError` and the queue
+   * stays unconfigured (validated first, through the same
+   * construction gate as `new EndpointAutoDisable`). Enabling also
+   * unlocks `reviseEndpointAutoDisableCallbacks`: the callback gate
+   * opens the moment the tracker exists. No persistence: a restart
+   * returns to unconfigured — the enable is live-only. Once enabled,
+   * later calls revise per WR-415. The queue itself holds no audit
+   * log — the server audits a real revision as
+   * `endpoint_auto_disable_revised` (`previous` / `current`, both
+   * `{ failureThreshold, windowMs }`). Direct queue users call this
+   * method; server users must go through
    * `RelayServer.reviseEndpointAutoDisable`, which adds the audit.
    */
   reviseEndpointAutoDisable(patch: EndpointAutoDisableRevision): EndpointAutoDisableRevision {
     if (this.autoDisable === undefined) {
-      throw new Error(
-        "reviseEndpointAutoDisable: endpoint auto-disable is not configured — enabling it requires a restart"
-      );
+      // WR-461: enable — validate with the construction-time rules,
+      // then install a fresh tracker with an empty streak table
+      // (mirroring construction, retry.ts:5301-5305). Validation
+      // throws before anything is assigned, so an illegal patch
+      // leaves the queue unconfigured. Both knobs have construction
+      // defaults, so an empty patch enables with all defaults —
+      // unlike the revise path, where an empty patch is a no-op
+      // because there is nothing to revise. The fresh tracker starts
+      // with no streaks: failures before the enable were never
+      // recorded and are not retroactively recorded.
+      if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+        throw new RangeError(
+          `reviseEndpointAutoDisable: patch must be an object, got ${JSON.stringify(patch)}`
+        );
+      }
+      this.autoDisable = new EndpointAutoDisable(patch);
+      return this.autoDisable.config();
     }
     return this.autoDisable.revise(patch);
   }
