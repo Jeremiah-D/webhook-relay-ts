@@ -282,9 +282,15 @@ describe("RetryQueue reviseReplayIdempotency enable (WR-460)", () => {
     f.setFail(false);
     q.enqueue({ id: "cap-a", payload: PAYLOAD, targetUrl: URL, headers: {} });
     await timer.drain();
+    // Mark the boundary *between* cap-a and cap-b: cap-a was recorded
+    // before this instant (so the third insert evicts it), while cap-b
+    // and cap-c are recorded after it (so they survive as the oldest).
+    // The assertions below then hold by program order, not by cap-b
+    // and the marker landing in the same wall-clock millisecond — a
+    // slow runner used to cross that boundary and fail CI (WR-465).
+    const t3 = Date.now();
     q.enqueue({ id: "cap-b", payload: PAYLOAD_2, targetUrl: URL, headers: {} });
     await timer.drain();
-    const t3 = Date.now();
     q.enqueue({ id: "cap-c", payload: PAYLOAD_3, targetUrl: URL, headers: {} });
     await timer.drain();
     // The cap already evicted the oldest pair on the third insert.
