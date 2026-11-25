@@ -5004,7 +5004,21 @@ export class RetryQueue {
   private readonly replayApproval?: ReplayApprovalStore;
   /** WR-68: cumulative entries held back by the egress gate. */
   private replayEgressThrottled = 0;
-  private readonly prober?: DownstreamProber;
+  /** WR-34: the downstream health prober; undefined when not configured. WR-466: deliberately *not* readonly — `reviseProbeEndpoints` installs a fresh prober here when probing is enabled at runtime (it was undefined before, so there is nothing to retune in place). */
+  private prober?: DownstreamProber;
+  /**
+   * WR-466: the probe audit channel, retained at construction so
+   * `reviseProbeEndpoints` can wire the audit channel when probing is
+   * enabled at runtime (construction only passed it to the prober, it
+   * never stored it). Under `RelayServer` this is the server's audit
+   * wrapper, which appends to the audit log first and then forwards to
+   * the operator cell — the wrapper reads that cell live, so a
+   * server-side callback revision stays in effect after an enable.
+   * Only ever read while `prober` is undefined: a configured prober's
+   * observer can only move via `reviseProbeAuditCallback`, which throws
+   * while unconfigured — so the retained reference can never go stale.
+   */
+  private readonly onProbeAudit?: (event: ProbeAuditEvent) => void;
   /** WR-201: adaptive weight tuner; undefined when `weightTuning` is unset. */
   private readonly weightTuner?: WeightTuner;
   /** WR-201: periodic retune sweeper; undefined when `weightTuning` is unset. */
@@ -6035,6 +6049,10 @@ export class RetryQueue {
       // ledger; the operator HTTP layer issues tokens from it.
       this.replayApproval = new ReplayApprovalStore(opts.replayApproval);
     }
+    // WR-466: retain the probe audit channel even when probing is
+    // unconfigured, so a runtime enable can wire it (see the field
+    // doc — the reference can never go stale).
+    this.onProbeAudit = opts.onProbeAudit;
     if (opts.probe !== undefined) {
       // A probe outcome feeds the circuit breaker exactly like a delivery
       // outcome: consecutive probe failures trip the circuit early, a
@@ -7329,7 +7347,8 @@ export class RetryQueue {
    * An illegal patch throws `RangeError` and the live values are
    * untouched; an empty patch is a `RangeError`; revising to the live
    * values is a no-op. Throws `Error` when probing was never
-   * configured — enabling it needs a restart. The probed endpoint
+   * configured — enable it first via `reviseProbeEndpoints()` (WR-466);
+   * cadence alone cannot create probe targets. The probed endpoint
    * list is revised separately, via `reviseProbeEndpoints()` (WR-356).
    * Returns the live config.
    */
@@ -7630,17 +7649,110 @@ export class RetryQueue {
    * and the live list is untouched; an empty patch is a `RangeError`;
    * a patch with no net change is a silent no-op. A real revision is
    * audited as `probe_endpoints_revised` with `previous` / `current`
-   * endpoint lists, via the `onProbeAudit` channel. Throws `Error`
-   * when probing was never configured — enabling it needs a restart.
+   * endpoint lists, via the `onProbeAudit` channel.
+   *
+   * WR-466: when probing was never configured, the same call *enables*
+   * it instead of throwing — but unlike the revise path, the patch
+   * must carry an `add` list with at least one endpoint: there is no
+   * live list to fall back on, so an empty patch, a non-object patch,
+   * a patch without `add`, an empty `add`, or a patch whose `add` is
+   * not an array throws `RangeError` and the queue stays unconfigured
+   * (and can still be enabled afterwards). `remove` must be empty or
+   * absent at enable time — with no live endpoints every named
+   * endpoint is unknown, so a non-empty `remove` throws `RangeError`
+   * exactly like `retuneEndpoints` does for an unknown endpoint. The
+   * `add` entries pass through the same construction gates as `new
+   * DownstreamProber` (non-empty strings, no duplicates), which throw
+   * before the field is assigned — no half-built prober is left
+   * behind. The enable mirrors construction (retry.ts:6056-6074): a
+   * fresh `DownstreamProber` with the `add` endpoints, the same-shaped
+   * `recordOutcome` closure feeding every tenant's breaker, and the
+   * audit channel retained at construction (`onProbeAudit`), taking
+   * the construction cadence defaults (`intervalMs` 30_000, `method`
+   * `"HEAD"`, `timeoutMs` 5_000) — the cadence itself is not part of
+   * this patch, so no `probe_revised` is emitted for the defaults.
+   * When the queue is already running the prober is started at once
+   * (first round one interval later, no startup burst); when it is
+   * stopped or paused, `start()` arms it, exactly as for a
+   * construction-configured prober. The fresh prober starts with empty
+   * counters: outcomes from before the enable are never retroactively
+   * recorded, and the breaker keeps its own pre-enable state. The
+   * enable is audited exactly once as `probe_endpoints_revised` with
+   * `previous: []` and `current` the enabled endpoint list. Once
+   * enabled, later calls revise per WR-356. No persistence: a restart
+   * returns to unconfigured — the enable is live-only. The queue
+   * itself holds no audit log — the server audits nothing extra; the
+   * one event above is the whole audit. Direct queue users call this
+   * method; server users must go through
+   * `RelayServer.reviseProbeEndpoints`, which mounts the getters.
    * Returns the live endpoint list.
    */
   reviseProbeEndpoints(patch: ProbeEndpointsRevision): string[] {
     const prober = this.prober;
     if (prober === undefined) {
-      throw new Error(
-        "reviseProbeEndpoints: downstream probing is not configured — enabling it requires a restart: " +
-          "the prober is created at startup and a running relay cannot start probing new endpoints without one"
-      );
+      // WR-466: enable — validate first, mirroring the
+      // `retuneEndpoints` gates, so an illegal patch throws
+      // `RangeError` and the queue stays unconfigured (and can still
+      // be enabled afterwards). The `add` entries themselves are
+      // validated by the `DownstreamProber` constructor below, which
+      // throws before the field is assigned.
+      if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+        throw new RangeError(
+          `probe endpoints revision must be an object, got ${JSON.stringify(patch)}`
+        );
+      }
+      const add = patch.add ?? [];
+      const remove = patch.remove ?? [];
+      if (!Array.isArray(add) || !Array.isArray(remove)) {
+        throw new RangeError("probe endpoints revision add/remove must be arrays of target URLs");
+      }
+      if (add.length === 0) {
+        throw new RangeError(
+          "reviseProbeEndpoints: enabling downstream probing requires an add list with at least one endpoint — the patch must carry the endpoints to probe; an empty patch cannot enable it"
+        );
+      }
+      if (remove.length > 0) {
+        for (const ep of remove) {
+          if (typeof ep !== "string" || ep === "") {
+            throw new RangeError("`probe.endpoints` entries must be non-empty strings");
+          }
+        }
+        // Nothing is live yet, so every named endpoint is unknown —
+        // the same gate `retuneEndpoints` applies to a remove with no
+        // live target.
+        throw new RangeError(`unknown probe endpoint ${JSON.stringify(remove[0])}`);
+      }
+      // Mirror the construction wiring (retry.ts:6056-6074): the
+      // recordOutcome closure feeds every tenant's breaker exactly
+      // like a delivery outcome, and the audit channel is the one
+      // retained at construction (the server's audit wrapper when the
+      // queue runs under `RelayServer`). Cadence takes the
+      // construction defaults inside `new DownstreamProber`.
+      const enabled = new DownstreamProber({
+        endpoints: add,
+        recordOutcome: (endpoint, ok) => {
+          // WR-48: probes measure the downstream itself (shared across
+          // tenants), so a probe outcome feeds every tenant's breaker
+          // instance for that endpoint.
+          for (const b of this.breakers.values()) {
+            if (ok) b.recordSuccess(endpoint);
+            else b.recordFailure(endpoint);
+          }
+        },
+        onAudit: this.onProbeAudit,
+      });
+      this.prober = enabled;
+      // A running queue probes from now: `start()` is idempotent and
+      // schedules the first round one interval later (no burst). A
+      // stopped queue picks the prober up on the next `start()`, via
+      // the live `this.prober` read there.
+      if (this.running) enabled.start();
+      this.onProbeAudit?.({
+        event: "probe_endpoints_revised",
+        previous: [],
+        current: [...add],
+      });
+      return enabled.snapshotEndpoints();
     }
     return prober.retuneEndpoints(patch);
   }
@@ -15486,8 +15598,8 @@ export class RetryQueue {
    * A non-function value throws `RangeError` and the live callback is
    * untouched; replacing with the same reference (or clearing when
    * already unset) is a no-op. Throws `Error` when probing was never
-   * configured — the prober only ever exists with `probe` in place,
-   * so enabling observation needs a restart. The same channel also
+   * configured — enable probing first via `reviseProbeEndpoints()`
+   * (WR-466). The same channel also
    * carries `probe_endpoints_revised` (WR-356), so a list revision
    * after this one reports to the new callback too. Under
    * `RelayServer` the prober holds the server's audit closure, so

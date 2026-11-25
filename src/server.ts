@@ -6561,7 +6561,8 @@ export interface RelayServer extends Server {
    * revision is audited as `probe_revised` with `previous` / `current`
    * (the construction values as first `previous`), and returns the
    * live config. Always set; throws `Error` when probing was never
-   * configured — enabling it needs a restart. The endpoint list is
+   * configured — enable it first via `reviseProbeEndpoints` (WR-466);
+   * cadence alone cannot create probe targets. The endpoint list is
    * revised separately, via `reviseProbeEndpoints` (WR-356); this
    * revises only the rhythm. Orthogonal to WR-331 (which revises the circuit
    * breaker's half-open probe knobs) and to WR-10 (which owns the
@@ -6570,7 +6571,9 @@ export interface RelayServer extends Server {
   reviseProbe?: (patch: ProbeRevision) => ProbeConfig;
   /**
    * WR-355: live downstream probe config — the three cadence knobs.
-   * Only set when `probe` was configured; `undefined` otherwise.
+   * Only set once probing is on — at construction when `probe` was
+   * configured, or from the `reviseProbeEndpoints` enable path
+   * (WR-466); `undefined` otherwise.
    */
   getProbeConfig?: () => ProbeConfig | undefined;
   /**
@@ -6588,15 +6591,26 @@ export interface RelayServer extends Server {
    * change is a silent no-op with no audit event. A real revision is
    * audited as `probe_endpoints_revised` with `previous` / `current`
    * endpoint lists, via the `onProbeAudit` → audit-log channel, and
-   * returns the live endpoint list. Always set; throws `Error` when
-   * probing was never configured — enabling it needs a restart. The
+   * returns the live endpoint list. Always set. WR-466: on a relay
+   * where probing was never configured, the same call *enables* it —
+   * but the patch must carry a non-empty `add` list (at least one
+   * endpoint); an empty patch, a non-object patch, a patch without
+   * `add`, an empty `add`, or a non-empty `remove` throws `RangeError`
+   * and leaves the relay unconfigured. The cadence takes the
+   * construction defaults (`intervalMs` 30_000, `method` `"HEAD"`,
+   * `timeoutMs` 5_000); the enable is audited once as
+   * `probe_endpoints_revised` with `previous: []`, and
+   * `getProbeEndpoints` / `getProbeConfig` mount at the same time. A
+   * restart returns to unconfigured (live-only, no persistence). The
    * cadence knobs are revised separately, via `reviseProbe` (WR-355).
    */
   reviseProbeEndpoints?: (patch: ProbeEndpointsRevision) => string[];
   /**
    * WR-356: live probed endpoint list — the target URLs currently
-   * being probed, in live order. Only set when `probe` was
-   * configured; `undefined` otherwise.
+   * being probed, in live order. Only set once probing is on — at
+   * construction when `probe` was configured, or from the
+   * `reviseProbeEndpoints` enable path (WR-466); `undefined`
+   * otherwise.
    */
   getProbeEndpoints?: () => string[] | undefined;
   /**
@@ -8562,7 +8576,8 @@ export interface RelayServer extends Server {
    * `probe_audit_callback_revised` with `previous` / `current`
    * recording only 'set' / 'cleared' presence, never a function body.
    * Always set; throws `Error` when downstream probing was never
-   * configured — enabling it needs a restart. The new callback takes
+   * configured — enable probing first via `reviseProbeEndpoints`
+   * (WR-466). The new callback takes
    * effect from the next probe round; results already reported are
    * never re-delivered, and the probe cadence, the endpoint list, the
    * counters, and the circuit-breaker feed are untouched. Direct queue
@@ -19402,24 +19417,40 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   };
 
   // WR-355: live downstream probe config. Only set when `probe` was
-  // configured.
+  // configured — WR-466 mounts it from the enable path when probing
+  // is enabled at runtime.
   if (queue.getProbeConfig() !== undefined) {
     server.getProbeConfig = (): ProbeConfig => queue.getProbeConfig()!;
   }
 
   // WR-356: downstream probe endpoint list runtime revision. The
-  // method is always set (like reviseProbe above); with probing
-  // unconfigured the queue throws Error — enabling it needs a
-  // restart. The audit event `probe_endpoints_revised` (with the
-  // previous and current endpoint lists) is emitted by the prober via
-  // the `onProbeAudit` → audit-log channel, so a real revision is
-  // audited exactly once; a net-zero or same-value patch is a silent
-  // no-op.
-  server.reviseProbeEndpoints = (patch: ProbeEndpointsRevision): string[] =>
-    queue.reviseProbeEndpoints(patch);
+  // method is always set. WR-466: with probing unconfigured the same
+  // call *enables* it (the queue installs the prober and audits the
+  // enable as `probe_endpoints_revised` with `previous: []` via the
+  // `onProbeAudit` → audit-log channel, so a real enable is audited
+  // exactly once and the server appends nothing here); an illegal
+  // patch still throws `RangeError` in the queue and leaves the relay
+  // unconfigured. A real revision is audited as
+  // `probe_endpoints_revised` (with the previous and current endpoint
+  // lists) by the prober via the `onProbeAudit` → audit-log channel,
+  // so a real revision is audited exactly once; a net-zero or
+  // same-value patch is a silent no-op.
+  server.reviseProbeEndpoints = (patch: ProbeEndpointsRevision): string[] => {
+    if (queue.getProbeEndpoints() === undefined) {
+      // WR-466: enable — mount the getters at the same time (WR-448 /
+      // WR-459 / WR-460 precedent). `getProbeConfig` mounts here too:
+      // the enabled prober reports the construction cadence defaults.
+      const next = queue.reviseProbeEndpoints(patch);
+      server.getProbeEndpoints = (): string[] => queue.getProbeEndpoints()!;
+      server.getProbeConfig = (): ProbeConfig => queue.getProbeConfig()!;
+      return next;
+    }
+    return queue.reviseProbeEndpoints(patch);
+  };
 
   // WR-356: live probed endpoint list. Only set when `probe` was
-  // configured.
+  // configured — WR-466 mounts it from the enable path when probing
+  // is enabled at runtime.
   if (queue.getProbeEndpoints() !== undefined) {
     server.getProbeEndpoints = (): string[] => queue.getProbeEndpoints()!;
   }
@@ -23211,7 +23242,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // `probe_endpoints_revised` first, then forwards to the cell) is
   // never touched, so a replacement cannot bypass the audit. With
   // probing unconfigured the queue throws the canonical "must restart"
-  // Error (delegated below, exactly like WR-397's purged gate). A
+  // Error (delegated below, exactly like WR-397's purged gate) —
+  // enable probing first with `reviseProbeEndpoints` (WR-466). A
   // non-function callback throws `RangeError` and the live cell is
   // untouched; a same-reference replacement (or clearing when already
   // unset) is a silent no-op. A real replacement is audited as

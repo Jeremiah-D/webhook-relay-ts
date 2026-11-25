@@ -1380,6 +1380,18 @@ reliability primitives that matter for any signed-payload pipeline.
   live list untouched; an empty patch is a `RangeError`; a patch with no
   net change is a silent no-op. A real revision is audited as
   `probe_endpoints_revised` with `previous` / `current` endpoint lists.
+  Live enable (WR-466): `server.reviseProbeEndpoints({ add })` also enables
+  probing on a relay that never configured it — the patch must carry a
+  non-empty `add` list (at least one endpoint); the cadence takes the
+  construction defaults (`intervalMs` 30_000, `method` "HEAD", `timeoutMs`
+  5_000), so no `probe_revised` is emitted for the defaults. The new prober
+  starts with empty counters — nothing is probed before the enable, and
+  enabling never replays past outcomes. The enable is audited once as
+  `probe_endpoints_revised` with `previous: []`, and
+  `server.getProbeEndpoints()` / `server.getProbeConfig()` mount at the same
+  time; `reviseProbe` and `reviseProbeAuditCallback` unlock with it. An
+  illegal patch throws `RangeError` and leaves the relay unconfigured. A
+  restart returns to unconfigured (live-only, no persistence).
   Live revision (WR-404): `server.reviseProbeAuditCallback(cb | null)`
   swaps the probe audit observer live — only the observation moves (the
   probe itself still runs on WR-34/WR-355/WR-356: same cadence, same
@@ -1390,8 +1402,6 @@ reliability primitives that matter for any signed-payload pipeline.
   is audited as `probe_audit_callback_revised` with `previous` /
   `current` recording only 'set' / 'cleared' presence, never a
   function body.
-  Enabling probing when it was never configured still requires a
-  restart.
   (Not to be confused with the keep-alive pool's *connection* health
   probing, `OutboundConnectionPool({ healthProbe })`, which culls dead
   idle sockets before reuse.)

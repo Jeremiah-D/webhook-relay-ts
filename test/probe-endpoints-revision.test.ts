@@ -297,14 +297,15 @@ describe("DownstreamProber.retuneEndpoints (WR-356)", () => {
 describe("RetryQueue probe endpoints revision (WR-356)", () => {
   const okSender: Sender = async () => ({ statusCode: 200, body: Buffer.alloc(0) });
 
-  it("unconfigured: revise throws the must-restart Error, getter returns undefined", () => {
+  it("unconfigured: revise enables probing with the construction defaults (WR-466)", () => {
     const q = new RetryQueue({ sender: okSender });
     assert.equal(q.getProbeEndpoints(), undefined);
-    assert.throws(
-      () => q.reviseProbeEndpoints({ add: [EP] }),
-      /not configured — enabling it requires a restart/
-    );
-    assert.equal(q.getProbeEndpoints(), undefined);
+    assert.equal(q.getProbeConfig(), undefined);
+    assert.equal(q.probeConfigured(), false);
+    assert.deepEqual(q.reviseProbeEndpoints({ add: [EP] }), [EP]);
+    assert.deepEqual(q.getProbeEndpoints(), [EP]);
+    assert.deepEqual(q.getProbeConfig(), { intervalMs: 30000, timeoutMs: 5000, method: "HEAD" });
+    assert.equal(q.probeConfigured(), true);
     q.stop();
   });
 
@@ -429,13 +430,24 @@ describe("RelayServer probe endpoints revision (WR-356)", () => {
     assert.deepEqual(relay.getProbeEndpoints!(), [EP, EP2]);
   });
 
-  it("unconfigured relay: revise throws the must-restart Error and the getter is not mounted", async () => {
-    const { relay } = makeRelay();
+  it("unconfigured relay: revise enables probing and mounts the getters (WR-466)", async () => {
+    const { relay, audit } = makeRelay();
     await listen(relay);
     assert.equal(relay.getProbeEndpoints, undefined);
-    assert.throws(
-      () => relay.reviseProbeEndpoints!({ add: [EP] }),
-      /not configured — enabling it requires a restart/
-    );
+    assert.equal(relay.getProbeConfig, undefined);
+    assert.deepEqual(relay.reviseProbeEndpoints!({ add: [EP] }), [EP]);
+    assert.deepEqual(relay.getProbeEndpoints!(), [EP]);
+    assert.deepEqual(relay.getProbeConfig!(), {
+      intervalMs: 30000,
+      timeoutMs: 5000,
+      method: "HEAD",
+    });
+    // The enable is audited once as probe_endpoints_revised with
+    // previous: [] — and nothing else.
+    const revised = eventsOf(audit, "probe_endpoints_revised");
+    assert.equal(revised.length, 1);
+    assert.deepEqual(revised[0].previous, []);
+    assert.deepEqual(revised[0].current, [EP]);
+    assert.equal(eventsOf(audit, "probe_revised").length, 0);
   });
 });
