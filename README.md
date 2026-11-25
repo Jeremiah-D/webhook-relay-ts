@@ -12159,7 +12159,8 @@ The new observer takes effect from the next bypass or park; transitions
 already reported are never re-delivered. A real revision is audited as
 `ordered_audit_callback_revised` with `previous` / `current` ('set' /
 'cleared' only). Revising when ordered delivery was never configured
-throws `Error` (enabling it needs a restart). This only swaps the
+throws `Error` (enable ordered delivery live first via
+`reviseOrdered`, WR-464). This only swaps the
 observation receiver — the ordered gate, the head hold bound, and the
 park behavior are untouched.
 
@@ -12182,7 +12183,25 @@ values is a silent no-op. A real revision is audited as one
 endpoint URL; `previous` / `current`: `{ maxHeadOfLineHoldMs }`, an
 unbounded bound written as the string `"Infinity"`). The hold clocks,
 the line order, the urgent bypass, and `getOrderedStats()` are
-untouched; enabling ordering for a new scope still needs a restart.
+untouched. On an already-configured queue, revising a scope that was
+never configured still throws `RangeError`.
+
+WR-464: when ordered delivery was never configured at all, the same
+`reviseOrdered` call *enables* it instead of throwing — the patch must
+set at least one bound (an empty patch, a scope with no bound, or a
+non-object patch throws `RangeError` and the relay stays unconfigured).
+A global enable is the equivalent of starting with `ordered: true`
+(bound `Infinity`) or `ordered: { maxHeadOfLineHoldMs: n }`; an
+endpoint enable builds that endpoint's scope only; a mixed patch builds
+global + endpoint scopes at once. The enable is audited as one
+`ordered_revised` event per moved scope with `previous: null`. The
+fresh tracker starts with empty lines and the default `Date.now` clock
+(`now` is not part of the patch), so deliveries made before the enable
+are never retroactively ordered — the next dispatch registers each item
+onto its line tail, its hold clock starting at entry, and the poison
+bound is measured from the enable onwards. Enabling also unlocks
+`reviseOrderedAuditCallback` (WR-401). A restart returns to
+unconfigured — the enable is live-only.
 
 **Fail-fast** — an illegal `ordered` value (bad shape, non-positive
 `maxHeadOfLineHoldMs`, …) throws `RangeError` at construction.

@@ -8499,7 +8499,8 @@ export interface RelayServer extends Server {
    * as `ordered_audit_callback_revised` with `previous` / `current`
    * recording only 'set' / 'cleared' presence, never a function body.
    * Always set; throws `Error` when ordered delivery was never
-   * configured — enabling it needs a restart. The new callback takes
+   * configured — enable it live first via `reviseOrdered` (WR-464).
+   * The new callback takes
    * effect from the next bypass or park; transitions already reported
    * are never re-delivered, and the ordered gate, the head hold
    * bound, the park behavior, the line positions, and
@@ -8529,9 +8530,15 @@ export interface RelayServer extends Server {
    * lowered bound parks on its next dispatch, a head inside a raised
    * bound keeps holding until the new bound, and an already-parked
    * head stays dead-lettered; the hold clocks, the line order, the
-   * urgent bypass, and `getOrderedStats()` are untouched. Always set;
-   * throws `Error` when ordered delivery was never configured —
-   * enabling it needs a restart. Returns the resolved live
+   * urgent bypass, and `getOrderedStats()` are untouched. WR-464:
+   * when ordered delivery was never configured, the same call
+   * *enables* it instead of throwing — the patch must set at least
+   * one bound (an empty patch, a scope with no bound, or a non-object
+   * patch throws `RangeError` and the relay stays unconfigured); the
+   * enable is audited as one `ordered_revised` event per moved scope
+   * with `previous: null`, and the fresh tracker starts with empty
+   * lines, so deliveries made before the enable are never
+   * retroactively ordered. Always set. Returns the resolved live
    * configuration after the revision. Direct queue users use
    * `RetryQueue.reviseOrdered` instead — calling the queue method on
    * a server-owned queue would skip the `ordered_revised` audit.
@@ -23119,15 +23126,47 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // clocks, the line order, the urgent bypass, and
   // `getOrderedStats` are untouched by this method — only the bound(s)
   // move.
+  // WR-464: when ordered delivery was never configured, the same call
+  // *enables* it instead of delegating to a throw — the queue installs
+  // a fresh config + tracker (an illegal patch throws `RangeError`
+  // in the queue before either happens, so nothing is audited). The
+  // enable is audited as one `ordered_revised` event per moved scope
+  // with `previous: null`; the scopes audited are exactly the scopes
+  // the patch set a bound for, global first, then endpoints in patch
+  // order — the same order as the revision path below. There is no
+  // getter to mount (unlike WR-463): the server exposes no
+  // `getOrderedConfig` / `getOrderedStats`, the queue read points are
+  // the only read points.
   server.reviseOrdered = (patch: OrderedRevision): OrderedRevision => {
     const prev = queue.getOrderedConfig();
-    if (prev === undefined) {
-      // Delegates to the queue for the canonical "must restart" Error.
-      return queue.reviseOrdered(patch);
-    }
-    const next = queue.reviseOrdered(patch);
     const forAudit = (bound: number): number | "Infinity" =>
       bound === Infinity ? "Infinity" : bound;
+    if (prev === undefined) {
+      // WR-464: enable — the queue installs a fresh config + tracker.
+      // Audit the enable with `previous: null` once per moved scope;
+      // an illegal patch throws RangeError in the queue before either
+      // happens.
+      const next = queue.reviseOrdered(patch);
+      if (patch.global?.maxHeadOfLineHoldMs !== undefined) {
+        opts.auditLog.append({
+          event: "ordered_revised",
+          scope: "global",
+          previous: null,
+          current: { maxHeadOfLineHoldMs: forAudit(next.global!.maxHeadOfLineHoldMs) },
+        });
+      }
+      for (const [endpoint, epPatch] of Object.entries(patch.endpoints ?? {})) {
+        if (epPatch?.maxHeadOfLineHoldMs === undefined) continue;
+        opts.auditLog.append({
+          event: "ordered_revised",
+          scope: endpoint,
+          previous: null,
+          current: { maxHeadOfLineHoldMs: forAudit(next.endpoints![endpoint]!.maxHeadOfLineHoldMs) },
+        });
+      }
+      return next;
+    }
+    const next = queue.reviseOrdered(patch);
     const maybeAudit = (scope: string, prevBound: number | undefined, nextBound: number | undefined): void => {
       if (prevBound === undefined || nextBound === undefined) return;
       if (prevBound === nextBound) return;

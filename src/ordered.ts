@@ -55,9 +55,11 @@ export interface OrderedModeOptions {
  * scope keeps its live bound; within a scope, an omitted
  * `maxHeadOfLineHoldMs` keeps its live value. At least one bound must
  * be present, else the patch throws `RangeError`. A scope that was
- * never configured cannot be revised (global scope on a record-only
- * config, or an endpoint with no ordered config) — enabling ordering
- * for a new scope needs a restart.
+ * never configured cannot be revised on an already-configured queue
+ * (global scope on a record-only config, or an endpoint with no
+ * ordered config). On a queue where ordered delivery was never
+ * configured at all, the same call enables it instead (WR-464) — the
+ * patch then builds the named scope(s) from scratch.
  */
 export interface OrderedRevision {
   /** New bound for the global scope (all endpoints), when configured. */

@@ -4875,9 +4875,20 @@ export class RetryQueue {
    * `ordered` option is absent/disabled — the gate, the tracker, and
    * the series are all compiled out of the dispatch path then.
    */
-  private readonly orderedTracker?: OrderedTracker;
+  /**
+   * WR-113: per-endpoint ordered-delivery state. `undefined` when the
+   * `ordered` option is absent/disabled — the gate, the tracker, and
+   * the series are all compiled out of the dispatch path then.
+   * WR-464: deliberately *not* readonly — `reviseOrdered` installs
+   * the tracker + config live when ordered delivery was never
+   * configured (same enable path as `batcher`, WR-450). The gate,
+   * the settle/track read points, and `orderedConfigured()` all read
+   * these fields live, so an enable can never strand a half-built
+   * pair: both are assigned together, after full validation.
+   */
+  private orderedTracker?: OrderedTracker;
   /** WR-113: normalized ordered config (global scope + exact-targetUrl records). */
-  private readonly orderedConfig?: ResolvedOrderedConfig;
+  private orderedConfig?: ResolvedOrderedConfig;
   // WR-401: deliberately *not* readonly — `reviseOrderedAuditCallback`
   // swaps this field live (see `reviseDeadLetterPurgedCallback`,
   // WR-397). It holds the *caller's* callback; the ordered gate and
@@ -15123,8 +15134,8 @@ export class RetryQueue {
    * value throws `RangeError` and the live callback is untouched;
    * replacing with the same reference (or clearing when already
    * unset) is a no-op. Throws `Error` when ordered delivery was never
-   * configured — the tracker only ever exists with `ordered` in
-   * place, so enabling observation needs a restart. Under
+   * configured — enable it live first with `reviseOrdered` (WR-464),
+   * or configure `ordered` at startup. Under
    * `RelayServer` the field holds the server's audit closure, so
    * direct calls here would replace the audit wrapper; server users
    * must go through `RelayServer.reviseOrderedAuditCallback`, which
@@ -15164,20 +15175,39 @@ export class RetryQueue {
    * hold clocks (`headSinceMs`), the line order, the urgent bypass,
    * and `getOrderedStats()` are untouched. A patch identical to the
    * live values is a silent no-op. Returns the resolved live
-   * configuration after the revision. Throws `Error` when ordered
-   * delivery was never configured — enabling it needs a restart. The
-   * queue itself holds no audit log — the server audits a real
-   * revision as one `ordered_revised` event per moved scope (`scope` /
-   * `previous` / `current`). Direct queue users call this method;
-   * server users must go through `RelayServer.reviseOrdered`, which
-   * adds the audit.
+   * configuration after the revision.
+   *
+   * WR-464: when ordered delivery was never configured, the same call
+   * *enables* it instead of throwing — but unlike the revise path, a
+   * patch must set at least one bound: there is no live value to fall
+   * back on, so an empty patch, a scope with no bound, or a non-object
+   * patch throws `RangeError` and the queue stays unconfigured (and
+   * can still be enabled afterwards). The values pass through the same
+   * construction gates (`assertValidMaxHeadOfLineHoldMs`), so an
+   * illegal value throws `RangeError` before anything is assigned —
+   * no half-built config is left behind. The enable builds the config
+   * and a fresh `OrderedTracker` together: a global enable is the
+   * equivalent of constructing with `ordered: true` (bound `Infinity`)
+   * or `ordered: { maxHeadOfLineHoldMs: n }`; an endpoint enable builds
+   * that endpoint's scope only; a mixed patch builds global + endpoint
+   * scopes at once. `now` is not part of the patch — the enabled
+   * tracker keeps the default `Date.now` clock, unlike construction
+   * where `now` can be injected. The fresh tracker starts with empty
+   * lines: deliveries made before the enable are never retroactively
+   * ordered — the next dispatch self-heals each item onto its line
+   * tail (`orderedGate`), its `headSinceMs` starting at entry, and
+   * the poison bound is measured from the enable onwards. Once
+   * enabled, later calls revise per WR-416 (an unconfigured scope on
+   * the now-configured queue still throws `RangeError`). Enabling
+   * also unlocks `reviseOrderedAuditCallback` (WR-401), whose gate is
+   * the same `orderedConfigured()`. No persistence: a restart returns
+   * to unconfigured — the enable is live-only. The queue itself holds
+   * no audit log — the server audits the enable as one
+   * `ordered_revised` event per moved scope (`previous: null`).
+   * Direct queue users call this method; server users must go through
+   * `RelayServer.reviseOrdered`, which adds the audit.
    */
   reviseOrdered(patch: OrderedRevision): OrderedRevision {
-    if (this.orderedConfig === undefined) {
-      throw new Error(
-        "reviseOrdered: ordered delivery is not configured — enabling it requires a restart"
-      );
-    }
     if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
       throw new RangeError(
         `reviseOrdered: patch must be an object, got ${JSON.stringify(patch)}`
@@ -15185,6 +15215,9 @@ export class RetryQueue {
     }
     // Validate-then-apply: every scope and bound is checked before
     // any live value moves, so a bad patch leaves the config intact.
+    // The unconfigured-scope guards only fire on an already-configured
+    // queue — on an unconfigured queue the same patch enables instead
+    // (WR-464), so the guards read `this.orderedConfig` live.
     const globalPatch = patch.global;
     let globalBound: number | undefined;
     if (globalPatch !== undefined) {
@@ -15194,7 +15227,7 @@ export class RetryQueue {
         );
       }
       if (globalPatch.maxHeadOfLineHoldMs !== undefined) {
-        if (this.orderedConfig.global === undefined) {
+        if (this.orderedConfig !== undefined && this.orderedConfig.global === undefined) {
           throw new RangeError(
             "reviseOrdered: global ordered scope is not configured — enabling it requires a restart"
           );
@@ -15222,7 +15255,10 @@ export class RetryQueue {
           );
         }
         if (epPatch.maxHeadOfLineHoldMs === undefined) continue;
-        if (!this.orderedConfig.endpoints.has(endpoint)) {
+        if (endpoint.length === 0) {
+          throw new RangeError("reviseOrdered: endpoint keys must be non-empty target URLs");
+        }
+        if (this.orderedConfig !== undefined && !this.orderedConfig.endpoints.has(endpoint)) {
           throw new RangeError(
             `reviseOrdered: endpoint ${JSON.stringify(endpoint)} is not configured for ordered delivery — enabling it requires a restart`
           );
@@ -15238,6 +15274,25 @@ export class RetryQueue {
       throw new RangeError(
         "reviseOrdered: patch must set at least one maxHeadOfLineHoldMs"
       );
+    }
+    if (this.orderedConfig === undefined) {
+      // WR-464: enable — the config and the tracker are built together
+      // and assigned together, after all validation above, so an
+      // illegal patch can never leave a half-built pair behind. The
+      // tracker starts with empty lines and the default `Date.now`
+      // clock; deliveries made before the enable are never
+      // retroactively ordered.
+      const endpoints = new Map<string, ResolvedOrderedEndpointConfig>();
+      for (const [endpoint, bound] of endpointBounds) {
+        endpoints.set(endpoint, { enabled: true, maxHeadOfLineHoldMs: bound });
+      }
+      const config: ResolvedOrderedConfig = { endpoints };
+      if (globalBound !== undefined) {
+        config.global = { enabled: true, maxHeadOfLineHoldMs: globalBound };
+      }
+      this.orderedConfig = config;
+      this.orderedTracker = new OrderedTracker();
+      return this.getOrderedConfig()!;
     }
     // The resolved config objects are plain and unfrozen: mutate the
     // bound in place so the next dispatch reads the new value.

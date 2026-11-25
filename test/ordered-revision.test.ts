@@ -111,7 +111,7 @@ async function armHead(s: StuckHead): Promise<void> {
 }
 
 describe("RetryQueue ordered hold-bound revision (WR-416)", () => {
-  it("unconfigured queue throws the must-restart Error and reports no config", () => {
+  it("an unconfigured queue enables ordered delivery live instead of throwing (WR-464)", () => {
     const timer = manualTimer();
     const q = new RetryQueue({
       sender: async () => {},
@@ -120,13 +120,12 @@ describe("RetryQueue ordered hold-bound revision (WR-416)", () => {
     q.start();
     try {
       assert.equal(q.getOrderedConfig(), undefined);
-      assert.throws(
-        () => q.reviseOrdered({ global: { maxHeadOfLineHoldMs: 1000 } }),
-        (err: unknown) =>
-          err instanceof Error &&
-          /requires a restart/.test(err.message) &&
-          /reviseOrdered/.test(err.message)
-      );
+      assert.equal(q.orderedConfigured(), false);
+      assert.deepEqual(q.reviseOrdered({ global: { maxHeadOfLineHoldMs: 1000 } }), {
+        global: { maxHeadOfLineHoldMs: 1000 },
+      });
+      assert.equal(q.orderedConfigured(), true);
+      assert.deepEqual(q.getOrderedConfig(), { global: { maxHeadOfLineHoldMs: 1000 } });
     } finally {
       q.stop();
     }
@@ -443,15 +442,15 @@ describe("RelayServer ordered hold-bound revision (WR-416)", () => {
     assert.equal(eventsOf(auditLog, name).length, target);
   }
 
-  it("unconfigured server throws the must-restart Error", () => {
-    const { relay } = makeServer();
-    assert.throws(
-      () => relay.reviseOrdered!({ global: { maxHeadOfLineHoldMs: 1000 } }),
-      (err: unknown) =>
-        err instanceof Error &&
-        /requires a restart/.test(err.message) &&
-        /reviseOrdered/.test(err.message)
-    );
+  it("an unconfigured server enables ordered delivery live and audits previous: null (WR-464)", () => {
+    const { relay, auditLog } = makeServer();
+    const next = relay.reviseOrdered!({ global: { maxHeadOfLineHoldMs: 1000 } });
+    assert.deepEqual(next, { global: { maxHeadOfLineHoldMs: 1000 } });
+    const enabled = eventsOf(auditLog, "ordered_revised");
+    assert.equal(enabled.length, 1);
+    assert.equal(enabled[0]!.scope, "global");
+    assert.equal(enabled[0]!.previous, null);
+    assert.deepEqual(enabled[0]!.current, { maxHeadOfLineHoldMs: 1000 });
   });
 
   it("a real global revision audits ordered_revised with exact previous/current", () => {
