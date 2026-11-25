@@ -122,11 +122,19 @@ export interface OtlpExporterOptions {
  * WR-414: partial live revision of the OTLP export parameters.
  * An omitted field keeps its live value. The collector endpoint is
  * not revisable — it is fixed at construction.
+ *
+ * WR-465: `endpoint` is enable-only — the collector endpoint, required
+ * when OTLP export was never configured (the enable patch is the full
+ * `OtlpExporterOptions` minus the injectable `random` / `now`, which
+ * keep their construction defaults). On an already-configured exporter
+ * it is rejected: the endpoint stays fixed at construction and cannot
+ * be re-pointed here.
  */
 export interface OtlpRevision {
   sampleRate?: number;
   maxBuffered?: number;
   serviceName?: string;
+  endpoint?: string;
 }
 
 /** Live OTLP export parameter snapshot (`OtlpExporter.current()`). */
@@ -407,6 +415,14 @@ export class OtlpExporter {
     if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
       throw new RangeError(
         `reviseOtlp: patch must be an object, got ${JSON.stringify(patch)}`
+      );
+    }
+    // WR-465: the endpoint is enable-only (see `OtlpRevision`) — on a
+    // configured exporter it is rejected, never silently ignored: the
+    // collector destination is fixed at construction.
+    if (patch.endpoint !== undefined) {
+      throw new RangeError(
+        "reviseOtlp: endpoint is fixed at construction and cannot be re-pointed — enable OTLP export with an endpoint first, then revise only sampleRate / maxBuffered / serviceName"
       );
     }
     const next: OtlpExportConfig = {

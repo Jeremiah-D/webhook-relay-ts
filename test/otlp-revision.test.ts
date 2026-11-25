@@ -278,17 +278,25 @@ describe("otlp revision: retry queue (WR-414)", () => {
     headers: {},
   });
 
-  it("unconfigured queue throws the canonical must-restart Error", async () => {
+  it("unconfigured queue enables with an endpoint, and refuses a patch without one (WR-465)", async () => {
     const ok: Sender = async () => {};
     const q = new RetryQueue({ sender: ok, baseDelayMs: 10, jitterMs: 0, maxAttempts: 1 });
     assert.equal(q.getOtlpConfig(), undefined);
     assert.throws(
       () => q.reviseOtlp({ sampleRate: 0.5 }),
       (err: unknown) =>
-        err instanceof Error &&
+        err instanceof RangeError &&
         err.message ===
-          "reviseOtlp: otlp export is not configured — enabling it requires a restart"
+          "reviseOtlp: enabling OTLP export requires an endpoint — the patch must carry the collector URL; an empty patch cannot enable it"
     );
+    assert.equal(q.getOtlpConfig(), undefined, "a refused enable leaves the queue unconfigured");
+    const enabled = q.reviseOtlp({ endpoint: url(), sampleRate: 0.5 });
+    assert.deepEqual(enabled, {
+      sampleRate: 0.5,
+      maxBuffered: 1000,
+      serviceName: "webhook-relay-ts",
+    });
+    assert.equal(q.getOtlpStats().enabled, true);
     await q.shutdown(2000);
   });
 
@@ -454,14 +462,37 @@ describe("otlp revision: server (WR-414)", () => {
     assert.equal(eventsOf(auditLog, "otlp_export_revised").length, 1);
   });
 
-  it("unconfigured server throws the canonical must-restart Error", () => {
-    const { relay } = makeServer();
+  it("unconfigured server enables with an endpoint, and refuses a patch without one (WR-465)", () => {
+    const { relay, auditLog } = makeServer();
     assert.throws(
       () => relay.reviseOtlp!({ sampleRate: 0.5 }),
       (err: unknown) =>
-        err instanceof Error &&
+        err instanceof RangeError &&
         err.message ===
-          "reviseOtlp: otlp export is not configured — enabling it requires a restart"
+          "reviseOtlp: enabling OTLP export requires an endpoint — the patch must carry the collector URL; an empty patch cannot enable it"
+    );
+    assert.equal(
+      eventsOf(auditLog, "otlp_export_revised").length,
+      0,
+      "a refused enable audits nothing"
+    );
+    const next = relay.reviseOtlp!({ endpoint: `http://127.0.0.1:${collector.port}/v1/logs` });
+    assert.deepEqual(next, {
+      sampleRate: 1,
+      maxBuffered: 1000,
+      serviceName: "webhook-relay-ts",
+    });
+    const revised = eventsOf(auditLog, "otlp_export_revised");
+    assert.equal(revised.length, 1);
+    assert.equal(revised[0].previous, null);
+    assert.deepEqual(revised[0].current, {
+      sampleRate: 1,
+      maxBuffered: 1000,
+      serviceName: "webhook-relay-ts",
+    });
+    assert.ok(
+      !JSON.stringify(revised[0]).includes(`127.0.0.1:${collector.port}`),
+      "the enable audit must never record the endpoint"
     );
   });
 

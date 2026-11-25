@@ -8381,9 +8381,11 @@ export interface RelayServer extends Server {
    * admission, the new `maxBuffered` from the next overflow check,
    * and the new `serviceName` from the next payload build; the flush
    * timer and `getOtlpStats()` counting are untouched. Always set;
-   * throws `Error` when OTLP export was never configured — enabling
-   * it needs a restart. Returns the resolved live parameters after
-   * the revision. Direct queue users use
+   * WR-465: with OTLP export never configured the same call *enables*
+   * it — the patch must then carry the collector `endpoint` (required;
+   * the three knobs take their construction defaults), and the enable
+   * is audited once as `otlp_export_revised` with `previous: null`.
+   * Returns the resolved live parameters after the revision. Direct queue users use
    * `RetryQueue.reviseOtlp` instead — calling the queue method on a
    * server-owned queue would skip the `otlp_export_revised` audit.
    */
@@ -22749,14 +22751,30 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // revision is a silent no-op — nothing is audited. A real revision
   // is audited as `otlp_export_revised` with `previous` / `current`
   // recording only the three values (`sampleRate` / `maxBuffered` /
-  // `serviceName`), never the endpoint. The in-flight buffer, the
-  // flush timer, and the export counters are untouched by this
-  // method — only the three knobs move.
+  // `serviceName`), never the endpoint. WR-465: with the exporter
+  // unconfigured the same call *enables* it — the queue builds a fresh
+  // exporter (a missing endpoint or illegal value still throws
+  // `RangeError` there, leaving the server unconfigured) and the enable
+  // is audited once as `otlp_export_revised` with `previous: null`
+  // and the resolved three values as `current`. The in-flight buffer,
+  // the flush timer, and the export counters are untouched by this
+  // method — only the three knobs move (or, on enable, the exporter
+  // itself is installed).
   server.reviseOtlp = (patch: OtlpRevision): OtlpRevision => {
     const prev = queue.getOtlpConfig();
     if (prev === undefined) {
-      // Delegates to the queue for the canonical "must restart" Error.
-      return queue.reviseOtlp(patch);
+      // WR-465: enable — the queue builds the fresh exporter (an empty
+      // or illegal patch still throws RangeError there, leaving the
+      // server unconfigured). Audit the enable with `previous: null`
+      // and the resolved three values as `current`, never the endpoint.
+      const next = queue.reviseOtlp(patch);
+      const current = queue.getOtlpConfig()!;
+      opts.auditLog.append({
+        event: "otlp_export_revised",
+        previous: null,
+        current,
+      });
+      return next;
     }
     const next = queue.reviseOtlp(patch);
     const current = {

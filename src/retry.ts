@@ -4609,8 +4609,11 @@ export class RetryQueue {
    * WR-388: the SLO-miss dispatch closure. Always a stable closure
    * reading `callerOnSloMiss` live (never the caller callback itself),
    * so `reviseSloMissCallback` only ever moves the inner field.
+   * WR-465: deliberately *not* readonly — `reviseOtlp` installs the
+   * OTLP export wrapper here when export is enabled at runtime (it
+   * was the plain forwarder before, so there is no export to preserve).
    */
-  private readonly onSloMiss?: (info: SloMissInfo) => void;
+  private onSloMiss?: (info: SloMissInfo) => void;
   /**
    * WR-143: most recent phase-timeout phase per in-flight delivery
    * (see `src/phase-timeouts.ts`) — set when an attempt's phase budget
@@ -5006,8 +5009,8 @@ export class RetryQueue {
   private readonly weightTuner?: WeightTuner;
   /** WR-201: periodic retune sweeper; undefined when `weightTuning` is unset. */
   private readonly weightTuneSweeper?: WeightTuneSweeper;
-  /** WR-83: OTLP delivery-event exporter; undefined when not configured. */
-  private readonly otlpExporter?: OtlpExporter;
+  /** WR-83: OTLP delivery-event exporter; undefined when not configured. WR-465: deliberately *not* readonly — `reviseOtlp` installs a fresh exporter here when the feature is enabled at runtime (it was undefined before, so there is nothing to retune in place). */
+  private otlpExporter?: OtlpExporter;
   /**
    * WR-85: shadow-target dry-run mirroring dispatcher; undefined when
    * `shadowTargets` is unset (zero behavior change).
@@ -7689,19 +7692,115 @@ export class RetryQueue {
    * never retroactively), and the new `serviceName` from the next
    * payload build; the in-flight buffer is kept (nothing is cleared,
    * re-sent, or dropped by the revision itself), the flush timer is
-   * untouched, and `getOtlpStats()` counting is unchanged. Throws
-   * `Error` when OTLP export was never configured — enabling it
-   * needs a restart. The queue itself holds no audit log — the
-   * server audits a real revision as `otlp_export_revised`
-   * (`previous` / `current`, the three values only, never the
-   * endpoint). Direct queue users call this method; server users
-   * must go through `RelayServer.reviseOtlp`, which adds the audit.
+   * untouched, and `getOtlpStats()` counting is unchanged.
+   *
+   * WR-465: when OTLP export was never configured, the same call
+   * *enables* it instead of throwing — but unlike the revise path,
+   * the patch must carry an `endpoint`: there is no live value to fall
+   * back on, so a patch without one (including an empty patch), a
+   * non-object patch, or `null` throws `RangeError` and the queue stays
+   * unconfigured (and can still be enabled afterwards). The three
+   * knobs are optional at enable time and take their construction
+   * defaults (`sampleRate` 1.0, `maxBuffered` 1000, `serviceName`
+   * `"webhook-relay-ts"`); `random` / `now` are not part of the patch
+   * and keep their defaults. The values pass through the same
+   * construction gates as `new OtlpExporter`, so an illegal endpoint
+   * or knob throws `RangeError` before anything is assigned — no
+   * half-built exporter is left behind. The enable wires the exporter
+   * exactly as construction does (retry.ts:5726-5773): the delivery-event
+   * subscription (so the next delivery event exports) and the
+   * `onSloMiss` wrapper (so the next SLO miss exports alongside
+   * delivery events while the caller callback still fires exactly
+   * once, via the live `callerOnSloMiss` read). The fresh exporter
+   * starts with an empty buffer: deliveries made before the enable are
+   * never retroactively exported, and there is nothing to drain. When
+   * the queue is already running the subscription is live immediately;
+   * when it is paused or stopped, `start()` re-arms the exporter via
+   * the live `resume()` read point, exactly as for a
+   * construction-configured exporter. Once enabled, later calls revise
+   * per WR-414 (an `endpoint` in the patch is rejected — the collector
+   * destination stays fixed). No persistence: a restart returns to
+   * unconfigured — the enable is live-only. The queue itself holds no
+   * audit log — the server audits the enable as `otlp_export_revised`
+   * (`previous: null`, `current` the three values, never the endpoint).
+   * Direct queue users call this method; server users must go through
+   * `RelayServer.reviseOtlp`, which adds the audit.
    */
   reviseOtlp(patch: OtlpRevision): OtlpRevision {
     if (this.otlpExporter === undefined) {
-      throw new Error(
-        "reviseOtlp: otlp export is not configured — enabling it requires a restart"
-      );
+      // WR-465: enable — the patch must carry the collector endpoint
+      // (there is no construction default for it); the knobs fall back
+      // to the construction defaults inside `new OtlpExporter`, which
+      // re-validates everything through the same gates and throws
+      // before the field is assigned, so a bad patch can never leave a
+      // half-built exporter behind. `null` is a `RangeError` like any
+      // non-object patch (WR-443 family precedent), never a silent
+      // no-op — there is nothing to no-op on.
+      if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+        throw new RangeError(
+          `reviseOtlp: patch must be an object, got ${JSON.stringify(patch)}`
+        );
+      }
+      if (patch.endpoint === undefined) {
+        throw new RangeError(
+          "reviseOtlp: enabling OTLP export requires an endpoint — the patch must carry the collector URL; an empty patch cannot enable it"
+        );
+      }
+      const exporter = new OtlpExporter({
+        endpoint: patch.endpoint,
+        sampleRate: patch.sampleRate,
+        maxBuffered: patch.maxBuffered,
+        serviceName: patch.serviceName,
+      });
+      this.otlpExporter = exporter;
+      // Mirror the construction wiring (retry.ts:5726-5773): delivery
+      // events are observed through the public subscription (the
+      // exporter's `record()` never throws and never blocks), and the
+      // caller's slo-miss hook is wrapped so misses export alongside
+      // delivery events while still firing exactly once.
+      this.subscribeDeliveryEvents((event) => {
+        try {
+          exporter.record({
+            eventType: event.type,
+            eventId: event.id,
+            traceId: event.traceId,
+            endpoint: event.targetUrl,
+            attempts: event.attempts,
+            error: event.error,
+            tenant: event.tenant,
+            // WR-98: W3C trace-context span correlation attributes.
+            ...(event.traceSpan === undefined
+              ? {}
+              : { traceSpanId: event.traceSpan.spanId, traceSampled: event.traceSpan.sampled }),
+          });
+        } catch {
+          // Unreachable by contract (`record()` never throws) — the
+          // delivery path must never see an export throw.
+        }
+      });
+      // WR-388: the wrapper reads `callerOnSloMiss` live off `this`,
+      // never a captured snapshot — a revision swaps the caller
+      // callback underneath while the `slo_missed` export keeps firing.
+      this.onSloMiss = (info) => {
+        this.callerOnSloMiss?.(info);
+        try {
+          exporter.record({
+            eventType: "slo_missed",
+            eventId: info.id,
+            traceId: info.traceId,
+            endpoint: info.endpoint,
+            tenant: info.tenant,
+            sloMs: info.sloMs,
+            latencyMs: info.latencyMs,
+            // WR-95: the dominant latency phase, when phase tracking is
+            // enabled and a phase was measurable.
+            dominantPhase: info.dominantPhase,
+          });
+        } catch {
+          // Same contract as above: export never breaks the hook path.
+        }
+      };
+      return exporter.current();
     }
     return this.otlpExporter.revise(patch);
   }

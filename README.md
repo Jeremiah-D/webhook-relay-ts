@@ -6682,6 +6682,20 @@ const server = createRelayServer({
   from the next payload build. Server revisions are audited as
   `otlp_export_revised` with `previous` / `current` (the three values
   only, never the endpoint).
+- **Live enable (WR-465)** — a relay started *without* OTLP export can
+  enable it at runtime: `server.reviseOtlp({ endpoint, sampleRate?,
+  maxBuffered?, serviceName? })` (or `queue.reviseOtlp(...)`) builds a
+  fresh exporter — the patch must carry the collector `endpoint`
+  (required; the three knobs take their construction defaults), and an
+  empty patch, a knob-only patch, `null`, or an illegal value throws
+  `RangeError` and leaves the relay unconfigured (it can still be
+  enabled afterwards). The fresh exporter starts with an empty buffer:
+  deliveries made before the enable are never retroactively exported;
+  the next delivery event (and the next SLO miss) exports. The enable
+  is audited once as `otlp_export_revised` with `previous: null`.
+  Once enabled, later calls revise per WR-414 (an `endpoint` in the
+  patch is rejected — the collector destination stays fixed). A restart
+  returns to unconfigured — the enable is live-only.
 - **Observability** — `queue.getOtlpStats()` returns
   `{ enabled, buffered, dropped, exported, lastError? }`; `GET /metrics`
   adds `relay_otlp_exports_total{event_type,status}` and
