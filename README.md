@@ -4365,6 +4365,19 @@ const queue = new RetryQueue({
   built, no callbacks fire, no store exists. A throwing callback can
   never break the delivery path (the receipt is recorded first, the
   callback runs isolated).
+- **Live revision (WR-467)** — the observers are revisable without a
+  restart, via `reviseDeliveryReceiptCallbacks(patch)` on the queue and
+  the server. The patch is partial (an omitted field keeps its live
+  value) and `null` clears that hook back to no observer (the receipt
+  is still recorded and journaled, only the forwarding stops); an empty
+  patch or a non-function value throws `RangeError` and the live hooks
+  are untouched, and a same-value patch is a silent no-op. With
+  receipts never configured the call throws `Error` — enabling them
+  needs a restart. A real revision is audited as
+  `delivery_receipt_callbacks_revised` with `previous` / `current`
+  recording per-field presence only (`set` / `cleared`), never a
+  function body. `maxEntries`, `journalDir`, and the receipt clock are
+  not revisable; a restart restores the construction callbacks.
 
 ## Per-tenant monthly delivery budgets
 

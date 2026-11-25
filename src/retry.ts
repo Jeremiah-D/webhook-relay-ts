@@ -330,6 +330,7 @@ import {
   DeliveryReceiptStore,
   type DeliveryReceipt,
   type DeliveryReceiptCallbacks,
+  type DeliveryReceiptCallbacksRevision,
   type DeliveryReceiptFilter,
   type DeliveryReceiptOptions,
   type DeliveryReceiptOutcome,
@@ -742,6 +743,7 @@ export { OutboundRateLimiter } from "./outbound-ratelimit.ts";
 export type {
   DeliveryReceipt,
   DeliveryReceiptCallbacks,
+  DeliveryReceiptCallbacksRevision,
   DeliveryReceiptFilter,
   DeliveryReceiptOptions,
   DeliveryReceiptOutcome,
@@ -2046,7 +2048,10 @@ export interface RetryQueueOptions {
    * log with an optional append-only JSONL journal (`journalDir`).
    * Query with `getDeliveryReceipts()`, export with
    * `exportDeliveryReceipts()`. Callback failures are isolated — they
-   * never break the delivery path. Disabled by default (absent = zero
+   * never break the delivery path. The observers are live-revisable
+   * via `RetryQueue.reviseDeliveryReceiptCallbacks` (WR-467) — the new
+   * hooks take effect from the next terminal delivery; receipts that
+   * already fired are never re-delivered. Disabled by default (absent = zero
    * overhead: no receipts are built, no callbacks fire, no store exists).
    */
   deliveryReceipts?: DeliveryReceiptOptions;
@@ -4808,6 +4813,18 @@ export class RetryQueue {
   private readonly deliveryReceipts?: DeliveryReceiptStore;
   /** WR-155: receipt callbacks and clock; undefined when receipts are disabled. */
   private readonly deliveryReceiptOpts?: DeliveryReceiptOptions;
+  // WR-467: deliberately *not* readonly —
+  // `reviseDeliveryReceiptCallbacks` swaps these fields live.
+  // They hold the *caller's* callbacks; `emitDeliveryReceipt` reads
+  // these fields live (along WR-394's
+  // `callerOnDeadLetterEscalated`), so a revision can never drop the
+  // receipt record or the journal append. The server holds no audit
+  // closure here — the receipt callbacks pass straight through at
+  // construction — so the server method delegates to the queue setter
+  // and audits the revision itself; direct queue users hold their own
+  // callbacks in the same fields.
+  private callerOnReceiptDelivered?: (receipt: DeliveryReceipt) => void;
+  private callerOnReceiptFailed?: (receipt: DeliveryReceipt) => void;
   /** WR-94: per-tenant adaptive concurrency controllers (WR-48 scoping). */
   private readonly adaptiveConcurrencies = new Map<string, AdaptiveConcurrencyController>();
   /** WR-95: latency phase options; undefined when disabled. Mutable only via `reviseLatencyPhases` (WR-360) — the stored options are what lazily-built per-tenant trackers are constructed from, so a revision must reach tenants born later. */
@@ -5955,6 +5972,10 @@ export class RetryQueue {
     if (opts.deliveryReceipts !== undefined) {
       this.deliveryReceipts = new DeliveryReceiptStore(opts.deliveryReceipts);
       this.deliveryReceiptOpts = opts.deliveryReceipts;
+      // WR-467: the live receipt observers start as the construction
+      // callbacks; `reviseDeliveryReceiptCallbacks` swaps them.
+      this.callerOnReceiptDelivered = opts.deliveryReceipts.onDelivered;
+      this.callerOnReceiptFailed = opts.deliveryReceipts.onFailed;
     }
     // WR-95: opt-in latency phase tracking. Same eager-default/lazy-tenant
     // pattern: invalid options throw at construction.
@@ -9367,6 +9388,11 @@ export class RetryQueue {
   /** WR-394: whether the dead-letter storm escalation subsystem is enabled (queue-level). */
   escalationConfigured(): boolean {
     return this.escalation !== undefined;
+  }
+
+  /** WR-467: whether the delivery-receipt subsystem is enabled (queue-level). */
+  deliveryReceiptsConfigured(): boolean {
+    return this.deliveryReceipts !== undefined;
   }
 
   /** WR-398: whether the completion-callback subsystem is enabled (queue-level). */
@@ -14785,6 +14811,83 @@ export class RetryQueue {
   }
 
   /**
+   * WR-467: live-redirect the delivery-receipt observers — the
+   * queue-side setter behind
+   * `RelayServer.reviseDeliveryReceiptCallbacks`. The new hooks take
+   * effect from the next terminal delivery; receipts that already
+   * fired are never re-delivered. `null` clears a hook back to no
+   * observer (the receipt is still recorded, still journaled, and
+   * still queryable — only the forwarding stops). An omitted field
+   * keeps its live value, so one hook can move without touching the
+   * other. An empty or non-object patch throws `RangeError`; a
+   * non-function value for a provided field throws `RangeError` and
+   * the live hooks are left completely intact. A patch identical to
+   * the live values is a no-op. Only the observers move: the ring,
+   * the journal, `maxEntries`, the clock, and the receipt shape are
+   * untouched, and a throwing callback is still isolated (record
+   * first, callback after, along WR-155). Throws `Error` when
+   * delivery receipts were never configured — the receipts only ever
+   * exist when the store is set, so enabling them needs a restart.
+   * Unlike WR-394 there is no audit closure to protect — the receipt
+   * callbacks pass straight through at construction — so the server
+   * method delegates here directly and audits the revision itself;
+   * direct calls on a standalone queue are equally valid. The queue
+   * itself holds no audit log — the server audits a real revision as
+   * `delivery_receipt_callbacks_revised`.
+   */
+  reviseDeliveryReceiptCallbacks(patch: DeliveryReceiptCallbacksRevision): void {
+    if (this.deliveryReceipts === undefined) {
+      throw new Error(
+        "reviseDeliveryReceiptCallbacks: delivery receipts are not configured — enabling them requires a restart"
+      );
+    }
+    if (patch === null || typeof patch !== "object") {
+      throw new RangeError(
+        "reviseDeliveryReceiptCallbacks: patch must be an object with at least one of onDelivered / onFailed"
+      );
+    }
+    const hasDelivered = patch.onDelivered !== undefined;
+    const hasFailed = patch.onFailed !== undefined;
+    if (!hasDelivered && !hasFailed) {
+      throw new RangeError(
+        "reviseDeliveryReceiptCallbacks: patch must set at least one of onDelivered / onFailed"
+      );
+    }
+    if (
+      hasDelivered &&
+      patch.onDelivered !== null &&
+      typeof patch.onDelivered !== "function"
+    ) {
+      throw new RangeError(
+        "reviseDeliveryReceiptCallbacks: onDelivered must be a function or null"
+      );
+    }
+    if (
+      hasFailed &&
+      patch.onFailed !== null &&
+      typeof patch.onFailed !== "function"
+    ) {
+      throw new RangeError(
+        "reviseDeliveryReceiptCallbacks: onFailed must be a function or null"
+      );
+    }
+    const nextDelivered = hasDelivered
+      ? patch.onDelivered ?? undefined
+      : this.callerOnReceiptDelivered;
+    const nextFailed = hasFailed
+      ? patch.onFailed ?? undefined
+      : this.callerOnReceiptFailed;
+    if (
+      nextDelivered === this.callerOnReceiptDelivered &&
+      nextFailed === this.callerOnReceiptFailed
+    ) {
+      return;
+    }
+    this.callerOnReceiptDelivered = nextDelivered;
+    this.callerOnReceiptFailed = nextFailed;
+  }
+
+  /**
    * WR-395: live-redirect the shadow-target mirror observers — the
    * queue-side setter behind `RelayServer.reviseShadowCallbacks`.
    * The new hooks take effect from the next mirrored copy's outcome;
@@ -16918,10 +17021,10 @@ export class RetryQueue {
     const store = this.deliveryReceipts;
     if (store === undefined) return;
     const stored = store.record(receipt);
+    // WR-467: read the live observers — `reviseDeliveryReceiptCallbacks`
+    // swaps these fields, never the record/journal path above.
     const cb =
-      stored.outcome === "delivered"
-        ? this.deliveryReceiptOpts?.onDelivered
-        : this.deliveryReceiptOpts?.onFailed;
+      stored.outcome === "delivered" ? this.callerOnReceiptDelivered : this.callerOnReceiptFailed;
     if (cb === undefined) return;
     try {
       cb(stored);
@@ -16936,6 +17039,21 @@ export class RetryQueue {
    */
   getDeliveryReceipts(filter?: DeliveryReceiptFilter): DeliveryReceipt[] | undefined {
     return this.deliveryReceipts?.query(filter);
+  }
+
+  /**
+   * WR-467: the live delivery-receipt observers, or `undefined` when
+   * receipts are disabled. The server reads this before and after a
+   * revision to audit presence (`set` / `cleared`) without ever
+   * recording a function body. The returned object is a fresh
+   * snapshot — mutating it never moves the live observers.
+   */
+  getDeliveryReceiptCallbacks(): DeliveryReceiptCallbacks | undefined {
+    if (this.deliveryReceipts === undefined) return undefined;
+    return {
+      onDelivered: this.callerOnReceiptDelivered,
+      onFailed: this.callerOnReceiptFailed,
+    };
   }
 
   /**

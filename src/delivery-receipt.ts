@@ -44,6 +44,21 @@ export interface DeliveryReceiptCallbacks {
   onFailed?: (receipt: DeliveryReceipt) => void;
 }
 
+/**
+ * WR-467: patch for `RetryQueue.reviseDeliveryReceiptCallbacks` /
+ * `RelayServer.reviseDeliveryReceiptCallbacks`. Each field is optional —
+ * an omitted field keeps its live value; `null` clears that hook back
+ * to no observer (the receipt is still recorded and still journaled,
+ * only the forwarding stops). At least one field must be present, else
+ * the patch throws `RangeError` and the live hooks are untouched.
+ * Throws `Error` when delivery receipts were never configured —
+ * enabling them needs a restart.
+ */
+export interface DeliveryReceiptCallbacksRevision {
+  onDelivered?: ((receipt: DeliveryReceipt) => void) | null;
+  onFailed?: ((receipt: DeliveryReceipt) => void) | null;
+}
+
 export interface DeliveryReceiptOptions extends DeliveryReceiptCallbacks {
   /**
    * How many receipts the in-memory ring keeps; older ones are evicted.

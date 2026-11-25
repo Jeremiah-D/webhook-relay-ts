@@ -28,7 +28,7 @@ import {
   selectSignatureAlgorithmVerifier,
   type SignatureAlgorithmRule,
 } from "./signature-alg.ts";
-import { RetryQueue, errorBudgetBurnAuditEvent, type AssertionFailureInfo, type AttemptFailedInfo, type BatchInfo, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutEvent, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeadLetterEscalationCallbacksRevision, type DeliveryDeadlineConfig, type DeliveryDeadlineExceededInfo, type DeliveryDeadlineRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type DownstreamResponseSummary, type EndpointAutoDisableRevision, type EndpointPauseCallbacksRevision, type EndpointPauseInfo, type ErrorBudgetConfig, type ErrorBudgetRevision, type EscalationConfig, type EscalationRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type FailureClass, type QuorumCallbacksRevision, type QuorumRetention, type QuorumRetentionRevision, type ReplayCallbacksRevision, type ReplayForcedInfo, type ReplayIdempotencyConfig, type ReplayIdempotencyRevision, type ReplaySkippedInfo, type ResponseAssertionRule, type ResponseAssertionsRevision, type RetryItem, type RetryBudgetDepletedInfo, type ScheduledFiredEvent, type Sender, type SenderCallOptions, type SemanticFailureInfo, type ShadowCallbacksRevision, type MaintenanceWindowTransition, type SloMissInfo, type SloRiskConfig, type SloRiskInfo, type SloRiskRevision, type StarvationGuardAuditEvent, type TenantBudgetAuditEvent, type UrgentDowngradedEvent, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
+import { RetryQueue, errorBudgetBurnAuditEvent, type AssertionFailureInfo, type AttemptFailedInfo, type BatchInfo, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutEvent, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeadLetterEscalationCallbacksRevision, type DeliveryDeadlineConfig, type DeliveryDeadlineExceededInfo, type DeliveryDeadlineRevision, type DeliveryReceiptCallbacksRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type DownstreamResponseSummary, type EndpointAutoDisableRevision, type EndpointPauseCallbacksRevision, type EndpointPauseInfo, type ErrorBudgetConfig, type ErrorBudgetRevision, type EscalationConfig, type EscalationRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type FailureClass, type QuorumCallbacksRevision, type QuorumRetention, type QuorumRetentionRevision, type ReplayCallbacksRevision, type ReplayForcedInfo, type ReplayIdempotencyConfig, type ReplayIdempotencyRevision, type ReplaySkippedInfo, type ResponseAssertionRule, type ResponseAssertionsRevision, type RetryItem, type RetryBudgetDepletedInfo, type ScheduledFiredEvent, type Sender, type SenderCallOptions, type SemanticFailureInfo, type ShadowCallbacksRevision, type MaintenanceWindowTransition, type SloMissInfo, type SloRiskConfig, type SloRiskInfo, type SloRiskRevision, type StarvationGuardAuditEvent, type TenantBudgetAuditEvent, type UrgentDowngradedEvent, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
 import { parseDeliverAtHeader, DELIVER_AT_HEADER } from "./retry.ts";
 import type { ShadowDeliveredInfo, ShadowFailedInfo, ShadowTargetConfig, ShadowTargetsConfig } from "./retry.ts";
 import type {
@@ -9794,6 +9794,31 @@ export interface RelayServer extends Server {
         ) => void)
       | null
   ) => void;
+  /**
+   * WR-467: live-redirect the delivery-receipt observers at runtime —
+   * no restart. Replaces the `onDelivered` / `onFailed` callbacks each
+   * terminal delivery's receipt is forwarded to, after the receipt
+   * itself is recorded and journaled. The patch is partial — an
+   * omitted field keeps its live value — and `null` clears that hook
+   * back to no observer (the receipt is still recorded, still
+   * journaled, and still queryable, just no longer forwarded to an
+   * operator). An empty or non-object patch throws `RangeError`, as
+   * does a non-function value for a provided field, and the live
+   * callbacks are untouched; a patch identical to the live values is
+   * a silent no-op. A real revision is audited as
+   * `delivery_receipt_callbacks_revised` with `previous` / `current`
+   * recording per-field `onDelivered` / `onFailed` presence ('set' /
+   * 'cleared'), never a function body. Always set; throws `Error`
+   * when delivery receipts were never configured — enabling them
+   * needs a restart. The new callbacks take effect from the next
+   * terminal delivery; receipts that already fired are never
+   * re-delivered, and the ring, the journal, `maxEntries`, the clock,
+   * and the receipt shape are untouched. Direct queue users call
+   * `RetryQueue.reviseDeliveryReceiptCallbacks` instead — the queue
+   * method is equally valid there, since the receipt callbacks pass
+   * straight through with no audit closure to protect.
+   */
+  reviseDeliveryReceiptCallbacks?: (patch: DeliveryReceiptCallbacksRevision) => void;
   /**
    * WR-331: revise one endpoint's live half-open probe knobs at
    * runtime — no restart. The patch merges over the endpoint's live
@@ -25139,6 +25164,53 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       event: "dead_letter_callback_revised",
       previous: prev,
       current: nextPresence,
+    });
+  };
+
+  // WR-467: live delivery-receipt observer revision. Unlike the
+  // WR-394 family there is no audit closure to protect — the receipt
+  // callbacks pass straight through to the queue at construction —
+  // so this method delegates the validate-then-apply work to the
+  // queue (RangeError on an illegal or empty patch, live callbacks
+  // untouched; Error when receipts were never configured — enabling
+  // them needs a restart) and only owns the audit: the live
+  // presence is read from the queue before and after the delegation,
+  // so a same-value revision is a silent no-op and a real revision
+  // appends `delivery_receipt_callbacks_revised` with `previous` /
+  // `current` recording per-field `onDelivered` / `onFailed`
+  // presence ('set' / 'cleared'), never a function body. Reading the
+  // live values from the queue (rather than tracking cells here)
+  // keeps the audit truthful even when the queue method is called
+  // directly. The new callbacks take effect from the next terminal
+  // delivery; receipts that already fired are never re-delivered,
+  // and the ring, the journal, `maxEntries`, the clock, and the
+  // receipt shape are untouched.
+  server.reviseDeliveryReceiptCallbacks = (patch: DeliveryReceiptCallbacksRevision): void => {
+    if (!queue.deliveryReceiptsConfigured()) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseDeliveryReceiptCallbacks(patch);
+    }
+    const presence = (cbs: { onDelivered?: unknown; onFailed?: unknown } | undefined) => ({
+      onDelivered: cbs?.onDelivered === undefined ? "cleared" : "set",
+      onFailed: cbs?.onFailed === undefined ? "cleared" : "set",
+    });
+    const previousCallbacks = queue.getDeliveryReceiptCallbacks();
+    // Validates and applies; throws before mutating on a bad patch.
+    queue.reviseDeliveryReceiptCallbacks(patch);
+    const currentCallbacks = queue.getDeliveryReceiptCallbacks();
+    // Same references: silent no-op, nothing audited. A set-to-set
+    // replacement (a different function) is a real revision even
+    // though the presence payload below reads the same.
+    if (
+      previousCallbacks?.onDelivered === currentCallbacks?.onDelivered &&
+      previousCallbacks?.onFailed === currentCallbacks?.onFailed
+    ) {
+      return;
+    }
+    opts.auditLog.append({
+      event: "delivery_receipt_callbacks_revised",
+      previous: presence(previousCallbacks),
+      current: presence(currentCallbacks),
     });
   };
 
