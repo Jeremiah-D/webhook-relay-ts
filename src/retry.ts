@@ -4797,8 +4797,8 @@ export class RetryQueue {
   private readonly adaptiveBackoffs = new Map<string, AdaptiveBackoffController>();
   /** WR-94: adaptive concurrency options; undefined when disabled. WR-337: live-revisable — `reviseAdaptiveConcurrency` replaces this with the merged options so tenants born later start from the revised values. WR-459: live-enablable — `reviseAdaptiveConcurrency` installs the resolved config on an unconfigured queue. */
   private adaptiveConcurrencyOpts?: AdaptiveConcurrencyOptions;
-  /** WR-97: the shared per-(tenant, endpoint) outbound rate limiter; undefined when disabled. */
-  private readonly tenantRateLimiter?: TenantRateLimiter;
+  /** WR-97: the shared per-(tenant, endpoint) outbound rate limiter; undefined when disabled. WR-463: deliberately *not* readonly — `reviseTenantRateLimit` installs a fresh limiter at runtime when the option was never configured, so the cap can be enabled live instead of needing a restart. */
+  private tenantRateLimiter?: TenantRateLimiter;
   /** WR-154: the shared per-endpoint outbound token-bucket rate limiter; undefined when disabled. WR-462: deliberately *not* readonly — `reviseOutboundRateLimit` installs a fresh limiter at runtime when the option was never configured, so the cap can be enabled live instead of needing a restart. */
   private outboundRateLimiter?: OutboundRateLimiter;
   /** WR-155: the structured delivery-receipt log; undefined when disabled. */
@@ -16429,18 +16429,59 @@ export class RetryQueue {
    * burst at once; widening never tops a bucket up. An illegal patch
    * throws `RangeError` and the live values are untouched; an empty
    * patch is a `RangeError`; revising to the live values is a no-op.
-   * Throws `Error` when the limit was never configured — enabling it
-   * needs a restart. Endpoint overrides are untouched by a defaults
-   * revision (they still win per field); `mode` switches only affect
-   * calls after the switch. Returns the live snapshot.
+   * Endpoint overrides are untouched by a defaults revision (they
+   * still win per field); `mode` switches only affect calls after
+   * the switch. Returns the live snapshot.
+   *
+   * WR-463: when the limit was never configured, the same call
+   * *enables* it instead of throwing — but unlike the revise path,
+   * both knobs are required: there is no construction default to
+   * fall back on, so an empty patch, a single-field patch, or a
+   * non-object patch throws `RangeError` and the queue stays
+   * unconfigured (and can still be enabled afterwards). `mode`
+   * defaults to `"queue"`; explicit `"reject-429"` is allowed. The
+   * values pass through the same construction gates as
+   * `new TenantRateLimiter`, so an illegal value throws `RangeError`
+   * before anything is assigned — no half-built limiter is left
+   * behind. The fresh limiter starts with an empty bucket table: a
+   * new scope starts with a full bucket, so the first burst after
+   * the enable is available immediately, and deliveries made before
+   * the enable are never retroactively charged. Endpoints are always
+   * empty at enable — overrides are added afterwards via
+   * `reviseTenantRateLimitEndpoint`. The next `take()` /
+   * `admitTenantDelivery()` judges by the new limiter; deliveries
+   * already rescheduled keep their original schedule. No
+   * persistence: a restart returns to unconfigured — the enable is
+   * live-only. Once enabled, later calls revise per WR-329. The
+   * queue itself holds no audit log — the server audits the enable
+   * as `tenant_rate_limit_revised` (`previous: null`, `current` the
+   * three values).
    */
   reviseTenantRateLimit(patch: TenantRateLimitRevision): TenantRateLimitSnapshot {
     const limiter = this.tenantRateLimiter;
     if (limiter === undefined) {
-      throw new Error(
-        "reviseTenantRateLimit: tenant rate limit is not configured — enabling it requires a restart: " +
-          "the limiter is created at startup and a running relay cannot start capping without one"
-      );
+      // WR-463: enable — both knobs are required (no construction
+      // default exists for either), validated before anything is
+      // assigned so an illegal patch leaves the queue unconfigured.
+      // The constructor re-validates the values through the same
+      // gates and throws before the field is assigned, so a bad
+      // patch can never leave a half-built limiter behind.
+      if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+        throw new RangeError(
+          `reviseTenantRateLimit: patch must be an object, got ${JSON.stringify(patch)}`
+        );
+      }
+      if (patch.burst === undefined || patch.refillPerSecond === undefined) {
+        throw new RangeError(
+          "reviseTenantRateLimit: enabling the tenant rate limit requires both burst and refillPerSecond — an empty or single-field patch cannot enable it"
+        );
+      }
+      this.tenantRateLimiter = new TenantRateLimiter({
+        burst: patch.burst,
+        refillPerSecond: patch.refillPerSecond,
+        mode: patch.mode,
+      });
+      return this.tenantRateLimiter.current();
     }
     return limiter.retune(patch);
   }

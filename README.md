@@ -4231,12 +4231,26 @@ const queue = new RetryQueue({
   `tenant_rate_limit_endpoint_revised` (with `endpoint` and the
   effective `previous` / `current` `{ burst, refillPerSecond }`), and
   `tenant_rate_limit_endpoint_removed` (with `endpoint` and the removed
-  override as `previous`). Revising a relay that never configured the
-  limit throws `Error` — first enabling it still needs a restart. No
-  new Prometheus series. Three-way contrast: WR-310 revises the
-  relay-level *global* rate, WR-329 revises this *tenant-level*
-  outbound rate, and WR-322 revises *endpoint quotas* (the WR-15
-  per-minute budget) — three different gates.
+  override as `previous`). No new Prometheus series. Three-way contrast:
+  WR-310 revises the relay-level *global* rate, WR-329 revises this
+  *tenant-level* outbound rate, and WR-322 revises *endpoint quotas*
+  (the WR-15 per-minute budget) — three different gates.
+- **Live enable (WR-463)** — a relay that never configured the limit
+  can enable it at runtime with `reviseTenantRateLimit({ burst,
+  refillPerSecond })`: both knobs are required at enable (there is no
+  default to fall back on), so an empty, single-field, or non-object
+  patch throws `RangeError` and leaves the relay unconfigured;
+  `mode` defaults to `"queue"` and `"reject-429"` may be given
+  explicitly; `endpoints` is always empty at enable and overrides
+  are added afterwards with `reviseTenantRateLimitEndpoint`. The
+  fresh limiter starts with an empty bucket table — a new scope
+  starts with a full bucket, so the first burst after the enable is
+  available immediately — and deliveries made before the enable are
+  never retroactively charged. The enable is audited once as
+  `tenant_rate_limit_revised` with `previous: null`, and the
+  `getTenantRateLimit()` getter is mounted at the same time. A
+  restart restores unconfigured: the limiter is in-memory only, so
+  the relay returns to fail-open unlimited.
 
 ## Per-endpoint outbound rate limiting
 

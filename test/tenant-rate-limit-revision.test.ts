@@ -275,16 +275,32 @@ describe("RetryQueue tenant rate-limit revision (WR-329)", () => {
     }
   });
 
-  it("unconfigured: revisions throw the must-restart Error, the getter is undefined, remove is false", () => {
+  it("unconfigured: reviseTenantRateLimit with both knobs enables (WR-463); incomplete patches throw RangeError; the endpoint revision still throws the must-restart Error, remove is false", () => {
     const q = new RetryQueue({});
+    const unconfigured = new RetryQueue({});
     assert.equal(q.getTenantRateLimit(), undefined);
-    assert.throws(() => q.reviseTenantRateLimit({ burst: 1 }), /not configured — enabling it requires a restart/);
+    assert.equal(q.getTenantRateLimitStats(), undefined);
+    // Single-field / empty / non-object patches cannot enable: the
+    // queue stays unconfigured and can still be enabled afterwards.
+    assert.throws(() => q.reviseTenantRateLimit({ burst: 1 }), RangeError);
+    assert.throws(() => q.reviseTenantRateLimit({}), RangeError);
+    assert.throws(() => q.reviseTenantRateLimit(null as never), RangeError);
+    assert.equal(q.getTenantRateLimit(), undefined);
+    assert.deepEqual(q.reviseTenantRateLimit({ burst: 10, refillPerSecond: 5 }), {
+      burst: 10,
+      refillPerSecond: 5,
+      mode: "queue",
+      endpoints: {},
+    });
+    assert.deepEqual(q.getTenantRateLimitStats(), []);
+    // The endpoint revision still needs a configured limiter: on a
+    // queue that never enabled, it throws the must-restart Error.
     assert.throws(
-      () => q.reviseTenantRateLimitEndpoint(TARGET, { burst: 1 }),
+      () => unconfigured.reviseTenantRateLimitEndpoint(TARGET, { burst: 1 }),
       /not configured — enabling it requires a restart/
     );
+    assert.equal(unconfigured.removeTenantRateLimitEndpoint(TARGET), false);
     assert.equal(q.removeTenantRateLimitEndpoint(TARGET), false);
-    assert.equal(q.getTenantRateLimitStats(), undefined);
   });
 });
 
@@ -481,15 +497,33 @@ describe("RelayServer tenant rate-limit revision (WR-329)", () => {
     }
   });
 
-  it("unconfigured: revisions throw the must-restart Error, the getter is unset, remove is false", async () => {
+  it("unconfigured: reviseTenantRateLimit with both knobs enables (WR-463) and mounts the getter; the endpoint revision still throws the must-restart Error, remove is false", async () => {
     const { relay } = makeRelay({});
     await listen(relay);
     assert.equal(relay.getTenantRateLimit, undefined);
-    assert.throws(() => relay.reviseTenantRateLimit!({ burst: 1 }), /not configured — enabling it requires a restart/);
+    // A single-field patch cannot enable: RangeError, still unset.
+    assert.throws(() => relay.reviseTenantRateLimit!({ burst: 1 }), RangeError);
+    assert.equal(relay.getTenantRateLimit, undefined);
+    assert.deepEqual(relay.reviseTenantRateLimit!({ burst: 10, refillPerSecond: 5 }), {
+      burst: 10,
+      refillPerSecond: 5,
+      mode: "queue",
+      endpoints: {},
+    });
+    assert.deepEqual(relay.getTenantRateLimit!(), {
+      burst: 10,
+      refillPerSecond: 5,
+      mode: "queue",
+      endpoints: {},
+    });
+    // The endpoint revision still needs a configured limiter on a
+    // relay that never enabled.
+    const { relay: fresh } = makeRelay({});
+    await listen(fresh);
     assert.throws(
-      () => relay.reviseTenantRateLimitEndpoint!(forwardUrl, { burst: 1 }),
+      () => fresh.reviseTenantRateLimitEndpoint!(forwardUrl, { burst: 1 }),
       /not configured — enabling it requires a restart/
     );
-    assert.equal(relay.removeTenantRateLimitEndpoint(forwardUrl), false);
+    assert.equal(fresh.removeTenantRateLimitEndpoint(forwardUrl), false);
   });
 });

@@ -8933,11 +8933,18 @@ export interface RelayServer extends Server {
    * event. A real revision is audited as `tenant_rate_limit_revised`
    * with `previous` / `current` `{ burst, refillPerSecond, mode }`
    * (the construction defaults as first `previous`), and returns the
-   * live snapshot. Always set; throws `Error` when the limit was
-   * never configured — enabling it needs a restart. Endpoint
-   * overrides are untouched by a defaults revision; a `mode` switch
-   * only affects calls after the switch (dispatch still never
-   * re-checks in `reject-429` mode).
+   * live snapshot. Always set. WR-463: with the limit never
+   * configured the same call *enables* it instead of throwing — both
+   * knobs are required (no construction default exists for either),
+   * so an empty, single-field, or non-object patch throws
+   * `RangeError` and leaves the relay unconfigured; `mode` defaults
+   * to `"queue"`, explicit `"reject-429"` is allowed, and `endpoints`
+   * is always empty at enable (overrides are added afterwards via
+   * `reviseTenantRateLimitEndpoint`). The getter is mounted and the
+   * enable is audited with `previous: null`. Endpoint overrides are
+   * untouched by a defaults revision; a `mode` switch only affects
+   * calls after the switch (dispatch still never re-checks in
+   * `reject-429` mode).
    */
   reviseTenantRateLimit?: (patch: TenantRateLimitRevision) => TenantRateLimitSnapshot;
   /**
@@ -8972,7 +8979,9 @@ export interface RelayServer extends Server {
   /**
    * WR-329: live per-tenant outbound rate-limit snapshot — the
    * tenant-level defaults, mode, and endpoint overrides. Only set
-   * when `tenantRateLimit` was configured; `undefined` otherwise.
+   * when `tenantRateLimit` was configured — or once it has been
+   * enabled live via `reviseTenantRateLimit` (WR-463); `undefined`
+   * otherwise.
    */
   getTenantRateLimit?: () => TenantRateLimitSnapshot | undefined;
   /**
@@ -23784,17 +23793,28 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   }
 
   // WR-329: per-tenant outbound rate-limit defaults runtime revision.
-  // The method is always set (like setGlobalRateLimit above); with the
-  // limit unconfigured the queue throws Error — enabling the cap needs
-  // a restart. A real revision is audited as `tenant_rate_limit_revised`
-  // with the previous and current burst / refill / mode (the
-  // construction defaults as first `previous`); an empty or same-value
-  // patch is a silent no-op.
+  // The method is always set (like setGlobalRateLimit above). WR-463:
+  // with the limit unconfigured the same call *enables* it instead
+  // of throwing — both knobs are required, the getter is mounted,
+  // and the enable is audited with `previous: null`. A real revision
+  // is audited as `tenant_rate_limit_revised` with the previous and
+  // current burst / refill / mode (the construction defaults as first
+  // `previous`); an empty or same-value patch is a silent no-op.
   server.reviseTenantRateLimit = (patch: TenantRateLimitRevision): TenantRateLimitSnapshot => {
     const prev = queue.getTenantRateLimit();
     if (prev === undefined) {
-      // Delegates to the queue for the canonical "must restart" Error.
-      return queue.reviseTenantRateLimit(patch);
+      // WR-463: enable — the queue installs a fresh limiter with an
+      // empty bucket table. Audit the enable with `previous: null`
+      // and mount the getter, exactly once; an illegal patch throws
+      // RangeError in the queue before either happens.
+      const next = queue.reviseTenantRateLimit(patch);
+      opts.auditLog.append({
+        event: "tenant_rate_limit_revised",
+        previous: null,
+        current: { burst: next.burst, refillPerSecond: next.refillPerSecond, mode: next.mode },
+      });
+      server.getTenantRateLimit = (): TenantRateLimitSnapshot => queue.getTenantRateLimit()!;
+      return next;
     }
     // Validate-then-apply inside retune: an illegal patch throws
     // RangeError and the live values are left completely intact.
@@ -23877,7 +23897,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   };
 
   // WR-329: live per-tenant outbound rate-limit snapshot. Only set
-  // when `retry.tenantRateLimit` was configured.
+  // when `retry.tenantRateLimit` was configured — or once it has
+  // been enabled live (WR-463 mounts it in the enable branch above).
   if (queue.getTenantRateLimit() !== undefined) {
     server.getTenantRateLimit = (): TenantRateLimitSnapshot => queue.getTenantRateLimit()!;
   }
