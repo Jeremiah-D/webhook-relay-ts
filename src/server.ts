@@ -9820,6 +9820,25 @@ export interface RelayServer extends Server {
    */
   reviseDeliveryReceiptCallbacks?: (patch: DeliveryReceiptCallbacksRevision) => void;
   /**
+   * WR-468: move the delivery-receipt ring bound live — no restart.
+   * Tightening trims the oldest receipts to the new bound on the
+   * spot (the trimmed count joins `dropped`, as with over-capacity
+   * eviction); widening only moves the bound, the ring stays whole.
+   * A non-positive integer throws `RangeError` and the live bound and
+   * ring are untouched; revising to the live value is a silent no-op.
+   * A real revision is audited as
+   * `delivery_receipt_max_entries_revised` with numeric `previous` /
+   * `current`. Always set; throws `Error` when delivery receipts were
+   * never configured — enabling them needs a restart. The new bound
+   * takes effect from the next record; already-trimmed receipts are
+   * never restored and the journal file is never rewritten, and a
+   * restart restores the construction bound. Direct queue users call
+   * `RetryQueue.reviseDeliveryReceiptMaxEntries` instead — the queue
+   * method is equally valid there, since the ring bound lives in the
+   * store with no audit closure to protect.
+   */
+  reviseDeliveryReceiptMaxEntries?: (maxEntries: number) => void;
+  /**
    * WR-331: revise one endpoint's live half-open probe knobs at
    * runtime — no restart. The patch merges over the endpoint's live
    * effective probe values; an illegal patch (or an empty patch)
@@ -25211,6 +25230,39 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       event: "delivery_receipt_callbacks_revised",
       previous: presence(previousCallbacks),
       current: presence(currentCallbacks),
+    });
+  };
+
+  // WR-468: live delivery-receipt ring-bound revision. Like WR-467
+  // there is no audit closure to protect — the bound lives in the
+  // store — so this method delegates the validate-then-apply work to
+  // the queue (RangeError on an illegal bound, live bound and ring
+  // untouched; Error when receipts were never configured — enabling
+  // them needs a restart) and only owns the audit: the live bound is
+  // read from the queue before and after the delegation, so a
+  // same-value revision is a silent no-op and a real revision
+  // appends `delivery_receipt_max_entries_revised` with numeric
+  // `previous` / `current`. Reading the live value from the queue
+  // (rather than tracking a cell here) keeps the audit truthful even
+  // when the queue method is called directly. Tightening trims the
+  // oldest receipts on the spot; the new bound takes effect from the
+  // next record, and a restart restores the construction bound.
+  server.reviseDeliveryReceiptMaxEntries = (maxEntries: number): void => {
+    if (!queue.deliveryReceiptsConfigured()) {
+      // Delegates to the queue for the canonical "must restart" Error.
+      return queue.reviseDeliveryReceiptMaxEntries(maxEntries);
+    }
+    const previous = queue.getDeliveryReceiptMaxEntries()!;
+    // Validates and applies; throws before mutating on a bad bound.
+    queue.reviseDeliveryReceiptMaxEntries(maxEntries);
+    const current = queue.getDeliveryReceiptMaxEntries()!;
+    if (previous === current) {
+      return;
+    }
+    opts.auditLog.append({
+      event: "delivery_receipt_max_entries_revised",
+      previous,
+      current,
     });
   };
 

@@ -14888,6 +14888,39 @@ export class RetryQueue {
   }
 
   /**
+   * WR-468: move the delivery-receipt ring bound live — the
+   * queue-side setter behind
+   * `RelayServer.reviseDeliveryReceiptMaxEntries`. A non-positive
+   * integer throws `RangeError` and the live bound and ring are
+   * untouched; the same value is a silent no-op. Tightening trims
+   * the oldest receipts to the new bound on the spot (the trimmed
+   * count joins the store's `dropped`, exactly as with over-capacity
+   * eviction); widening only moves the bound, the ring stays whole.
+   * The new bound takes effect from the next `record` — already
+   * trimmed receipts are never restored and the journal file is
+   * never rewritten — and a restart restores the construction bound
+   * (live-only). Only the bound moves: the callbacks, the journal,
+   * the clock, and the receipt shape are untouched. Throws `Error`
+   * when delivery receipts were never configured — the receipts only
+   * ever exist when the store is set, so enabling them needs a
+   * restart. The queue itself holds no audit log — the server audits
+   * a real revision as `delivery_receipt_max_entries_revised`.
+   */
+  reviseDeliveryReceiptMaxEntries(maxEntries: number): void {
+    if (this.deliveryReceipts === undefined) {
+      throw new Error(
+        "reviseDeliveryReceiptMaxEntries: delivery receipts are not configured — enabling them requires a restart"
+      );
+    }
+    if (!Number.isInteger(maxEntries) || maxEntries <= 0) {
+      throw new RangeError(
+        `reviseDeliveryReceiptMaxEntries: maxEntries must be a positive integer, got ${maxEntries}`
+      );
+    }
+    this.deliveryReceipts.setMaxEntries(maxEntries);
+  }
+
+  /**
    * WR-395: live-redirect the shadow-target mirror observers — the
    * queue-side setter behind `RelayServer.reviseShadowCallbacks`.
    * The new hooks take effect from the next mirrored copy's outcome;
@@ -17054,6 +17087,16 @@ export class RetryQueue {
       onDelivered: this.callerOnReceiptDelivered,
       onFailed: this.callerOnReceiptFailed,
     };
+  }
+
+  /**
+   * WR-468: the live delivery-receipt ring bound, or `undefined`
+   * when receipts are disabled. The server reads this before and
+   * after a revision to audit the numeric `previous` / `current`
+   * without ever touching the ring.
+   */
+  getDeliveryReceiptMaxEntries(): number | undefined {
+    return this.deliveryReceipts?.getMaxEntries();
   }
 
   /**

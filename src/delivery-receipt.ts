@@ -92,7 +92,10 @@ const JOURNAL_FILE = "delivery-receipts.jsonl";
 
 /** Bounded in-memory receipt log with an optional append-only JSONL journal. */
 export class DeliveryReceiptStore {
-  private readonly maxEntries: number;
+  // WR-468: deliberately *not* readonly — `setMaxEntries` moves the
+  // ring bound live, so the store reads this field on every `record`
+  // and `recover` instead of caching the construction value.
+  private maxEntries: number;
   private readonly journalPath: string | undefined;
   private readonly now: () => number;
   private readonly ring: DeliveryReceipt[] = [];
@@ -118,6 +121,40 @@ export class DeliveryReceiptStore {
       }
       this.journalPath = join(journalDir, JOURNAL_FILE);
       this.recover();
+    }
+  }
+
+  /** WR-468: the live ring bound. `record` / `recover` read this on
+   * every call, so a revision via `setMaxEntries` takes effect
+   * immediately without a restart. */
+  getMaxEntries(): number {
+    return this.maxEntries;
+  }
+
+  /**
+   * WR-468: move the ring bound live — the store-side setter behind
+   * `RetryQueue.reviseDeliveryReceiptMaxEntries`. A non-positive
+   * integer throws `RangeError` and the live bound and ring are
+   * untouched; the same value is a silent no-op. Tightening trims
+   * the oldest receipts to the new bound on the spot and the trimmed
+   * count joins `dropped`, exactly as with over-capacity eviction
+   * in `record`; widening only moves the bound, the ring stays whole.
+   * The journal file is never rewritten — already-journaled receipts
+   * stay journaled — and a later `recover` still reads the tail by
+   * the bound in force at construction of the *new* store.
+   */
+  setMaxEntries(maxEntries: number): void {
+    if (!Number.isInteger(maxEntries) || maxEntries <= 0) {
+      throw new RangeError(
+        `deliveryReceipts.maxEntries must be a positive integer, got ${maxEntries}`
+      );
+    }
+    if (maxEntries === this.maxEntries) return;
+    this.maxEntries = maxEntries;
+    if (this.ring.length > maxEntries) {
+      const removed = this.ring.length - maxEntries;
+      this.ring.splice(0, removed);
+      this.dropped += removed;
     }
   }
 

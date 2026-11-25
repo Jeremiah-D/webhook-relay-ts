@@ -4376,8 +4376,23 @@ const queue = new RetryQueue({
   needs a restart. A real revision is audited as
   `delivery_receipt_callbacks_revised` with `previous` / `current`
   recording per-field presence only (`set` / `cleared`), never a
-  function body. `maxEntries`, `journalDir`, and the receipt clock are
-  not revisable; a restart restores the construction callbacks.
+  function body. `journalDir` and the receipt clock are not
+  revisable; a restart restores the construction callbacks and
+  `maxEntries`.
+- **Live revision (WR-468)** — the ring bound `maxEntries` is
+  revisable without a restart, via
+  `reviseDeliveryReceiptMaxEntries(maxEntries)` on the queue and the
+  server. A non-positive integer throws `RangeError` and the live
+  bound and ring are untouched, and revising to the live value is a
+  silent no-op. With receipts never configured the call throws
+  `Error` — enabling them needs a restart. Tightening trims the
+  oldest receipts to the new bound on the spot (the trimmed count
+  joins `dropped`, as with over-capacity eviction); widening only
+  moves the bound, the ring stays whole. The new bound takes effect
+  from the next record; already-trimmed receipts are never restored
+  and the journal file is never rewritten. A real revision is audited
+  as `delivery_receipt_max_entries_revised` with numeric `previous` /
+  `current`. A restart restores the construction bound.
 
 ## Per-tenant monthly delivery budgets
 
