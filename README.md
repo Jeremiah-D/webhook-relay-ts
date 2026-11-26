@@ -4372,8 +4372,8 @@ const queue = new RetryQueue({
   is still recorded and journaled, only the forwarding stops); an empty
   patch or a non-function value throws `RangeError` and the live hooks
   are untouched, and a same-value patch is a silent no-op. With
-  receipts never configured the call throws `Error` — enabling them
-  needs a restart. A real revision is audited as
+  receipts never configured the call throws `Error` — enable them
+  live via `enableDeliveryReceipts` (WR-471). A real revision is audited as
   `delivery_receipt_callbacks_revised` with `previous` / `current`
   recording per-field presence only (`set` / `cleared`), never a
   function body. The receipt clock is not revisable; a restart
@@ -4384,7 +4384,8 @@ const queue = new RetryQueue({
   server. A non-positive integer throws `RangeError` and the live
   bound and ring are untouched, and revising to the live value is a
   silent no-op. With receipts never configured the call throws
-  `Error` — enabling them needs a restart. Tightening trims the
+  `Error` — enable them live via `enableDeliveryReceipts` (WR-471).
+  Tightening trims the
   oldest receipts to the new bound on the spot (the trimmed count
   joins `dropped`, as with over-capacity eviction); widening only
   moves the bound, the ring stays whole. The new bound takes effect
@@ -4402,7 +4403,8 @@ const queue = new RetryQueue({
   missing directory is created. A non-string or empty directory
   throws `RangeError` and the live path is untouched, and revising to
   the same directory (compared after `join`) is a silent no-op. With
-  receipts never configured the call throws `Error`. A real
+  receipts never configured the call throws `Error` — enable them
+  live via `enableDeliveryReceipts` (WR-471). A real
   revision is audited as `delivery_receipt_journal_dir_revised` with
   `previous` / `current` recording the directory strings. After a
   restart, recovery reads only the current directory's tail — receipts
@@ -4421,7 +4423,27 @@ const queue = new RetryQueue({
   and is audited as `delivery_receipt_journal_dir_revised` with
   `previous: null`. A restart restores the journal-less construction
   state — the enable is live-only. Enabling the whole receipt store
-  from nothing still needs a restart (WR-471 owns that).
+  from nothing is the same idea one level up (WR-471 below).
+- **Live enable (WR-471)** — when receipts were never configured at
+  all, `enableDeliveryReceipts(opts?)` on the queue and the server
+  enables the whole store without a restart: the retry / dead-letter
+  / dedup state keeps running, and receipts start from the next
+  terminal delivery — receipts that fired before the enable are never
+  backfilled. `opts` is optional: omitted (or empty) enables with the
+  construction defaults (`maxEntries` 1000, no journal, no callbacks,
+  `Date.now` clock), and the enable is still real — the ring starts
+  recording, is queryable, and exports. With a `journalDir` the
+  journal's existing tail is recovered into the new ring (bounded by
+  the enable-time `maxEntries`, corrupt lines skipped). An illegal
+  `maxEntries` / `journalDir` throws `RangeError` and the relay stays
+  unconfigured, still enableable afterwards. On a relay that is
+  already configured the call throws `Error` — enabling never
+  revises; use the three `reviseDeliveryReceipt*` setters to change a
+  live store. A real enable is audited as `delivery_receipts_enabled`
+  with `previous: null` and `current` recording the resolved
+  `{ maxEntries, journalDir, onDelivered, onFailed }` (callback
+  presence only, never a function body). A restart restores the
+  unconfigured construction state — the enable is live-only.
 
 ## Per-tenant monthly delivery budgets
 

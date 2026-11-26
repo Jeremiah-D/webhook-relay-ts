@@ -9809,8 +9809,8 @@ export interface RelayServer extends Server {
    * `delivery_receipt_callbacks_revised` with `previous` / `current`
    * recording per-field `onDelivered` / `onFailed` presence ('set' /
    * 'cleared'), never a function body. Always set; throws `Error`
-   * when delivery receipts were never configured — enabling them
-   * needs a restart. The new callbacks take effect from the next
+   * when delivery receipts were never configured — enable them live
+   * via `enableDeliveryReceipts` (WR-471). The new callbacks take effect from the next
    * terminal delivery; receipts that already fired are never
    * re-delivered, and the ring, the journal, `maxEntries`, the clock,
    * and the receipt shape are untouched. Direct queue users call
@@ -9829,7 +9829,8 @@ export interface RelayServer extends Server {
    * A real revision is audited as
    * `delivery_receipt_max_entries_revised` with numeric `previous` /
    * `current`. Always set; throws `Error` when delivery receipts were
-   * never configured — enabling them needs a restart. The new bound
+   * never configured — enable them live via `enableDeliveryReceipts`
+   * (WR-471). The new bound
    * takes effect from the next record; already-trimmed receipts are
    * never restored and the journal file is never rewritten, and a
    * restart restores the construction bound. Direct queue users call
@@ -9864,6 +9865,33 @@ export interface RelayServer extends Server {
    * in the store with no audit closure to protect.
    */
   reviseDeliveryReceiptJournalDir?: (journalDir: string) => void;
+  /**
+   * WR-471: enable the whole delivery-receipt store live — no
+   * restart — on a relay constructed without one. `opts` is
+   * optional: omitted (or empty) enables with the construction
+   * defaults (`maxEntries` 1000, no journal, no callbacks,
+   * `Date.now` clock), and the enable is still real — the ring
+   * starts recording from the next terminal delivery, is queryable,
+   * and exports. With a `journalDir` the journal's existing tail is
+   * recovered into the new ring (bounded by the enable-time
+   * `maxEntries`). Receipts that fired before the enable are never
+   * backfilled. An illegal `maxEntries` / `journalDir` throws
+   * `RangeError` and the relay stays unconfigured, still enableable
+   * afterwards. On a relay that is already configured this throws
+   * `Error` — enabling never revises; use
+   * `reviseDeliveryReceiptCallbacks` /
+   * `reviseDeliveryReceiptMaxEntries` /
+   * `reviseDeliveryReceiptJournalDir` to change a live store. A
+   * real enable is audited as `delivery_receipts_enabled` with
+   * `previous: null` and `current` recording the resolved
+   * `{ maxEntries, journalDir, onDelivered, onFailed }` (callback
+   * presence only, never a function body). A restart restores the
+   * unconfigured construction state (live-only). Direct queue users
+   * call `RetryQueue.enableDeliveryReceipts` instead — the queue
+   * method is equally valid there, since the store lives in the
+   * queue with no audit closure to protect.
+   */
+  enableDeliveryReceipts?: (opts?: DeliveryReceiptOptions) => void;
   /**
    * WR-331: revise one endpoint's live half-open probe knobs at
    * runtime — no restart. The patch merges over the endpoint's live
@@ -25330,6 +25358,43 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       event: "delivery_receipt_journal_dir_revised",
       previous: previous ?? null,
       current,
+    });
+  };
+
+  // WR-471: live enable of the whole delivery-receipt store. Like
+  // WR-467 / WR-468 / WR-469 there is no audit closure to protect —
+  // the store lives in the queue — so this method delegates the
+  // validate-then-install work to the queue (RangeError on an
+  // illegal `maxEntries` / `journalDir`, the relay staying
+  // unconfigured; Error when receipts are already configured, taken
+  // canonical from the queue) and only owns the audit: a real enable
+  // appends `delivery_receipts_enabled` with `previous: null` and
+  // `current` recording the resolved `{ maxEntries, journalDir,
+  // onDelivered, onFailed }` — the numeric bound, the directory
+  // string (or null when no journal), and callback presence
+  // ('set' / 'cleared'), never a function body. The resolved values
+  // are read live from the queue after the delegation, so the audit
+  // records what was actually installed. Receipts that fired before
+  // the enable are never backfilled; a restart restores the
+  // unconfigured construction state.
+  server.enableDeliveryReceipts = (receiptOpts?: DeliveryReceiptOptions): void => {
+    if (queue.deliveryReceiptsConfigured()) {
+      // Delegates to the queue for the canonical "already
+      // configured" Error.
+      return queue.enableDeliveryReceipts(receiptOpts);
+    }
+    // Validates and installs; throws before mutating on bad opts.
+    queue.enableDeliveryReceipts(receiptOpts);
+    const callbacks = queue.getDeliveryReceiptCallbacks();
+    opts.auditLog.append({
+      event: "delivery_receipts_enabled",
+      previous: null,
+      current: {
+        maxEntries: queue.getDeliveryReceiptMaxEntries()!,
+        journalDir: queue.getDeliveryReceiptJournalDir() ?? null,
+        onDelivered: callbacks?.onDelivered === undefined ? "cleared" : "set",
+        onFailed: callbacks?.onFailed === undefined ? "cleared" : "set",
+      },
     });
   };
 

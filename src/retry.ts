@@ -4809,10 +4809,14 @@ export class RetryQueue {
   private tenantRateLimiter?: TenantRateLimiter;
   /** WR-154: the shared per-endpoint outbound token-bucket rate limiter; undefined when disabled. WR-462: deliberately *not* readonly — `reviseOutboundRateLimit` installs a fresh limiter at runtime when the option was never configured, so the cap can be enabled live instead of needing a restart. */
   private outboundRateLimiter?: OutboundRateLimiter;
-  /** WR-155: the structured delivery-receipt log; undefined when disabled. */
-  private readonly deliveryReceipts?: DeliveryReceiptStore;
-  /** WR-155: receipt callbacks and clock; undefined when receipts are disabled. */
-  private readonly deliveryReceiptOpts?: DeliveryReceiptOptions;
+  /** WR-155: the structured delivery-receipt log; undefined when disabled.
+   * WR-471: deliberately *not* readonly — `enableDeliveryReceipts`
+   * installs the store live on an unconfigured queue, so the whole
+   * receipt store can be enabled without a restart. */
+  private deliveryReceipts?: DeliveryReceiptStore;
+  /** WR-155: receipt callbacks and clock; undefined when receipts are disabled.
+   * WR-471: deliberately *not* readonly, for the same live enable. */
+  private deliveryReceiptOpts?: DeliveryReceiptOptions;
   // WR-467: deliberately *not* readonly —
   // `reviseDeliveryReceiptCallbacks` swaps these fields live.
   // They hold the *caller's* callbacks; `emitDeliveryReceipt` reads
@@ -14827,7 +14831,8 @@ export class RetryQueue {
    * untouched, and a throwing callback is still isolated (record
    * first, callback after, along WR-155). Throws `Error` when
    * delivery receipts were never configured — the receipts only ever
-   * exist when the store is set, so enabling them needs a restart.
+   * exist when the store is set, so enable them live via
+   * `enableDeliveryReceipts` (WR-471).
    * Unlike WR-394 there is no audit closure to protect — the receipt
    * callbacks pass straight through at construction — so the server
    * method delegates here directly and audits the revision itself;
@@ -14902,8 +14907,8 @@ export class RetryQueue {
    * (live-only). Only the bound moves: the callbacks, the journal,
    * the clock, and the receipt shape are untouched. Throws `Error`
    * when delivery receipts were never configured — the receipts only
-   * ever exist when the store is set, so enabling them needs a
-   * restart. The queue itself holds no audit log — the server audits
+   * ever exist when the store is set, so enable them live via
+   * `enableDeliveryReceipts` (WR-471). The queue itself holds no audit log — the server audits
    * a real revision as `delivery_receipt_max_entries_revised`.
    */
   reviseDeliveryReceiptMaxEntries(maxEntries: number): void {
@@ -14963,6 +14968,51 @@ export class RetryQueue {
       );
     }
     this.deliveryReceipts.setJournalDir(journalDir);
+  }
+
+  /**
+   * WR-471: enable the whole delivery-receipt store live on a queue
+   * that was constructed without one — the queue-side method behind
+   * `RelayServer.enableDeliveryReceipts`. No restart, no state lost:
+   * the retry / dead-letter / dedup state keeps running and the
+   * receipts start from the next terminal delivery. Receipts that
+   * fired before the enable are never backfilled.
+   *
+   * `opts` is optional — an omitted (or empty) options object enables
+   * with the construction defaults (`maxEntries` 1000, no journal,
+   * no callbacks, `Date.now` clock), and the enable is still real:
+   * the ring starts recording, is queryable, and exports. With a
+   * `journalDir` the construction-time `recover()` pulls the
+   * journal's existing tail into the new ring (bounded by the
+   * enable-time `maxEntries`, corrupt lines skipped), so on-disk
+   * evidence is not lost.
+   *
+   * Validate-before-assign: the store is constructed in a local
+   * first, so an illegal `maxEntries` / `journalDir` throws
+   * `RangeError` from the store constructor and the queue stays
+   * unconfigured — still enableable afterwards. On a queue that is
+   * already configured this throws `Error`: enabling never revises,
+   * use `reviseDeliveryReceiptCallbacks` /
+   * `reviseDeliveryReceiptMaxEntries` /
+   * `reviseDeliveryReceiptJournalDir` to change a live store. A
+   * restart restores the unconfigured construction state
+   * (live-only). The queue itself holds no audit log — the server
+   * audits a real enable as `delivery_receipts_enabled` with
+   * `previous: null`.
+   */
+  enableDeliveryReceipts(opts?: DeliveryReceiptOptions): void {
+    if (this.deliveryReceipts !== undefined) {
+      throw new Error(
+        "enableDeliveryReceipts: delivery receipts are already configured — use reviseDeliveryReceiptCallbacks / reviseDeliveryReceiptMaxEntries / reviseDeliveryReceiptJournalDir to change them"
+      );
+    }
+    // Validate-before-assign: the constructor is the validation
+    // gate — a RangeError here leaves the queue unconfigured.
+    const store = new DeliveryReceiptStore(opts);
+    this.deliveryReceipts = store;
+    this.deliveryReceiptOpts = opts;
+    this.callerOnReceiptDelivered = opts?.onDelivered;
+    this.callerOnReceiptFailed = opts?.onFailed;
   }
 
   /**
