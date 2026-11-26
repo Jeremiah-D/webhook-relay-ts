@@ -13420,8 +13420,24 @@ live values untouched; a same-value revision is a silent no-op. A real
 server-side revision is audited as `escalation_revised` with `previous` /
 `current`. Revising requires the feature to be configured — on a relay
 without `deadLetterEscalation`, `reviseEscalation` throws `Error`
-(enabling it needs a restart). `url`, `signingSecret`, `keyId`, the
+(enable it live with `enableEscalation`, below). `url`, `signingSecret`, `keyId`, the
 transport, the clock, and the timers are never revisable.
+
+**Live enable (WR-472).** A relay constructed without
+`deadLetterEscalation` can enable it without a restart:
+`RetryQueue.enableEscalation(opts)` / `RelayServer.enableEscalation(opts)`,
+with `url` and `signingSecret` required (plus the six knobs, `keyId`, and
+an injectable `post` / clock / timers as at construction). The escalator
+starts with empty scopes — dead letters recorded before the enable are
+never counted and never produce a retroactive alert; the next dead letter
+after the enable is the first sample. An illegal option throws
+`RangeError` (`TypeError` for a non-function `post`) and leaves the relay
+unconfigured, still enableable afterwards; enabling an already-configured
+relay throws `Error` — use `reviseEscalation` /
+`reviseDeadLetterEscalationCallbacks` to change it. A real server-side
+enable is audited as `escalation_enabled` with `previous: null` and
+`current` the live six-knob config (never the url, signingSecret, or
+keyId). A restart restores the unconfigured state.
 
 **Live callback redirection (WR-394).** `relay.reviseDeadLetterEscalationCallbacks({ onDeadLetterEscalated, onDeadLetterEscalationFailed })`
 / `queue.reviseDeadLetterEscalationCallbacks(patch)` swaps the operator
@@ -13440,7 +13456,7 @@ values is a silent no-op. A real revision is audited as
 `oldOnDeadLetterEscalationFailed` ('set' / 'absent') presence, never a
 function body — and the audit can never be bypassed by a replacement.
 Revising when dead-letter escalation was never configured throws `Error`
-(enabling it needs a restart): the alerts only ever fire when the
+(enable it live with `enableEscalation`, WR-472): the alerts only ever fire when the
 escalator is set. Only the observers move: the storm thresholds, the
 cooldown, the alert retry/backoff, and the counters are untouched.
 

@@ -7710,7 +7710,8 @@ export interface RelayServer extends Server {
    * construction values as first `previous` — the defaults 10min /
    * 20 / 1h / 2 / 1000ms / 5000ms when unset), and returns the live
    * config. Always set; throws `Error` when `deadLetterEscalation`
-   * was never configured — enabling it needs a restart. The revision
+   * was never configured — enable it live with `enableEscalation`
+   * (WR-472). The revision
    * takes effect on the next `recordDeadLetter`: a tightened window
    * prunes older samples on the next record, a widened window never
    * resurrects pruned samples, and an already-alerted scope is
@@ -7719,8 +7720,33 @@ export interface RelayServer extends Server {
    */
   reviseEscalation?: (patch: EscalationRevision) => EscalationConfig;
   /**
+   * WR-472: enable dead-letter storm escalation live on a relay
+   * constructed without it — no restart. `opts` is required: an
+   * escalation with no operator `url` / `signingSecret` is
+   * meaningless, so an omitted (or empty) options object throws
+   * `RangeError`, as does an illegal url (non-http(s), invalid, or
+   * hitting `selfOrigins`), an empty `signingSecret` / `keyId`, an
+   * illegal six-knob value, or a non-function `post` (`TypeError`);
+   * the relay stays unconfigured and still enableable afterwards.
+   * On a relay that is already configured this throws `Error` —
+   * enabling never revises; use `reviseEscalation` /
+   * `reviseDeadLetterEscalationCallbacks` to change a live
+   * escalator. A real enable is audited as `escalation_enabled`
+   * with `previous: null` and `current` the live six-knob config
+   * (never the url, signingSecret, or keyId). The escalator starts
+   * with empty scopes — dead letters recorded before the enable are
+   * never counted and never produce a retroactive alert. A restart
+   * restores the unconfigured construction state (live-only).
+   * Direct queue users call `RetryQueue.enableEscalation` instead —
+   * the queue method is equally valid there, since the escalator
+   * lives in the queue with the server's audit wrappers already in
+   * the live caller fields.
+   */
+  enableEscalation?: (opts: DeadLetterEscalationOptions) => void;
+  /**
    * WR-377: live dead-letter storm escalation config — the six knobs.
-   * Only set when `deadLetterEscalation` was configured; `undefined`
+   * Only set when `deadLetterEscalation` was configured, or once
+   * `enableEscalation` (WR-472) has mounted it at runtime; `undefined`
    * otherwise.
    */
   getEscalationConfig?: () => EscalationConfig | undefined;
@@ -18982,14 +19008,21 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // relay's own listener would re-enter intake on every threshold
   // crossing and amplify the storm it reports. Same derivation as the
   // WR-47 check above — the configuration-time check (declared
-  // `selfOrigins`) ran at queue construction.
-  queue.setEscalationSelfCheck(
-    createBoundAddressSelfCheck(() => {
-      const addr = server.address();
-      if (addr === null || typeof addr === "string") return addr;
-      return { address: addr.address, port: addr.port };
-    })
-  );
+  // `selfOrigins`) ran at queue construction. WR-472: shared with the
+  // live-enable path — `enableEscalation` re-installs this same
+  // predicate on the freshly built escalator, which never saw the
+  // startup install (and `setEscalationSelfCheck` is a no-op while
+  // the feature is off, so calling it here is safe either way).
+  const installEscalationSelfCheck = (): void => {
+    queue.setEscalationSelfCheck(
+      createBoundAddressSelfCheck(() => {
+        const addr = server.address();
+        if (addr === null || typeof addr === "string") return addr;
+        return { address: addr.address, port: addr.port };
+      })
+    );
+  };
+  installEscalationSelfCheck();
 
   if (opts.gracefulShutdown) {
     const timeoutMs = opts.gracefulShutdown.timeoutMs ?? 30_000;
@@ -21014,16 +21047,16 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
 
   // WR-377: dead-letter storm escalation knob runtime revision. The
   // method is always set (like reviseErrorBudget above); with the
-  // escalator unconfigured the queue throws Error — enabling it needs
-  // a restart. A real revision is audited as `escalation_revised`
-  // with the previous and current six-knob config (the construction
-  // values as first `previous` — the defaults 10min / 20 / 1h / 2 /
-  // 1000ms / 5000ms when unset); an empty or same-value patch is a
-  // silent no-op. The revision takes effect on the next
-  // `recordDeadLetter`: a tightened window prunes older samples on
-  // the next record, a widened window never resurrects pruned
-  // samples, and an already-alerted scope is untouched until the
-  // next dead letter re-evaluates it.
+  // escalator unconfigured the queue throws Error — enable it live
+  // with `enableEscalation` (WR-472). A real revision is audited as
+  // `escalation_revised` with the previous and current six-knob
+  // config (the construction values as first `previous` — the defaults
+  // 10min / 20 / 1h / 2 / 1000ms / 5000ms when unset); an empty or
+  // same-value patch is a silent no-op. The revision takes effect on
+  // the next `recordDeadLetter`: a tightened window prunes older
+  // samples on the next record, a widened window never resurrects
+  // pruned samples, and an already-alerted scope is untouched until
+  // the next dead letter re-evaluates it.
   server.reviseEscalation = (patch: EscalationRevision): EscalationConfig => {
     const prev = queue.getEscalationConfig();
     if (prev === undefined) {
@@ -21052,10 +21085,45 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   };
 
   // WR-377: live dead-letter storm escalation config. Only set when
-  // `deadLetterEscalation` was configured.
+  // `deadLetterEscalation` was configured — WR-472 mounts it from
+  // the enable path when escalation is enabled at runtime.
   if (queue.getEscalationConfig() !== undefined) {
     server.getEscalationConfig = (): EscalationConfig => queue.getEscalationConfig()!;
   }
+
+  // WR-472: live enable of dead-letter storm escalation on a relay
+  // constructed without it. Like WR-471 there is no audit closure to
+  // protect — the escalator lives in the queue, and its hooks are the
+  // stable closures reading the live caller fields, so the server's
+  // `dead_letter_escalated` / `dead_letter_escalation_failed` audit
+  // wrappers (installed at construction) start observing alerts with
+  // no rewiring. This method delegates the validate-then-install work
+  // to the queue (RangeError on illegal opts, the relay staying
+  // unconfigured; Error when escalation is already configured, taken
+  // canonical from the queue), then re-installs the runtime loop
+  // check against the actually bound address — the new escalator
+  // never saw the startup install — mounts `getEscalationConfig`,
+  // and audits the enable once as `escalation_enabled` with
+  // `previous: null` and `current` the live six-knob config (no url,
+  // signingSecret, or keyId). Dead letters recorded before the enable
+  // are never counted; a restart restores the unconfigured
+  // construction state.
+  server.enableEscalation = (escalationOpts: DeadLetterEscalationOptions): void => {
+    if (queue.escalationConfigured()) {
+      // Delegates to the queue for the canonical "already
+      // configured" Error.
+      return queue.enableEscalation(escalationOpts);
+    }
+    // Validates and installs; throws before mutating on bad opts.
+    queue.enableEscalation(escalationOpts);
+    installEscalationSelfCheck();
+    server.getEscalationConfig = (): EscalationConfig => queue.getEscalationConfig()!;
+    opts.auditLog.append({
+      event: "escalation_enabled",
+      previous: null,
+      current: queue.getEscalationConfig()!,
+    });
+  };
 
   // WR-378: stale-endpoint auto-pause knob runtime revision. The
   // method is always set (like reviseErrorBudget above). WR-445: with
@@ -22451,7 +22519,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // 'cleared' / 'unchanged'; `oldOnDeadLetterEscalated` /
   // `oldOnDeadLetterEscalationFailed`: 'set' / 'absent'), never a
   // function body. With dead-letter escalation unconfigured the queue
-  // throws the canonical "must restart" Error.
+  // throws the canonical "must restart" Error — enable it live with
+  // `enableEscalation` (WR-472).
   server.reviseDeadLetterEscalationCallbacks = (
     patch: DeadLetterEscalationCallbacksRevision
   ): void => {

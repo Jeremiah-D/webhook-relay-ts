@@ -5091,8 +5091,11 @@ export class RetryQueue {
   private completionCallbackVersion = 0;
   /** WR-412: knob names changed by the most recent real completion-callback revision. */
   private completionCallbackLastChanged: string[] = [];
-  /** WR-93: dead-letter storm escalator; undefined when the feature is off. */
-  private readonly escalation?: DeadLetterStormEscalator;
+  // WR-93: dead-letter storm escalator; undefined when the feature is
+  // off. WR-472: deliberately *not* readonly — `enableEscalation`
+  // installs it live on an unconfigured queue (along WR-471's
+  // delivery-receipt store).
+  private escalation?: DeadLetterStormEscalator;
   // WR-394: deliberately *not* readonly —
   // `reviseDeadLetterEscalationCallbacks` swaps these fields live.
   // They hold the *caller's* callbacks; the escalator's hooks below
@@ -13025,8 +13028,8 @@ export class RetryQueue {
    * resurrects pruned samples, and an already-alerted scope is
    * neither opened nor closed early — the next dead letter
    * re-evaluates the latch under the new threshold. Throws `Error`
-   * when escalation was never configured — enabling it needs a
-   * restart. Returns the live config.
+   * when escalation was never configured — enable it live with
+   * `enableEscalation` (WR-472). Returns the live config.
    */
   reviseEscalation(patch: EscalationRevision): EscalationConfig {
     if (this.escalation === undefined) {
@@ -13035,6 +13038,58 @@ export class RetryQueue {
       );
     }
     return this.escalation.retune(patch);
+  }
+
+  /**
+   * WR-472: enable dead-letter storm escalation live on a queue that
+   * was constructed without it — the queue-side method behind
+   * `RelayServer.enableEscalation`. No restart, no state lost: the
+   * retry / dead-letter / dedup state keeps running and the escalator
+   * starts with empty scopes — dead letters recorded before the
+   * enable are never counted and never produce a retroactive alert;
+   * the next dead letter after the enable is the first sample.
+   *
+   * Unlike WR-471's delivery receipts, `opts` is required — an
+   * escalation with no operator `url` / `signingSecret` is
+   * meaningless, so an omitted (or empty) options object throws
+   * `RangeError`. Validate-before-assign: the options are resolved
+   * through the same `resolveDeadLetterEscalationConfig` gate as
+   * construction, so an illegal url (non-http(s), invalid, or
+   * hitting `selfOrigins`), an empty `signingSecret` / `keyId`, an
+   * illegal six-knob value, or a non-function `post` throws
+   * `RangeError` (`TypeError` for `post`) and the queue stays
+   * unconfigured — still enableable afterwards. On a queue that is
+   * already configured this throws `Error`: enabling never revises,
+   * use `reviseEscalation` / `reviseDeadLetterEscalationCallbacks`
+   * to change a live escalator. The new escalator's hooks are the
+   * same stable closures as construction, reading the live caller
+   * fields — callbacks registered at construction start receiving
+   * alerts with no rewiring, and `reviseDeadLetterEscalationCallbacks`
+   * opens the moment the escalator exists. A restart restores the
+   * unconfigured construction state (live-only). The queue itself
+   * holds no audit log — the server audits a real enable as
+   * `escalation_enabled` with `previous: null`.
+   */
+  enableEscalation(opts: DeadLetterEscalationOptions): void {
+    if (this.escalation !== undefined) {
+      throw new Error(
+        "enableEscalation: escalation is already configured — use reviseEscalation / reviseDeadLetterEscalationCallbacks to change it"
+      );
+    }
+    // Validate-before-assign: the resolver is the validation gate —
+    // a RangeError here leaves the queue unconfigured. `undefined`
+    // opts resolve to `undefined` (feature off), which is not an
+    // enable: escalation needs an operator url and a signing secret.
+    const resolved = resolveDeadLetterEscalationConfig(opts);
+    if (resolved === undefined) {
+      throw new RangeError(
+        "enableEscalation: escalation options are required — url and signingSecret must be set"
+      );
+    }
+    this.escalation = new DeadLetterStormEscalator(resolved, {
+      onEscalated: (info) => this.callerOnDeadLetterEscalated?.(info),
+      onFailed: (info) => this.callerOnDeadLetterEscalationFailed?.(info),
+    });
   }
 
   /**
@@ -14753,7 +14808,8 @@ export class RetryQueue {
    * thresholds, the cooldown, the alert retry/backoff, and the
    * counters are untouched. Throws `Error` when dead-letter escalation
    * was never configured — the alerts only ever fire when the
-   * escalator is set, so enabling it needs a restart. Under
+   * escalator is set, so enable it live with `enableEscalation`
+   * (WR-472). Under
    * `RelayServer` the fields hold the server's audit closures, so
    * direct calls here would replace the audit wrappers; server users
    * must go through
