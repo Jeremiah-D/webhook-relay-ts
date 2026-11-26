@@ -14921,6 +14921,48 @@ export class RetryQueue {
   }
 
   /**
+   * WR-469: move the delivery-receipt journal directory live — the
+   * queue-side setter behind
+   * `RelayServer.reviseDeliveryReceiptJournalDir`. A non-string or
+   * empty directory throws `RangeError` and the live path is left
+   * completely untouched; revising to the same directory (compared
+   * after `join`, so `./receipts` and `receipts` are the same
+   * directory) is a silent no-op. The switch takes effect from the
+   * next `record` — already-journaled receipts are never migrated
+   * and never replayed, the old journal file is never rewritten and
+   * never deleted (it stays on disk as the archive), and the ring
+   * and `dropped` are untouched. A restart recovers only the current
+   * directory's tail — receipts journaled to a previous directory
+   * are not recovered — and restores the construction directory
+   * (live-only). Throws `Error` when delivery receipts were never
+   * configured, and the same `Error` when receipts are configured
+   * but no journal was — switching a journal on from nothing is
+   * enabling, not revising, and needs a restart (WR-470 owns the
+   * enable family). Only the journal directory moves: the callbacks,
+   * `maxEntries`, the clock, and the receipt shape are untouched.
+   * The queue itself holds no audit log — the server audits a real
+   * revision as `delivery_receipt_journal_dir_revised`.
+   */
+  reviseDeliveryReceiptJournalDir(journalDir: string): void {
+    if (this.deliveryReceipts === undefined) {
+      throw new Error(
+        "reviseDeliveryReceiptJournalDir: delivery receipts are not configured — enabling them requires a restart"
+      );
+    }
+    if (this.deliveryReceipts.getJournalDir() === undefined) {
+      throw new Error(
+        "reviseDeliveryReceiptJournalDir: delivery receipts are not configured — enabling them requires a restart"
+      );
+    }
+    if (typeof journalDir !== "string" || journalDir.length === 0) {
+      throw new RangeError(
+        "reviseDeliveryReceiptJournalDir: journalDir must be a non-empty string"
+      );
+    }
+    this.deliveryReceipts.setJournalDir(journalDir);
+  }
+
+  /**
    * WR-395: live-redirect the shadow-target mirror observers — the
    * queue-side setter behind `RelayServer.reviseShadowCallbacks`.
    * The new hooks take effect from the next mirrored copy's outcome;
@@ -17097,6 +17139,16 @@ export class RetryQueue {
    */
   getDeliveryReceiptMaxEntries(): number | undefined {
     return this.deliveryReceipts?.getMaxEntries();
+  }
+
+  /**
+   * WR-469: the live delivery-receipt journal directory, or
+   * `undefined` when receipts are disabled or no journal was
+   * configured. The server reads this before and after a revision
+   * to audit the directory strings as `previous` / `current`.
+   */
+  getDeliveryReceiptJournalDir(): string | undefined {
+    return this.deliveryReceipts?.getJournalDir();
   }
 
   /**

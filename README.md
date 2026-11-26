@@ -4376,9 +4376,8 @@ const queue = new RetryQueue({
   needs a restart. A real revision is audited as
   `delivery_receipt_callbacks_revised` with `previous` / `current`
   recording per-field presence only (`set` / `cleared`), never a
-  function body. `journalDir` and the receipt clock are not
-  revisable; a restart restores the construction callbacks and
-  `maxEntries`.
+  function body. The receipt clock is not revisable; a restart
+  restores the construction callbacks, `maxEntries`, and `journalDir`.
 - **Live revision (WR-468)** — the ring bound `maxEntries` is
   revisable without a restart, via
   `reviseDeliveryReceiptMaxEntries(maxEntries)` on the queue and the
@@ -4393,6 +4392,23 @@ const queue = new RetryQueue({
   and the journal file is never rewritten. A real revision is audited
   as `delivery_receipt_max_entries_revised` with numeric `previous` /
   `current`. A restart restores the construction bound.
+- **Live revision (WR-469)** — the journal directory `journalDir` is
+  revisable without a restart, via
+  `reviseDeliveryReceiptJournalDir(journalDir)` on the queue and the
+  server. The switch takes effect from the next record: the old
+  journal file is never rewritten and never deleted (it stays on disk
+  as the archive), receipts already written there are not migrated
+  and not replayed, and the ring and `dropped` are untouched. A
+  missing directory is created. A non-string or empty directory
+  throws `RangeError` and the live path is untouched, and revising to
+  the same directory (compared after `join`) is a silent no-op. With
+  receipts never configured the call throws `Error`, as it does when
+  receipts are configured but no journal was — switching a journal on
+  from nothing is enabling, not revising, and needs a restart. A real
+  revision is audited as `delivery_receipt_journal_dir_revised` with
+  `previous` / `current` recording the directory strings. After a
+  restart, recovery reads only the current directory's tail — receipts
+  journaled to a previous directory are not recovered.
 
 ## Per-tenant monthly delivery budgets
 

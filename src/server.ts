@@ -9839,6 +9839,29 @@ export interface RelayServer extends Server {
    */
   reviseDeliveryReceiptMaxEntries?: (maxEntries: number) => void;
   /**
+   * WR-469: move the delivery-receipt journal directory live — no
+   * restart. The switch takes effect from the next record: the old
+   * journal file is never rewritten and never deleted (it stays on
+   * disk as the archive), receipts already written there are not
+   * migrated and not replayed, and the ring and `dropped` are
+   * untouched. A non-string or empty directory throws `RangeError`
+   * and the live path is untouched; revising to the same directory
+   * (compared after `join`) is a silent no-op. A missing directory
+   * is created. Always set; throws `Error` when delivery receipts
+   * were never configured, and the same `Error` when receipts are
+   * configured but no journal was — switching a journal on from
+   * nothing is enabling, not revising, and needs a restart. A real
+   * revision is audited as `delivery_receipt_journal_dir_revised`
+   * with `previous` / `current` recording the directory strings
+   * (local configuration paths, never secret material). A restart
+   * recovers only the current directory's tail and restores the
+   * construction directory. Direct queue users call
+   * `RetryQueue.reviseDeliveryReceiptJournalDir` instead — the queue
+   * method is equally valid there, since the journal directory lives
+   * in the store with no audit closure to protect.
+   */
+  reviseDeliveryReceiptJournalDir?: (journalDir: string) => void;
+  /**
    * WR-331: revise one endpoint's live half-open probe knobs at
    * runtime — no restart. The patch merges over the endpoint's live
    * effective probe values; an illegal patch (or an empty patch)
@@ -25261,6 +25284,46 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     }
     opts.auditLog.append({
       event: "delivery_receipt_max_entries_revised",
+      previous,
+      current,
+    });
+  };
+
+  // WR-469: live delivery-receipt journal-directory revision. Like
+  // WR-467 / WR-468 there is no audit closure to protect — the
+  // directory lives in the store — so this method delegates the
+  // validate-then-apply work to the queue (RangeError on a non-string
+  // or empty directory, live path untouched; Error when receipts were
+  // never configured, and the same Error when receipts are configured
+  // but no journal was — enabling a journal needs a restart) and
+  // only owns the audit: the live directory is read from the queue
+  // before and after the delegation, so a same-directory revision is
+  // a silent no-op and a real revision appends
+  // `delivery_receipt_journal_dir_revised` with `previous` /
+  // `current` recording the directory strings (local configuration
+  // paths, never secret material). Reading the live value from the
+  // queue (rather than tracking a cell here) keeps the audit truthful
+  // even when the queue method is called directly. The old journal
+  // file is never rewritten and never deleted; the new directory
+  // takes effect from the next record, and a restart recovers only
+  // the current directory's tail and restores the construction
+  // directory.
+  server.reviseDeliveryReceiptJournalDir = (journalDir: string): void => {
+    if (queue.getDeliveryReceiptJournalDir() === undefined) {
+      // Delegates to the queue for the canonical "must restart" Error
+      // (covers both receipts-never-configured and journal-never-
+      // configured; the queue throws the same message for both).
+      return queue.reviseDeliveryReceiptJournalDir(journalDir);
+    }
+    const previous = queue.getDeliveryReceiptJournalDir()!;
+    // Validates and applies; throws before mutating on a bad directory.
+    queue.reviseDeliveryReceiptJournalDir(journalDir);
+    const current = queue.getDeliveryReceiptJournalDir()!;
+    if (previous === current) {
+      return;
+    }
+    opts.auditLog.append({
+      event: "delivery_receipt_journal_dir_revised",
       previous,
       current,
     });

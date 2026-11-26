@@ -96,7 +96,13 @@ export class DeliveryReceiptStore {
   // ring bound live, so the store reads this field on every `record`
   // and `recover` instead of caching the construction value.
   private maxEntries: number;
-  private readonly journalPath: string | undefined;
+  // WR-469: deliberately *not* readonly either — `setJournalDir`
+  // moves the journal directory live. `journalDir` is the directory
+  // as configured (what the server audits as previous / current);
+  // `journalPath` is the derived `<journalDir>/delivery-receipts.jsonl`
+  // that `record` appends to and `recover` reads.
+  private journalDir: string | undefined;
+  private journalPath: string | undefined;
   private readonly now: () => number;
   private readonly ring: DeliveryReceipt[] = [];
   private dropped = 0;
@@ -119,9 +125,56 @@ export class DeliveryReceiptStore {
         // Best-effort: without a writable directory the journal stays off,
         // the in-memory ring still works.
       }
+      this.journalDir = journalDir;
       this.journalPath = join(journalDir, JOURNAL_FILE);
       this.recover();
     }
+  }
+
+  /** WR-469: the live journal directory, or `undefined` when no
+   * journal was configured. The server reads this before and after a
+   * revision to audit the directory strings as `previous` / `current`. */
+  getJournalDir(): string | undefined {
+    return this.journalDir;
+  }
+
+  /**
+   * WR-469: move the journal directory live — the store-side setter
+   * behind `RetryQueue.reviseDeliveryReceiptJournalDir`. A non-string
+   * or empty directory throws `RangeError` (same check as the
+   * constructor) and the live path is left completely untouched; a
+   * directory that was never configured throws `Error` — switching
+   * the journal on from nothing is enabling, not revising, and needs
+   * a restart (WR-470 owns the enable family). A missing directory
+   * is created best-effort, as at construction. The switch takes
+   * effect from the next `record`: the old journal file is never
+   * rewritten and never deleted — it stays on disk as the archive —
+   * receipts already written there are not migrated and not replayed,
+   * and the ring and `dropped` are untouched. Revising to the same
+   * directory (compared after `join`, so `./receipts` and `receipts`
+   * are the same directory) is a silent no-op. A restart recovers
+   * only the current directory's tail — receipts journaled to a
+   * previous directory are not recovered.
+   */
+  setJournalDir(journalDir: string): void {
+    if (this.journalPath === undefined) {
+      throw new Error(
+        "deliveryReceipts.journalDir: journal is not configured — enabling it requires a restart"
+      );
+    }
+    if (typeof journalDir !== "string" || journalDir.length === 0) {
+      throw new RangeError("deliveryReceipts.journalDir must be a non-empty string");
+    }
+    if (join(journalDir, JOURNAL_FILE) === this.journalPath) return;
+    try {
+      mkdirSync(journalDir, { recursive: true });
+    } catch {
+      // Best-effort, as at construction: if the directory cannot be
+      // created the new path is still adopted and journal writes fail
+      // silently per `record` — the in-memory ring still works.
+    }
+    this.journalDir = journalDir;
+    this.journalPath = join(journalDir, JOURNAL_FILE);
   }
 
   /** WR-468: the live ring bound. `record` / `recover` read this on
