@@ -16,9 +16,6 @@ const opToken = "slo-risk-revision-op-token";
 const URL_A = "http://localhost:9999/a";
 const EP_A = "http://a.example/hook";
 
-const MUST_RESTART =
-  "reviseSloRisk: SLO risk prediction is not configured — enabling it requires a restart";
-
 const DEFAULTS = {
   warnRatio: 0.8,
   ewmaAlpha: 0.2,
@@ -314,14 +311,14 @@ describe("RetryQueue.reviseSloRisk (WR-347)", () => {
     }
   });
 
-  it("unconfigured queue throws must-restart and the getter returns undefined", async () => {
-    const q = new RetryQueue({ sender: async () => {} });
+  it("an unconfigured queue enables on first revision; the getter returns the full config", async () => {
+    const q = new RetryQueue({ sender: async () => {}, latency: { sloMs: 1000 } });
     try {
       assert.equal(q.getSloRiskConfig(), undefined);
-      assert.throws(() => q.reviseSloRisk({ warnRatio: 0.6 }), {
-        name: "Error",
-        message: MUST_RESTART,
-      });
+      // WR-473: the same call that used to throw must-restart now
+      // enables the predictor, resolving missing fields to the defaults.
+      assert.deepEqual(q.reviseSloRisk({ warnRatio: 0.6 }), { ...DEFAULTS, warnRatio: 0.6 });
+      assert.deepEqual(q.getSloRiskConfig(), { ...DEFAULTS, warnRatio: 0.6 });
     } finally {
       await q.shutdown();
     }
@@ -438,14 +435,18 @@ describe("RelayServer SLO-risk revision (WR-347)", () => {
     assert.deepEqual(revised[0].current, { ...DEFAULTS, warnRatio: 0.6 });
   });
 
-  it("unconfigured server throws must-restart and mounts no getter", async () => {
-    const { relay } = makeRelay(undefined);
+  it("an unconfigured server enables on first revision and mounts the getter", async () => {
+    const { relay, audit } = makeRelay(undefined);
     await listen(relay);
     assert.equal(relay.getSloRiskConfig, undefined);
     assert.equal(typeof relay.reviseSloRisk, "function", "revise is always set");
-    assert.throws(() => relay.reviseSloRisk!({ warnRatio: 0.6 }), {
-      name: "Error",
-      message: MUST_RESTART,
-    });
+    // WR-473: the same call that used to throw must-restart now
+    // enables the predictor; the enable audits `previous: null`.
+    assert.deepEqual(relay.reviseSloRisk!({ warnRatio: 0.6 }), { ...DEFAULTS, warnRatio: 0.6 });
+    assert.deepEqual(relay.getSloRiskConfig!(), { ...DEFAULTS, warnRatio: 0.6 });
+    const revised = eventsOf(audit, "slo_risk_revised");
+    assert.equal(revised.length, 1);
+    assert.equal(revised[0].previous, null);
+    assert.deepEqual(revised[0].current, { ...DEFAULTS, warnRatio: 0.6 });
   });
 });

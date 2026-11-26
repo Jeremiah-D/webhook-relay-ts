@@ -152,11 +152,12 @@ function checkRatio(name: string, value: number | undefined, def: number, upperI
 
 /**
  * WR-347: validate SLO-risk options and fill in defaults — the single
- * validation path shared by construction and `retune()`, so a live
- * revision is checked by the same five gates (and the same error
- * text) as startup. Throws `RangeError` on any invalid value.
+ * validation path shared by construction, `retune()`, and the WR-473
+ * live enable in `RetryQueue.reviseSloRisk`, so a live revision or
+ * enable is checked by the same five gates (and the same error text)
+ * as startup. Throws `RangeError` on any invalid value.
  */
-function resolveSloRiskOptions(opts: SloRiskOptions): {
+export function resolveSloRiskOptions(opts: SloRiskOptions): {
   warnRatio: number;
   ewmaAlpha: number;
   minSamples: number;

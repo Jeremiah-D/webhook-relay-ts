@@ -624,7 +624,8 @@ reliability primitives that matter for any signed-payload pipeline.
   audited as `latency_phases_revised` with `previous` / `current`.
 - `src/slo-risk.ts` — SLO-breach prediction and early warning
   (`SloRiskPredictor`), opt-in under `retry.latency.sloRisk` (disabled by
-  default). Every `enqueue` and every delivered sample feeds a per-endpoint
+  default, but live-enableable via `reviseSloRisk` once latency tracking
+  is configured — WR-473). Every `enqueue` and every delivered sample feeds a per-endpoint
   observation; the score is `max(latencyPressure, backlogPressure)` where
   latency pressure is the rolling p95 against `sloMs` and backlog pressure
   is a forward queueing projection (backlog EWMA + smoothed trend ×
@@ -655,13 +656,27 @@ reliability primitives that matter for any signed-payload pipeline.
   the next `observe`. A same-value revision is a silent no-op; a
   real revision is audited as `slo_risk_revised` with `previous` /
   `current`. An illegal patch throws `RangeError` and leaves the
-  live values untouched. A predictor that was never configured
-  cannot be switched on at runtime — enabling it requires a
-  restart. Unlike WR-147 (which revises the error-budget burn-rate
+  live values untouched. A predictor that was never configured is
+  switched on with the same call — see **Live enable (WR-473)** below.
+  Unlike WR-147 (which revises the error-budget burn-rate
   alert — a post-hoc error-rate signal), this revises the SLO-breach
   *prediction* thresholds: it only changes when the relay warns
   early, never whether a delivery proceeds, and never the latency
   SLO budget itself (`sloMs` comes from the `observe` caller).
+- **Live enable (WR-473)** — the same `server.reviseSloRisk(patch)` call
+  also switches on a predictor that was never configured, no restart:
+  the patch is resolved against the construction defaults (0.8 / 0.2 /
+  3 / 0.7 / 3), so at least one knob must be set — an empty patch is a
+  `RangeError`, as is a non-object patch or an illegal knob value, and
+  the relay stays unconfigured. The predictor starts with empty
+  per-endpoint state: observations from before the enable are never
+  evaluated retroactively, and the enable is audited as
+  `slo_risk_revised` with `previous: null`. Enabling also unlocks
+  `reviseSloRiskCallback` (WR-407). It needs latency tracking — on a
+  relay without `latency` configured the call throws `Error` and the
+  relay stays unconfigured, because a predictor with no observation
+  channel would never fire. A restart restores the unconfigured
+  construction state.
 - **Live callback revision (WR-407)** — `server.reviseSloRiskCallback(cb)`
   swaps the SLO-risk observer at runtime, no restart (`null` clears
   back to audit-only: risk is still predicted and audited as
@@ -676,8 +691,9 @@ reliability primitives that matter for any signed-payload pipeline.
   replacement is audited as `slo_risk_callback_revised` with
   `previous` / `current` ('set' / 'cleared' presence only, never a
   function body). The five knobs themselves still move only through
-  `reviseSloRisk` (WR-347); a predictor that was never configured
-  cannot be switched on at runtime — enabling it requires a restart.
+  `reviseSloRisk` (WR-347); a predictor that was never configured is
+  switched on with `reviseSloRisk` (WR-473), which also unlocks this
+  callback gate.
 - `src/endpoint-health.ts` — outbound endpoint health scoring
   (`EndpointHealthTracker`), opt-in under `retry.endpointHealth`
   (disabled by default; an explicit server-level `endpointHealth` wins

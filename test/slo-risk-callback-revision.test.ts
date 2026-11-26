@@ -341,9 +341,11 @@ describe("RetryQueue.reviseSloRiskCallback (WR-407)", () => {
     }
   });
 
-  it("unconfigured queue throws must-restart; the gate precedes validation", async () => {
-    const q = new RetryQueue({ sender: async () => {} });
+  it("the callback gate stays closed until sloRisk is enabled, then opens", async () => {
+    const q = new RetryQueue({ sender: async () => {}, latency: { sloMs: 1000 } });
     try {
+      // No predictor yet: the gate is still fail-closed, and it
+      // precedes validation — even an illegal value throws Error.
       assert.equal(q.getSloRiskConfig(), undefined);
       assert.throws(() => q.reviseSloRiskCallback(() => {}), {
         name: "Error",
@@ -353,6 +355,14 @@ describe("RetryQueue.reviseSloRiskCallback (WR-407)", () => {
         name: "Error",
         message: MUST_RESTART,
       });
+      // WR-473: enabling sloRisk unlocks the gate — the callback
+      // replacement then works on the fresh predictor.
+      q.reviseSloRisk({ warnRatio: 0.6 });
+      const seen: SloRiskInfo[] = [];
+      q.reviseSloRiskCallback((info) => seen.push(info));
+      // A non-function callback now throws RangeError, not Error.
+      assert.throws(() => q.reviseSloRiskCallback("nope" as never), RangeError);
+      assert.deepEqual(seen, []);
     } finally {
       await q.shutdown();
     }
@@ -734,7 +744,7 @@ describe("RelayServer.reviseSloRiskCallback (WR-407)", () => {
     }
   });
 
-  it("unconfigured server throws must-restart and mounts no getter", async () => {
+  it("the callback gate opens once sloRisk is enabled", async () => {
     const dir = mkdtempSync(join(tmpdir(), "slo-risk-callback-revision-"));
     const audit = new AuditLog(join(dir, "audit.jsonl"));
     const relay = createRelayServer({
@@ -746,14 +756,25 @@ describe("RelayServer.reviseSloRiskCallback (WR-407)", () => {
       retry: { baseDelayMs: 10, jitterMs: 0, maxAttempts: 2, latency: { sloMs: 50 } },
     });
     servers.push(relay);
-    const port = await listen(relay);
+    await listen(relay);
     try {
       assert.equal(relay.getSloRiskConfig, undefined);
       assert.equal(typeof relay.reviseSloRiskCallback, "function", "revise is always set");
+      // No predictor yet: the gate is still fail-closed.
       assert.throws(() => relay.reviseSloRiskCallback!(() => {}), {
         name: "Error",
         message: MUST_RESTART,
       });
+      // WR-473: enabling sloRisk unlocks the gate — the replacement
+      // then works and audits exactly like the configured case.
+      relay.reviseSloRisk!({ warnRatio: 0.6 });
+      const seen: SloRiskInfo[] = [];
+      relay.reviseSloRiskCallback!((info) => seen.push(info));
+      const replaced = eventsOf(audit, "slo_risk_callback_revised");
+      assert.equal(replaced.length, 1);
+      assert.equal(replaced[0].previous, "cleared");
+      assert.equal(replaced[0].current, "set");
+      assert.deepEqual(seen, []);
     } finally {
       relay.close();
       await new Promise((r) => relay.once("close", r));

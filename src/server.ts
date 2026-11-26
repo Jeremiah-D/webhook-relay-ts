@@ -7803,12 +7803,18 @@ export interface RelayServer extends Server {
    * is audited as `slo_risk_revised` with `previous` / `current`
    * (the construction values as first `previous` — the defaults 0.8
    * / 0.2 / 3 / 0.7 / 3 when unset), and returns the live config.
-   * Always set; throws `Error` when `sloRisk` was never configured
-   * — enabling it needs a restart. This revises the SLO-breach
-   * prediction thresholds; WR-147 revises the error-budget burn-rate
-   * alert, WR-13 reports already-missed latency, and the latency SLO
-   * budget itself (`sloMs`) comes from the `observe` caller, not
-   * from this predictor's config.
+   * Always set. WR-473: when the predictor was never configured,
+   * the same call *enables* it — the patch is resolved against the
+   * construction defaults, a fresh predictor with empty per-endpoint
+   * state is installed (observations from before the enable are
+   * never evaluated), the enable is audited with `previous: null`,
+   * and the getter is mounted at the same time. Enabling needs
+   * latency tracking: without `latency` configured the call throws
+   * `Error` and the relay stays unconfigured. This revises the
+   * SLO-breach prediction thresholds; WR-147 revises the error-budget
+   * burn-rate alert, WR-13 reports already-missed latency, and the
+   * latency SLO budget itself (`sloMs`) comes from the `observe`
+   * caller, not from this predictor's config.
    */
   reviseSloRisk?: (patch: SloRiskRevision) => SloRiskConfig;
   /**
@@ -7823,9 +7829,10 @@ export interface RelayServer extends Server {
    * silent no-op. A real replacement is audited as
    * `slo_risk_callback_revised` with `previous` / `current` recording
    * only 'set' / 'cleared' presence, never a function body. Always
-   * set; throws `Error` when SLO-risk prediction was never configured
-   * — enabling it needs a restart. The new callback takes effect from
-   * the next risk-state transition; transitions already reported are
+   * set; throws `Error` while SLO-risk prediction was never
+   * configured — enable it first with `reviseSloRisk` (WR-473),
+   * which opens this gate the moment the predictor exists. The new
+   * callback takes effect from the next risk-state transition; transitions already reported are
    * never re-delivered, and the five knobs, the EWMA state, the
    * `atRisk` latch, the score, and the prediction are untouched. The
    * five knobs themselves still move only through `reviseSloRisk`
@@ -7836,7 +7843,9 @@ export interface RelayServer extends Server {
   reviseSloRiskCallback?: (cb: ((info: SloRiskInfo) => void) | null) => void;
   /**
    * WR-347: live SLO-breach prediction config — the five knobs.
-   * Only set when `sloRisk` was configured; `undefined` otherwise.
+   * Only set when `sloRisk` was configured — WR-473 mounts it from
+   * the enable path when the feature is enabled at runtime;
+   * `undefined` otherwise.
    */
   getSloRiskConfig?: () => SloRiskConfig | undefined;
   /**
@@ -11699,6 +11708,17 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // itself).
   let operatorSloRiskCallback: ((info: SloRiskInfo) => void) | undefined =
     latencyOpts?.sloRisk?.onSloRisk;
+  // WR-473: the `slo_risk` audit wrapper, named so the live-enable
+  // path in `server.reviseSloRisk` can install the same closure the
+  // construction path uses — every early-warning transition is
+  // audited as `slo_risk` (state "elevated" / "cleared"), not just
+  // observed. WR-407: it forwards to the operator cell, never to the
+  // constructor callback directly, so a live revision cannot bypass
+  // the audit.
+  const sloRiskAuditWrapper = (info: SloRiskInfo): void => {
+    opts.auditLog.append({ event: "slo_risk", ...info });
+    operatorSloRiskCallback?.(info);
+  };
   // WR-389: the operator's urgent-downgrade callback, held in a mutable
   // cell so `server.reviseUrgentDowngradedCallback` can replace it at
   // runtime. The audit wrapper below reads this cell — never the
@@ -12485,13 +12505,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
             ? {
                 sloRisk: {
                   ...latencyOpts.sloRisk,
-                  onSloRisk: (info) => {
-                    opts.auditLog.append({ event: "slo_risk", ...info });
-                    // WR-407: forward to the operator cell, never to the
-                    // constructor callback directly, so a live revision cannot
-                    // bypass the audit.
-                    operatorSloRiskCallback?.(info);
-                  },
+                  onSloRisk: sloRiskAuditWrapper,
                 },
               }
             : {}),
@@ -21670,22 +21684,44 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   };
 
   // WR-347: SLO-breach prediction knob runtime revision. The method
-  // is always set (like reviseErrorBudget above); with the predictor
-  // unconfigured the queue throws Error — enabling it needs a
-  // restart. A real revision is audited as `slo_risk_revised` with
-  // the previous and current five-knob config (the construction
-  // values as first `previous` — the defaults 0.8 / 0.2 / 3 / 0.7 /
-  // 3 when unset); an empty or same-value patch is a silent no-op.
-  // The revision takes effect on the next `observe`: the EWMA
-  // update, the cold-start gate, the forward projection, and the
-  // elevated/cleared gates all read the live values, while the
-  // accumulated EWMA state and the `atRisk` latch are untouched
-  // until the next observation re-evaluates them.
+  // is always set (like reviseErrorBudget above). WR-473: with the
+  // predictor unconfigured the same call *enables* it — the queue
+  // installs the predictor (an empty or illegal patch still throws
+  // RangeError there, leaving the server unconfigured; without
+  // latency tracking it throws Error), the `slo_risk` audit wrapper
+  // is installed as the queue's observer, the getter is mounted at
+  // the same time, and the enable is audited as `slo_risk_revised`
+  // with `previous: null`. A real revision is audited as
+  // `slo_risk_revised` with the previous and current five-knob
+  // config (the construction values as first `previous` — the
+  // defaults 0.8 / 0.2 / 3 / 0.7 / 3 when unset); an empty or
+  // same-value patch is a silent no-op. The revision takes effect
+  // on the next `observe`: the EWMA update, the cold-start gate,
+  // the forward projection, and the elevated/cleared gates all read
+  // the live values, while the accumulated EWMA state and the
+  // `atRisk` latch are untouched until the next observation
+  // re-evaluates them.
   server.reviseSloRisk = (patch: SloRiskRevision): SloRiskConfig => {
     const prev = queue.getSloRiskConfig();
     if (prev === undefined) {
-      // Delegates to the queue for the canonical "must restart" Error.
-      return queue.reviseSloRisk(patch);
+      // WR-473: enable — the queue installs the predictor (an empty
+      // or illegal patch still throws RangeError there, leaving the
+      // server unconfigured; without latency tracking it throws
+      // Error). Install the audit wrapper so transitions after the
+      // enable are still audited as `slo_risk` and still reach the
+      // operator callback — without it the predictor would alert into
+      // the void and `reviseSloRiskCallback` would swap a cell nobody
+      // reads. Then mount the getter and audit the enable with
+      // `previous: null`.
+      const next = queue.reviseSloRisk(patch);
+      queue.reviseSloRiskCallback(sloRiskAuditWrapper);
+      server.getSloRiskConfig = (): SloRiskConfig => queue.getSloRiskConfig()!;
+      opts.auditLog.append({
+        event: "slo_risk_revised",
+        previous: null,
+        current: next,
+      });
+      return next;
     }
     // Validate-then-apply inside retune: an illegal patch throws
     // RangeError and the live values are left completely intact.
@@ -21709,8 +21745,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
 
   // WR-407: live SLO-risk observer revision. The method is always set;
   // with the predictor unconfigured the queue throws the canonical
-  // "must restart" Error (delegated below, exactly like WR-347's
-  // reviseSloRisk gate). Only the operator cell moves: the queue's audit
+  // Error (delegated below — enable the predictor first with
+  // `reviseSloRisk`, WR-473). Only the operator cell moves: the queue's audit
   // wrapper (which appends `slo_risk` first, then forwards to the
   // cell) is never touched, so a replacement cannot bypass the audit.
   // A non-function callback throws `RangeError` and the live cell is
@@ -21745,7 +21781,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   };
 
   // WR-347: live SLO-breach prediction config. Only set when
-  // `sloRisk` was configured.
+  // `sloRisk` was configured — WR-473 mounts it from the enable
+  // path when the feature is enabled at runtime.
   if (queue.getSloRiskConfig() !== undefined) {
     server.getSloRiskConfig = (): SloRiskConfig => queue.getSloRiskConfig()!;
   }

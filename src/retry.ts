@@ -127,6 +127,7 @@ import {
 } from "./latency.ts";
 import {
   SloRiskPredictor,
+  resolveSloRiskOptions,
   type SloRiskConfig,
   type SloRiskInfo,
   type SloRiskObservation,
@@ -13205,18 +13206,54 @@ export class RetryQueue {
    * until the next observation re-evaluates it. An illegal patch
    * throws `RangeError` and the live values are untouched; an empty
    * patch is a `RangeError`; revising to the live values is a no-op.
-   * Throws `Error` when SLO-risk prediction was never configured —
-   * enabling it needs a restart. The one config is shared by all
-   * tenants: every live per-tenant predictor is retuned in place
-   * (they all share one live config, so a single validation covers
-   * them all), and tenants born later start from the revised values.
-   * Returns the live config.
+   * The one config is shared by all tenants: every live per-tenant
+   * predictor is retuned in place (they all share one live config,
+   * so a single validation covers them all), and tenants born later
+   * start from the revised values. Returns the live config.
+   *
+   * WR-473: when the predictor was never configured, the same call
+   * *enables* it instead of throwing: the patch is validated with
+   * the construction-time rules (an empty or non-object patch is a
+   * `RangeError`, same as `retune`), missing knobs take the
+   * construction defaults (0.8 / 0.2 / 3 / 0.7 / 3), and the
+   * per-tenant predictors start empty — observations from before the
+   * enable were never fed in and are never evaluated retroactively;
+   * the cold-start gate counts from the enable. Enabling needs
+   * latency tracking: the predictor nests under it (`evaluateSloRisk`
+   * returns early without a latency tracker), so a queue without
+   * latency throws `Error` and stays unconfigured — enabling a
+   * predictor that could never observe would be a silent no-op.
+   * Enabling also unlocks `reviseSloRiskCallback`. No persistence: a
+   * restart returns to unconfigured — the enable is live-only.
    */
   reviseSloRisk(patch: SloRiskRevision): SloRiskConfig {
     if (this.sloRiskOpts === undefined) {
-      throw new Error(
-        "reviseSloRisk: SLO risk prediction is not configured — enabling it requires a restart"
-      );
+      // WR-473: enable — the same patch guards as `retune`, then the
+      // construction resolver (missing fields take the defaults).
+      // Validation throws before anything is assigned, so an illegal
+      // patch leaves the queue unconfigured — still enableable
+      // afterwards. The latency gate comes first: without latency
+      // tracking there is no observation channel to enable.
+      if (!this.latencyConfigured()) {
+        throw new Error(
+          "reviseSloRisk: latency tracking is not configured — enable latency tracking first"
+        );
+      }
+      if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+        throw new RangeError(`sloRisk revision must be an object, got ${JSON.stringify(patch)}`);
+      }
+      if (Object.keys(patch).length === 0) {
+        throw new RangeError("sloRisk revision must not be empty");
+      }
+      const resolved = resolveSloRiskOptions(patch);
+      this.sloRiskOpts = resolved;
+      return {
+        warnRatio: resolved.warnRatio,
+        ewmaAlpha: resolved.ewmaAlpha,
+        minSamples: resolved.minSamples,
+        clearRatio: resolved.clearRatio,
+        trendHorizon: resolved.trendHorizon,
+      };
     }
     // Retune the default tenant's predictor first so the returned
     // config is the live one (sloRiskFor creates it lazily when
@@ -13244,7 +13281,9 @@ export class RetryQueue {
    * non-function value throws `RangeError` and the live callback is
    * untouched; replacing with the same reference (or clearing when
    * already unset) is a no-op. Throws `Error` when SLO-risk
-   * prediction was never configured — enabling it needs a restart.
+   * prediction was never configured — enable it first with
+   * `reviseSloRisk` (WR-473), which opens this gate the moment the
+   * predictor exists.
    * Every live per-tenant predictor is swapped in place (each holds
    * a tenant-attaching closure built at construction), and
    * `sloRiskOpts` is updated so tenants born later start from the
