@@ -14935,21 +14935,24 @@ export class RetryQueue {
    * directory's tail — receipts journaled to a previous directory
    * are not recovered — and restores the construction directory
    * (live-only). Throws `Error` when delivery receipts were never
-   * configured, and the same `Error` when receipts are configured
-   * but no journal was — switching a journal on from nothing is
-   * enabling, not revising, and needs a restart (WR-470 owns the
-   * enable family). Only the journal directory moves: the callbacks,
-   * `maxEntries`, the clock, and the receipt shape are untouched.
-   * The queue itself holds no audit log — the server audits a real
-   * revision as `delivery_receipt_journal_dir_revised`.
+   * configured.
+   *
+   * WR-470: when receipts are configured but no journal was, this
+   * same setter now *enables* the journal instead of throwing: the
+   * directory is validated before installing (a bad directory throws
+   * `RangeError` and the store stays journal-less, still enableable
+   * afterwards), created best-effort, adopted, and its existing
+   * journal tail is recovered into the ring (bounded by
+   * `maxEntries`, oldest evicted first, evicted count joining
+   * `dropped`). The enable takes effect from the next `record`, and
+   * a restart restores the journal-less construction state. Only the
+   * journal directory moves: the callbacks, `maxEntries`, the clock,
+   * and the receipt shape are untouched. The queue itself holds no
+   * audit log — the server audits a real revision (and an enable, as
+   * `previous: null`) as `delivery_receipt_journal_dir_revised`.
    */
   reviseDeliveryReceiptJournalDir(journalDir: string): void {
     if (this.deliveryReceipts === undefined) {
-      throw new Error(
-        "reviseDeliveryReceiptJournalDir: delivery receipts are not configured — enabling them requires a restart"
-      );
-    }
-    if (this.deliveryReceipts.getJournalDir() === undefined) {
       throw new Error(
         "reviseDeliveryReceiptJournalDir: delivery receipts are not configured — enabling them requires a restart"
       );

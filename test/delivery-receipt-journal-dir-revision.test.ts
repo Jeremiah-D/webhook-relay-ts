@@ -132,7 +132,7 @@ describe("DeliveryReceiptStore journal directory revision (WR-469)", () => {
     assert.equal(store.getJournalDir(), dir2);
   });
 
-  it("a missing directory is created on switch; a store without a journal cannot switch one on", () => {
+  it("a missing directory is created on switch; a store without a journal enables one (WR-470)", () => {
     const dir1 = freshDir();
     const parent = freshDir();
     const dir2 = join(parent, "nested", "journal");
@@ -142,13 +142,15 @@ describe("DeliveryReceiptStore journal directory revision (WR-469)", () => {
     assert.equal(existsSync(dir2), true);
     store.record(receipt("r1"));
     assert.deepEqual(journalIds(dir2), ["r1"]);
-    // Enabling is not revising: a journal-less store throws Error.
+    // WR-470: enabling is no longer an Error — a journal-less store
+    // adopts the directory and journals from the next record.
     const bare = new DeliveryReceiptStore({ maxEntries: 5 });
     assert.equal(bare.getJournalDir(), undefined);
-    assert.throws(
-      () => bare.setJournalDir(dir2),
-      (e: unknown) => e instanceof Error && /not configured/.test(e.message)
-    );
+    bare.record(receipt("r0"));
+    bare.setJournalDir(dir2);
+    assert.equal(bare.getJournalDir(), dir2);
+    bare.record(receipt("r9"));
+    assert.deepEqual(journalIds(dir2), ["r1", "r9"]);
   });
 
   it("a restart recovers only the new journal's tail; old-file receipts are not recovered", () => {
@@ -222,7 +224,7 @@ describe("RetryQueue delivery receipt journal directory revision (WR-469)", () =
     }
   });
 
-  it("unconfigured receipts and a journal-less configuration throw Error; illegal dirs throw RangeError", async () => {
+  it("unconfigured receipts throw Error; illegal dirs throw RangeError; a journal-less configuration enables (WR-470)", async () => {
     const dir1 = freshDir();
     const dir2 = freshDir();
     const { q, t } = makeQueue(dir1);
@@ -263,10 +265,10 @@ describe("RetryQueue delivery receipt journal directory revision (WR-469)", () =
     try {
       assert.equal(noJournal.deliveryReceiptsConfigured(), true);
       assert.equal(noJournal.getDeliveryReceiptJournalDir(), undefined);
-      assert.throws(
-        () => noJournal.reviseDeliveryReceiptJournalDir(dir2),
-        (e: unknown) => e instanceof Error && /not configured/.test(e.message)
-      );
+      // WR-470: a journal-less configuration enables via the same
+      // setter instead of throwing.
+      noJournal.reviseDeliveryReceiptJournalDir(dir2);
+      assert.equal(noJournal.getDeliveryReceiptJournalDir(), dir2);
     } finally {
       noJournal.stop();
     }
@@ -324,7 +326,7 @@ describe("RelayServer delivery receipt journal directory revision (WR-469)", () 
     assert.equal(revised[1].current, dir3);
   });
 
-  it("a same-directory revision is a silent no-op; an illegal dir throws and audits nothing; unconfigured throws Error", () => {
+  it("a same-directory revision is a silent no-op; an illegal dir throws and audits nothing; unconfigured throws Error; a journal-less server enables (WR-470)", () => {
     const dir1 = freshDir();
     const dir2 = freshDir();
     const { relay, auditLog } = receiptServer(dir1);
@@ -350,15 +352,16 @@ describe("RelayServer delivery receipt journal directory revision (WR-469)", () 
       (e: unknown) => e instanceof Error && /not configured/.test(e.message)
     );
     assert.equal(eventsOf(bare.auditLog, "delivery_receipt_journal_dir_revised").length, 0);
-    // Receipts configured but journal-less: the same Error, no audit.
+    // Receipts configured but journal-less: WR-470 enables via the
+    // same setter and audits previous: null.
     const noJournal = makeServer({
       retry: { baseDelayMs: 1, maxDelayMs: 5, jitterMs: 0, maxAttempts: 1 },
       deliveryReceipts: { maxEntries: 5 },
     });
-    assert.throws(
-      () => noJournal.relay.reviseDeliveryReceiptJournalDir!(dir2),
-      (e: unknown) => e instanceof Error && /not configured/.test(e.message)
-    );
-    assert.equal(eventsOf(noJournal.auditLog, "delivery_receipt_journal_dir_revised").length, 0);
+    noJournal.relay.reviseDeliveryReceiptJournalDir!(dir2);
+    const enabled = eventsOf(noJournal.auditLog, "delivery_receipt_journal_dir_revised");
+    assert.equal(enabled.length, 1);
+    assert.equal(enabled[0].previous, null);
+    assert.equal(enabled[0].current, dir2);
   });
 });

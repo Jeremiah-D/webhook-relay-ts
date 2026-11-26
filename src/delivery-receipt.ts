@@ -142,11 +142,8 @@ export class DeliveryReceiptStore {
    * WR-469: move the journal directory live — the store-side setter
    * behind `RetryQueue.reviseDeliveryReceiptJournalDir`. A non-string
    * or empty directory throws `RangeError` (same check as the
-   * constructor) and the live path is left completely untouched; a
-   * directory that was never configured throws `Error` — switching
-   * the journal on from nothing is enabling, not revising, and needs
-   * a restart (WR-470 owns the enable family). A missing directory
-   * is created best-effort, as at construction. The switch takes
+   * constructor) and the live path is left completely untouched. A
+   * missing directory is created best-effort, as at construction. The switch takes
    * effect from the next `record`: the old journal file is never
    * rewritten and never deleted — it stays on disk as the archive —
    * receipts already written there are not migrated and not replayed,
@@ -155,13 +152,23 @@ export class DeliveryReceiptStore {
    * are the same directory) is a silent no-op. A restart recovers
    * only the current directory's tail — receipts journaled to a
    * previous directory are not recovered.
+   *
+   * WR-470: the "never configured" Error above is gone — calling
+   * this on a journal-less store now *enables* the journal instead
+   * of throwing (the whole-store gate, receipts never configured at
+   * all, still lives in the queue layer). The enable validates
+   * before installing, creates the directory best-effort, adopts the
+   * path, and then `recover()`s the new journal's tail into the ring
+   * — receipts already on disk are not lost. The recover can push
+   * the ring past `maxEntries` (the ring may already hold live
+   * receipts recorded while the journal was off), so the enable
+   * trims the oldest receipts back to the bound and the trimmed
+   * count joins `dropped`, exactly as over-capacity eviction in
+   * `record` — the ring invariant `stored <= maxEntries` holds at
+   * all times. A restart restores the construction state (journal
+   * off) — the enable is live-only.
    */
   setJournalDir(journalDir: string): void {
-    if (this.journalPath === undefined) {
-      throw new Error(
-        "deliveryReceipts.journalDir: journal is not configured — enabling it requires a restart"
-      );
-    }
     if (typeof journalDir !== "string" || journalDir.length === 0) {
       throw new RangeError("deliveryReceipts.journalDir must be a non-empty string");
     }
@@ -173,8 +180,20 @@ export class DeliveryReceiptStore {
       // created the new path is still adopted and journal writes fail
       // silently per `record` — the in-memory ring still works.
     }
+    const enabling = this.journalPath === undefined;
     this.journalDir = journalDir;
     this.journalPath = join(journalDir, JOURNAL_FILE);
+    if (enabling) {
+      // WR-470: pull the new journal's tail into the ring, as the
+      // constructor does — then re-assert the ring bound (see the
+      // doc comment above).
+      this.recover();
+      if (this.ring.length > this.maxEntries) {
+        const removed = this.ring.length - this.maxEntries;
+        this.ring.splice(0, removed);
+        this.dropped += removed;
+      }
+    }
   }
 
   /** WR-468: the live ring bound. `record` / `recover` read this on

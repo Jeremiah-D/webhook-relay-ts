@@ -4402,13 +4402,26 @@ const queue = new RetryQueue({
   missing directory is created. A non-string or empty directory
   throws `RangeError` and the live path is untouched, and revising to
   the same directory (compared after `join`) is a silent no-op. With
-  receipts never configured the call throws `Error`, as it does when
-  receipts are configured but no journal was — switching a journal on
-  from nothing is enabling, not revising, and needs a restart. A real
+  receipts never configured the call throws `Error`. A real
   revision is audited as `delivery_receipt_journal_dir_revised` with
   `previous` / `current` recording the directory strings. After a
   restart, recovery reads only the current directory's tail — receipts
   journaled to a previous directory are not recovered.
+- **Live enable (WR-470)** — when receipts are configured but no
+  journal was, the same `reviseDeliveryReceiptJournalDir(journalDir)`
+  call *enables* the journal instead of throwing: the directory is
+  validated before installing (a non-string or empty directory throws
+  `RangeError` and the relay stays journal-less, still enableable
+  afterwards), created if missing, adopted, and its existing journal
+  tail is recovered into the ring — receipts already on disk are not
+  lost. The recover can push the ring past `maxEntries` (the ring may
+  already hold live receipts), so the oldest receipts are evicted back
+  to the bound and the evicted count joins `dropped`, exactly as with
+  over-capacity eviction. The enable takes effect from the next record
+  and is audited as `delivery_receipt_journal_dir_revised` with
+  `previous: null`. A restart restores the journal-less construction
+  state — the enable is live-only. Enabling the whole receipt store
+  from nothing still needs a restart (WR-471 owns that).
 
 ## Per-tenant monthly delivery budgets
 
