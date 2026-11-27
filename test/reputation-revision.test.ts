@@ -229,14 +229,29 @@ describe("RelayServer sender reputation revision (WR-379)", () => {
     });
   });
 
-  it("unconfigured relay: revise is always set but throws the must-restart Error, and the getter is not mounted", async () => {
-    const { relay } = makeRelay();
+  it("unconfigured relay: revise enables scoring, mounts the getter, and audits previous null (WR-480)", async () => {
+    const { relay, audit } = makeRelay();
     await listen(relay);
     assert.equal(typeof relay.reviseSenderReputation, "function");
     assert.equal(relay.getSenderReputationConfig, undefined);
-    assert.throws(
-      () => relay.reviseSenderReputation!({ lowThreshold: 30 }),
-      /reviseSenderReputation: sender reputation is not configured — enabling it requires a restart/
-    );
+    assert.deepEqual(relay.reviseSenderReputation!({ lowThreshold: 30 }), {
+      ...construction,
+      lowThreshold: 30,
+    });
+    assert.deepEqual(relay.getSenderReputationConfig!(), {
+      ...construction,
+      lowThreshold: 30,
+    });
+    const revised = eventsOf(audit, "sender_reputation_revised");
+    assert.equal(revised.length, 1);
+    assert.equal(revised[0].previous, null);
+    assert.deepEqual(revised[0].current, { ...construction, lowThreshold: 30 });
+    // The WR-379 chain keeps working after the enable.
+    assert.deepEqual(relay.reviseSenderReputation!({ verifyFailurePenalty: 10 }), {
+      ...construction,
+      lowThreshold: 30,
+      verifyFailurePenalty: 10,
+    });
+    assert.equal(eventsOf(audit, "sender_reputation_revised").length, 2);
   });
 });

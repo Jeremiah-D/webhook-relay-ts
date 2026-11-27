@@ -306,6 +306,7 @@ import { InboundApiKeyAuth, type ApiKeyOptions, type EndpointApiKeyRule } from "
 import {
   SenderReputationTracker,
   assertValidReputationOptions,
+  reputationConfigOf,
   type ReputationConfig,
   type ReputationOptions,
   type ReputationPenaltyKind,
@@ -6770,8 +6771,16 @@ export interface RelayServer extends Server {
    * same-value revision is a no-op with no audit event. A real
    * revision is audited as `sender_reputation_revised` with
    * `previous` / `current` (all six knobs), and returns the live
-   * config. Always set; throws `Error` when `senderReputation` was
-   * never configured — enabling it needs a restart. Orthogonal to
+   * config. Always set; WR-480: with `senderReputation` never
+   * configured the same call *enables* scoring (a fresh tracker is
+   * built with the construction defaults, retuned with the patch,
+   * and mounted with the getter and the WR-119 tightening helpers;
+   * the enable audits as `sender_reputation_revised` with
+   * `previous: null`); an empty patch on an unconfigured relay is a
+   * silent no-op reporting the construction defaults, and an illegal
+   * patch throws `RangeError` leaving the relay unconfigured. A
+   * restart restores the unconfigured construction state (live-only).
+   * Orthogonal to
    * WR-119 (which owns the scoring mechanism itself), WR-359 (which
    * revises the outbound endpoint-health knobs), WR-357 (which
    * revises the inbound fail2ban thresholds), and WR-361 (which
@@ -6780,8 +6789,9 @@ export interface RelayServer extends Server {
   reviseSenderReputation?: (patch: SenderReputationRevision) => ReputationConfig;
   /**
    * WR-379: live inbound sender reputation config — the six scoring
-   * knobs. Only set when `senderReputation` was configured;
-   * `undefined` otherwise.
+   * knobs. Only set when `senderReputation` was configured — WR-480
+   * mounts it from the enable path when scoring is enabled at
+   * runtime; `undefined` otherwise.
    */
   getSenderReputationConfig?: () => ReputationConfig | undefined;
   /**
@@ -13331,14 +13341,17 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // unset means the tracker is never constructed and intake is
   // byte-identical.
   assertValidReputationOptions(opts.senderReputation);
-  const reputation =
+  let reputation =
     opts.senderReputation !== undefined ? new SenderReputationTracker(opts.senderReputation) : undefined;
   // WR-119 tightening (c): degraded senders admit through a second,
   // doubled dedup window. Built only when dedup itself is configured —
   // otherwise there is no window to lengthen — and in-memory only (no
   // journal, no custom store): the tightening path must never share the
-  // base window's durability state.
-  const tightenedDeduplicator =
+  // base window's durability state. WR-480: factored so the enable
+  // path installs the identical helper when scoring is enabled at
+  // runtime — a relay enabled live must tighten exactly like one
+  // configured at startup.
+  const buildTightenedDeduplicator = (): DeliveryDeduplicator | undefined =>
     reputation !== undefined && opts.dedup !== undefined
       ? new DeliveryDeduplicator({
           windowMs: (opts.dedup.windowMs ?? 300_000) * 2,
@@ -13346,16 +13359,19 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
           now: opts.dedup.now,
         })
       : undefined;
+  let tightenedDeduplicator = buildTightenedDeduplicator();
   // WR-119 tightening (a): the degraded-sender budget is half the
   // configured inbound budget (per-IP first, else per-endpoint). Unset
   // when no inbound rate limiter is configured — halving "no budget" is
   // meaningless, so the tightening is a documented no-op there.
-  const tightenedBudgetPerSecond =
+  // WR-480: factored like the (c) helper above, for the enable path.
+  const buildTightenedBudgetPerSecond = (): number | undefined =>
     reputation !== undefined && opts.rateLimit !== undefined
       ? (opts.rateLimit.perIpPerSecond ?? opts.rateLimit.perEndpointPerSecond) !== undefined
         ? ((opts.rateLimit.perIpPerSecond ?? opts.rateLimit.perEndpointPerSecond) as number) / 2
         : undefined
       : undefined;
+  let tightenedBudgetPerSecond = buildTightenedBudgetPerSecond();
   // Scoped operator API keys (WR-82): validated once at startup so a bad
   // scope, empty id/key, or duplicate id/key can never fail a request
   // mid-flight. WR-156 wraps the ring in OperatorKeyRing so a
@@ -19886,19 +19902,69 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   }
 
   // WR-379: inbound sender reputation six-knob runtime revision. The
-  // method is always set (like reviseEndpointHealth above); with
-  // senderReputation unconfigured the canonical must-restart Error is
-  // thrown — enabling it needs a restart. A real revision is audited
-  // as `sender_reputation_revised` with the previous and current
-  // config (all six knobs, the construction values as first
-  // `previous`); an empty patch throws RangeError inside retune; a
-  // same-value revision is a silent no-op.
+  // method is always set (like reviseEndpointHealth above); WR-480:
+  // with `senderReputation` unconfigured the same call *enables*
+  // scoring — a fresh tracker is built with the construction defaults,
+  // retuned with the patch (so an illegal patch throws `RangeError`
+  // inside retune and the relay stays unconfigured, still enableable
+  // afterwards), and mounted together with the getter and the WR-119
+  // tightening helpers, so a relay enabled live tightens exactly like
+  // one configured at startup; the enable is audited as
+  // `sender_reputation_revised` with `previous: null`. An empty patch
+  // on an unconfigured relay is a silent no-op (it reports the
+  // construction defaults but enables nothing); a non-object patch
+  // throws `RangeError`. A restart restores the unconfigured
+  // construction state (live-only). A real revision is audited as
+  // `sender_reputation_revised` with the previous and current config
+  // (all six knobs, the construction values as first `previous`); an
+  // empty patch throws RangeError inside retune; a same-value revision
+  // is a silent no-op.
   server.reviseSenderReputation = (patch: SenderReputationRevision): ReputationConfig => {
     if (reputation === undefined) {
-      throw new Error(
-        "reviseSenderReputation: sender reputation is not configured — enabling it requires a restart: " +
-          "the tracker is created at startup and a running relay cannot start scoring senders without one"
-      );
+      // WR-480: enable — validate first, mirroring the `retune`
+      // gates, so an illegal patch throws `RangeError` and the relay
+      // stays unconfigured (and can still be enabled afterwards).
+      // The tracker is built with the construction defaults and then
+      // retuned, so the merged values pass the same gates as a
+      // startup-configured tracker; the throwaway is discarded on
+      // failure, so a rejected enable leaves nothing behind.
+      if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+        throw new RangeError(
+          `sender reputation revision must be an object, got ${JSON.stringify(patch)}`
+        );
+      }
+      if (
+        patch.halfLifeMs === undefined &&
+        patch.lowThreshold === undefined &&
+        patch.highThreshold === undefined &&
+        patch.verifyFailurePenalty === undefined &&
+        patch.rateLimitPenalty === undefined &&
+        patch.schemaViolationPenalty === undefined
+      ) {
+        // An empty patch enables nothing: report the construction
+        // defaults, mount nothing, audit nothing.
+        return reputationConfigOf({});
+      }
+      const enabled = new SenderReputationTracker({});
+      const next = enabled.retune(patch);
+      reputation = enabled;
+      // The intake closures, metrics render, and audit helpers read
+      // the live `reputation` variable, so scoring and the forced
+      // signature check (tightening (b)) take effect from the next
+      // request; install the (a)/(c) tightening helpers too, so a
+      // relay enabled live tightens exactly like one configured at
+      // startup (dedup window doubled, budget halved, both from the
+      // live options).
+      tightenedDeduplicator = buildTightenedDeduplicator();
+      tightenedBudgetPerSecond = buildTightenedBudgetPerSecond();
+      // Mount the getter at the same time (WR-448 / WR-466 precedent).
+      server.getSenderReputationConfig = (): ReputationConfig => reputation!.snapshot();
+      opts.auditLog.append({
+        event: "sender_reputation_revised",
+        previous: null,
+        current: next,
+      });
+      return next;
     }
     const prev = reputation.snapshot();
     // Validate-then-apply inside retune: an illegal patch throws
@@ -19923,7 +19989,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   };
 
   // WR-379: live inbound sender reputation config. Only set when
-  // `senderReputation` was configured.
+  // `senderReputation` was configured — WR-480 mounts it from the
+  // enable path when scoring is enabled at runtime.
   if (reputation !== undefined) {
     server.getSenderReputationConfig = (): ReputationConfig => reputation.snapshot();
   }

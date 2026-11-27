@@ -13160,8 +13160,16 @@ createRelayServer({
   would leave `lowThreshold >= highThreshold` after merging) throws
   `RangeError` and the live values are untouched; a same-value patch is a
   silent no-op. A real revision audits as `sender_reputation_revised`
-  with `previous` / `current` (all six knobs). Unconfigured, the method
-  throws the must-restart `Error` — enabling scoring needs a restart.
+  with `previous` / `current` (all six knobs). Unconfigured, the same
+  call *enables* scoring (WR-480): a fresh tracker is built with the
+  construction defaults, retuned with the patch, and mounted with the
+  getter and the WR-119 tightening helpers, so a relay enabled live
+  tightens exactly like one configured at startup; the enable audits as
+  `sender_reputation_revised` with `previous: null`. An empty patch on
+  an unconfigured relay is a silent no-op reporting the construction
+  defaults; an illegal patch throws `RangeError` and the relay stays
+  unconfigured, still enableable afterwards. A restart restores the
+  unconfigured construction state.
   Unlike WR-359 (outbound endpoint health), this is the *inbound* trust
   valve; unlike WR-357 (fail2ban), it revises the scoring knobs, not the
   ban thresholds.
