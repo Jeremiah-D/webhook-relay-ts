@@ -12177,8 +12177,12 @@ const queue = new RetryQueue({
   accumulating. A real revision is audited as `max_followers_revised`
   with `previous` / `current`; a same-value revision is a silent
   no-op, an illegal value throws `RangeError` and leaves the live
-  value intact. Revising when coalescing was never configured throws —
-  enabling it needs a restart. The one bound is shared by all
+  value intact. Calling it when coalescing was never configured
+  enables it live instead (WR-475): a fresh coalescer with the given
+  bound is installed, the getter is mounted, and the enable is audited
+  as `max_followers_revised` with `previous: null` — deliveries
+  already underway are never retroactively merged, and a restart
+  restores the unconfigured state. The one bound is shared by all
   endpoints and tenants, and by the main path and the shadow mirrors.
   This is the merge fan-in cap; WR-91 is the merging mechanism itself.
 - **Combinations** — coalescing wraps the fully composed sender, so the

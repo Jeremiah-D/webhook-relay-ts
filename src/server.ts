@@ -6895,17 +6895,21 @@ export interface RelayServer extends Server {
    * real revision is audited as `max_followers_revised` with
    * `previous` / `current` (the construction value — or `Infinity`
    * when unset — as first `previous`), and returns the live bound.
-   * Always set; throws `Error` when coalescing was never configured —
-   * enabling it needs a restart. The one bound is shared by all
-   * endpoints and tenants, and by the main path and the shadow
-   * mirrors. This revises the merge fan-in cap; WR-91 is the merging
-   * mechanism itself, WR-336 the opposite-direction valve (hedging
-   * duplicates attempts, coalescing reuses them).
+   * Always set; WR-475: when coalescing was never configured the same
+   * call enables it — the queue builds a fresh coalescer with the
+   * given bound, the getter is mounted at the same time, and the
+   * enable is audited as `max_followers_revised` with `previous:
+   * null`. The one bound is shared by all endpoints and tenants, and
+   * by the main path and the shadow mirrors. This revises the merge
+   * fan-in cap; WR-91 is the merging mechanism itself, WR-336 the
+   * opposite-direction valve (hedging duplicates attempts, coalescing
+   * reuses them).
    */
   reviseMaxFollowers?: (maxFollowers: number) => number;
   /**
    * WR-348: live coalescing follower bound. Only set when `coalesce`
-   * was configured; `undefined` otherwise.
+   * was configured, or once `reviseMaxFollowers` (WR-475) has enabled
+   * it at runtime; `undefined` otherwise.
    */
   getMaxFollowers?: () => number | undefined;
   /**
@@ -20063,17 +20067,34 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   }
 
   // WR-348: coalescing follower-bound runtime revision. The method is
-  // always set (like reviseSlowStart above); with coalescing
-  // unconfigured the queue throws Error — enabling it needs a restart.
-  // A real revision is audited as `max_followers_revised` with the
-  // previous and current bound (the construction value — or `Infinity`
-  // when unset — as first `previous`); a same-value revision is a
-  // silent no-op.
+  // always set (like reviseSlowStart above); WR-475: with coalescing
+  // unconfigured the same call *enables* it — the queue builds a fresh
+  // coalescer (an illegal value throws RangeError there, leaving the
+  // relay unconfigured), the getter is mounted at the same time, and
+  // the enable is audited as `max_followers_revised` with `previous:
+  // null`. No rewiring is needed here: the queue owns the sender
+  // re-wrap, so deliveries after the enable merge through the same
+  // coalescer on the main path and the shadow mirrors alike, and
+  // deliveries already underway are never retroactively merged. A real
+  // revision is audited as `max_followers_revised` with the previous
+  // and current bound (the construction value — or `Infinity` when
+  // unset — as first `previous`); a same-value revision is a silent
+  // no-op.
   server.reviseMaxFollowers = (maxFollowers: number): number => {
     const prev = queue.getMaxFollowers();
     if (prev === undefined) {
-      // Delegates to the queue for the canonical "must restart" Error.
-      return queue.reviseMaxFollowers(maxFollowers);
+      // WR-475: enable — the queue builds the fresh coalescer (an
+      // illegal value throws RangeError there, leaving the relay
+      // unconfigured). Mount the getter and audit the enable with
+      // `previous: null`.
+      const next = queue.reviseMaxFollowers(maxFollowers);
+      server.getMaxFollowers = (): number => queue.getMaxFollowers()!;
+      opts.auditLog.append({
+        event: "max_followers_revised",
+        previous: null,
+        current: next,
+      });
+      return next;
     }
     // Validate-then-apply inside retune: an illegal value throws
     // RangeError and the live value is left completely intact.
@@ -20090,7 +20111,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   };
 
   // WR-348: live coalescing follower bound. Only set when `coalesce`
-  // was configured.
+  // was configured — WR-475 mounts it from the enable path when
+  // coalescing is enabled at runtime.
   if (queue.getMaxFollowers() !== undefined) {
     server.getMaxFollowers = (): number => queue.getMaxFollowers()!;
   }

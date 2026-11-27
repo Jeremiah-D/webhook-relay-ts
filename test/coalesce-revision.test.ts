@@ -181,14 +181,44 @@ describe("coalesce revision: OutboundCoalescer live maxFollowers (WR-348)", () =
 });
 
 describe("coalesce revision: RetryQueue (WR-348)", () => {
-  it("unconfigured queue: revise throws the must-restart Error and the getter is undefined", () => {
-    const q = new RetryQueue({ sender: async () => okResponse });
-    assert.equal(q.getMaxFollowers(), undefined);
-    assert.throws(
-      () => q.reviseMaxFollowers(2),
-      /reviseMaxFollowers: request coalescing is not configured — enabling it requires a restart/
-    );
-    assert.equal(q.getMaxFollowers(), undefined);
+  it("unconfigured queue: revise enables coalescing live and the getter follows", async () => {
+    const { inner, calls, release, arm } = gatedSender();
+    let delivered = 0;
+    const q = new RetryQueue({
+      sender: inner,
+      onDelivered: () => { delivered++; },
+    });
+    q.start();
+    try {
+      assert.equal(q.getMaxFollowers(), undefined);
+      assert.equal(q.getCoalesceStats(), undefined);
+      // WR-475: the same call that used to throw now enables.
+      assert.equal(q.reviseMaxFollowers(2), 2);
+      assert.equal(q.getMaxFollowers(), 2);
+      assert.equal(q.getCoalesceStats()?.physicalAttempts, 0);
+      // The enabled bound merges followers like a constructed one.
+      q.enqueue(item("a"));
+      q.enqueue(item("b"));
+      q.enqueue(item("c"));
+      await waitFor(() => calls() === 1);
+      await sleep(30); // let the followers attach while the attempt is in flight
+      release();
+      await waitFor(() => delivered === 3);
+      assert.equal(calls(), 1);
+      assert.equal(q.getCoalesceStats()?.mergedDeliveries, 2);
+      arm();
+      // Tightening past the enabled value still governs the next join.
+      q.reviseMaxFollowers(1);
+      q.enqueue(item("d", BODY2));
+      q.enqueue(item("e", BODY2));
+      q.enqueue(item("f", BODY2));
+      await waitFor(() => calls() === 3);
+      release();
+      await waitFor(() => delivered === 6);
+      assert.equal(calls(), 3);
+    } finally {
+      q.stop();
+    }
   });
 
   it("queue revision governs the next join; the getter follows the live value", async () => {
@@ -344,13 +374,19 @@ describe("coalesce revision: RelayServer (WR-348)", () => {
     assert.equal(revised[0].current, 5);
   });
 
-  it("unconfigured relay: revise throws the must-restart Error and the getter is not mounted", async () => {
-    const { relay } = makeRelay();
+  it("unconfigured relay: revise enables coalescing live, mounts the getter, and audits previous:null", async () => {
+    const { relay, audit } = makeRelay();
     await listen(relay);
     assert.equal(relay.getMaxFollowers, undefined);
-    assert.throws(
-      () => relay.reviseMaxFollowers!(2),
-      /not configured — enabling it requires a restart/
-    );
+    // WR-475: the same call that used to throw now enables.
+    assert.equal(relay.reviseMaxFollowers!(2), 2);
+    assert.equal(relay.getMaxFollowers!(), 2);
+    const revised = eventsOf(audit, "max_followers_revised");
+    assert.equal(revised.length, 1);
+    assert.equal(revised[0].previous, null);
+    assert.equal(revised[0].current, 2);
+    // A same-value revision after the enable is still a silent no-op.
+    relay.reviseMaxFollowers!(2);
+    assert.equal(eventsOf(audit, "max_followers_revised").length, 1);
   });
 });

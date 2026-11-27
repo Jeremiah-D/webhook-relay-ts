@@ -4355,13 +4355,19 @@ function completionCallbackOriginsEqual(a?: string[], b?: string[]): boolean {
  * in-memory dead-letter list for later inspection.
  */
 export class RetryQueue {
-  private readonly sender: Sender;
+  /**
+   * WR-475: deliberately *not* readonly — `reviseMaxFollowers` re-wraps
+   * the live sender when coalescing is enabled at runtime.
+   */
+  private sender: Sender;
   /**
    * WR-91: in-flight request coalescer, wrapping `sender` when the
    * `coalesce` option is enabled. `undefined` = every delivery is its
-   * own physical attempt (pre-WR-91 behavior).
+   * own physical attempt (pre-WR-91 behavior). WR-475: deliberately
+   * *not* readonly — `reviseMaxFollowers` installs the coalescer live
+   * when the queue was constructed without one.
    */
-  private readonly coalescer?: OutboundCoalescer;
+  private coalescer?: OutboundCoalescer;
   /**
    * Backoff parameters are deliberately *not* readonly: WR-32 hot reload
    * retunes them at runtime. `delayForAttempt` reads them at schedule
@@ -5239,6 +5245,14 @@ export class RetryQueue {
     // keyed by their own (shadow) targetUrl, so they never merge with
     // main-path attempts. `false`/absent keeps the exact pre-WR-91
     // behavior; invalid options throw here, at construction.
+    //
+    // WR-475: the dispatcher does not capture `this.sender` directly —
+    // it captures a stable forwarder that reads the queue's live sender
+    // on every call. That is what lets a later live-enable
+    // (`reviseMaxFollowers` re-wrapping `this.sender`) reach the shadow
+    // mirrors too, with no second sender and no rewiring: at
+    // construction the forwarder and `this.sender` are the same
+    // function either way, so configured behavior is unchanged.
     if (opts.coalesce === undefined || opts.coalesce === false) {
       this.coalescer = undefined;
     } else {
@@ -5454,7 +5468,10 @@ export class RetryQueue {
     this.shadow =
       opts.shadowTargets !== undefined
         ? new ShadowDispatcher(opts.shadowTargets, {
-            sender: this.sender,
+            // WR-475: stable forwarder over the queue's live sender (see
+            // the coalescing install above) — a live-enable re-wrap
+            // reaches the mirrors through it.
+            sender: (item, senderOpts) => this.sender(item, senderOpts),
             onDelivered: opts.onShadowDelivered,
             onFailed: opts.onShadowFailed,
           })
@@ -12895,16 +12912,30 @@ export class RetryQueue {
    * `OutboundCoalescer.retuneMaxFollowers`). The new bound governs the
    * next join decision; deliveries already attached to an in-flight
    * attempt stay on it. An illegal value throws `RangeError` and the
-   * live value is untouched. Throws `Error` when coalescing was never
-   * configured — enabling it needs a restart. Returns the live bound.
-   * The one bound is shared by the main path and the shadow mirrors —
-   * both go through the same coalescer.
+   * live value is untouched. Returns the live bound.
+   *
+   * WR-475: calling this on a queue constructed without coalescing
+   * *enables* it — a fresh `OutboundCoalescer` with the given bound is
+   * installed and the live sender re-wrapped, exactly as the
+   * constructor does. The fresh coalescer has no in-flight history, so
+   * deliveries already underway are never retroactively merged, and
+   * the re-wrap covers the main path and the shadow mirrors alike
+   * (the shadow dispatcher reads the live sender through the stable
+   * forwarder installed at construction). An illegal value throws
+   * `RangeError` before anything is installed, so the queue stays
+   * unconfigured and is still enable-able afterwards. `coalesce:
+   * false` is the same as unconfigured. A restart restores the
+   * unconfigured construction state — the enable is live-only, with
+   * no persistence. The one bound is shared by the main path and the
+   * shadow mirrors — both go through the same coalescer.
    */
   reviseMaxFollowers(maxFollowers: number): number {
     if (this.coalescer === undefined) {
-      throw new Error(
-        "reviseMaxFollowers: request coalescing is not configured — enabling it requires a restart"
-      );
+      // Validate-then-install: the constructor throws RangeError on an
+      // illegal value before anything is assigned, so the queue stays
+      // unconfigured. The re-wrap is the constructor's own step.
+      this.coalescer = new OutboundCoalescer({ maxFollowers });
+      this.sender = this.coalescer.wrap(this.sender);
     }
     return this.coalescer.retuneMaxFollowers(maxFollowers);
   }
