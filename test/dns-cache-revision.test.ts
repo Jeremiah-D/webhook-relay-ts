@@ -378,18 +378,38 @@ describe("RelayServer DNS cache revision (WR-342)", () => {
     });
   });
 
-  it("unconfigured relay: revise throws the must-restart Error and the getter is not mounted", async () => {
-    const { relay } = makeRelay();
+  it("unconfigured relay: revise enables the cache (WR-481), mounting the getter and auditing previous null", async () => {
+    const { relay, audit } = makeRelay();
     await listen(relay);
     assert.equal(relay.getDnsCacheConfig, undefined);
-    assert.throws(
-      () => relay.reviseDnsCache!({ ttlMs: 5000 }),
-      /not configured — enabling it requires a restart/
-    );
-    assert.throws(
-      () => relay.reviseDnsCache!({}),
-      /not configured — enabling it requires a restart/
-    );
-    assert.equal(relay.getDnsCacheConfig, undefined);
+    // The enable builds the cache from the patch (omitted fields take
+    // the construction defaults) and mounts the getter at once.
+    assert.deepEqual(relay.reviseDnsCache!({ ttlMs: 5000 }), {
+      ttlMs: 5000,
+      refreshBackoffMs: 5000,
+      maxHosts: 1024,
+    });
+    assert.deepEqual(relay.getDnsCacheConfig!(), {
+      ttlMs: 5000,
+      refreshBackoffMs: 5000,
+      maxHosts: 1024,
+    });
+    const revised = eventsOf(audit, "dns_cache_revised");
+    assert.equal(revised.length, 1);
+    assert.equal(revised[0].previous, null);
+    assert.deepEqual(revised[0].current, {
+      ttlMs: 5000,
+      refreshBackoffMs: 5000,
+      maxHosts: 1024,
+    });
+    // Past the enable, revision chains previous from the enabled values.
+    relay.reviseDnsCache!({ refreshBackoffMs: 30_000 });
+    const revised2 = eventsOf(audit, "dns_cache_revised");
+    assert.equal(revised2.length, 2);
+    assert.deepEqual(revised2[1].previous, {
+      ttlMs: 5000,
+      refreshBackoffMs: 5000,
+      maxHosts: 1024,
+    });
   });
 });

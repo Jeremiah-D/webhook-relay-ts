@@ -4,6 +4,7 @@ import {
   request as httpsRequest,
   createServer as createHttpsServer,
 } from "node:https";
+import { lookup as systemDnsLookup } from "node:dns";
 import type { IncomingMessage, Server } from "node:http";
 import type { LookupFunction } from "node:net";
 import { randomUUID } from "node:crypto";
@@ -1521,7 +1522,8 @@ export interface RelayServerOptions {
    * the WR-34 downstream probes do too. One instance is shared by the
    * main and shadow senders: a single counter set, a single `/metrics`
    * block (`relay_dns_cache_*`). `undefined` keeps the OS-resolver
-   * behavior. Invalid values throw `RangeError` at startup.
+   * behavior — until `reviseDnsCache` installs one at runtime (WR-481).
+   * Invalid values throw `RangeError` at startup.
    */
   dnsCache?: DnsCache | DnsCacheOptions;
   /**
@@ -3389,7 +3391,29 @@ export function createDefaultSender(
    * `egress_residency_blocked`; library users get the hook directly. A
    * compiled `EgressResidencyGate` instance keeps its own `onBlocked`.
    */
-  onEgressResidencyBlocked?: (info: EgressResidencyBlockedInfo) => void
+  onEgressResidencyBlocked?: (info: EgressResidencyBlockedInfo) => void,
+  /**
+   * WR-481: live outbound DNS lookup — a stable delegating function
+   * (in `createRelayServer`, the cell over the shared cache) that the
+   * sender resolves through *instead of* `dnsCache.lookup`. The
+   * delegate is consulted per resolution, so a cache installed later
+   * — a relay whose `dnsCache` was never configured, enabled at
+   * runtime via `reviseDnsCache` — governs the next attempt without
+   * rebuilding the sender; with no cache installed it calls the
+   * system resolver, exactly the pre-WR-481 behavior (Node still asks
+   * the lookup with `{ all: true }`, so happy-eyeballs is preserved).
+   * When unset, the sender uses `dnsCache?.lookup` exactly as before.
+   * The pin (WR-194) and the SSRF guard (WR-373) wrap this lookup, so
+   * they keep judging exactly the addresses the connection will use.
+   * A caller-supplied compiled `DnsCache` instance keeps its own
+   * counters; the delegate only decides *how* names resolve.
+   * Appended last on purpose: positional callers (tests included)
+   * count slots, so a new parameter must never shift the existing
+   * ones — WR-481 first landed mid-signature and broke the
+   * CloudEvents (WR-207) and phase-timeout callers that pass
+   * `cloudEvents` / `phaseTimeouts` by position.
+   */
+  liveDnsLookup?: LookupFunction
 ): PooledSender {
   if (tlsPins !== undefined) {
     for (const [endpoint, pins] of Object.entries(tlsPins)) {
@@ -3903,7 +3927,10 @@ export function createDefaultSender(
     }
   }
   // Bound arrow property — no `this` context needed downstream.
-  const dnsLookup = resolvedDnsCache?.lookup;
+  // WR-481: the live lookup wins when one is supplied — it reads the
+  // live cache cell per resolution (see the parameter doc); otherwise
+  // the compiled cache's lookup, exactly as before.
+  const dnsLookup = liveDnsLookup ?? resolvedDnsCache?.lookup;
   // WR-194: compile the DNS pin once — it wraps the effective lookup
   // (the WR-92 cache above when configured, the system resolver
   // otherwise), so the pin judges exactly the addresses the connection
@@ -7124,21 +7151,31 @@ export interface RelayServer extends Server {
    * the next failed refresh. Shrinking `maxHosts` evicts the
    * soonest-expiring entries until the cache fits; growing it leaves
    * every entry in place. An illegal patch throws `RangeError` and the
-   * live values are untouched; an empty patch is a `RangeError`; a
-   * same-value revision is a no-op with no audit event. A real
-   * revision is audited as `dns_cache_revised` with `previous` /
+   * live values are untouched; an empty patch is a `RangeError` once
+   * configured; a same-value revision is a no-op with no audit event.
+   * A real revision is audited as `dns_cache_revised` with `previous` /
    * `current` (the construction values as first `previous`), and
-   * returns the live config. Always set; throws `Error` when the DNS
-   * cache was never configured — enabling it needs a restart. This
-   * revises the cache configuration; WR-92 is the cache mechanism
-   * itself, WR-170 the DoH resolver it fronts, WR-194 the resolution
-   * pinning above it, and WR-211 the SRV discovery that reads
-   * through it.
+   * returns the live config. WR-481: with the cache unconfigured the
+   * same call *enables* it instead of throwing — the patch builds the
+   * cache (omitted fields take the construction defaults), the main
+   * sender, the shadow senders, and the probes resolve through it from
+   * the next attempt/round, the getter is mounted at the same time,
+   * and the enable is audited as `dns_cache_revised` with `previous:
+   * null`. An illegal patch throws `RangeError` and the relay stays
+   * unconfigured; an empty patch on an unconfigured relay is a silent
+   * no-op that reports the construction defaults. A restart returns to
+   * unconfigured. A caller-supplied `sender` keeps its own resolver.
+   * Always set. This revises the cache configuration; WR-92 is the
+   * cache mechanism itself, WR-170 the DoH resolver it fronts, WR-194
+   * the resolution pinning above it, and WR-211 the SRV discovery
+   * that reads through it.
    */
   reviseDnsCache?: (patch: DnsCacheRevision) => DnsCacheConfig;
   /**
    * WR-342: live outbound DNS cache config — the three cache tunables.
-   * Only set when `dnsCache` was configured; `undefined` otherwise.
+   * Only set when `dnsCache` was configured, or once it is enabled at
+   * runtime (WR-481 mounts it from the enable path); `undefined`
+   * otherwise.
    */
   getDnsCacheConfig?: () => DnsCacheConfig | undefined;
   /**
@@ -11199,6 +11236,30 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
       throw new RangeError(`createRelayServer: invalid dnsCache: ${(err as Error).message}`);
     }
   }
+  // WR-481: the live DNS lookup — a stable delegating function that
+  // reads the live `sharedDnsCache` cell per resolution, so a cache
+  // installed later (via `reviseDnsCache` on an unconfigured relay)
+  // governs the next attempt on the main sender, every shadow sender,
+  // and the downstream probes alike, with no sender rebuild. With no
+  // cache installed it calls the system resolver — exactly the
+  // pre-WR-481 behavior (verified: Node still asks the lookup with
+  // `{ all: true }`, so happy-eyeballs is preserved). The same function
+  // object is handed to every `createDefaultSender` call below and to
+  // the queue's probe options, so one assignment in `reviseDnsCache`
+  // flips all three at once; the cache instance itself stays shared
+  // (WR-92: one counter set, one `/metrics` block). Boundaries: the
+  // egress residency gate (WR-374) and a prober installed later via
+  // `reviseProbeEndpoints` (WR-466) are built before the cache exists
+  // and keep the system resolver — they are only rewired when built
+  // after the enable.
+  const liveDnsLookup: LookupFunction = (hostname, options, callback) => {
+    const cache = sharedDnsCache;
+    if (cache !== undefined) {
+      cache.lookup(hostname, options, callback);
+    } else {
+      systemDnsLookup(hostname, options, callback);
+    }
+  };
   // WR-114: the dynamic endpoint registry. Always constructed — empty
   // when `opts.endpoints` is unset — so the sender's per-attempt
   // resolution has a stable lookup target and an unused registry is
@@ -11453,7 +11514,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     );
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, liveCompressOutbound, opts.outboundHttp2, onHttp2Fallback, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, liveTlsSniOverrides, liveResponseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallback, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, liveAwsSigV4Configs, opts.awsSecretResolver, opts.outboundSchemas, liveOauth2Configs, undefined, opts.compressBrotli, opts.phaseTimeouts, opts.tlsCa, opts.chaos, onChaosInjectedAudit, liveResponseGuard, opts.doh, onDohFallback, proxyHealthMonitor, opts.outboundCredentials, opts.dnsPin, onDnsPinMismatch, liveCloudEvents, opts.outboundSsrfGuard, onOutboundSsrfBlocked, onOutboundSsrfAllowlisted, onOutboundSsrfProxySkipped, opts.egressResidency, onEgressResidencyBlocked)
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, liveCompressOutbound, opts.outboundHttp2, onHttp2Fallback, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, liveTlsSniOverrides, liveResponseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallback, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, liveAwsSigV4Configs, opts.awsSecretResolver, opts.outboundSchemas, liveOauth2Configs, undefined, opts.compressBrotli, opts.phaseTimeouts, opts.tlsCa, opts.chaos, onChaosInjectedAudit, liveResponseGuard, opts.doh, onDohFallback, proxyHealthMonitor, opts.outboundCredentials, opts.dnsPin, onDnsPinMismatch, liveCloudEvents, opts.outboundSsrfGuard, onOutboundSsrfBlocked, onOutboundSsrfAllowlisted, onOutboundSsrfProxySkipped, opts.egressResidency, onEgressResidencyBlocked, liveDnsLookup)
       : undefined;
   // WR-146: tail-latency hedging for outbound attempts (opt-in). The
   // wrapper sits around whichever sender the queue uses — the default
@@ -11671,7 +11732,21 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
                   // WR-440: the same live record as the main sender, so
                   // a revision governs shadow mirrors from the next
                   // attempt too.
-                  liveCloudEvents
+                  liveCloudEvents,
+                  // outboundSsrfGuard / onOutboundSsrfBlocked /
+                  // onOutboundSsrfAllowlisted / onOutboundSsrfProxySkipped /
+                  // egressResidency / onEgressResidencyBlocked stay off for
+                  // shadow copies (pre-existing); the trailing slot is the
+                  // WR-481 live DNS lookup — the same live lookup as the
+                  // main sender, so a cache enabled at runtime governs
+                  // shadow mirrors from the next attempt too.
+                  undefined,
+                  undefined,
+                  undefined,
+                  undefined,
+                  undefined,
+                  undefined,
+                  liveDnsLookup
                 ),
               })
             ),
@@ -12051,13 +12126,12 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
             },
           },
         }),
-    // WR-92: downstream health probes (WR-34) resolve through the shared
-    // DNS cache when one is configured — the same stale-while-revalidate
-    // treatment as the delivery path. An explicit `probe.lookup` still
-    // wins (explicit beats ambient).
-    ...(sharedDnsCache !== undefined && opts.retry?.probe !== undefined
-      ? { probe: { lookup: sharedDnsCache.lookup, ...opts.retry.probe } }
-      : {}),
+    // WR-92/WR-481: the probes' DNS lookup is wired at the `probe:`
+    // key below — the effective one. This literal sets `probe` there
+    // last, so a `probe` spread here would be silently overwritten
+    // (the pre-WR-481 spread here was dead for exactly that reason:
+    // construction-configured probes never actually resolved through
+    // the cache). Do not re-add a spread here; wire it below.
     // WR-147: wrap the caller's onBurnRateAlert so every burn-rate alert
     // is audited as `error_budget_burn`, not just observed. The monitor
     // itself swallows a throwing callback, so alerting can never break
@@ -12271,7 +12345,18 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     // An explicit server-level `probe` wins over the nested `retry.probe`;
     // either way the queue owns the prober. Wrap the caller's hook so
     // every probe outcome worth auditing lands in the audit log.
-    probe: opts.probe ?? opts.retry?.probe,
+    // WR-92/WR-481: the probes resolve through the live lookup (the
+    // shared DNS cache when one is installed, the system resolver
+    // otherwise) — the same stale-while-revalidate treatment as the
+    // delivery path, so a cache enabled at runtime governs probe rounds
+    // from the next round on. An explicit `probe.lookup` still wins
+    // (explicit beats ambient). A prober installed later via
+    // `reviseProbeEndpoints` (WR-466) is built without a lookup and
+    // keeps the system resolver.
+    probe:
+      (opts.probe ?? opts.retry?.probe) === undefined
+        ? undefined
+        : { lookup: liveDnsLookup, ...(opts.probe ?? opts.retry?.probe) },
     // WR-83: an explicit server-level `otlp` wins over the nested
     // `retry.otlp`; either way the queue owns the exporter.
     otlp: opts.otlp ?? opts.retry?.otlp,
@@ -20624,17 +20709,54 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   }
 
   // WR-342: outbound DNS cache config runtime revision. The method is
-  // always set (like reviseAdaptiveBackoff above); with the cache
-  // unconfigured the revision throws Error — enabling it needs a
-  // restart. A real revision is audited as `dns_cache_revised` with
-  // the previous and current config (the construction values as first
-  // `previous`); an empty or same-value patch is a silent no-op.
+  // always set (like reviseAdaptiveBackoff above); WR-481: with the
+  // cache unconfigured the same call *enables* it — the patch builds a
+  // fresh cache (omitted fields take the construction defaults), the
+  // live cell flips so the main sender, the shadow senders, and the
+  // probes resolve through it from the next attempt/round, the getter
+  // is mounted at the same time, and the enable is audited as
+  // `dns_cache_revised` with `previous: null`. A real revision is
+  // audited as `dns_cache_revised` with the previous and current
+  // config (the construction values as first `previous`); an empty or
+  // same-value patch is a silent no-op.
   server.reviseDnsCache = (patch: DnsCacheRevision): DnsCacheConfig => {
     if (sharedDnsCache === undefined) {
-      throw new Error(
-        "reviseDnsCache: DNS cache is not configured — enabling it requires a restart: " +
-          "the cache is created at startup and a running relay cannot start caching resolutions without one"
-      );
+      // WR-481: enable — validate first, mirroring the `retune`
+      // gates, so an illegal patch throws `RangeError` and the relay
+      // stays unconfigured (and can still be enabled afterwards).
+      // The constructor gates below throw before anything is
+      // installed, so a rejected enable leaves nothing behind. An
+      // empty patch enables nothing (WR-479): report the construction
+      // defaults, mount nothing, audit nothing. A caller-supplied
+      // `opts.sender` keeps its own resolver — the cache then serves
+      // the probes and the config surface only. No deliveries are
+      // retroactively re-resolved; a restart returns to unconfigured
+      // (live-only).
+      if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+        throw new RangeError(
+          `dnsCache revision must be an object, got ${JSON.stringify(patch)}`
+        );
+      }
+      if (
+        patch.ttlMs === undefined &&
+        patch.refreshBackoffMs === undefined &&
+        patch.maxHosts === undefined
+      ) {
+        return new DnsCache().config();
+      }
+      const cache = new DnsCache(patch);
+      sharedDnsCache = cache;
+      if (defaultSender !== undefined) {
+        defaultSender.dnsCache = cache;
+      }
+      server.getDnsCacheConfig = (): DnsCacheConfig => sharedDnsCache!.config();
+      const current = cache.config();
+      opts.auditLog.append({
+        event: "dns_cache_revised",
+        previous: null,
+        current,
+      });
+      return current;
     }
     const prev = sharedDnsCache.config();
     // Validate-then-apply inside retune: an illegal patch throws
@@ -20656,7 +20778,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   };
 
   // WR-342: live outbound DNS cache config. Only set when `dnsCache`
-  // was configured.
+  // was configured — WR-481 mounts it from the enable path when the
+  // cache is enabled at runtime.
   if (sharedDnsCache !== undefined) {
     server.getDnsCacheConfig = (): DnsCacheConfig => sharedDnsCache.config();
   }

@@ -12417,13 +12417,25 @@ const server = createRelayServer({
   until the cache fits; growing it leaves every entry in place. An
   illegal or empty patch throws `RangeError` and leaves the live config
   untouched; a same-value revision is a silent no-op. A real revision
-  is audited as `dns_cache_revised` with `previous` / `current`. With
-  no cache configured, revising throws — enabling the cache needs a
-  restart. This revises the cache *configuration*; WR-92 is the cache
-  mechanism itself, WR-170 the DoH resolver it fronts, WR-194 the
-  resolution pinning above it, WR-373 the SSRF guard that classifies
-  the resolved addresses above it, and WR-211 the SRV discovery that
-  reads through it.
+  is audited as `dns_cache_revised` with `previous` / `current`.
+  **Live enable (WR-481)** — with no cache configured, the same call
+  *enables* it instead of throwing: the patch builds the cache
+  (omitted fields take the construction defaults), the main sender, the
+  shadow senders, and the probes resolve through it from the next
+  attempt/round, the getter is mounted at the same time, and the enable
+  is audited as `dns_cache_revised` with `previous: null`. An illegal
+  patch throws `RangeError` and the relay stays unconfigured; an empty
+  patch on an unconfigured relay is a silent no-op that reports the
+  construction defaults. A restart returns to unconfigured; a
+  caller-supplied `sender` keeps its own resolver. (Before WR-481 the
+  probes' cache wiring was dead — a later `probe:` key in the queue
+  options overwrote the lookup spread — so construction-configured
+  probes never actually resolved through the cache; the wiring now
+  lives at the effective key.) This revises the cache *configuration*;
+  WR-92 is the cache mechanism itself, WR-170 the DoH resolver it
+  fronts, WR-194 the resolution pinning above it, WR-373 the SSRF guard
+  that classifies the resolved addresses above it, and WR-211 the SRV
+  discovery that reads through it.
 
 ## DNS resolution pinning (opt-in)
 
