@@ -205,7 +205,7 @@ describe("SlowStartController.retune (WR-338)", () => {
 });
 
 describe("RetryQueue slow-start revision (WR-338)", () => {
-  function makeQueue(slowStart?: SlowStartOptions) {
+  function makeQueue(slowStart?: SlowStartOptions, withBreaker = true) {
     const timer = manualTimer();
     let now = 0;
     const f = controllableSender();
@@ -217,7 +217,9 @@ describe("RetryQueue slow-start revision (WR-338)", () => {
       random: () => 0, // deterministic parking delay
       setTimer: timer.setTimer,
       maxConcurrentPerEndpoint: 8,
-      circuitBreaker: { failureThreshold: 2, cooldownMs: 1000, nowMs: () => now },
+      ...(withBreaker
+        ? { circuitBreaker: { failureThreshold: 2, cooldownMs: 1000, nowMs: () => now } }
+        : {}),
       ...(slowStart === undefined ? {} : { slowStart }),
     });
     return { q, timer, f, advance: (ms: number) => (now += ms) };
@@ -245,16 +247,12 @@ describe("RetryQueue slow-start revision (WR-338)", () => {
     await timer.step(); // half-open probe succeeds -> closed, ramp starts
   }
 
-  it("unconfigured: revise throws the must-restart Error, getter returns undefined", () => {
-    const { q } = makeQueue();
+  it("unconfigured without a breaker: revise throws the breaker Error, getter returns undefined", () => {
+    const { q } = makeQueue(undefined, false);
     assert.equal(q.getSlowStartConfig(), undefined);
     assert.throws(
       () => q.reviseSlowStart({ floor: 2 }),
-      /not configured — enabling it requires a restart/
-    );
-    assert.throws(
-      () => q.reviseSlowStart({ floor: 2 }),
-      /cannot start pacing recoveries without one/
+      /circuit breaker is not configured/
     );
     assert.equal(q.getSlowStartConfig(), undefined);
     q.stop();
@@ -391,13 +389,13 @@ describe("RelayServer slow-start revision (WR-338)", () => {
     assert.deepEqual(relay.getSlowStartConfig!(), { ...construction, floor: 2 });
   });
 
-  it("unconfigured relay: revise throws the must-restart Error and the getter is not mounted", async () => {
+  it("unconfigured relay without a breaker: revise throws the breaker Error and the getter is not mounted", async () => {
     const { relay } = makeRelay();
     await listen(relay);
     assert.equal(relay.getSlowStartConfig, undefined);
     assert.throws(
       () => relay.reviseSlowStart!({ floor: 2 }),
-      /not configured — enabling it requires a restart/
+      /circuit breaker is not configured/
     );
   });
 

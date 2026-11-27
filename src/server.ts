@@ -6870,8 +6870,12 @@ export interface RelayServer extends Server {
    * a same-value revision is a no-op with no audit event. A real
    * revision is audited as `slow_start_revised` with `previous` /
    * `current` (the construction values as first `previous`), and
-   * returns the live config. Always set; throws `Error` when slow
-   * start was never configured — enabling it needs a restart. The one
+   * returns the live config. Always set; WR-476: when slow start was
+   * never configured the same call *enables* it — an empty patch
+   * enables with all defaults — provided a circuit breaker is
+   * configured, otherwise it throws `Error` (enable the breaker
+   * first). The enable is audited as `slow_start_revised` with
+   * `previous: null`, and the getter mounts at the same time. The one
    * config is shared by all tenants: there is no per-tenant override.
    * This paces breaker-recovery ramps; WR-337 revises the steady-state
    * AIMD cap instead, and EB-332 is the other repo's subscription-level
@@ -6880,8 +6884,9 @@ export interface RelayServer extends Server {
   reviseSlowStart?: (patch: SlowStartRevision) => SlowStartConfig;
   /**
    * WR-338: live slow-start config — the three ramp inputs shared by
-   * all tenants. Only set when `slowStart` was configured; `undefined`
-   * otherwise.
+   * all tenants. Only set when `slowStart` was configured — WR-476
+   * mounts it from the enable path when the feature is enabled at
+   * runtime; `undefined` otherwise.
    */
   getSlowStartConfig?: () => SlowStartConfig | undefined;
   /**
@@ -20031,16 +20036,30 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   }
 
   // WR-338: slow-start config runtime revision. The method is always
-  // set (like reviseAdaptiveConcurrency above); with the controller
-  // unconfigured the queue throws Error — enabling it needs a
-  // restart. A real revision is audited as `slow_start_revised` with
-  // the previous and current config (the construction values as first
-  // `previous`); an empty or same-value patch is a silent no-op.
+  // set (like reviseAdaptiveConcurrency above); WR-476: with the
+  // controller unconfigured the same call *enables* it — the queue
+  // installs the config and builds the default tenant's controller
+  // eagerly; the getter is mounted at the same time and the enable is
+  // audited with `previous: null`. Enabling needs a circuit breaker
+  // configured (the queue throws Error without one; an illegal patch
+  // throws RangeError there, leaving the relay unconfigured). A real
+  // revision is audited as `slow_start_revised` with the previous and
+  // current config (the construction values as first `previous`); an
+  // empty or same-value patch is a silent no-op.
   server.reviseSlowStart = (patch: SlowStartRevision): SlowStartConfig => {
     const prev = queue.getSlowStartConfig();
     if (prev === undefined) {
-      // Delegates to the queue for the canonical "must restart" Error.
-      return queue.reviseSlowStart(patch);
+      // WR-476: enable — the queue installs the resolved config and
+      // builds the default tenant's controller eagerly. Mount the
+      // getter and audit the enable with `previous: null`.
+      const next = queue.reviseSlowStart(patch);
+      server.getSlowStartConfig = (): SlowStartConfig => queue.getSlowStartConfig()!;
+      opts.auditLog.append({
+        event: "slow_start_revised",
+        previous: null,
+        current: next,
+      });
+      return next;
     }
     // Validate-then-apply inside retune: an illegal patch throws
     // RangeError and the live values are left completely intact.
@@ -20061,7 +20080,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   };
 
   // WR-338: live slow-start config. Only set when
-  // `retry.slowStart` was configured.
+  // `retry.slowStart` was configured — WR-476 mounts it from the
+  // enable path when the feature is enabled at runtime.
   if (queue.getSlowStartConfig() !== undefined) {
     server.getSlowStartConfig = (): SlowStartConfig => queue.getSlowStartConfig()!;
   }

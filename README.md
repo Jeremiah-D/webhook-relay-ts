@@ -4188,9 +4188,16 @@ const queue = new RetryQueue({
   patch is a silent no-op; a real revision is audited as
   `slow_start_revised` with `previous` / `current`. The one config is
   shared by all tenants (every per-tenant controller is retuned in
-  place; tenants born later start from the revised values). Revising
-  the feature when it was never configured throws `Error` — enabling
-  it needs a restart. This paces breaker-recovery ramps; WR-337
+  place; tenants born later start from the revised values). When the
+  feature was never configured the same call *enables* it instead
+  (WR-476): an empty patch enables with all defaults (`exponential` /
+  `floor` 1 / the fixed cap as ceiling), the getter mounts at the same
+  time, and the enable is audited as `slow_start_revised` with
+  `previous: null`. Enabling needs a `circuitBreaker` configured —
+  without one the call throws `Error`, since the ramp would be a
+  silent no-op; enable the breaker first (WR-455), then enable slow
+  start. No persistence: a restart returns to unconfigured. This paces
+  breaker-recovery ramps; WR-337
   revises the steady-state AIMD cap instead, and EB-332 is the other
   repo's subscription-level slow start, a different mechanism.
 

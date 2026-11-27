@@ -2173,7 +2173,9 @@ export interface RetryQueueOptions {
    * `min(fixed, adaptive, ramp)` — the ramp can only ever pace recovery,
    * never exceed the steady-state limits. Disabled by default; and
    * without a `circuitBreaker` configured the ramp can never start, so
-   * the option alone changes nothing.
+   * the option alone changes nothing. WR-476: live-enablable —
+   * `reviseSlowStart` installs the resolved config on an unconfigured
+   * queue (a circuit breaker must already be configured).
    */
   slowStart?: SlowStartOptions;
   /**
@@ -12069,18 +12071,61 @@ export class RetryQueue {
    * starts its ramp at the new floor on the new curve. An illegal
    * patch throws `RangeError` and the live values are untouched; an
    * empty patch is a `RangeError`; revising to the live values is a
-   * no-op. Throws `Error` when slow start was never configured —
-   * enabling it needs a restart. The one config is shared by all
-   * tenants: every per-tenant controller is retuned in place, and
-   * tenants born later start from the revised values. Returns the
+   * no-op.
+   *
+   * WR-476: when slow start was never configured, the same call
+   * *enables* it instead of throwing — but only when a circuit
+   * breaker is configured: without one no close event can ever fire,
+   * so the ramp would be a silent no-op, and the call throws `Error`
+   * instead (enable the breaker first, then enable slow start). Every
+   * knob has a construction default (`curve` exponential / `floor` 1 /
+   * `maxLimit` the live fixed cap), so an empty patch enables with all
+   * defaults, and a fresh controller is built with no ramps —
+   * deliveries before the enable were never paced and are not
+   * retroactively paced; pacing starts at the next breaker-close
+   * event. A non-object or illegal patch throws `RangeError` and the
+   * queue stays unconfigured (validated first, through the same
+   * construction gate as `assertSlowStartOptions`). No persistence: a
+   * restart returns to unconfigured — the enable is live-only. Once
+   * enabled, later calls revise per WR-338. The one config is shared
+   * by all tenants: every per-tenant controller is retuned in place,
+   * and tenants born later start from the revised values. Returns the
    * live config.
    */
   reviseSlowStart(patch: SlowStartRevision): SlowStartConfig {
     if (this.slowStartOpts === undefined) {
-      throw new Error(
-        "reviseSlowStart: slow start is not configured — enabling it requires a restart: " +
-          "the controller is created at startup and a running relay cannot start pacing recoveries without one"
-      );
+      // WR-476: enable — the breaker must already be configured: the
+      // ramp only ever starts on a breaker-close event, so on a relay
+      // without one the feature would be a silent no-op (slowstart.ts
+      // says so at the top of the module). Validate with the
+      // construction-time rules, then install the resolved config and
+      // build the default tenant's controller eagerly (mirroring
+      // construction, retry.ts:5518-5521). Validation throws before
+      // anything is assigned, so an illegal patch leaves the queue
+      // unconfigured. `assertSlowStartOptions` resolves every omitted
+      // knob to its construction default, so an empty patch enables
+      // with all defaults — unlike the revise path, where an empty
+      // patch is a `RangeError` because there is nothing to revise.
+      // The fresh controller starts with no ramps: deliveries before
+      // the enable were never paced and are not retroactively paced.
+      if (this.circuitBreakerOpts === undefined) {
+        throw new Error(
+          "reviseSlowStart: circuit breaker is not configured — slow start paces breaker recoveries and is a no-op without one; enable the circuit breaker first (reviseCircuitBreakerDefaults)"
+        );
+      }
+      if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+        throw new RangeError(
+          `slowStart revision must be an object, got ${JSON.stringify(patch)}`
+        );
+      }
+      const next = assertSlowStartOptions({
+        curve: patch.curve,
+        floor: patch.floor,
+        maxLimit: patch.maxLimit ?? this.maxConcurrentPerEndpoint,
+      });
+      this.slowStartOpts = next;
+      const primary = this.slowStartFor(undefined)!;
+      return primary.snapshot();
     }
     if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
       throw new RangeError(`slowStart revision must be an object, got ${JSON.stringify(patch)}`);
