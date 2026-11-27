@@ -2717,7 +2717,10 @@ export interface RetryQueueOptions {
    * Live-revisable via `RetryQueue.reviseCompletionCallback` (WR-412) —
    * the receipt target, secrets, and knobs move at runtime; the
    * failure observer stays with
-   * `reviseCompletionCallbackFailedCallback` (WR-398).
+   * `reviseCompletionCallbackFailedCallback` (WR-398). WR-478: the
+   * same call also *enables* the feature on a queue constructed
+   * without it — a patch carrying a `url` installs the receipt
+   * sender, omitted knobs taking the construction defaults.
    */
   completionCallback?: CompletionCallbackOptions;
   /**
@@ -5091,8 +5094,8 @@ export class RetryQueue {
   private readonly weighted?: WeightedDispatcher;
   /** WR-202: consistent-hash sticky routing; undefined when not configured. */
   private readonly consistentHash?: ConsistentHashDispatcher;
-  /** WR-47: completion-receipt sender; undefined when the feature is off. */
-  private readonly callbacker?: CompletionCallbacker;
+  /** WR-47: completion-receipt sender; undefined when the feature is off. WR-478: deliberately *not* readonly — `reviseCompletionCallback` installs a fresh callbacker here when completion callbacks are enabled at runtime (it was undefined before, so there is nothing to retune in place). */
+  private callbacker?: CompletionCallbacker;
   // WR-412: the construction-time completion-callback options, kept so
   // `reviseCompletionCallback` can merge a patch over the live values
   // (notably `selfOrigins`, which the resolved config drops, and the
@@ -15509,8 +15512,8 @@ export class RetryQueue {
    * the live callback is untouched; replacing with the same reference
    * (or clearing when already unset) is a no-op. Throws `Error` when
    * completion callbacks were never configured — the receipts only
-   * ever fire with `completionCallback` in place, so enabling
-   * observation needs a restart. Under `RelayServer` the field holds
+   * ever fire with `completionCallback` in place, so enable them
+   * first with `reviseCompletionCallback` (WR-478). Under `RelayServer` the field holds
    * the server's audit closure, so direct calls here would replace
    * the audit wrapper; server users must go through
    * `RelayServer.reviseCompletionCallbackFailedCallback`, which swaps
@@ -15523,7 +15526,7 @@ export class RetryQueue {
   ): void {
     if (!this.completionCallbackConfigured()) {
       throw new Error(
-        "reviseCompletionCallbackFailedCallback: completion callback is not configured — enabling completion callback observation requires a restart"
+        "reviseCompletionCallbackFailedCallback: completion callback is not configured — enable it first with reviseCompletionCallback (WR-478)"
       );
     }
     if (cb !== null && typeof cb !== "function") {
@@ -15555,18 +15558,37 @@ export class RetryQueue {
    * finishes on the config it started with (the callbacker captures
    * the config at `send` time, so one receipt never splits across
    * two endpoints). A patch identical to the live values — including
-   * an empty patch — is a silent no-op. Throws `Error` when
-   * completion callbacks were never configured — enabling them needs
-   * a restart. The queue itself holds no audit log — the server
+   * an empty patch — is a silent no-op.
+   *
+   * WR-478: when completion callbacks were never configured, the same
+   * call *enables* them instead of throwing — but unlike the revise
+   * path, the patch must carry a `url`: there is no live config to
+   * fall back on and no default target, so an empty patch, a patch
+   * without `url`, or an illegal patch throws `RangeError` and the
+   * queue stays unconfigured (and can still be enabled afterwards).
+   * Omitted knobs take the construction defaults (`maxAttempts` 3,
+   * `backoffMs` 500, `timeoutMs` 5000, `keyPrefix` `""`). The enable
+   * mirrors construction (retry.ts:5733-5747): a fresh
+   * `CompletionCallbacker` with the same-shaped `onFailed` closure
+   * reading the live `callerOnCompletionCallbackFailed` cell, so the
+   * failure observer (`reviseCompletionCallbackFailedCallback`,
+   * WR-398) is unblocked by the same call — no separate FailedCallback
+   * enable item. The runtime loop check cannot run here — the queue
+   * holds no `selfCheck` until the server installs one (a no-op
+   * while unconfigured) — but the declared-`selfOrigins` check already
+   * ran inside the resolver, the server re-installs the runtime check
+   * on the fresh callbacker immediately after enabling, and `send()`
+   * re-checks before every POST regardless, so a self-target url can
+   * never loop. The fresh callbacker starts with empty state:
+   * receipts from before the enable were never sent (there was no
+   * sender), and the first terminal delivery after the enable gets
+   * the first receipt. Once enabled, later calls revise per WR-412.
+   * No persistence: a restart returns to unconfigured — the enable
+   * is live-only. The queue itself holds no audit log — the server
    * audits a real revision as `completion_callback_revised` (target
    * origin and changed knob names only, never secret material).
    */
   reviseCompletionCallback(patch: CompletionCallbackRevision): void {
-    if (!this.completionCallbackConfigured()) {
-      throw new Error(
-        "reviseCompletionCallback: completion callback is not configured — enabling it requires a restart"
-      );
-    }
     if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
       throw new RangeError(
         `reviseCompletionCallback: patch must be an object, got ${JSON.stringify(patch)}`
@@ -15604,6 +15626,70 @@ export class RetryQueue {
         );
       }
     }
+    if (!this.completionCallbackConfigured()) {
+      // WR-478: enable — validate first, mirroring the construction
+      // gates, so an illegal patch throws `RangeError` and the queue
+      // stays unconfigured (and can still be enabled afterwards). The
+      // patch must carry a `url`: a receipt needs a target, and the
+      // resolver has no default for one.
+      if (patch.url === undefined) {
+        throw new RangeError(
+          "reviseCompletionCallback: enabling completion callbacks requires a `url` — the patch must carry the receipt target; an empty patch cannot enable it"
+        );
+      }
+      const merged: CompletionCallbackOptions = {
+        url: patch.url,
+        ...(patch.selfOrigins !== undefined ? { selfOrigins: patch.selfOrigins } : {}),
+        ...(patch.signingSecret !== undefined
+          ? { signingSecret: patch.signingSecret ?? undefined }
+          : {}),
+        ...(patch.keyId !== undefined ? { keyId: patch.keyId ?? undefined } : {}),
+        ...(patch.idempotencySecret !== undefined
+          ? { idempotencySecret: patch.idempotencySecret ?? undefined }
+          : {}),
+        ...(patch.keyPrefix !== undefined ? { keyPrefix: patch.keyPrefix } : {}),
+        ...(patch.maxAttempts !== undefined ? { maxAttempts: patch.maxAttempts } : {}),
+        ...(patch.backoffMs !== undefined ? { backoffMs: patch.backoffMs } : {}),
+        ...(patch.timeoutMs !== undefined ? { timeoutMs: patch.timeoutMs } : {}),
+      };
+      // Validate-then-install: the merged config must pass the
+      // construction gates (including the declared-`selfOrigins` loop
+      // check) before anything is assigned. Omitted knobs take the
+      // construction defaults inside the resolver.
+      const next = resolveCompletionCallbackConfig(merged);
+      if (next === undefined) {
+        // Unreachable: `merged` is always defined, but the resolver's
+        // `undefined`-when-off return keeps the guard explicit instead
+        // of a non-null assertion.
+        throw new Error(
+          "reviseCompletionCallback: resolved completion callback config is undefined (unreachable)"
+        );
+      }
+      // Mirror the construction wiring (retry.ts:5733-5747): the
+      // callbacker's `onFailed` hook is a stable closure reading the
+      // live caller cell, so the failure observer installed before or
+      // after the enable is never dropped. The runtime loop check is
+      // installed by the server on the fresh callbacker right after
+      // this call (server.ts `installCompletionCallbackSelfCheck`).
+      this.callbacker = new CompletionCallbacker(next, {
+        onFailed: (info) => this.callerOnCompletionCallbackFailed?.(info),
+      });
+      this.completionCallbackOpts = { ...merged };
+      this.completionCallbackVersion += 1;
+      // The enable sets exactly the knobs the patch carried; the rest
+      // are construction defaults, not changes.
+      const changed: string[] = ["url"];
+      if (patch.selfOrigins !== undefined) changed.push("selfOrigins");
+      if (patch.signingSecret !== undefined) changed.push("signingSecret");
+      if (patch.keyId !== undefined) changed.push("keyId");
+      if (patch.idempotencySecret !== undefined) changed.push("idempotencySecret");
+      if (patch.keyPrefix !== undefined) changed.push("keyPrefix");
+      if (patch.maxAttempts !== undefined) changed.push("maxAttempts");
+      if (patch.backoffMs !== undefined) changed.push("backoffMs");
+      if (patch.timeoutMs !== undefined) changed.push("timeoutMs");
+      this.completionCallbackLastChanged = changed;
+      return;
+    }
     const current = this.completionCallbackOpts;
     const merged: CompletionCallbackOptions = {
       ...current,
@@ -15630,7 +15716,7 @@ export class RetryQueue {
       // the resolver's `undefined`-when-off return keeps the guard
       // explicit instead of a non-null assertion.
       throw new Error(
-        "reviseCompletionCallback: completion callback is not configured — enabling it requires a restart"
+        "reviseCompletionCallback: resolved completion callback config is undefined (unreachable)"
       );
     }
     // Runtime loop check on a new url, against the server-installed

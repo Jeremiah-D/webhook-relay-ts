@@ -13370,7 +13370,8 @@ unset) is a silent no-op. A real revision is audited as
 `completion_callback_failed_callback_revised` with `previous` / `current`
 recording only 'set' / 'cleared' presence, never a function body.
 Revising when completion callbacks were never configured throws `Error`
-(enabling them needs a restart). This only moves the failure observer;
+— enable them first with `server.reviseCompletionCallback(patch)` (WR-478).
+This only moves the failure observer;
 the receipt configuration itself still goes through `completionCallback`
 at construction.
 
@@ -13389,8 +13390,12 @@ config it started with. A patch identical to the live values is a
 silent no-op. A real revision is audited as
 `completion_callback_revised` with `previous` / `current` recording
 only the target origin and the changed knob names, never secret
-material. Revising when completion callbacks were never configured
-throws `Error` (enabling them needs a restart). This only swaps the
+material. WR-478: when completion callbacks were never configured, the
+same call *enables* them — the patch must carry a `url` (an empty or
+illegal patch throws `RangeError` and leaves the relay unconfigured),
+omitted knobs take the construction defaults (`maxAttempts` 3, `backoffMs`
+500, `timeoutMs` 5000), and the enable is audited once as
+`completion_callback_revised` with `previous: null`. This only swaps the
 receipt target / secret / knobs — the failure observer stays with
 WR-398.
 

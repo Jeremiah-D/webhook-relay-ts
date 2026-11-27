@@ -2095,7 +2095,10 @@ export interface RelayServerOptions {
    * Live-revisable via `server.reviseCompletionCallback` (WR-412) — the
    * receipt target, secrets, and knobs move at runtime; the failure
    * observer stays with `reviseCompletionCallbackFailedCallback`
-   * (WR-398).
+   * (WR-398). WR-478: the same call also *enables* the feature on a
+   * relay constructed without it — a patch carrying a `url` installs
+   * the receipt sender, omitted knobs taking the construction
+   * defaults.
    */
   completionCallback?: CompletionCallbackOptions;
   /**
@@ -8386,7 +8389,8 @@ export interface RelayServer extends Server {
    * is audited as `completion_callback_failed_callback_revised` with
    * `previous` / `current` recording only 'set' / 'cleared' presence,
    * never a function body. Always set; throws `Error` when completion
-   * callbacks were never configured — enabling them needs a restart.
+   * callbacks were never configured — enable them first with
+   * `reviseCompletionCallback` (WR-478).
    * The new callback takes effect from the next exhausted receipt;
    * failures already reported are never re-delivered, and the receipt
    * POST, retry/backoff, self-check, and receipt statistics are
@@ -8414,8 +8418,12 @@ export interface RelayServer extends Server {
    * revision is audited as `completion_callback_revised` with
    * `previous` / `current` recording only the target origin and
    * `changed` listing the changed knob names, never secret material.
-   * Always set; throws `Error` when completion callbacks were never
-   * configured — enabling them needs a restart. This only swaps the
+   * Always set; WR-478: when completion callbacks were never
+   * configured the same call enables them — the patch must carry a
+   * `url` (an empty or illegal patch throws `RangeError` and leaves
+   * the relay unconfigured), omitted knobs take the construction
+   * defaults, and the enable is audited once as
+   * `completion_callback_revised` with `previous: null`. This only swaps the
    * receipt target / secret / knobs; the failure observer stays with
    * `reviseCompletionCallbackFailedCallback` (WR-398). Direct queue
    * users use `RetryQueue.reviseCompletionCallback` instead —
@@ -19050,13 +19058,21 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // undeclared self-target (e.g. an ephemeral test port) is refused.
   // WR-56: the check only needs the intake listener — the operator plane
   // 404s webhooks, so a callback pointed at it can never re-enter intake.
-  queue.setCompletionCallbackSelfCheck(
-    createBoundAddressSelfCheck(() => {
-      const addr = server.address();
-      if (addr === null || typeof addr === "string") return addr;
-      return { address: addr.address, port: addr.port };
-    })
-  );
+  // WR-478: shared with the live-enable path — `reviseCompletionCallback`
+  // re-installs this same predicate on the freshly built callbacker,
+  // which never saw the startup install (and
+  // `setCompletionCallbackSelfCheck` is a no-op while the feature is
+  // off, so calling it here is safe either way).
+  const installCompletionCallbackSelfCheck = (): void => {
+    queue.setCompletionCallbackSelfCheck(
+      createBoundAddressSelfCheck(() => {
+        const addr = server.address();
+        if (addr === null || typeof addr === "string") return addr;
+        return { address: addr.address, port: addr.port };
+      })
+    );
+  };
+  installCompletionCallbackSelfCheck();
 
   // WR-93 runtime loop check: a storm-alert URL that resolves to this
   // relay's own listener would re-enter intake on every threshold
@@ -23051,7 +23067,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     cb: ((info: CompletionCallbackFailedInfo) => void) | null
   ): void => {
     if (!queue.completionCallbackConfigured()) {
-      // Delegates to the queue for the canonical "must restart" Error.
+      // Delegates to the queue for the canonical "not configured" Error —
+      // enable the feature first with `reviseCompletionCallback` (WR-478).
       return queue.reviseCompletionCallbackFailedCallback(cb);
     }
     if (cb !== null && typeof cb !== "function") {
@@ -23084,11 +23101,33 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // pure secret rotation is visible as a version bump, not as a
   // value). The failure observer (`callback_failed` audit + operator
   // cell) is untouched by this method — it stays with WR-398.
+  // WR-478: with completion callbacks unconfigured the same call
+  // *enables* them — the queue builds a fresh callbacker (an illegal
+  // patch still throws RangeError there, leaving the relay
+  // unconfigured), the runtime loop check is re-installed on the
+  // fresh callbacker, and the enable is audited once as
+  // `completion_callback_revised` with `previous: null`. Enabling
+  // also opens the `reviseCompletionCallbackFailedCallback` gate
+  // (WR-398), which shares the same `completionCallbackConfigured`
+  // check — no separate FailedCallback enable is needed.
   server.reviseCompletionCallback = (patch: CompletionCallbackRevision): void => {
     const prev = queue.getCompletionCallbackConfig();
     if (prev === undefined) {
-      // Delegates to the queue for the canonical "must restart" Error.
-      return queue.reviseCompletionCallback(patch);
+      // WR-478: enable — the queue builds the fresh callbacker (an
+      // illegal patch still throws RangeError there, leaving the relay
+      // unconfigured). Re-install the runtime loop check — the new
+      // callbacker never saw the startup install — and audit the
+      // enable with `previous: null`.
+      queue.reviseCompletionCallback(patch);
+      installCompletionCallbackSelfCheck();
+      const next = queue.getCompletionCallbackConfig()!;
+      opts.auditLog.append({
+        event: "completion_callback_revised",
+        previous: null,
+        current: new URL(next.url).origin,
+        changed: next.lastChanged,
+      });
+      return;
     }
     queue.reviseCompletionCallback(patch);
     const next = queue.getCompletionCallbackConfig()!;

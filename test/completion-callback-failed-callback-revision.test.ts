@@ -131,7 +131,8 @@ describe("RetryQueue completion-callback-failed callback revision (WR-398)", () 
     assert.equal(q.completionCallbackConfigured(), false);
     assert.throws(
       () => q.reviseCompletionCallbackFailedCallback(() => {}),
-      (err: unknown) => err instanceof Error && /requires a restart/.test(err.message)
+      (err: unknown) =>
+        err instanceof Error && /enable it first with reviseCompletionCallback/.test(err.message)
     );
     const { q: configured } = failingReceiptQueue({});
     try {
@@ -421,7 +422,8 @@ describe("RelayServer completion-callback-failed callback revision (WR-398)", ()
     servers.push(relay);
     assert.throws(
       () => relay.reviseCompletionCallbackFailedCallback!(() => {}),
-      (err: unknown) => err instanceof Error && /requires a restart/.test(err.message)
+      (err: unknown) =>
+        err instanceof Error && /enable it first with reviseCompletionCallback/.test(err.message)
     );
   });
 });

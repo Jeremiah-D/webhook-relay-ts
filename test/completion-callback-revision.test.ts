@@ -347,15 +347,18 @@ describe("RetryQueue completion-callback revision (WR-412)", () => {
     }
   });
 
-  it("revising with completion callbacks unconfigured throws Error", () => {
+  it("revising with completion callbacks unconfigured enables them (WR-478)", () => {
     const q = new RetryQueue({ sender: async () => {} });
     try {
       assert.equal(q.completionCallbackConfigured(), false);
       assert.equal(q.getCompletionCallbackConfig(), undefined);
-      assert.throws(
-        () => q.reviseCompletionCallback({ url: NEW_URL }),
-        (err: unknown) => err instanceof Error && /requires a restart/.test(err.message)
-      );
+      q.reviseCompletionCallback({ url: NEW_URL });
+      assert.equal(q.completionCallbackConfigured(), true);
+      const config = q.getCompletionCallbackConfig();
+      assert.ok(config);
+      assert.equal(config.url, NEW_URL);
+      assert.equal(config.version, 1);
+      assert.deepEqual(config.lastChanged, ["url"]);
     } finally {
       q.stop();
     }
@@ -553,7 +556,7 @@ describe("RelayServer completion-callback revision (WR-412)", () => {
     assert.equal(eventsOf(auditLog, "completion_callback_revised").length, 1);
   });
 
-  it("same-value revision audits nothing; unconfigured revise throws Error", async () => {
+  it("same-value revision audits nothing; unconfigured revise enables (WR-478)", async () => {
     const { relay, auditLog } = callbackServer({ url: "http://127.0.0.1:1/receipts" });
     await listen(relay);
     relay.reviseCompletionCallback!({ url: "http://127.0.0.1:1/receipts" });
@@ -569,10 +572,12 @@ describe("RelayServer completion-callback revision (WR-412)", () => {
       sender: async () => undefined,
     });
     servers.push(relay2);
-    assert.throws(
-      () => relay2.reviseCompletionCallback!({ url: NEW_URL }),
-      (err: unknown) => err instanceof Error && /requires a restart/.test(err.message)
-    );
+    relay2.reviseCompletionCallback!({ url: NEW_URL });
+    const enabled = eventsOf(auditLog2, "completion_callback_revised");
+    assert.equal(enabled.length, 1);
+    assert.equal(enabled[0].previous, null);
+    assert.equal(enabled[0].current, "http://new-caller.example");
+    assert.deepEqual(enabled[0].changed, ["url"]);
   });
 
   it("the runtime selfCheck rejects the relay's own bound address at the server level", async () => {
