@@ -236,9 +236,15 @@ describe("server setDedupWindow (WR-308)", () => {
     assert.equal(delivered.length, 1);
   });
 
-  it("throws Error when dedup is not configured", () => {
-    const { relay } = makeServer();
-    assert.throws(() => relay.setDedupWindow!({ windowMs: 1_000 }), /not configured/);
+  it("enables dedup when it was not configured (WR-482)", () => {
+    const { relay, auditLog } = makeServer();
+    // No longer the WR-308 must-restart Error: the same call enables.
+    const next = relay.setDedupWindow!({ windowMs: 1_000 });
+    assert.deepEqual(next, { windowMs: 1_000, maxEntries: 10_000 });
+    const revised = eventsOf(auditLog, "dedup_revised");
+    assert.equal(revised.length, 1);
+    assert.equal(revised[0].previous, null);
+    assert.deepEqual(revised[0].current, { windowMs: 1_000, maxEntries: 10_000 });
   });
 
   it("re-pushes the WR-119 shadow to 2x the new window", async () => {

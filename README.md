@@ -5235,8 +5235,15 @@ const server = createRelayServer({
   WR-119 doubled window for degraded senders is re-pushed to 2x the new
   main window with the same cap. With a custom store the window still
   revises but `maxEntries` is fail-closed (`RangeError` — the cap belongs
-  to the store). Without `dedup` configured the method throws `Error`:
-  enabling dedup needs a restart. `deduplicator.stats()` reports the
+  to the store). WR-482: with `dedup` never configured the same call
+  *enables* it instead of throwing — missing fields resolve to the
+  construction defaults (300_000 ms / 10_000 entries), the enable is
+  audited as `dedup_revised` with `previous: null`, and the WR-119
+  doubled shadow is installed alongside when sender reputation is
+  configured; an empty patch is a silent no-op reporting the
+  construction defaults, and an illegal patch throws `RangeError` and
+  leaves the relay unconfigured. A restart returns to unconfigured.
+  `deduplicator.stats()` reports the
   live `windowMs` / `maxEntries` alongside the counters.
 
 ## Payload gzip compression

@@ -2152,7 +2152,9 @@ export interface RelayServerOptions {
    * Runtime revision (WR-308): `server.setDedupWindow(patch)` revises
    * `windowMs` / `maxEntries` in place — the next intake judges by the
    * new values, and the WR-119 doubled window for degraded senders is
-   * re-pushed to 2x the new main window.
+   * re-pushed to 2x the new main window. WR-482: the same call also
+   * *enables* dedup on a relay built without it (missing fields take
+   * the construction defaults; audited with `previous: null`).
    */
   dedup?: DedupOptions;
   /**
@@ -6376,9 +6378,14 @@ export interface RelayServer extends Server {
    * the live values are untouched; an empty patch (or values equal to
    * the live ones) is a no-op with no audit event. A real revision is
    * audited as `dedup_revised` with `previous` / `current`
-   * `{ windowMs, maxEntries }`, and returns the live values. Only set
-   * when `dedup` was configured at startup — otherwise it throws
-   * `Error`: enabling dedup needs a restart.
+   * `{ windowMs, maxEntries }`, and returns the live values. WR-482:
+   * with dedup never configured the same call *enables* it instead of
+   * throwing — missing fields resolve to the construction defaults
+   * (300_000 ms / 10_000 entries) and the enable is audited with
+   * `previous: null`; an empty patch is a silent no-op reporting the
+   * construction defaults, and an illegal patch throws `RangeError`
+   * and leaves the relay unconfigured. A restart returns to
+   * unconfigured. Always set.
    */
   setDedupWindow?: (patch: DedupWindowRevision) => { windowMs: number; maxEntries: number };
   /**
@@ -13313,7 +13320,11 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   const schemaRegistry =
     opts.payloadSchemas !== undefined ? new InboundSchemaRegistry(opts.payloadSchemas) : undefined;
   const schemaMetrics = new SchemaMetrics();
-  const deduplicator = opts.dedup ? new DeliveryDeduplicator(opts.dedup) : undefined;
+  // WR-482: `let` (was `const`) so `setDedupWindow` can install a fresh
+  // deduplicator when dedup was never configured — the intake gate
+  // reads this binding live, so suppression starts from the next
+  // request. A restart returns to unconfigured (live-only).
+  let deduplicator = opts.dedup ? new DeliveryDeduplicator(opts.dedup) : undefined;
   // WR-183: payload secret-leak detection. Enabled by default in
   // alert-only mode; the same scanner instance backs both the inbound
   // intake scan in `admitOneEvent` and the audit log's scan of persisted
@@ -13435,15 +13446,22 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // base window's durability state. WR-480: factored so the enable
   // path installs the identical helper when scoring is enabled at
   // runtime — a relay enabled live must tighten exactly like one
-  // configured at startup.
-  const buildTightenedDeduplicator = (): DeliveryDeduplicator | undefined =>
-    reputation !== undefined && opts.dedup !== undefined
-      ? new DeliveryDeduplicator({
-          windowMs: (opts.dedup.windowMs ?? 300_000) * 2,
-          maxEntries: opts.dedup.maxEntries,
-          now: opts.dedup.now,
-        })
-      : undefined;
+  // configured at startup. WR-482: reads the *live* deduplicator
+  // instead of the construction option, so a relay that enabled dedup
+  // at runtime (setDedupWindow) tightens exactly like one configured
+  // at startup — and so does a relay that enables reputation after
+  // dedup (the WR-480 enable path re-calls this helper). The clock
+  // still comes from the construction option: a live-enabled
+  // deduplicator was built on the default clock.
+  const buildTightenedDeduplicator = (): DeliveryDeduplicator | undefined => {
+    if (reputation === undefined || deduplicator === undefined) return undefined;
+    const live = deduplicator.current();
+    return new DeliveryDeduplicator({
+      windowMs: live.windowMs * 2,
+      maxEntries: live.maxEntries,
+      now: opts.dedup?.now,
+    });
+  };
   let tightenedDeduplicator = buildTightenedDeduplicator();
   // WR-119 tightening (a): the degraded-sender budget is half the
   // configured inbound budget (per-IP first, else per-endpoint). Unset
@@ -19372,16 +19390,50 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   };
 
   // WR-308: inbound dedup window/cap runtime revision. The method is
-  // always set (like updateInboundMtlsConfig above); with dedup
-  // unconfigured it throws Error — enabling dedup needs a restart.
-  // A real revision is audited as `dedup_revised` with the previous and
-  // current window/cap; an empty or same-value patch is a silent no-op.
+  // always set (like updateInboundMtlsConfig above); WR-482: with dedup
+  // unconfigured the same call *enables* it — a patch carrying at least
+  // one knob builds a fresh deduplicator on the construction defaults
+  // (300_000 ms / 10_000 entries), retunes it with the patch, and
+  // mounts it (with the WR-119 doubled shadow when reputation is
+  // configured); the enable is audited as `dedup_revised` with
+  // `previous: null`. An empty patch is a silent no-op reporting the
+  // construction defaults; an illegal patch throws `RangeError` and
+  // leaves the relay unconfigured. A real revision is audited as
+  // `dedup_revised` with the previous and current window/cap; an empty
+  // or same-value patch is a silent no-op. A restart returns to
+  // unconfigured (live-only, never persisted).
   server.setDedupWindow = (patch: DedupWindowRevision): { windowMs: number; maxEntries: number } => {
     if (deduplicator === undefined) {
-      throw new Error(
-        "setDedupWindow: inbound dedup is not configured — enabling it requires a restart: " +
-          "the deduplicator is created at startup and a running server cannot start suppressing without one"
-      );
+      // WR-482: enable — validate first, mirroring the `retune`
+      // gates, so an illegal patch throws `RangeError` and the relay
+      // stays unconfigured (and can still be enabled afterwards).
+      // The deduplicator is built with the construction defaults and
+      // then retuned, so the merged values pass the same gates as a
+      // startup-configured deduplicator; the throwaway is discarded on
+      // failure, so a rejected enable leaves nothing behind. An empty
+      // patch enables nothing: report the construction defaults,
+      // mount nothing, audit nothing.
+      if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+        throw new RangeError(
+          `dedup window revision must be an object, got ${JSON.stringify(patch)}`
+        );
+      }
+      if (patch.windowMs === undefined && patch.maxEntries === undefined) {
+        return new DeliveryDeduplicator({}).current();
+      }
+      const enabled = new DeliveryDeduplicator({});
+      const next = enabled.retune(patch);
+      deduplicator = enabled;
+      // WR-119 tightening (c): with reputation configured, install
+      // the doubled shadow alongside — a relay enabled live tightens
+      // exactly like one configured at startup.
+      tightenedDeduplicator = buildTightenedDeduplicator();
+      opts.auditLog.append({
+        event: "dedup_revised",
+        previous: null,
+        current: next,
+      });
+      return next;
     }
     const previous = deduplicator.current();
     // Validate-then-apply inside retune: an illegal patch throws
