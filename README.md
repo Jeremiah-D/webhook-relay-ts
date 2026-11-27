@@ -580,11 +580,26 @@ reliability primitives that matter for any signed-payload pipeline.
   `slo_miss_callback_revised` with `previous` / `current` ('set' /
   'cleared' presence, never a function body) — and the audit can never
   be bypassed by a replacement. With latency tracking unconfigured,
-  revision throws `Error` — enabling observation needs a restart. When
+  revision throws `Error` — enable tracking first with `enableLatency`
+  (WR-474), which opens the gate without a restart. When
   OTLP export is configured the `slo_missed` export survives a revision:
   the wrapper keeps exporting while the caller callback underneath is
   swapped. Only the observer moves: SLO thresholds, sampling windows,
   and in-flight delivery timing are untouched.
+  **Live enable (WR-474)** — `relay.enableLatency(opts?)` /
+  `queue.enableLatency(opts?)` switches latency SLO tracking on for a
+  relay constructed without it, no restart: empty or omitted `opts`
+  enables with the construction defaults (`sloMs` 5000 /
+  `maxSamplesPerEndpoint` 1024), an illegal `sloMs` /
+  `maxSamplesPerEndpoint` or non-object `opts` throws `RangeError` and
+  the relay stays unconfigured, and an already-configured relay throws
+  `Error` — enabling never revises. Deliveries enqueued before the
+  enable are never sampled (no backfill); the next enqueue starts the
+  clock. `onSloMiss` still moves only through `reviseSloMissCallback`
+  and sloRisk only through `reviseSloRisk` — neither is installed by
+  the enable. A real enable is audited once as `latency_enabled` with
+  `previous: null`. A restart restores the unconfigured state
+  (live-only).
 - `src/changepoint.ts` — online changepoint detection for per-endpoint
   accepted→delivered latency (`LatencyChangepointDetector` /
   `LatencyChangepointMonitor`). A Page-Hinkley test watches the latency
@@ -625,7 +640,8 @@ reliability primitives that matter for any signed-payload pipeline.
 - `src/slo-risk.ts` — SLO-breach prediction and early warning
   (`SloRiskPredictor`), opt-in under `retry.latency.sloRisk` (disabled by
   default, but live-enableable via `reviseSloRisk` once latency tracking
-  is configured — WR-473). Every `enqueue` and every delivered sample feeds a per-endpoint
+  is configured — WR-473; the latency precondition itself can now be
+  satisfied live via `enableLatency`, WR-474). Every `enqueue` and every delivered sample feeds a per-endpoint
   observation; the score is `max(latencyPressure, backlogPressure)` where
   latency pressure is the rolling p95 against `sloMs` and backlog pressure
   is a forward queueing projection (backlog EWMA + smoothed trend ×

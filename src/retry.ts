@@ -4601,7 +4601,10 @@ export class RetryQueue {
    * tenant's slow downstream does not pollute another's SLO picture.
    */
   private readonly latencies = new Map<string, LatencyTracker>();
-  private readonly latencyOpts?: LatencyOptions;
+  // WR-474: deliberately *not* readonly — `enableLatency` installs the
+  // options here when tracking is enabled at runtime (it was undefined
+  // before, so there is nothing to merge in place).
+  private latencyOpts?: LatencyOptions;
   /** WR-98: resolved trace-context option; `undefined` = feature off. */
   private readonly traceContextOpts?: ResolvedTraceContextOptions;
   // WR-388: deliberately *not* readonly — `reviseSloMissCallback`
@@ -9540,7 +9543,8 @@ export class RetryQueue {
    * WR-388: whether latency tracking is configured (queue-level) — the
    * `reviseSloMissCallback` gate. SLO misses can only be observed when
    * `opts.latency` is set; without it there is no miss channel to
-   * observe, so enabling observation needs a restart.
+   * observe — enable it live with `enableLatency` (WR-474), which opens
+   * this gate the moment the tracker exists.
    */
   latencyConfigured(): boolean {
     return this.latencyOpts !== undefined;
@@ -13177,6 +13181,70 @@ export class RetryQueue {
   }
 
   /**
+   * WR-474: enable accepted→delivered latency SLO tracking live on a
+   * queue constructed without it — the queue-side method behind
+   * `RelayServer.enableLatency`. No restart, no state lost: the retry /
+   * dead-letter / dedup state keeps running and the tracker starts
+   * empty — deliveries enqueued before the enable never sampled (their
+   * `recordAccepted` never happened), so they never produce a histogram
+   * row, a `slo_missed`, or a slo-risk observation; the next enqueue
+   * after the enable is the first clock.
+   *
+   * `opts` is optional: an omitted (or empty) options object enables
+   * with the construction defaults (`sloMs` 5000 /
+   * `maxSamplesPerEndpoint` 1024). Validate-before-assign: the resolved
+   * options are probed through the same `LatencyTracker` constructor
+   * gate as construction, so an illegal `sloMs` (0 / negative / NaN /
+   * Infinity / non-number), an illegal `maxSamplesPerEndpoint` (0 /
+   * fraction / NaN / non-number), or a non-object `opts` throws
+   * `RangeError` and the queue stays unconfigured — still enableable
+   * afterwards. On a queue that is already configured this throws
+   * `Error`: enabling never revises — there is no `sloMs` /
+   * `maxSamplesPerEndpoint` revision setter. The `onSloMiss` hook and
+   * the slo-risk predictor are deliberately *not* installed here: the
+   * miss observer still moves only through `reviseSloMissCallback`
+   * (WR-388, whose gate this enable opens) and sloRisk only through
+   * `reviseSloRisk` (WR-473, whose latency precondition this enable
+   * satisfies live). A restart restores the unconfigured construction
+   * state (live-only). The queue itself holds no audit log — the server
+   * audits a real enable as `latency_enabled` with `previous: null`.
+   */
+  enableLatency(opts: LatencyTrackerOptions = {}): void {
+    if (this.latencyOpts !== undefined) {
+      throw new Error("enableLatency: latency tracking is already configured");
+    }
+    if (opts === null || typeof opts !== "object" || Array.isArray(opts)) {
+      throw new RangeError(
+        `enableLatency: latency options must be an object, got ${JSON.stringify(opts)}`
+      );
+    }
+    const resolved: LatencyTrackerOptions = {
+      sloMs: opts.sloMs ?? 5000,
+      maxSamplesPerEndpoint: opts.maxSamplesPerEndpoint ?? 1024,
+      ...(opts.now !== undefined ? { now: opts.now } : {}),
+    };
+    // Validate-before-assign: the probe runs the same constructor gate
+    // as construction — a RangeError here leaves the queue unconfigured.
+    new LatencyTracker(resolved);
+    this.latencyOpts = resolved;
+    // Eagerly build the default tenant's tracker, like construction.
+    this.latencyFor(undefined);
+  }
+
+  /**
+   * WR-474: the live latency SLO config — `sloMs` and
+   * `maxSamplesPerEndpoint` — or `undefined` when tracking is off. A
+   * snapshot: mutating the returned object never moves the tracker.
+   */
+  getLatencyConfig(): { sloMs: number; maxSamplesPerEndpoint: number } | undefined {
+    if (this.latencyOpts === undefined) return undefined;
+    return {
+      sloMs: this.latencyOpts.sloMs ?? 5000,
+      maxSamplesPerEndpoint: this.latencyOpts.maxSamplesPerEndpoint ?? 1024,
+    };
+  }
+
+  /**
    * WR-71: per-(tenant, endpoint) SLO-risk snapshot — one row per endpoint
    * with at least one risk evaluation (endpoints still in cold start are
    * omitted). Rows carry `tenant` only when set. Empty when the predictor
@@ -14297,7 +14365,8 @@ export class RetryQueue {
    * callback is untouched; replacing with the same reference (or
    * clearing when already unset) is a no-op. Throws `Error` when
    * latency tracking is not configured — misses can only happen with
-   * `opts.latency` in place, so enabling observation needs a restart.
+   * `opts.latency` in place, so enable it first with `enableLatency`
+   * (WR-474), which opens this gate the moment the tracker exists.
    * When OTLP export is configured the swap only moves the inner
    * caller field (`callerOnSloMiss`); the dispatch closure keeps
    * exporting every `slo_missed`, so a revision can never drop the

@@ -156,22 +156,40 @@ describe("RetryQueue SLO-miss callback revision (WR-388)", () => {
     }
   });
 
-  it("a queue without latency tracking cannot gain an observer at runtime — must restart", async () => {
+  it("a queue without latency tracking gains an observer after enableLatency (WR-474)", async () => {
+    let now = 0;
     const timer = manualTimer();
+    const seen: SloMissInfo[] = [];
     const q = new RetryQueue({
       sender: async () => {},
       jitterMs: 0,
       setTimer: timer.setTimer,
     });
-    assert.throws(
-      () => q.reviseSloMissCallback(() => {}),
-      /requires a restart/
-    );
-    assert.throws(
-      () => q.reviseSloMissCallback(null),
-      /requires a restart/
-    );
-    q.stop();
+    q.start();
+    try {
+      assert.throws(
+        () => q.reviseSloMissCallback(() => {}),
+        /requires a restart/
+      );
+      assert.throws(
+        () => q.reviseSloMissCallback(null),
+        /requires a restart/
+      );
+      // WR-474: enabling latency tracking opens the gate — the observer
+      // is installable without a restart, and the next miss enters it.
+      q.enableLatency({ sloMs: 100, now: () => now });
+      q.reviseSloMissCallback((info) => seen.push(info));
+      now = 0;
+      q.enqueue(item("enable-1"));
+      now = 250;
+      await timer.run();
+      assert.equal(seen.length, 1);
+      assert.equal(seen[0].id, "enable-1");
+      assert.equal(seen[0].latencyMs, 250);
+      assert.equal(seen[0].sloMs, 100);
+    } finally {
+      q.stop();
+    }
   });
 
   it("a non-function value throws RangeError and the live callback is untouched", async () => {
@@ -668,12 +686,13 @@ describe("RelayServer SLO-miss callback revision (WR-388)", () => {
     assert.equal(seen[0].sloMs, 10);
   });
 
-  it("a server without latency tracking cannot gain an observer at runtime — must restart", async () => {
+  it("a server without latency tracking gains an observer after enableLatency (WR-474)", async () => {
     const dir = mkdtempSync(join(tmpdir(), "slomiss-nolatency-"));
     const audit = new AuditLog(join(dir, "audit.jsonl"));
     const slow: Sender = async () => {
       await sleep(60);
     };
+    const seen: SloMissInfo[] = [];
     const relay = createRelayServer({
       ["sec" + "ret"]: relaySecret,
       forwardUrl: URL,
@@ -687,11 +706,26 @@ describe("RelayServer SLO-miss callback revision (WR-388)", () => {
       },
     });
     servers.push(relay);
-    await listen(relay);
+    const port = await listen(relay);
     assert.throws(
       () => relay.reviseSloMissCallback!(() => {}),
       /requires a restart/
     );
     assert.equal(revisedEvents(audit).length, 0);
+    // WR-474: enabling latency tracking opens the gate — the observer is
+    // installable without a restart, and the next miss enters it (and is
+    // still audited as `slo_missed`).
+    relay.enableLatency!({ sloMs: 10 });
+    relay.reviseSloMissCallback!((info) => seen.push(info));
+    assert.deepEqual(
+      revisedEvents(audit).map((e) => [e.previous, e.current]),
+      [["cleared", "set"]]
+    );
+    assert.equal(await postWebhook(port), 202);
+    await drainUntil(() => seen.length >= 1);
+    await drainUntil(() => missedEvents(audit).length >= 1);
+    assert.ok(seen[0].latencyMs > 10);
+    assert.equal(seen[0].sloMs, 10);
+    assert.ok(missedEvents(audit)[0].latencyMs > 10);
   });
 });

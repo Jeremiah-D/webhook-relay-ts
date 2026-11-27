@@ -28,7 +28,7 @@ import {
   selectSignatureAlgorithmVerifier,
   type SignatureAlgorithmRule,
 } from "./signature-alg.ts";
-import { RetryQueue, errorBudgetBurnAuditEvent, type AssertionFailureInfo, type AttemptFailedInfo, type BatchInfo, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutEvent, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeadLetterEscalationCallbacksRevision, type DeliveryDeadlineConfig, type DeliveryDeadlineExceededInfo, type DeliveryDeadlineRevision, type DeliveryReceiptCallbacksRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type DownstreamResponseSummary, type EndpointAutoDisableRevision, type EndpointPauseCallbacksRevision, type EndpointPauseInfo, type ErrorBudgetConfig, type ErrorBudgetRevision, type EscalationConfig, type EscalationRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type FailureClass, type QuorumCallbacksRevision, type QuorumRetention, type QuorumRetentionRevision, type ReplayCallbacksRevision, type ReplayForcedInfo, type ReplayIdempotencyConfig, type ReplayIdempotencyRevision, type ReplaySkippedInfo, type ResponseAssertionRule, type ResponseAssertionsRevision, type RetryItem, type RetryBudgetDepletedInfo, type ScheduledFiredEvent, type Sender, type SenderCallOptions, type SemanticFailureInfo, type ShadowCallbacksRevision, type MaintenanceWindowTransition, type SloMissInfo, type SloRiskConfig, type SloRiskInfo, type SloRiskRevision, type StarvationGuardAuditEvent, type TenantBudgetAuditEvent, type UrgentDowngradedEvent, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
+import { RetryQueue, errorBudgetBurnAuditEvent, type AssertionFailureInfo, type AttemptFailedInfo, type BatchInfo, type BurnRateAlertInfo, type CanaryRolloutEndpointTuning, type CanaryRolloutEvent, type CanaryRolloutRevision, type CircuitStateChangeCallback, type DeadLetterEscalationCallbacksRevision, type DeliveryDeadlineConfig, type DeliveryDeadlineExceededInfo, type DeliveryDeadlineRevision, type DeliveryReceiptCallbacksRevision, type DeliveryEvent, type DeliveryEventType, type DeliveryPriority, type DownstreamResponse, type DownstreamResponseSummary, type EndpointAutoDisableRevision, type EndpointPauseCallbacksRevision, type EndpointPauseInfo, type ErrorBudgetConfig, type ErrorBudgetRevision, type EscalationConfig, type EscalationRevision, type FailoverEndpointConfig, type FailoverRevision, type FailoverSwitchEvent, type FailureClass, type LatencyTrackerOptions, type QuorumCallbacksRevision, type QuorumRetention, type QuorumRetentionRevision, type ReplayCallbacksRevision, type ReplayForcedInfo, type ReplayIdempotencyConfig, type ReplayIdempotencyRevision, type ReplaySkippedInfo, type ResponseAssertionRule, type ResponseAssertionsRevision, type RetryItem, type RetryBudgetDepletedInfo, type ScheduledFiredEvent, type Sender, type SenderCallOptions, type SemanticFailureInfo, type ShadowCallbacksRevision, type MaintenanceWindowTransition, type SloMissInfo, type SloRiskConfig, type SloRiskInfo, type SloRiskRevision, type StarvationGuardAuditEvent, type TenantBudgetAuditEvent, type UrgentDowngradedEvent, type WeightTuningConfig, type WeightTuningRevision, type WeightsRetunedInfo } from "./retry.ts";
 import { parseDeliverAtHeader, DELIVER_AT_HEADER } from "./retry.ts";
 import type { ShadowDeliveredInfo, ShadowFailedInfo, ShadowTargetConfig, ShadowTargetsConfig } from "./retry.ts";
 import type {
@@ -9608,16 +9608,43 @@ export interface RelayServer extends Server {
    * already unset) is a silent no-op. A real replacement is audited as
    * `slo_miss_callback_revised` with `previous` / `current` recording
    * only 'set' / 'cleared' presence, never a function body. Always set;
-   * throws `Error` when latency tracking was not configured — enabling
-   * it needs a restart. The new callback takes effect from the next SLO
-   * miss; misses already reported are never re-delivered, and the SLO
-   * thresholds, sampling windows, and in-flight delivery timing are
-   * untouched. When OTLP export is configured the `slo_missed` export
-   * survives a revision. Direct queue users use
+   * throws `Error` while latency tracking was not configured — enable
+   * it first with `enableLatency` (WR-474), which opens this gate the
+   * moment the tracker exists. The new callback takes effect from the
+   * next SLO miss; misses already reported are never re-delivered, and
+   * the SLO thresholds, sampling windows, and in-flight delivery
+   * timing are untouched. When OTLP export is configured the
+   * `slo_missed` export survives a revision. Direct queue users use
    * `RetryQueue.reviseSloMissCallback` instead — calling the queue
    * method on a server-owned queue would replace the audit wrapper.
    */
   reviseSloMissCallback?: (cb: ((info: SloMissInfo) => void) | null) => void;
+  /**
+   * WR-474: enable accepted→delivered latency SLO tracking live on a
+   * relay constructed without it — no restart. `opts` is optional: an
+   * omitted (or empty) options object enables with the construction
+   * defaults (`sloMs` 5000 / `maxSamplesPerEndpoint` 1024). An illegal
+   * `sloMs` / `maxSamplesPerEndpoint` or a non-object `opts` throws
+   * `RangeError` and the relay stays unconfigured; on a relay that is
+   * already configured this throws `Error` — enabling never revises.
+   * A real enable is audited as `latency_enabled` with `previous: null`
+   * and `current` the live two-knob config (never `now`). Deliveries
+   * enqueued before the enable are never sampled; the next enqueue
+   * after the enable starts the clock. The miss observer is *not*
+   * installed here — `onSloMiss` still moves only through
+   * `reviseSloMissCallback` (WR-388, whose gate this enable opens) and
+   * sloRisk only through `reviseSloRisk` (WR-473). A restart restores
+   * the unconfigured construction state (live-only). Direct queue users
+   * call `RetryQueue.enableLatency` instead.
+   */
+  enableLatency?: (opts?: LatencyTrackerOptions) => void;
+  /**
+   * WR-474: live latency SLO config — `sloMs` and
+   * `maxSamplesPerEndpoint`. Only set when latency tracking was
+   * configured, or once `enableLatency` has mounted it at runtime;
+   * `undefined` otherwise.
+   */
+  getLatencyConfig?: () => { sloMs: number; maxSamplesPerEndpoint: number } | undefined;
   /**
    * WR-389: live-redirect the urgent-downgrade observer — the operator
    * callback that fires once per urgent delivery force-downgraded to the
@@ -21139,6 +21166,55 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     });
   };
 
+  // WR-474: live latency SLO config. Only set when `latency` was
+  // configured — `enableLatency` mounts it from the enable path when
+  // tracking is enabled at runtime.
+  if (queue.getLatencyConfig() !== undefined) {
+    server.getLatencyConfig = (): { sloMs: number; maxSamplesPerEndpoint: number } =>
+      queue.getLatencyConfig()!;
+  }
+
+  // WR-474: live enable of latency SLO tracking on a relay constructed
+  // without it. The queue's onSloMiss dispatch closure is a stable
+  // closure reading the live caller field (installed at construction),
+  // so the only construction-time side effect to reinstall is the
+  // server's `slo_missed` audit wrapper: it is built fresh here (same
+  // shape as the construction wrapper — append `slo_missed` first, then
+  // forward to the operator cell) and installed via
+  // `queue.reviseSloMissCallback`, so misses after the enable are
+  // audited and still reach the operator callback — without it the
+  // tracker would sample into the void and `reviseSloMissCallback`
+  // would swap a cell nobody reads. The operator callback itself still
+  // moves only through `server.reviseSloMissCallback` (WR-388 semantics
+  // unchanged). Then the getter is mounted and the enable is audited
+  // once as `latency_enabled` with `previous: null` and `current` the
+  // resolved two-knob config (`now` is a function and never enters the
+  // audit). Deliveries enqueued before the enable are never sampled; a
+  // restart restores the unconfigured construction state.
+  server.enableLatency = (trackerOpts?: LatencyTrackerOptions): void => {
+    if (queue.latencyConfigured()) {
+      // Delegates to the queue for the canonical "already
+      // configured" Error.
+      return queue.enableLatency(trackerOpts);
+    }
+    // Validates and installs; throws before mutating on bad opts.
+    queue.enableLatency(trackerOpts);
+    queue.reviseSloMissCallback((info) => {
+      opts.auditLog.append({ event: "slo_missed", ...info });
+      // WR-388: forward to the operator cell, never to the
+      // constructor callback directly, so a live revision cannot
+      // bypass the audit.
+      operatorSloMissCallback?.(info);
+    });
+    server.getLatencyConfig = (): { sloMs: number; maxSamplesPerEndpoint: number } =>
+      queue.getLatencyConfig()!;
+    opts.auditLog.append({
+      event: "latency_enabled",
+      previous: null,
+      current: queue.getLatencyConfig()!,
+    });
+  };
+
   // WR-378: stale-endpoint auto-pause knob runtime revision. The
   // method is always set (like reviseErrorBudget above). WR-445: with
   // the sweeper unconfigured the same call *enables* it — the queue
@@ -25046,8 +25122,8 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
 
   // WR-388: live SLO-miss observer revision. The method is always set;
   // with latency tracking unconfigured the queue throws the canonical
-  // "must restart" Error (delegated below, exactly like WR-371's
-  // queue-depth gate). Only the operator cell moves: the queue's audit
+  // Error (delegated below — enable latency tracking first with
+  // `enableLatency`, WR-474). Only the operator cell moves: the queue's audit
   // wrapper (which appends `slo_missed` first, then forwards to the
   // cell) is never touched, so a replacement cannot bypass the audit.
   // A non-function callback throws `RangeError` and the live cell is
