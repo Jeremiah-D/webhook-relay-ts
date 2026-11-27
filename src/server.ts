@@ -8534,13 +8534,17 @@ export interface RelayServer extends Server {
    * reference (or clearing when already unset) is a silent no-op. A
    * real replacement is audited as `batch_callback_revised` with
    * `previous` / `current` recording only 'set' / 'cleared' presence,
-   * never a function body. Always set; throws `Error` when batching was
-   * never configured — enabling it needs a restart. The new callback
-   * takes effect from the next flush; batches already reported are
-   * never re-delivered, and the window timer, `maxBatchSize`, retune,
-   * and the merge envelope are untouched. Direct queue users use
-   * `RetryQueue.reviseBatchCallback` instead — calling the queue
-   * method on a server-owned queue would replace the audit wrapper.
+   * never a function body. Always set; WR-477: with batching never
+   * configured the same call *enables* observation — the callback is
+   * installed and takes effect from the first flush after batching is
+   * enabled via `setBatchConfig` (audited as `batch_callback_revised`
+   * with `previous: 'cleared'`), while `null` is a silent no-op when
+   * nothing is installed. The new callback takes effect from the next
+   * flush; batches already reported are never re-delivered, and the
+   * window timer, `maxBatchSize`, retune, and the merge envelope are
+   * untouched. Direct queue users use `RetryQueue.reviseBatchCallback`
+   * instead — calling the queue method on a server-owned queue would
+   * replace the audit wrapper.
    */
   reviseBatchCallback?: (
     cb: ((info: BatchInfo) => void) | null
@@ -23409,23 +23413,25 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // server-side operator-callback cell moves — the queue's audit
   // wrapper (which appends `batch_flushed` first, then forwards to
   // the cell) is never touched, so a replacement cannot bypass the
-  // audit. With batching unconfigured the queue throws the canonical
-  // "must restart" Error (delegated below, exactly like WR-397's
-  // purged gate). A non-function callback throws `RangeError` and the
-  // live cell is untouched; a same-reference replacement (or clearing
-  // when already unset) is a silent no-op. A real replacement is
-  // audited as `batch_callback_revised` with `previous` / `current`
-  // recording only 'set' / 'cleared' presence, never a function body.
-  // The new callback takes effect from the next flush; batches
-  // already reported are never re-delivered, and the window timer,
-  // `maxBatchSize`, retune, and the merge envelope are untouched.
+  // audit. WR-477: with batching unconfigured the same call *enables*
+  // observation instead of throwing — the operator cell is installed
+  // and the queue already holds the audit wrapper (installed at
+  // construction), so the callback takes effect from the first flush
+  // after batching is enabled via `setBatchConfig`; `null` while
+  // unconfigured is a silent no-op when the cell is unset (and still
+  // clears when it was set at construction). A non-function callback
+  // throws `RangeError` and the live cell is untouched; a
+  // same-reference replacement (or clearing when already unset) is a
+  // silent no-op. A real replacement is audited as
+  // `batch_callback_revised` with `previous` / `current` recording
+  // only 'set' / 'cleared' presence, never a function body — an
+  // enable audits `previous: 'cleared'`. The new callback takes
+  // effect from the next flush; batches already reported are never
+  // re-delivered, and the window timer, `maxBatchSize`, retune, and
+  // the merge envelope are untouched.
   server.reviseBatchCallback = (
     cb: ((info: BatchInfo) => void) | null
   ): void => {
-    if (!queue.batchConfigured()) {
-      // Delegates to the queue for the canonical "must restart" Error.
-      return queue.reviseBatchCallback(cb);
-    }
     if (cb !== null && typeof cb !== "function") {
       throw new RangeError(
         "reviseBatchCallback: handler must be a function or null"

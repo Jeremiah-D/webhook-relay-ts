@@ -15777,19 +15777,37 @@ export class RetryQueue {
    * `getBatchStats()` — only the forwarding stops). A non-function
    * value throws `RangeError` and the live callback is untouched;
    * replacing with the same reference (or clearing when already
-   * unset) is a no-op. Throws `Error` when batching was never
-   * configured — the collector only ever exists with `batch` in
-   * place, so enabling observation needs a restart. Under
-   * `RelayServer` the field holds the server's audit closure, so
-   * direct calls here would replace the audit wrapper; server users
-   * must go through `RelayServer.reviseBatchCallback`, which swaps
-   * only the operator cell behind the audit closure.
+   * unset) is a no-op. WR-477: when batching was never configured,
+   * the same call *enables* observation instead of throwing — the
+   * callback is installed as-is and takes effect from the first flush
+   * after batching is enabled (WR-450 `setBatchConfig`, or a restart
+   * with `batch` configured); there is nothing to observe before
+   * then, and installing the observer never starts merging on its
+   * own. `null` while unconfigured is a silent no-op — there is no
+   * installed observer to clear, and clearing here would drop the
+   * constructor callback (under `RelayServer` that cell is the audit
+   * wrapper). A non-function value throws `RangeError` and the queue
+   * stays unconfigured, so the enable can still be retried
+   * afterwards. Under `RelayServer` the field holds the server's
+   * audit closure, so direct calls here would replace the audit
+   * wrapper; server users must go through
+   * `RelayServer.reviseBatchCallback`, which swaps only the operator
+   * cell behind the audit closure.
    */
   reviseBatchCallback(cb: ((info: BatchInfo) => void) | null): void {
     if (!this.batchConfigured()) {
-      throw new Error(
-        "reviseBatchCallback: batching is not configured — enabling it requires a restart"
-      );
+      // WR-477: enable — install the observer even though no batcher
+      // exists yet. Validation throws before anything is assigned, so
+      // an illegal value leaves the queue unconfigured.
+      if (cb === null) return;
+      if (typeof cb !== "function") {
+        throw new RangeError(
+          "reviseBatchCallback: handler must be a function or null"
+        );
+      }
+      if (cb === this.onBatch) return;
+      this.onBatch = cb;
+      return;
     }
     if (cb !== null && typeof cb !== "function") {
       throw new RangeError(

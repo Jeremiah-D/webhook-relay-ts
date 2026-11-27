@@ -146,16 +146,33 @@ describe("RetryQueue batch callback revision (WR-400)", () => {
     }
   });
 
-  it("revising with batching unconfigured throws Error; batchConfigured reports the live state", () => {
-    const q = new RetryQueue({ sender: async () => {} });
-    assert.equal(q.batchConfigured(), false);
-    assert.equal(q.getBatchConfig(), undefined);
-    assert.throws(
-      () => q.reviseBatchCallback(() => {}),
-      (err: unknown) => err instanceof Error && /requires a restart/.test(err.message)
-    );
+  it("WR-477: installing the callback on an unconfigured queue enables observation; batching itself stays unconfigured until setBatchConfig", async () => {
     const clock = fakeClock();
-    const { q: configured } = makeQueue(clock);
+    const seen: BatchInfo[] = [];
+    const q = new RetryQueue({
+      sender: async () => {},
+      setTimer: clock.setTimer,
+    });
+    q.start();
+    try {
+      assert.equal(q.batchConfigured(), false);
+      assert.equal(q.getBatchConfig(), undefined);
+      // No throw: the observer installs even though no batcher exists.
+      q.reviseBatchCallback((info) => seen.push(info));
+      assert.equal(q.batchConfigured(), false);
+      assert.equal(q.getBatchConfig(), undefined);
+      // The installed observer fires from the first flush after
+      // batching is enabled (WR-450).
+      q.setBatchConfig({ windowMs: 100, maxBatchSize: 10 });
+      q.enqueue(item("a", EP1));
+      await clock.advance(100);
+      assert.equal(seen.length, 1);
+      assert.deepEqual(seen[0].traceIds, ["trace-a"]);
+    } finally {
+      q.stop();
+    }
+    const clock2 = fakeClock();
+    const { q: configured } = makeQueue(clock2);
     try {
       assert.equal(configured.batchConfigured(), true);
       assert.deepEqual(configured.getBatchConfig(), { windowMs: 100, maxBatchSize: 10 });
@@ -481,9 +498,10 @@ describe("RelayServer batch callback revision (WR-400)", () => {
     assert.equal(eventsOf(auditLog, "batch_callback_revised").length, 0);
   });
 
-  it("revising with batching unconfigured throws Error", () => {
+  it("WR-477: revising with batching unconfigured enables observation and audits previous 'cleared'", () => {
     const dir = mkdtempSync(join(tmpdir(), "batch-callback-revision-"));
     const auditLog = new AuditLog(join(dir, "audit.jsonl"));
+    const seen: BatchInfo[] = [];
     const relay = createRelayServer({
       ["sec" + "ret"]: INGEST_KEY,
       forwardUrl: EP2,
@@ -494,9 +512,12 @@ describe("RelayServer batch callback revision (WR-400)", () => {
       },
     });
     servers.push(relay);
-    assert.throws(
-      () => relay.reviseBatchCallback!(() => {}),
-      (err: unknown) => err instanceof Error && /requires a restart/.test(err.message)
-    );
+    assert.equal(relay.getBatchConfig!(), undefined);
+    relay.reviseBatchCallback!((info) => seen.push(info));
+    const revised = eventsOf(auditLog, "batch_callback_revised");
+    assert.equal(revised.length, 1);
+    assert.equal(revised[0].previous, "cleared");
+    assert.equal(revised[0].current, "set");
+    assert.equal(relay.getBatchConfig!(), undefined);
   });
 });

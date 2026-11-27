@@ -13694,9 +13694,15 @@ flushing continue and are still audited as `batch_flushed` and counted in
 batch stats, just no longer forwarded to an operator). The new observer
 takes effect from the next flush; batches already reported are never
 re-delivered. A real revision is audited as `batch_callback_revised` with
-`previous` / `current` ('set' / 'cleared' only). Revising when batching
-was never configured throws `Error` (enabling it needs a restart). This
-only swaps the observation receiver — the merge rhythm still follows
+`previous` / `current` ('set' / 'cleared' only). WR-477: when batching
+was never configured the same call *enables* observation instead of
+throwing — the callback is installed and takes effect from the first
+flush after batching is enabled via `setBatchConfig` (audited as
+`batch_callback_revised` with `previous: 'cleared'`); `null` while
+unconfigured is a silent no-op when nothing is installed, and a
+non-function value throws `RangeError` and leaves the relay
+unconfigured. Installing the observer never starts merging on its own.
+This only swaps the observation receiver — the merge rhythm still follows
 WR-333 (`setBatchConfig`).
 
 **Live event stream:** with an `operatorToken` set, `GET /events` opens a
