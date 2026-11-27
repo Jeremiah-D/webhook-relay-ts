@@ -363,14 +363,20 @@ describe("RelayServer proxy health revision (WR-358)", () => {
     assert.deepEqual(relay.getProxyHealthConfig!(), { ...construction, intervalMs: 5000 });
   });
 
-  it("unconfigured relay: revise throws the must-restart Error and the getter is not mounted", async () => {
-    const { relay } = makeRelay();
+  it("unconfigured relay: revise enables probing, mounts the getters, and audits previous null once (WR-479)", async () => {
+    const { relay, audit } = makeRelay();
     await listen(relay);
     assert.equal(relay.getProxyHealthConfig, undefined);
-    assert.throws(
-      () => relay.reviseProxyHealth!({ intervalMs: 5000 }),
-      (err: unknown) =>
-        err instanceof Error && /requires a restart/.test((err as Error).message)
-    );
+    assert.equal(relay.getProxyHealthStats, undefined);
+    assert.deepEqual(relay.reviseProxyHealth!({ intervalMs: 5000 }), {
+      ...construction,
+      intervalMs: 5000,
+    });
+    assert.deepEqual(relay.getProxyHealthConfig!(), { ...construction, intervalMs: 5000 });
+    assert.deepEqual(relay.getProxyHealthStats!(), []);
+    const revised = eventsOf(audit, "proxy_health_revised");
+    assert.equal(revised.length, 1, "the enable is audited exactly once");
+    assert.equal(revised[0].previous, null);
+    assert.deepEqual(revised[0].current, { ...construction, intervalMs: 5000 });
   });
 });

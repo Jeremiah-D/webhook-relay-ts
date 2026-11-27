@@ -561,7 +561,9 @@ import {
 } from "./outbound-schema.ts";
 import type { ProbeAuditEvent, ProbeConfig, ProbeEndpointsRevision, ProbeOptions, ProbeRevision } from "./downstream-probe.ts";
 import {
+  DEFAULT_PROXY_HEALTH_CONFIG,
   ProxyHealthMonitor,
+  type ProxyHealthAuditEvent,
   type ProxyHealthConfig,
   type ProxyHealthOptions,
   type ProxyHealthRevision,
@@ -6627,23 +6629,40 @@ export interface RelayServer extends Server {
    * next failed probe — lowering the threshold never retroactively
    * marks a proxy unhealthy, raising it never re-admits one. An
    * illegal patch throws `RangeError` and the live values are
-   * untouched; an empty patch is a `RangeError`; a same-value revision
-   * is a no-op with no audit event. A real revision is audited as
-   * `proxy_health_revised` with `previous` / `current` (the three
-   * knobs), via the monitor's `onAudit` → audit-log channel, and
-   * returns the live config. Always set; throws `Error` when
-   * `proxyHealth` was never configured — enabling it needs a restart.
-   * The probe target and the tracked proxy list are revised separately
-   * (target stays construction-time; the list grows via
-   * `ensureTracked` at dispatch). Orthogonal to WR-181 (which owns
-   * the probing mechanism itself), WR-355 (downstream probes, not
-   * outbound proxies), and WR-10 (the circuit-breaker trip decision,
-   * untouched here).
+   * untouched; an empty patch is a `RangeError` on a configured
+   * relay; a same-value revision is a no-op with no audit event. A
+   * real revision is audited as `proxy_health_revised` with `previous`
+   * / `current` (the three knobs), via the monitor's `onAudit` →
+   * audit-log channel, and returns the live config. Always set.
+   *
+   * WR-479: when `proxyHealth` was never configured, the same call
+   * *enables* probing instead of throwing: a patch carrying at least
+   * one knob builds a fresh `ProxyHealthMonitor` (omitted knobs take
+   * the construction defaults, the tracked set is seeded from the
+   * `proxies` record exactly as at startup, and the monitor starts
+   * probing from the next interval — no burst, no retroactive
+   * verdicts), mounts `getProxyHealthConfig()` /
+   * `getProxyHealthStats()`, and audits the enable once as
+   * `proxy_health_revised` with `previous: null` through the
+   * monitor's `onAudit` channel. An empty patch on an unconfigured
+   * relay is a silent no-op: it reports the construction defaults
+   * but enables nothing (no monitor, no getter, no audit), and the
+   * relay can still be enabled afterwards. An illegal or non-object
+   * patch throws `RangeError` and leaves the relay unconfigured.
+   * No persistence: a restart returns to unconfigured — the enable
+   * is live-only. The probe target and the tracked proxy list are
+   * revised separately (target stays construction-time; the list
+   * grows via `ensureTracked` at dispatch). Orthogonal to WR-181
+   * (which owns the probing mechanism itself), WR-355 (downstream
+   * probes, not outbound proxies), and WR-10 (the circuit-breaker
+   * trip decision, untouched here).
    */
   reviseProxyHealth?: (patch: ProxyHealthRevision) => ProxyHealthConfig;
   /**
    * WR-358: live outbound proxy health config — the three probe knobs.
-   * Only set when `proxyHealth` was configured; `undefined` otherwise.
+   * Only set when `proxyHealth` was configured — WR-479 mounts it
+   * from the enable path when probing is enabled at runtime;
+   * `undefined` otherwise.
    */
   getProxyHealthConfig?: () => ProxyHealthConfig | undefined;
   /**
@@ -11232,7 +11251,23 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   // startup; `socks5://` entries are skipped (CONNECT probing only).
   // Every `proxy_unhealthy` / `proxy_recovered` / `proxy_degraded`
   // event lands in the audit log.
-  const proxyHealthMonitor =
+  // WR-479: the audit channel is retained in a named closure so the
+  // enable path can audit through it — the monitor itself emits no
+  // audit for the enable (it is constructed with the merged values,
+  // not retuned), so the enable audit travels this same `onAudit` →
+  // audit-log channel exactly once, and the server appends no second
+  // audit.
+  const onProxyHealthAudit = (event: ProxyHealthAuditEvent) => {
+    opts.auditLog.append(event);
+  };
+  // WR-479: deliberately *not* const — `reviseProxyHealth` installs a
+  // fresh monitor here when probing is enabled at runtime (it was
+  // undefined before, so there is nothing to retune in place). The
+  // dispatch closure, the metrics render, and the close handler all
+  // read this variable live, so the enabled monitor takes over
+  // failover, metrics, and shutdown with no further rewiring; the
+  // sender never held a copy (it consults the dispatch path).
+  let proxyHealthMonitor =
     opts.proxyHealth !== undefined
       ? new ProxyHealthMonitor({
           ...opts.proxyHealth,
@@ -11243,9 +11278,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
               )
             ),
           ],
-          onAudit: (event) => {
-            opts.auditLog.append(event);
-          },
+          onAudit: onProxyHealthAudit,
         })
       : undefined;
   // WR-192: resolve the outbound static credentials once at startup so
@@ -19657,27 +19690,89 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   }
 
   // WR-358: outbound proxy health probe rhythm runtime revision. The
-  // method is always set (like reviseProbe above); with proxyHealth
-  // unconfigured the canonical must-restart Error is thrown —
-  // enabling it needs a restart. A real revision is audited as
-  // `proxy_health_revised` with the previous and current config by
-  // the monitor itself via the `onAudit` → audit-log channel, so a
-  // real revision is audited exactly once; an empty or same-value
-  // patch is a silent no-op.
+  // method is always set (like reviseProbe above). WR-479: with
+  // proxyHealth unconfigured the same call *enables* probing (a patch
+  // carrying at least one knob builds a fresh monitor, starts it, and
+  // mounts the getters; the enable is audited as
+  // `proxy_health_revised` with `previous: null` through the
+  // monitor's `onAudit` → audit-log channel, so a real enable is
+  // audited exactly once and the server appends nothing here). An
+  // empty patch on an unconfigured relay is a silent no-op (it
+  // reports the construction defaults but enables nothing); an
+  // illegal or non-object patch throws `RangeError` and leaves the
+  // relay unconfigured, still enableable afterwards. A real revision
+  // is audited as `proxy_health_revised` with the previous and
+  // current config by the monitor itself via the `onAudit` →
+  // audit-log channel, so a real revision is audited exactly once;
+  // an empty patch on a configured relay is a `RangeError` and a
+  // same-value patch is a silent no-op.
   server.reviseProxyHealth = (patch: ProxyHealthRevision): ProxyHealthConfig => {
     if (proxyHealthMonitor === undefined) {
-      throw new Error(
-        "reviseProxyHealth: proxy health probing is not configured — enabling it requires a restart: " +
-          "the monitor is created at startup and a running relay cannot start probing proxies without one"
-      );
+      // WR-479: enable — validate first, mirroring the `retune`
+      // gates, so an illegal patch throws `RangeError` and the relay
+      // stays unconfigured (and can still be enabled afterwards).
+      // The constructor gates below throw before the field is
+      // assigned, so a rejected enable leaves nothing behind.
+      if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+        throw new RangeError(
+          `proxy health revision must be an object, got ${JSON.stringify(patch)}`
+        );
+      }
+      if (
+        patch.intervalMs === undefined &&
+        patch.probeTimeoutMs === undefined &&
+        patch.failureThreshold === undefined
+      ) {
+        // An empty patch enables nothing: report the construction
+        // defaults, mount nothing, audit nothing.
+        return { ...DEFAULT_PROXY_HEALTH_CONFIG };
+      }
+      // Mirror the construction wiring above: the patch knobs win,
+      // omitted knobs take the construction defaults inside the
+      // monitor, the tracked set is seeded from the `proxies` record
+      // exactly as at startup, and the audit channel is the retained
+      // one. The probe target stays the construction default — the
+      // revision carries no target.
+      const enabled = new ProxyHealthMonitor({
+        intervalMs: patch.intervalMs,
+        probeTimeoutMs: patch.probeTimeoutMs,
+        failureThreshold: patch.failureThreshold,
+        proxies: [
+          ...new Set(
+            Object.values(opts.proxies ?? {}).filter(
+              (u): u is string => typeof u === "string" && !isSocks5ProxyUrl(u)
+            )
+          ),
+        ],
+        onAudit: onProxyHealthAudit,
+      });
+      proxyHealthMonitor = enabled;
+      // A running relay probes from now: `start()` schedules the
+      // first round one interval later (no burst). The dispatch
+      // closure, metrics render, and close handler read the live
+      // variable, so no further rewiring is needed.
+      enabled.start();
+      // Mount the getters at the same time (WR-448 / WR-466
+      // precedent). The enabled monitor reports the enabled config
+      // and the tracked-proxy stats.
+      server.getProxyHealthConfig = (): ProxyHealthConfig => proxyHealthMonitor!.snapshot();
+      server.getProxyHealthStats = (): ProxyHealthStats[] => proxyHealthMonitor!.stats();
+      // The monitor emits no audit for the enable itself (it was
+      // constructed with the merged values, not retuned), so audit
+      // it once here through the monitor's own `onAudit` channel —
+      // never a second `auditLog.append` alongside it.
+      const current = enabled.snapshot();
+      onProxyHealthAudit({ event: "proxy_health_revised", previous: null, current });
+      return current;
     }
     return proxyHealthMonitor.retune(patch);
   };
 
   // WR-358: live outbound proxy health config. Only set when
-  // `proxyHealth` was configured.
+  // `proxyHealth` was configured — WR-479 mounts it from the enable
+  // path when probing is enabled at runtime.
   if (proxyHealthMonitor !== undefined) {
-    server.getProxyHealthConfig = (): ProxyHealthConfig => proxyHealthMonitor.snapshot();
+    server.getProxyHealthConfig = (): ProxyHealthConfig => proxyHealthMonitor!.snapshot();
   }
 
   // WR-359: outbound endpoint health scoring knob runtime revision.
@@ -26169,9 +26264,10 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
   }
 
   // WR-181: outbound proxy health snapshot. Only set when `proxyHealth`
-  // was configured.
+  // was configured — WR-479 mounts it from the enable path when
+  // probing is enabled at runtime.
   if (proxyHealthMonitor !== undefined) {
-    server.getProxyHealthStats = (): ProxyHealthStats[] => proxyHealthMonitor.stats();
+    server.getProxyHealthStats = (): ProxyHealthStats[] => proxyHealthMonitor!.stats();
   }
 
   return server;

@@ -94,13 +94,31 @@ export interface ProxyHealthConfig {
   failureThreshold: number;
 }
 
+/**
+ * Construction defaults for the three revisable knobs (WR-358):
+ * a probe round every 30 s, a 10 s CONNECT timeout, 3 consecutive
+ * failures to mark a proxy unhealthy. WR-479: exported so the
+ * server's enable path can report them for an empty patch on an
+ * unconfigured relay (a silent no-op that enables nothing) without
+ * duplicating the numbers.
+ */
+export const DEFAULT_PROXY_HEALTH_CONFIG: ProxyHealthConfig = {
+  intervalMs: 30_000,
+  probeTimeoutMs: 10_000,
+  failureThreshold: 3,
+};
+
 /** Partial patch for `ProxyHealthMonitor.retune` (WR-358). */
 export type ProxyHealthRevision = Partial<ProxyHealthConfig>;
 
 export interface ProxyHealthRevisedAuditEvent {
   event: "proxy_health_revised";
-  /** The live config before the revision. */
-  previous: ProxyHealthConfig;
+  /**
+   * The live config before the revision. `null` when the revision
+   * *enabled* probing on a relay that never configured it (WR-479) —
+   * there was no previous config.
+   */
+  previous: ProxyHealthConfig | null;
   /** The live config after the revision. */
   current: ProxyHealthConfig;
 }
@@ -279,9 +297,9 @@ export class ProxyHealthMonitor {
   private running = false;
 
   constructor(opts: ProxyHealthOptions = {}) {
-    const intervalMs = opts.intervalMs ?? 30_000;
-    const probeTimeoutMs = opts.probeTimeoutMs ?? 10_000;
-    const failureThreshold = opts.failureThreshold ?? 3;
+    const intervalMs = opts.intervalMs ?? DEFAULT_PROXY_HEALTH_CONFIG.intervalMs;
+    const probeTimeoutMs = opts.probeTimeoutMs ?? DEFAULT_PROXY_HEALTH_CONFIG.probeTimeoutMs;
+    const failureThreshold = opts.failureThreshold ?? DEFAULT_PROXY_HEALTH_CONFIG.failureThreshold;
     assertValidProxyHealthKnobs(intervalMs, probeTimeoutMs, failureThreshold);
     this.intervalMs = intervalMs;
     this.probeTimeoutMs = probeTimeoutMs;

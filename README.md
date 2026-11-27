@@ -2055,21 +2055,33 @@ reliability primitives that matter for any signed-payload pipeline.
   (`intervalMs` / `probeTimeoutMs` / `failureThreshold`, partial —
   omitted fields keep their live values); `server.getProxyHealthConfig()`
   returns the live config (the getter is only mounted when `proxyHealth`
-  was configured). A running monitor re-arms its pending timers at the
+  was configured, or once probing is enabled at runtime). A running monitor re-arms its pending timers at the
   new interval (no extra round, probe counts and health state untouched);
   `probeTimeoutMs` takes effect from the next probe and
   `failureThreshold` from the next failed probe — lowering the threshold
   never retroactively marks a proxy unhealthy, raising it never
   re-admits one. An illegal patch throws `RangeError` and leaves the
-  live values untouched; an empty or same-value patch is a silent
-  no-op. A real revision is audited as `proxy_health_revised` with
-  `previous` / `current`. Enabling probing when it was never configured
-  still requires a restart. Covered by `test/proxy-health.test.ts`
+  live values untouched; on a configured relay an empty patch is a
+  `RangeError` and a same-value patch is a silent no-op. A real revision is audited as `proxy_health_revised` with
+  `previous` / `current`. Live enable (WR-479): when probing was never
+  configured, the same call enables it — a patch carrying at least one
+  knob builds a fresh monitor (omitted knobs take the construction
+  defaults: 30 s interval, 10 s timeout, threshold 3; the tracked set
+  is seeded from the `proxies` record), starts probing from the next
+  interval, mounts both getters, and audits the enable once as
+  `proxy_health_revised` with `previous: null`. An empty patch on an
+  unconfigured relay is a silent no-op (it reports the defaults but
+  enables nothing); an illegal patch throws `RangeError` and leaves
+  the relay unconfigured. No restart, no persistence: a fresh relay is
+  unconfigured again. Covered by `test/proxy-health.test.ts`
   (19 tests: threshold/recovery matrix, backup/direct/stay failover, audit
   shapes, credential redaction, end-to-end relay delivery through a fake
   backup CONNECT proxy) and `test/proxy-health-revision.test.ts` (13
   tests: interval re-arm, live timeout/threshold reads, no-op and
-  must-restart cases, server audit). Zero dependencies (`node:net` + `src/proxy.ts`).
+  enable cases, server audit) and `test/proxy-health-enable.test.ts`
+  (5 tests: enable with live probing and `previous: null` audit,
+  illegal-patch rejection, same-value no-op, unconfigured empty-patch
+  behaviour, restart restores unconfigured). Zero dependencies (`node:net` + `src/proxy.ts`).
 - `bench/keepalive-bench.ts` (`npm run bench:keepalive`) — sequential
   deliveries to a localhost stub, before/after numbers (50 warmup deliveries
   per scenario; connection counts include warmup). Measured 2026-10-08,
