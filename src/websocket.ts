@@ -5,6 +5,11 @@ import { normalizePin, spkiFingerprint, TlsPinMismatchError } from "./pinning.ts
 import { sniServernameForHost } from "./tls-sni.ts";
 import { HttpDeliveryError } from "./failure.ts";
 import {
+  OutboundSsrfGuard,
+  type SsrfGuardAgentBinding,
+  type SsrfGuardMode,
+} from "./outbound-ssrf-guard.ts";
+import {
   PERMESSAGE_DEFLATE_OFFER,
   decompressMessage,
   maybeCompressMessage,
@@ -58,6 +63,18 @@ import { renderWebSocketBlock, type WebSocketOriginMetricsInput } from "./metric
  *   option); negotiated per connection at handshake, opportunistic per
  *   message (threshold + never-expand), RSV1-marked frames both ways.
  *   Negotiation is strict — see `src/deflate.ts`.
+ * - WR-483 outbound SSRF guard: when a per-endpoint binding (or a
+ *   pool-level `OutboundSsrfGuard`) is supplied, the socket dials
+ *   through the binding's `lookup` — both `tls.connect` and
+ *   `net.connect` take `lookup`, so the guard judges exactly the
+ *   addresses the connection uses. A private hit refuses the dial with
+ *   `OutboundSsrfBlockedError` before a byte is written (the queue
+ *   classifies it `non_retryable`, exactly like the HTTP/1.1 path).
+ *   The pool key binds the guard mode, so an allowlisted endpoint can
+ *   never ride a guarded endpoint's connection, or vice versa. A live
+ *   connection is never re-judged — it already went to a checked
+ *   address. WebSocket never tunnels (see `src/proxy.ts`), so the
+ *   binding never carries a proxy skip.
  *
  * `x-relay-*` headers (idempotency key, trace, …) ride the upgrade
  * request as plain HTTP headers — the WebSocket handshake *is* an HTTP
@@ -142,6 +159,15 @@ export interface WebSocketPoolOptions {
    * must not break a delivery).
    */
   onTlsPeerCertificate?: (socket: TLSSocket, targetUrl: string) => void;
+  /**
+   * WR-483: the outbound SSRF guard (see
+   * `src/outbound-ssrf-guard.ts`) the pool derives per-endpoint
+   * bindings from when the caller passes no binding to `deliver`.
+   * The server passes its shared guard here; a per-call binding always
+   * wins over the derived one. `undefined` keeps the exact pre-WR-483
+   * behavior (the OS resolver, no guard check).
+   */
+  ssrfGuard?: OutboundSsrfGuard;
 }
 
 /** Tuning for multiplexed WebSocket deliveries (WR-204). */
@@ -168,6 +194,8 @@ export interface ResolvedWebSocketPoolOptions {
   permessageDeflate: ResolvedPerMessageDeflate | undefined;
   multiplex: ResolvedWsMultiplexOptions | undefined;
   onTlsPeerCertificate: ((socket: TLSSocket, targetUrl: string) => void) | undefined;
+  /** WR-483: the pool-level SSRF guard, if one was supplied. */
+  ssrfGuard: OutboundSsrfGuard | undefined;
 }
 
 /** Validate pool options once, at startup — never mid-delivery. */
@@ -209,6 +237,10 @@ export function resolveWebSocketOptions(opts: WebSocketPoolOptions = {}): Resolv
   if (onTlsPeerCertificate !== undefined && typeof onTlsPeerCertificate !== "function") {
     fail("onTlsPeerCertificate must be a function");
   }
+  const ssrfGuard = opts.ssrfGuard;
+  if (ssrfGuard !== undefined && !(ssrfGuard instanceof OutboundSsrfGuard)) {
+    fail("ssrfGuard must be an OutboundSsrfGuard");
+  }
   return {
     timeoutMs,
     maxMessageBytes,
@@ -217,6 +249,7 @@ export function resolveWebSocketOptions(opts: WebSocketPoolOptions = {}): Resolv
     permessageDeflate,
     multiplex,
     onTlsPeerCertificate,
+    ssrfGuard,
   };
 }
 
@@ -324,13 +357,13 @@ function mean(samples: number[]): number {
 
 // --- connection ------------------------------------------------------------
 
-/** Per-origin pool key: reused connections never cross origins or pin sets. */
-function poolKey(url: URL, pins: string[] | undefined): string {
+/** Per-origin pool key: reused connections never cross origins or pin sets. WR-483: the guard mode binds the key, so an allowlisted endpoint can never ride a guarded endpoint's connection, or vice versa. */
+function poolKey(url: URL, pins: string[] | undefined, ssrfMode?: SsrfGuardMode): string {
   const pinHash =
     pins === undefined
       ? "-"
       : createHash("sha256").update(pins.map(normalizePin).sort().join(",")).digest("hex");
-  return `${url.protocol}//${url.host}/${pinHash}`;
+  return `${url.protocol}//${url.host}/${pinHash}${ssrfMode !== undefined ? `|ssrf:${ssrfMode}` : ""}`;
 }
 
 interface PooledWsConnection {
@@ -358,6 +391,13 @@ interface PooledWsConnection {
    * shared by concurrent deliveries and never marked `busy`.
    */
   mux?: MuxConnectionState;
+  /**
+   * WR-483: the SSRF guard mode this connection was opened under
+   * (`undefined` when unguarded). Check-in / removal re-derive the pool
+   * key from it, so a connection can never be filed under the wrong
+   * guard mode's key.
+   */
+  ssrfMode?: SsrfGuardMode;
 }
 
 /**
@@ -697,7 +737,12 @@ export class WebSocketPool {
    * `relayHeaders` are the `x-relay-*` headers, sent as upgrade request
    * headers on the connection this delivery opens; `pins` is the WR-21
    * whitelist for `wss:` (undefined for `ws:`); `targetUrl` names the
-   * endpoint in errors.
+   * endpoint in errors. WR-483: `ssrf` is the per-endpoint guard
+   * binding (from `OutboundSsrfGuard.bindingFor(targetUrl)`); when
+   * omitted and the pool carries a guard, one is derived from
+   * `targetUrl`. A private hit rejects with the raw
+   * `OutboundSsrfBlockedError` — the queue classifies it
+   * `non_retryable`, exactly like the HTTP/1.1 path.
    *
    * Note: the upgrade handshake is connection-scoped — a pooled
    * connection that is reused keeps the handshake headers of the
@@ -714,13 +759,19 @@ export class WebSocketPool {
     body: Buffer,
     relayHeaders: Record<string, string>,
     pins: string[] | undefined,
-    targetUrl: string
+    targetUrl: string,
+    ssrf?: SsrfGuardAgentBinding
   ): Promise<DownstreamResponse> {
     if (this.destroyed) throw new Error("websocket: pool destroyed");
+    // WR-483: resolve the guard binding once per delivery — a per-call
+    // binding (exact `targetUrl`, built by the sender) wins; a
+    // pool-level guard derives one from `targetUrl`; neither means the
+    // pre-WR-483 OS resolver, unchanged.
+    const binding = ssrf ?? this.opts.ssrfGuard?.bindingFor(targetUrl);
     if (this.opts.multiplex !== undefined) {
-      return this.deliverMux(url, body, relayHeaders, pins, targetUrl);
+      return this.deliverMux(url, body, relayHeaders, pins, targetUrl, binding);
     }
-    const conn = await this.checkout(url, relayHeaders, pins, targetUrl);
+    const conn = await this.checkout(url, relayHeaders, pins, targetUrl, binding);
     try {
       return await this.roundTrip(conn, body, targetUrl);
     } finally {
@@ -747,9 +798,10 @@ export class WebSocketPool {
     body: Buffer,
     relayHeaders: Record<string, string>,
     pins: string[] | undefined,
-    targetUrl: string
+    targetUrl: string,
+    ssrf?: SsrfGuardAgentBinding
   ): Promise<DownstreamResponse> {
-    const conn = await this.checkoutMux(url, relayHeaders, pins, targetUrl);
+    const conn = await this.checkoutMux(url, relayHeaders, pins, targetUrl, ssrf);
     const mux = conn.mux;
     if (mux === undefined || conn.dead || conn.socket.destroyed) {
       // Lost the race with a teardown: fail retryable, the retry queue
@@ -778,9 +830,10 @@ export class WebSocketPool {
     url: URL,
     relayHeaders: Record<string, string>,
     pins: string[] | undefined,
-    targetUrl: string
+    targetUrl: string,
+    ssrf?: SsrfGuardAgentBinding
   ): Promise<PooledWsConnection> {
-    const key = poolKey(url, pins);
+    const key = poolKey(url, pins, ssrf?.mode);
     const list = this.conns.get(key);
     if (list !== undefined) {
       for (const c of list) {
@@ -796,7 +849,7 @@ export class WebSocketPool {
     let opening = this.muxOpening.get(key);
     if (opening === undefined) {
       opening = (async (): Promise<PooledWsConnection> => {
-        const conn = await this.open(url, relayHeaders, pins, targetUrl);
+        const conn = await this.open(url, relayHeaders, pins, targetUrl, ssrf);
         if (this.destroyed) {
           // Same orphan-socket guard as the exclusive checkout path:
           // the fresh connection never entered `this.conns`, so
@@ -1190,9 +1243,10 @@ export class WebSocketPool {
     url: URL,
     relayHeaders: Record<string, string>,
     pins: string[] | undefined,
-    targetUrl: string
+    targetUrl: string,
+    ssrf?: SsrfGuardAgentBinding
   ): Promise<PooledWsConnection> {
-    const key = poolKey(url, pins);
+    const key = poolKey(url, pins, ssrf?.mode);
     const origin = WebSocketPool.originOf(url);
     const list = this.conns.get(key);
     if (list !== undefined) {
@@ -1209,7 +1263,7 @@ export class WebSocketPool {
         }
       }
     }
-    const conn = await this.open(url, relayHeaders, pins, targetUrl);
+    const conn = await this.open(url, relayHeaders, pins, targetUrl, ssrf);
     if (this.destroyed) {
       // The pool was destroyed while the handshake was in flight: the
       // fresh connection never entered `this.conns`, so `destroy()` could
@@ -1239,7 +1293,9 @@ export class WebSocketPool {
   }
 
   private remove(url: URL, pins: string[] | undefined, conn: PooledWsConnection): void {
-    const key = poolKey(url, pins);
+    // WR-483: the key re-derives from the connection's own guard mode —
+    // a connection is always removed from the key it was opened under.
+    const key = poolKey(url, pins, conn.ssrfMode);
     const list = this.conns.get(key);
     if (list === undefined) return;
     const i = list.indexOf(conn);
@@ -1580,7 +1636,8 @@ export class WebSocketPool {
     url: URL,
     relayHeaders: Record<string, string>,
     pins: string[] | undefined,
-    targetUrl: string
+    targetUrl: string,
+    ssrf?: SsrfGuardAgentBinding
   ): Promise<PooledWsConnection> {
     return new Promise<PooledWsConnection>((resolve, reject) => {
       const secure = url.protocol === "wss:";
@@ -1600,6 +1657,10 @@ export class WebSocketPool {
         settled = true;
         clearTimeout(timer);
         socket.destroy();
+        // WR-483: a guard refusal surfaces raw (the socket's `error`
+        // carries the `OutboundSsrfBlockedError` the lookup failed
+        // with) — the queue classifies it `non_retryable`, exactly
+        // like the HTTP/1.1 path. Nothing is wrapped here.
         reject(err);
       };
       const timer = setTimeout(() => {
@@ -1609,6 +1670,10 @@ export class WebSocketPool {
         ? tlsConnect({
             host,
             port,
+            // WR-483: the guard-checked lookup the socket dials
+            // through — `tls.connect` takes `lookup`, so the guard
+            // judges exactly the addresses this connection uses.
+            ...(ssrf !== undefined ? { lookup: ssrf.lookup } : {}),
             // SNI carries no IP addresses (RFC 6066): an IP literal here
             // is rejected outright by Node 25+ (DEP0123 became
             // ERR_INVALID_ARG_VALUE), so only DNS hosts send a servername
@@ -1618,7 +1683,12 @@ export class WebSocketPool {
             // and replace PKI verification (same as the HTTP/1.1 path).
             rejectUnauthorized: pins === undefined,
           })
-        : netConnect({ host, port });
+        : netConnect({
+            host,
+            port,
+            // WR-483: same guard-checked lookup as the `wss:` path.
+            ...(ssrf !== undefined ? { lookup: ssrf.lookup } : {}),
+          });
       const reader = new WsFrameReader();
       const conn: PooledWsConnection = {
         socket,
@@ -1628,6 +1698,9 @@ export class WebSocketPool {
         busy: false,
         dead: false,
         deflate: null,
+        // WR-483: the guard mode this connection was opened under, so
+        // check-in / removal file it under the right pool key.
+        ...(ssrf !== undefined ? { ssrfMode: ssrf.mode } : {}),
       };
 
       const verifyPins = (): void => {

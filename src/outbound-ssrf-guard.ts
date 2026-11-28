@@ -57,12 +57,16 @@ import type { LookupFunction } from "node:net";
  * Scope notes (mirroring the WR-194 pin):
  *
  * - The guard covers the HTTP/1.1 delivery path (pooled and one-off).
- *   The opt-in HTTP/2 session pool and the WebSocket pool manage their
- *   own connections and keep the OS resolver — they are not
- *   guard-checked.
+ *   Since WR-483 it also covers the opt-in HTTP/2 session pool and the
+ *   WebSocket pool: both dial through the per-endpoint bound lookup
+ *   (`Http2SessionPool.sessionFor` / `WebSocketPool.deliver` take the
+ *   binding, or derive one from a pool-level guard), with the pool key
+ *   binding the guard mode exactly like the HTTP/1.1 agent pool.
  * - Per-endpoint DoH bindings (WR-170) *are* guard-checked: the sender
  *   wraps the endpoint's DoH lookup with the same per-endpoint
  *   binding, so a DoH-resolved connection is judged like any other.
+ *   (The HTTP/2 path takes no DoH override — it never did — so an
+ *   H2 endpoint resolves through the guard's pin-checked lookup.)
  *   Downstream probes (WR-34) resolve through the raw cache lookup
  *   and are not guard-checked, like the pin.
  * - With keep-alive pooling (WR-24, the default), an established

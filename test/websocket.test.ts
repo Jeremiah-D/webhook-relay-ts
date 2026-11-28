@@ -4,6 +4,14 @@ import { createServer, type Server, type Socket } from "node:net";
 import { createServer as createTlsServer, type TLSSocket } from "node:tls";
 import { createHash } from "node:crypto";
 import { WebSocketPool, encodeWsFrame, wsAcceptKey, WsFrameReader } from "../src/websocket.ts";
+import {
+  OutboundSsrfGuard,
+  OutboundSsrfBlockedError,
+  type OutboundSsrfAllowlistedInfo,
+  type OutboundSsrfBlockedInfo,
+} from "../src/outbound-ssrf-guard.ts";
+import type { LookupAddress } from "node:dns";
+import type { LookupFunction } from "node:net";
 import { inboundWsAcceptKey } from "../src/inbound-ws.ts";
 // The raw-socket test server answers with the independent server-side
 // accept computation (inbound-ws.ts), so the client handshake is
@@ -406,4 +414,106 @@ test("frame reader unmasks masked frames", () => {
   const f = reader.next();
   assert.ok(f);
   assert.equal(f.payload.toString(), "secret");
+});
+
+// --- outbound SSRF guard (WR-483) -------------------------------------------
+
+/** Fake inner lookup: answers from a mutable hostname -> address map. */
+function fakeInner(map: Map<string, string[]>): LookupFunction {
+  return ((hostname: string, _options: unknown, callback: unknown) => {
+    const addrs = map.get(hostname);
+    const cb = callback as (
+      err: NodeJS.ErrnoException | null,
+      addresses: LookupAddress[]
+    ) => void;
+    if (addrs === undefined) {
+      const err = new Error(`ENOTFOUND ${hostname}`) as NodeJS.ErrnoException;
+      err.code = "ENOTFOUND";
+      cb(err, []);
+      return;
+    }
+    cb(
+      null,
+      addrs.map((address) => ({ address, family: (address.includes(":") ? 6 : 4) as 4 | 6 }))
+    );
+  }) as LookupFunction;
+}
+
+test("ssrf guard: wss target resolving to a private IP is refused before connect", async () => {
+  const srv = await trackServer(await startTestServer({ tls: true }));
+  srv.onText((_text, reply) => reply(Buffer.from("secure-ok")));
+  const port = new URL(srv.url()).port;
+  const targetUrl = `wss://evil.test:${port}/hook`;
+  const blocked: OutboundSsrfBlockedInfo[] = [];
+  const guard = new OutboundSsrfGuard({
+    inner: fakeInner(new Map([["evil.test", ["127.0.0.1"]]])),
+    onBlocked: (info) => blocked.push(info),
+  });
+  // No per-call binding: the pool derives one from the target URL.
+  const pool = trackPool(new WebSocketPool({ pingIntervalMs: 0, ssrfGuard: guard }));
+  await assert.rejects(
+    pool.deliver(new URL(targetUrl), Buffer.from("{}"), {}, undefined, targetUrl),
+    (err: unknown) => err instanceof OutboundSsrfBlockedError
+  );
+  // Refused before connect: the TLS server never saw a TCP connection.
+  assert.equal(srv.connections(), 0);
+  assert.equal(pool.getStats().created, 0);
+  assert.equal(guard.getStats().blocked, 1);
+  assert.equal(blocked.length, 1);
+  assert.equal(blocked[0]!.hostname, "evil.test");
+  assert.equal(blocked[0]!.category, "loopback");
+  assert.deepEqual(blocked[0]!.addresses, ["127.0.0.1"]);
+  assert.match(guard.render(), /relay_outbound_ssrf_lookups_total\{result="blocked"\} 1/);
+});
+
+test("ssrf guard: allowlisted ws endpoint delivers, guarded path stays separate", async () => {
+  const srv = await trackServer(await startTestServer());
+  srv.onText((text, reply) => reply(Buffer.concat([Buffer.from("got:"), text])));
+  const port = new URL(srv.url()).port;
+  const allowedUrl = `ws://allow.test:${port}/hook`;
+  const guardedUrl = `ws://allow.test:${port}/other`;
+  const allowed: OutboundSsrfAllowlistedInfo[] = [];
+  const guard = new OutboundSsrfGuard({
+    inner: fakeInner(new Map([["allow.test", ["127.0.0.1"]]])),
+    allowPrivateTargets: { [allowedUrl]: true },
+    onAllowlisted: (info) => allowed.push(info),
+  });
+  const pool = trackPool(new WebSocketPool({ pingIntervalMs: 0 }));
+  const res = await pool.deliver(
+    new URL(allowedUrl), Buffer.from("hi"), {}, undefined, allowedUrl,
+    guard.bindingFor(allowedUrl)
+  );
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.toString(), "got:hi");
+  assert.equal(guard.getStats().allowlisted, 1);
+  assert.equal(allowed.length, 1);
+  assert.equal(allowed[0]!.hostname, "allow.test");
+  // Same origin, guarded path: refused — it never rides the
+  // allowlisted endpoint's live connection.
+  await assert.rejects(
+    pool.deliver(
+      new URL(guardedUrl), Buffer.from("hi"), {}, undefined, guardedUrl,
+      guard.bindingFor(guardedUrl)
+    ),
+    (err: unknown) => err instanceof OutboundSsrfBlockedError
+  );
+  assert.equal(guard.getStats().blocked, 1);
+  // The allowlisted endpoint reuses its live connection afterwards.
+  const again = await pool.deliver(
+    new URL(allowedUrl), Buffer.from("hi"), {}, undefined, allowedUrl,
+    guard.bindingFor(allowedUrl)
+  );
+  assert.equal(again.statusCode, 200);
+  assert.equal(pool.getStats().created, 1);
+  assert.equal(pool.getStats().reused, 1);
+  assert.equal(srv.connections(), 1);
+});
+
+test("ssrf guard: unconfigured pool delivers exactly as before", async () => {
+  const srv = await trackServer(await startTestServer());
+  srv.onText((_text, reply) => reply(Buffer.from("ok")));
+  const pool = trackPool(new WebSocketPool({ pingIntervalMs: 0 }));
+  const res = await pool.deliver(new URL(srv.url()), Buffer.from("{}"), {}, undefined, srv.url());
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.toString(), "ok");
 });

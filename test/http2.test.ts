@@ -4,8 +4,16 @@ import { createServer as createH2Server, createSecureServer as createH2SecureSer
 import type { ServerHttp2Session, Http2Server } from "node:http2";
 import { createServer, type Server, type IncomingMessage } from "node:http";
 import { connect as tcpConnect, type Socket } from "node:net";
+import type { LookupAddress } from "node:dns";
+import type { LookupFunction } from "node:net";
 import { X509Certificate } from "node:crypto";
-import { Http2SessionPool, Http2UnavailableError, resolveHttp2PoolOptions } from "../src/http2.ts";
+import { Http2SessionPool, Http2UnavailableError, resolveHttp2PoolOptions, runHttp2Stream } from "../src/http2.ts";
+import {
+  OutboundSsrfGuard,
+  OutboundSsrfBlockedError,
+  type OutboundSsrfAllowlistedInfo,
+  type OutboundSsrfBlockedInfo,
+} from "../src/outbound-ssrf-guard.ts";
 import { createDefaultSender } from "../src/server.ts";
 import { HttpDeliveryError } from "../src/failure.ts";
 import { spkiFingerprint, TlsPinMismatchError } from "../src/pinning.ts";
@@ -549,5 +557,144 @@ describe("http2: stats and destroy", () => {
     assert.equal(err.name, "Http2UnavailableError");
     assert.equal(err.cause, cause);
     assert.match(err.message, /HTTP\/2 unavailable/);
+  });
+});
+
+describe("http2: outbound SSRF guard (WR-483)", () => {
+  /** Fake inner lookup: answers from a mutable hostname -> address map. */
+  function fakeInner(map: Map<string, string[]>): LookupFunction {
+    return ((hostname: string, _options: unknown, callback: unknown) => {
+      const addrs = map.get(hostname);
+      const cb = callback as (
+        err: NodeJS.ErrnoException | null,
+        addresses: LookupAddress[]
+      ) => void;
+      if (addrs === undefined) {
+        const err = new Error(`ENOTFOUND ${hostname}`) as NodeJS.ErrnoException;
+        err.code = "ENOTFOUND";
+        cb(err, []);
+        return;
+      }
+      cb(
+        null,
+        addrs.map((address) => ({ address, family: (address.includes(":") ? 6 : 4) as 4 | 6 }))
+      );
+    }) as LookupFunction;
+  }
+
+  it("refuses a session whose target resolves to a private IP, unwrapped", async () => {
+    const stub = startH2cStub();
+    const port = await stub.port;
+    const blocked: OutboundSsrfBlockedInfo[] = [];
+    const guard = new OutboundSsrfGuard({
+      inner: fakeInner(new Map([["evil.test", ["169.254.169.254"]]])),
+      onBlocked: (info) => blocked.push(info),
+    });
+    const pool = new Http2SessionPool({ enabled: true, hosts: ["evil.test"], ssrfGuard: guard });
+    try {
+      await assert.rejects(
+        pool.sessionFor(new URL(`http://evil.test:${port}/hook`)),
+        (err: unknown) => err instanceof OutboundSsrfBlockedError
+      );
+      // Refused before connect: the stub never saw a TCP connection,
+      // and the refusal is not an H2 failure (no HTTP/1.1 fallback).
+      assert.equal(stub.connections(), 0);
+      assert.equal(pool.getStats().established, 0);
+      assert.equal(guard.getStats().blocked, 1);
+      assert.equal(blocked.length, 1);
+      assert.equal(blocked[0]!.hostname, "evil.test");
+      assert.equal(blocked[0]!.category, "link-local");
+      assert.deepEqual(blocked[0]!.addresses, ["169.254.169.254"]);
+      // The shared relay_outbound_ssrf_* series carry the block.
+      assert.match(guard.render(), /relay_outbound_ssrf_lookups_total\{result="blocked"\} 1/);
+    } finally {
+      pool.destroy();
+      await stub.close();
+    }
+  });
+
+  it("allowlisted endpoint serves the private target and audits every serve", async () => {
+    const stub = startH2cStub();
+    const port = await stub.port;
+    const target = new URL(`http://allow.test:${port}/hook`);
+    const allowed: OutboundSsrfAllowlistedInfo[] = [];
+    const guard = new OutboundSsrfGuard({
+      inner: fakeInner(new Map([["allow.test", ["127.0.0.1"]]])),
+      allowPrivateTargets: { [target.href]: true },
+      onAllowlisted: (info) => allowed.push(info),
+    });
+    const pool = new Http2SessionPool({ enabled: true, hosts: ["allow.test"], ssrfGuard: guard });
+    try {
+      const session = await pool.sessionFor(target, undefined, undefined, undefined, undefined, guard.bindingFor(target.href));
+      const res = await runHttp2Stream(session, {
+        method: "POST",
+        path: "/hook",
+        headers: {},
+        body: BODY,
+      });
+      assert.equal(res.statusCode, 200);
+      assert.equal(res.body.toString(), "ok");
+      assert.equal(guard.getStats().allowlisted, 1);
+      assert.equal(allowed.length, 1);
+      assert.equal(allowed[0]!.hostname, "allow.test");
+      assert.equal(allowed[0]!.category, "loopback");
+      assert.deepEqual(allowed[0]!.addresses, ["127.0.0.1"]);
+    } finally {
+      pool.destroy();
+      await stub.close();
+    }
+  });
+
+  it("a single refusal neither poisons an established session nor crosses pool keys", async () => {
+    const stub = startH2cStub();
+    const port = await stub.port;
+    const guard = new OutboundSsrfGuard({
+      inner: fakeInner(new Map([["shared.test", ["127.0.0.1"]]])),
+      allowPrivateTargets: { [`http://shared.test:${port}/a`]: true },
+    });
+    const pool = new Http2SessionPool({ enabled: true, hosts: ["shared.test"], ssrfGuard: guard });
+    try {
+      const allowedUrl = new URL(`http://shared.test:${port}/a`);
+      const guardedUrl = new URL(`http://shared.test:${port}/b`);
+      const first = await pool.sessionFor(allowedUrl);
+      assert.equal(pool.getStats().established, 1);
+      // Same origin, guarded path: refused — the allowlisted session
+      // is untouched and the guarded endpoint gets no session of its own.
+      await assert.rejects(
+        pool.sessionFor(guardedUrl),
+        (err: unknown) => err instanceof OutboundSsrfBlockedError
+      );
+      assert.equal(pool.getStats().established, 1);
+      assert.equal(guard.getStats().blocked, 1);
+      // The allowlisted endpoint reuses its live session afterwards.
+      const again = await pool.sessionFor(allowedUrl);
+      assert.equal(again, first);
+      assert.equal(pool.getStats().established, 1);
+      assert.equal(pool.getStats().reused, 1);
+      assert.equal(pool.getStats().sessions.length, 1);
+    } finally {
+      pool.destroy();
+      await stub.close();
+    }
+  });
+
+  it("guard unconfigured: session establishment is unchanged", async () => {
+    const stub = startH2cStub();
+    const port = await stub.port;
+    const pool = new Http2SessionPool({ enabled: true, hosts: ["127.0.0.1"] });
+    try {
+      const session = await pool.sessionFor(new URL(`http://127.0.0.1:${port}/hook`));
+      const res = await runHttp2Stream(session, {
+        method: "POST",
+        path: "/hook",
+        headers: {},
+        body: BODY,
+      });
+      assert.equal(res.statusCode, 200);
+      assert.equal(pool.getStats().established, 1);
+    } finally {
+      pool.destroy();
+      await stub.close();
+    }
   });
 });

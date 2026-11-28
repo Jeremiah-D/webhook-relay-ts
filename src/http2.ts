@@ -4,10 +4,15 @@ import {
   type ClientHttp2Stream,
 } from "node:http2";
 import type { TLSSocket } from "node:tls";
-import type { Socket } from "node:net";
+import type { Socket, LookupFunction } from "node:net";
 import { normalizePin, spkiFingerprint } from "./pinning.ts";
 import { clientCertIdentity, type TlsClientCert } from "./mtls.ts";
 import { tlsSniPoolKeyFragment, type ResolvedTlsSniOverride } from "./tls-sni.ts";
+import {
+  OutboundSsrfGuard,
+  OutboundSsrfBlockedError,
+  type SsrfGuardAgentBinding,
+} from "./outbound-ssrf-guard.ts";
 import {
   assertTlsVersionMeetsFloor,
   compareTlsVersions,
@@ -45,6 +50,20 @@ import { createHash } from "node:crypto";
  * hand); the H1.1 tunneled path is the battle-tested one, so the pool
  * deliberately does not combine the two. The sender enforces this: an
  * endpoint with a proxy configured never attempts H2.
+ *
+ * Outbound SSRF guard (WR-483): when a per-endpoint binding (or a
+ * pool-level `OutboundSsrfGuard`) is supplied, the session dials
+ * through the binding's `lookup` — Node's `http2.connect` passes
+ * `lookup` to the underlying `net`/`tls` connect, so the guard judges
+ * exactly the addresses the session uses, with no second resolution
+ * and no TOCTOU window. A private hit refuses the session with
+ * `OutboundSsrfBlockedError` (unwrapped — never an
+ * `Http2UnavailableError`, so the sender does not fall back to
+ * HTTP/1.1; the attempt dead-letters `non_retryable`, exactly like the
+ * HTTP/1.1 path). The pool key binds the guard mode, so an allowlisted
+ * endpoint can never ride a guarded endpoint's session, or vice versa.
+ * A live session is never re-judged — it already went to a checked
+ * address.
  *
  * Zero dependencies (`node:http2` + `node:crypto` only).
  */
@@ -88,6 +107,15 @@ export interface Http2PoolOptions {
    * retries H2 on the very next delivery. Must be a finite number >= 0.
    */
   fallbackCooldownMs?: number;
+  /**
+   * WR-483: the outbound SSRF guard (see
+   * `src/outbound-ssrf-guard.ts`) the pool derives per-endpoint
+   * bindings from when the caller passes no binding to `sessionFor`.
+   * The server passes its shared guard here; a per-call binding always
+   * wins over the derived one. `undefined` keeps the exact pre-WR-483
+   * behavior (the OS resolver, no guard check).
+   */
+  ssrfGuard?: OutboundSsrfGuard;
 }
 
 const DEFAULTS = {
@@ -101,6 +129,8 @@ export interface ResolvedHttp2PoolOptions {
   hosts: string[];
   sessionIdleTimeoutMs: number;
   fallbackCooldownMs: number;
+  /** WR-483: the pool-level SSRF guard, if one was supplied. */
+  ssrfGuard: OutboundSsrfGuard | undefined;
 }
 
 /** Fired when an H2 failure falls back to the HTTP/1.1 pool (WR-423). */
@@ -181,7 +211,11 @@ export function resolveHttp2PoolOptions(opts: Http2PoolOptions = {}): ResolvedHt
   const fallbackCooldownMs = opts.fallbackCooldownMs ?? DEFAULTS.fallbackCooldownMs;
   assertNonNegativeFinite("sessionIdleTimeoutMs", sessionIdleTimeoutMs);
   assertNonNegativeFinite("fallbackCooldownMs", fallbackCooldownMs);
-  return { enabled, hosts, sessionIdleTimeoutMs, fallbackCooldownMs };
+  const ssrfGuard = opts.ssrfGuard;
+  if (ssrfGuard !== undefined && !(ssrfGuard instanceof OutboundSsrfGuard)) {
+    throw new RangeError("Http2SessionPool: ssrfGuard must be an OutboundSsrfGuard");
+  }
+  return { enabled, hosts, sessionIdleTimeoutMs, fallbackCooldownMs, ssrfGuard };
 }
 
 /** True when `url`'s (host, port) matches one `hosts` entry. */
@@ -211,7 +245,9 @@ export interface Http2SessionStats {
    * when a per-endpoint TLS SNI/ALPN override applies (see
    * `src/tls-sni.ts`) — the same binding rules as the HTTP/1.1 pool, so a
    * session pinned or authenticated for one endpoint can never serve
-   * another's.
+   * another's. WR-483: `|ssrf:<mode>` binds the guard mode the same way,
+   * so an allowlisted endpoint can never ride a guarded endpoint's
+   * session, or vice versa.
    */
   key: string;
   scheme: "http" | "https";
@@ -253,6 +289,8 @@ interface Http2Entry {
   tlsSni: ResolvedTlsSniOverride | undefined;
   /** TLS version floor (WR-74); undefined when the endpoint sets none. */
   minTlsVersion: MinTlsVersion | undefined;
+  /** WR-483: the guard-checked lookup this session dials through. */
+  ssrfLookup: LookupFunction | undefined;
   /** Negotiated version verified at session establishment (floored entries). */
   verifiedTlsVersion: string | undefined;
   session: ClientHttp2Session | undefined;
@@ -294,15 +332,25 @@ export class Http2SessionPool {
   /**
    * The H2 session serving `url` — established on first use, then shared
    * by every later delivery to the same `(scheme, host, port, pins, cert,
-   * tls identity, tls floor)`. Concurrent first deliveries share the in-flight
+   * tls identity, tls floor, ssrf mode)`. Concurrent first deliveries share the in-flight
    * connect. Throws {@link Http2UnavailableError} when H2 cannot serve the
    * delivery (not eligible, origin in fallback cooldown, connect failed,
    * pin verification failed, or TLS floor rejected) — the caller falls back to HTTP/1.1.
+   * WR-483: `ssrf` is the per-endpoint guard binding (from
+   * `OutboundSsrfGuard.bindingFor(targetUrl)`); when omitted and the
+   * pool carries a guard, one is derived from the URL. A private hit
+   * rejects with the raw {@link OutboundSsrfBlockedError} — never
+   * wrapped — so the caller dead-letters instead of falling back.
    */
-  async sessionFor(url: URL, pins?: readonly string[], clientCert?: TlsClientCert, tlsSni?: ResolvedTlsSniOverride, minTlsVersion?: MinTlsVersion): Promise<ClientHttp2Session> {
+  async sessionFor(url: URL, pins?: readonly string[], clientCert?: TlsClientCert, tlsSni?: ResolvedTlsSniOverride, minTlsVersion?: MinTlsVersion, ssrf?: SsrfGuardAgentBinding): Promise<ClientHttp2Session> {
     if (!this.eligibleFor(url)) {
       throw new Http2UnavailableError(`${url.host} is not eligible for HTTP/2`);
     }
+    // WR-483: resolve the guard binding before the pool key is built —
+    // the key binds the mode. A per-call binding (exact `targetUrl`,
+    // built by the sender) wins; a pool-level guard derives one from
+    // the URL; neither means the pre-WR-483 OS resolver, unchanged.
+    const binding = ssrf ?? this.opts.ssrfGuard?.bindingFor(url.href);
     const scheme = url.protocol === "https:" ? "https" : "http";
     const host = url.hostname;
     const port = url.port === "" ? (scheme === "https" ? 443 : 80) : Number(url.port);
@@ -317,6 +365,10 @@ export class Http2SessionPool {
     // WR-74: the floor binds the session key, like the keep-alive pool —
     // a session handshaked below one endpoint's floor can never serve it.
     if (minTlsVersion !== undefined) key += `|tlsmin:${minTlsVersion}`;
+    // WR-483: the guard mode binds the session key, like the keep-alive
+    // pool — an allowlisted endpoint can never ride a guarded
+    // endpoint's session, or vice versa.
+    if (binding !== undefined) key += `|ssrf:${binding.mode}`;
     let entry = this.entries.get(key);
     if (entry === undefined) {
       entry = {
@@ -324,6 +376,7 @@ export class Http2SessionPool {
         clientCert: clientCert !== undefined,
         pinWhitelist, verifiedPin: undefined, cert: clientCert,
         tlsSni, minTlsVersion, verifiedTlsVersion: undefined,
+        ssrfLookup: binding?.lookup,
         session: undefined, connecting: undefined, cooldownUntil: 0,
         lastUsed: Date.now(),
       };
@@ -393,6 +446,11 @@ export class Http2SessionPool {
       const session =
         entry.scheme === "https"
           ? h2connect(authority, {
+              // WR-483: the guard-checked lookup the session dials
+              // through — Node passes `lookup` to the underlying
+              // `tls.connect`, so the guard judges exactly the
+              // addresses this session uses.
+              ...(entry.ssrfLookup !== undefined ? { lookup: entry.ssrfLookup } : {}),
               // WR-60: per-endpoint SNI/ALPN override; without an entry the
               // historical ALPN offer (h2 only) and the origin host as SNI
               // apply, exactly as before.
@@ -414,15 +472,22 @@ export class Http2SessionPool {
                   }
                 : {}),
             })
-          : h2connect(authority);
+          : entry.ssrfLookup !== undefined
+            ? h2connect(authority, { lookup: entry.ssrfLookup })
+            : h2connect(authority);
       let ready = false;
       const fail = (err: Error): void => {
         if (ready) return; // handed to the persistent handlers below
         session.destroy();
+        // WR-483: a guard refusal is not an H2 failure — it reaches the
+        // caller unwrapped, so the sender dead-letters it
+        // (`non_retryable`) instead of falling back to HTTP/1.1.
         reject(
-          err instanceof Http2UnavailableError
+          err instanceof OutboundSsrfBlockedError
             ? err
-            : new Http2UnavailableError(`${entry.key}: ${err.message}`, err)
+            : err instanceof Http2UnavailableError
+              ? err
+              : new Http2UnavailableError(`${entry.key}: ${err.message}`, err)
         );
       };
       session.once("error", fail);

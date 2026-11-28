@@ -1,6 +1,7 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { createServer, request as httpRequest, type Server, type IncomingMessage } from "node:http";
+import { createServer as createH2Server, type Http2Server } from "node:http2";
 import { connect as tcpConnect, type Socket } from "node:net";
 import type { LookupAddress } from "node:dns";
 import type { LookupFunction } from "node:net";
@@ -392,7 +393,7 @@ describe("outbound-ssrf-guard: end-to-end through the relay server", () => {
   // (127.0.0.1 is already in no_proxy, the .test names are not).
   const savedNoProxy = process.env.NO_PROXY;
   const savedNoProxyLower = process.env.no_proxy;
-  const fakeHosts = ["private.test", "allowlisted.test", "proxied.test"];
+  const fakeHosts = ["private.test", "allowlisted.test", "proxied.test", "h2private.test", "wsprivate.test"];
 
   before(() => {
     process.env.NO_PROXY = `${savedNoProxy ?? ""},${fakeHosts.join(",")}`;
@@ -666,6 +667,150 @@ describe("outbound-ssrf-guard: end-to-end through the relay server", () => {
         (e) => (e as { event?: string }).event === "outbound_ssrf_blocked"
       );
       assert.equal(blocked.length, 0);
+    });
+  });
+
+  // WR-483: the guard also covers the HTTP/2 session pool and the
+  // WebSocket pool — a private hit on either path dead-letters on the
+  // first attempt (no retry budget, no H2→HTTP/1.1 fallback) and audits
+  // exactly one outbound_ssrf_blocked.
+  describe("blocked private target over HTTP/2", () => {
+    let downstream: Http2Server;
+    let relay: Server;
+    let relayPort: number;
+    let auditDir: string;
+    let streams = 0;
+    const dnsMap = new Map<string, string[]>();
+
+    before(async () => {
+      downstream = createH2Server();
+      downstream.on("stream", (stream) => {
+        streams++;
+        stream.resume();
+        stream.on("end", () => {
+          stream.respond({ ":status": 200 });
+          stream.end("ok");
+        });
+      });
+      const downstreamPort = await listenOn(downstream as unknown as Server);
+      dnsMap.set("h2private.test", ["127.0.0.1"]);
+      auditDir = mkdtempSync(join(tmpdir(), "audit-ssrf-h2-"));
+      const audit = new AuditLog(join(auditDir, "audit.jsonl"));
+      relay = createRelayServer({
+        // Computed key on purpose: the runtime redacts a literal `secret:` key.
+        ["sec" + "ret"]: relaySecret,
+        forwardUrl: `http://h2private.test:${downstreamPort}/hook`,
+        auditLog: audit,
+        operatorToken: OPERATOR,
+        retry: { baseDelayMs: 5, maxDelayMs: 10, maxAttempts: 2, jitterMs: 0 },
+        outboundKeepAlive: false,
+        dnsCache: {
+          resolve: async (hostname: string) =>
+            (dnsMap.get(hostname) ?? []).map((address) => ({ address, family: 4 as const })),
+        },
+        outboundHttp2: { enabled: true, hosts: ["h2private.test"] },
+        outboundSsrfGuard: {},
+      });
+      relayPort = await listenOn(relay);
+    });
+
+    after(() => {
+      relay.close();
+      downstream.close();
+    });
+
+    it("dead-letters on the first attempt without falling back to HTTP/1.1", async () => {
+      const auth = { authorization: `Bearer ${OPERATOR}` };
+      const r = await postSigned(relayPort, BODY);
+      assert.equal(r.status, 202);
+      let dead: Record<string, unknown>[] = [];
+      for (let i = 0; i < 200 && dead.length === 0; i++) {
+        await new Promise((res) => setTimeout(res, 25));
+        dead = ((await getJson(relayPort, "/dead-letter", auth)).body as Record<string, unknown>[]) ?? [];
+      }
+      assert.equal(dead.length, 1);
+      assert.equal(dead[0].attempts, 1);
+      assert.match(String(dead[0].lastError), /Outbound SSRF guard blocked h2private\.test: resolved address is loopback/);
+      assert.doesNotMatch(String(dead[0].lastError), /127\.0\.0\.1/);
+      // Refused before connect: the h2c stub saw no stream.
+      assert.equal(streams, 0);
+      const events = readAudit(auditDir) as Record<string, unknown>[];
+      const blocked = events.filter((e) => e.event === "outbound_ssrf_blocked");
+      assert.equal(blocked.length, 1);
+      assert.equal(blocked[0].hostname, "h2private.test");
+      assert.equal(blocked[0].category, "loopback");
+      assert.deepEqual(blocked[0].addresses, ["127.0.0.1"]);
+      // No H2→HTTP/1.1 fallback: the refusal is not an H2 failure, so
+      // the HTTP/1.1 path never re-judged (and re-audited) the target.
+      assert.equal(events.filter((e) => e.event === "http2_fallback").length, 0);
+      const deadAudits = events.filter((e) => e.event === "dead_letter");
+      assert.equal(deadAudits.length, 1);
+      assert.equal(deadAudits[0].failure_class, "non_retryable");
+    });
+  });
+
+  describe("blocked private target over WebSocket", () => {
+    let downstream: Server;
+    let relay: Server;
+    let relayPort: number;
+    let auditDir: string;
+    let connections = 0;
+    const dnsMap = new Map<string, string[]>();
+
+    before(async () => {
+      // Plain TCP listener: the guard refuses before connect, so it
+      // must never see a connection — no WebSocket server needed.
+      downstream = createServer();
+      downstream.on("connection", () => connections++);
+      const downstreamPort = await listenOn(downstream);
+      dnsMap.set("wsprivate.test", ["127.0.0.1"]);
+      auditDir = mkdtempSync(join(tmpdir(), "audit-ssrf-ws-"));
+      const audit = new AuditLog(join(auditDir, "audit.jsonl"));
+      relay = createRelayServer({
+        // Computed key on purpose: the runtime redacts a literal `secret:` key.
+        ["sec" + "ret"]: relaySecret,
+        forwardUrl: `wss://wsprivate.test:${downstreamPort}/hook`,
+        auditLog: audit,
+        operatorToken: OPERATOR,
+        retry: { baseDelayMs: 5, maxDelayMs: 10, maxAttempts: 2, jitterMs: 0 },
+        outboundKeepAlive: false,
+        dnsCache: {
+          resolve: async (hostname: string) =>
+            (dnsMap.get(hostname) ?? []).map((address) => ({ address, family: 4 as const })),
+        },
+        outboundSsrfGuard: {},
+      });
+      relayPort = await listenOn(relay);
+    });
+
+    after(() => {
+      relay.close();
+      downstream.close();
+    });
+
+    it("dead-letters on the first attempt before any socket is opened", async () => {
+      const auth = { authorization: `Bearer ${OPERATOR}` };
+      const r = await postSigned(relayPort, BODY);
+      assert.equal(r.status, 202);
+      let dead: Record<string, unknown>[] = [];
+      for (let i = 0; i < 200 && dead.length === 0; i++) {
+        await new Promise((res) => setTimeout(res, 25));
+        dead = ((await getJson(relayPort, "/dead-letter", auth)).body as Record<string, unknown>[]) ?? [];
+      }
+      assert.equal(dead.length, 1);
+      assert.equal(dead[0].attempts, 1);
+      assert.match(String(dead[0].lastError), /Outbound SSRF guard blocked wsprivate\.test: resolved address is loopback/);
+      assert.doesNotMatch(String(dead[0].lastError), /127\.0\.0\.1/);
+      assert.equal(connections, 0);
+      const events = readAudit(auditDir) as Record<string, unknown>[];
+      const blocked = events.filter((e) => e.event === "outbound_ssrf_blocked");
+      assert.equal(blocked.length, 1);
+      assert.equal(blocked[0].hostname, "wsprivate.test");
+      assert.equal(blocked[0].category, "loopback");
+      assert.deepEqual(blocked[0].addresses, ["127.0.0.1"]);
+      const deadAudits = events.filter((e) => e.event === "dead_letter");
+      assert.equal(deadAudits.length, 1);
+      assert.equal(deadAudits[0].failure_class, "non_retryable");
     });
   });
 });

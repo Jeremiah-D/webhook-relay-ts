@@ -4069,14 +4069,21 @@ export function createDefaultSender(
   const http2Opts = http2 === undefined ? undefined : resolveHttp2PoolOptions(http2);
   // No pool when H2 is disabled or no host is eligible for it: `undefined`
   // is the "H2 inactive" signal, mirroring `keepAlive: false`.
+  // WR-483: the shared SSRF guard rides the pool — `sessionFor` takes
+  // the per-endpoint binding per attempt, and the pool derives one from
+  // the URL when the caller passes none.
   const h2pool =
     http2Opts !== undefined && http2Opts.enabled && http2Opts.hosts.length > 0
-      ? new Http2SessionPool(http2Opts)
+      ? new Http2SessionPool({ ...http2Opts, ssrfGuard: resolvedSsrfGuard })
       : undefined;
   // WebSocket pool (WR-45): always created — a ws:/wss: target just
   // works. RangeError on invalid values, at startup — never mid-delivery.
+  // WR-483: the shared SSRF guard rides the pool, like the H2 pool
+  // above — `deliver` takes the per-endpoint binding per attempt, and
+  // the pool derives one from the target URL when the caller passes none.
   const wsPool = new WebSocketPool({
     ...websocket,
+    ssrfGuard: resolvedSsrfGuard,
     // WR-73: downstream cert-expiry capture on the wss: handshake (the
     // pool's verifyPins path feeds the monitor). The monitor is inert
     // unless enabled, so the request path is untouched when off.
@@ -5459,6 +5466,16 @@ export function createDefaultSender(
     // attempt, so the queue still sees a single attempt.
     let guardedApplied = false;
     let guardedBytesSaved = 0;
+    // WR-483: per-endpoint SSRF-guard binding — H2 never runs under a
+    // proxy (the dispatcher gates on `proxyUrl === undefined`) and
+    // takes no DoH override, so the binding wraps the pin-checked
+    // lookup the guard was compiled with. A refusal throws
+    // `OutboundSsrfBlockedError` out of `sessionFor` (never wrapped in
+    // `Http2UnavailableError`), so the dispatcher does not fall back
+    // to HTTP/1.1 — the attempt dead-letters `non_retryable`, exactly
+    // like the HTTP/1.1 path.
+    const ssrfBinding: SsrfGuardAgentBinding | undefined =
+      resolvedSsrfGuard?.bindingFor(item.targetUrl);
     const attempt = async (forcePlaintext: boolean): Promise<DownstreamResponse> => {
         // WR-89: the rotation candidates — the session pool keys sessions
         // per certificate identity, so each candidate gets its own
@@ -5482,7 +5499,7 @@ export function createDefaultSender(
         let lastErr: unknown;
         for (const candidate of candidates) {
           try {
-            session = await h2pool!.sessionFor(url, pins, candidate.cert, tlsSni, minTlsVersion);
+            session = await h2pool!.sessionFor(url, pins, candidate.cert, tlsSni, minTlsVersion, ssrfBinding);
             usedKid = candidate.kid;
             break;
           } catch (err) {
@@ -5626,7 +5643,16 @@ export function createDefaultSender(
         relayHeaders[name] = value;
       }
     }
-    return wsPool.deliver(url, body, relayHeaders, pins, item.targetUrl);
+    // WR-483: per-endpoint SSRF-guard binding — WebSocket never tunnels
+    // (`resolveProxyUrl` returns `undefined` for `ws:`/`wss:` and the
+    // dispatcher rejects an explicit proxy for non-HTTP(S) targets),
+    // so the binding never carries a proxy skip: the guard always
+    // judges the addresses the socket dials. A refusal throws
+    // `OutboundSsrfBlockedError` out of the dial, so the attempt
+    // dead-letters `non_retryable`, exactly like the HTTP/1.1 path.
+    const ssrfBinding: SsrfGuardAgentBinding | undefined =
+      resolvedSsrfGuard?.bindingFor(item.targetUrl);
+    return wsPool.deliver(url, body, relayHeaders, pins, item.targetUrl, ssrfBinding);
   };
 
   const innerSender = function defaultSender(item: RetryItem, callOpts?: SenderCallOptions): Promise<DownstreamResponse | void> {
