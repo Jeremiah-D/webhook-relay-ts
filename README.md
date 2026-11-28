@@ -1756,9 +1756,13 @@ reliability primitives that matter for any signed-payload pipeline.
   no-op. A real revision is audited as `outbound_keep_alive_revised`
   with `previous` / `current` `{ maxSocketsPerHost, idleTimeoutMs }`,
   and `pool.getStats()` reports the live values (plus the live adaptive
-  bounds when adaptive sizing is on). Throws `Error` when there is no
-  pool (`outboundKeepAlive: false` or a custom sender) — enabling
-  pooling needs a restart.
+  bounds when adaptive sizing is on). WR-485: with pooling disabled
+  (`outboundKeepAlive: false`) the same call *enables* it instead of
+  throwing — a fresh pool is built (missing fields resolve to the
+  construction defaults, so an empty patch enables at 64 / 30_000),
+  the enable is audited with `previous: null`, and later deliveries
+  reuse the pooled sockets; with a custom sender the call still throws
+  `Error`.
 - `src/warmup.ts` — outbound connection warm-up (WR-70): pre-connects the
   keep-alive pool to configured origins at startup so the first deliveries
   skip the TCP/TLS handshake. `warmupOutboundPool(pool, endpoints, cfg)`

@@ -315,11 +315,10 @@ describe("server setOutboundKeepAlive (WR-309)", () => {
     assert.deepEqual(relay.setOutboundKeepAlive!({}), { maxSocketsPerHost: 8, idleTimeoutMs: 5_000 });
   });
 
-  it("throws Error when pooling is disabled or a custom sender owns delivery", async () => {
-    const { relay } = makeServer({ outboundKeepAlive: false });
-    await listen(relay);
-    assert.throws(() => relay.setOutboundKeepAlive!({ maxSocketsPerHost: 4 }), /not configured/);
-
+  // WR-485: `outboundKeepAlive: false` no longer throws — the same call
+  // enables the pool (see test/keepalive-enable.test.ts). A custom
+  // sender still owns delivery, so there is no pool to enable or revise.
+  it("throws Error when a custom sender owns delivery", async () => {
     const custom = makeServer({ sender: async () => {} });
     await listen(custom.relay);
     assert.throws(() => custom.relay.setOutboundKeepAlive!({ maxSocketsPerHost: 4 }), /not configured/);

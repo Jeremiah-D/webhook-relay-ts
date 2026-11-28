@@ -4695,8 +4695,12 @@ export function createDefaultSender(
         // the first hop binds `item.targetUrl`, exactly as before.
         const ssrfBinding: SsrfGuardAgentBinding | undefined =
           resolvedSsrfGuard?.bindingFor(requestUrl ?? item.targetUrl, proxyUrl, dohBinding?.lookup);
+        // WR-485: the pool is read live off the sender — a pool enabled
+        // after startup (`setOutboundKeepAlive` on an
+        // `outboundKeepAlive: false` relay) must serve deliveries, so
+        // this path cannot keep reading the construction-time binding.
         const agent =
-          pool?.agentFor(
+          sender.pool?.agentFor(
             url,
             pins,
             proxyUrl,
@@ -5188,13 +5192,15 @@ export function createDefaultSender(
           });
         }
 
-        if (pool && agent) {
-          req.on("socket", (socket) => pool.noteSocket(agent, socket));
+        // WR-485: same live-pool read as the agent selection above.
+        if (sender.pool && agent) {
+          const livePool = sender.pool;
+          req.on("socket", (socket) => livePool.noteSocket(agent, socket));
           // Once the request settles the socket is back in the agent's free
           // list: stamp it idle and unref it, so a forgotten pool never pins
           // process exit. Deferred one tick — the agent frees the socket
           // just before 'close' fires.
-          req.on("close", () => setImmediate(() => pool.markIdle(agent)));
+          req.on("close", () => setImmediate(() => livePool.markIdle(agent)));
         }
         if (oneOffAgent !== undefined) {
           // No pooling: the tunneled socket must not outlive the delivery.
@@ -5391,7 +5397,7 @@ export function createDefaultSender(
           if (allowed.includes(presented)) {
             // Cache the handshake result on the pooled socket: pinning is
             // about server identity, and this connection already proved it.
-            pool?.cachePresentedPin(tlsSocket, presented);
+            sender.pool?.cachePresentedPin(tlsSocket, presented);
             // WR-101: OCSP after pinning — pinning anchors identity
             // (stops a compromised CA / MITM), OCSP checks revocation
             // freshness. The payload waits for the (possibly async)
@@ -5408,7 +5414,7 @@ export function createDefaultSender(
         };
         req.on("socket", (socket) => {
           const tlsSocket = socket as TLSSocket;
-          const cached = pool?.presentedPin(socket);
+          const cached = sender.pool?.presentedPin(socket);
           if (cached !== undefined) {
             // Reused pooled connection: the peer was pinned at handshake
             // time, and the pool key already binds this exact pin whitelist —
@@ -6291,7 +6297,9 @@ export function createDefaultSender(
     return kid;
   };
   sender.destroy = () => {
-    pool?.destroy();
+    // WR-485: destroy the live pool — a pool enabled after startup
+    // must not leak when the sender is destroyed.
+    sender.pool?.destroy();
     h2pool?.destroy();
     wsPool.destroy();
   };
@@ -6719,9 +6727,14 @@ export interface RelayServer extends Server {
    * the live ones) is a no-op with no audit event. A real revision is
    * audited as `outbound_keep_alive_revised` with `previous` / `current`
    * `{ maxSocketsPerHost, idleTimeoutMs }`, and returns the live values.
-   * Always set; throws `Error` when there is no pool
-   * (`outboundKeepAlive: false` or a custom sender) — enabling pooling
-   * needs a restart.
+   * Always set. WR-485: with pooling disabled
+   * (`outboundKeepAlive: false`) the same call *enables* it instead of
+   * throwing — a fresh pool is built (missing fields resolve to the
+   * construction defaults, so an empty patch enables at 64 / 30_000)
+   * and the enable is audited with `previous: null`; an illegal patch
+   * throws `RangeError` and leaves the relay unconfigured. With a
+   * custom sender the call still throws `Error` — there is no pool to
+   * enable or revise.
    */
   setOutboundKeepAlive?: (patch: OutboundKeepAliveRevision) => { maxSocketsPerHost: number; idleTimeoutMs: number };
   /**
@@ -19816,18 +19829,44 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     queue.getBatchConfig();
 
   // WR-309: outbound keep-alive pool cap / idle-timeout runtime
-  // revision. The method is always set (like setDedupWindow above);
-  // with pooling disabled it throws Error — enabling the pool needs a
-  // restart. A real revision is audited as
+  // revision. The method is always set (like setDedupWindow above).
+  // WR-485: with pooling disabled (`outboundKeepAlive: false`) the
+  // same call *enables* it instead of throwing — a fresh pool is
+  // built (missing fields resolve to the construction defaults, so an
+  // empty patch enables at 64 / 30_000) and mounted on the default
+  // sender, and the enable is audited as
+  // `outbound_keep_alive_revised` with `previous: null`. A custom
+  // sender owns delivery, so there is still no pool to enable and the
+  // call throws Error. A real revision is audited as
   // `outbound_keep_alive_revised` with the previous and current
   // cap/timeout; an empty or same-value patch is a silent no-op.
   server.setOutboundKeepAlive = (patch: OutboundKeepAliveRevision): { maxSocketsPerHost: number; idleTimeoutMs: number } => {
     const pool = defaultSender?.pool;
     if (pool === undefined) {
-      throw new Error(
-        "setOutboundKeepAlive: outbound keep-alive pool is not configured — enabling it requires a restart: " +
-          "the pool is created at startup (or disabled with `outboundKeepAlive: false` / a custom sender)"
-      );
+      if (defaultSender === undefined) {
+        throw new Error(
+          "setOutboundKeepAlive: outbound keep-alive pool is not configured — a custom sender owns delivery, so there is no pool to enable or revise"
+        );
+      }
+      // WR-485: enable — construct before mounting, so an illegal
+      // patch throws RangeError from the constructor and the relay
+      // stays unconfigured (a later valid patch still enables).
+      const enabled = new OutboundConnectionPool({
+        ...(patch.maxSocketsPerHost !== undefined ? { maxSocketsPerHost: patch.maxSocketsPerHost } : {}),
+        ...(patch.idleTimeoutMs !== undefined ? { idleTimeoutMs: patch.idleTimeoutMs } : {}),
+        // WR-194: the pin-checked lookup, wired exactly as at startup —
+        // the pin's lookup when one is configured, else the live shared
+        // lookup (which follows `reviseDnsCache`).
+        lookup: defaultSender.dnsPin?.lookup ?? liveDnsLookup,
+      });
+      defaultSender.pool = enabled;
+      const next = enabled.current();
+      opts.auditLog.append({
+        event: "outbound_keep_alive_revised",
+        previous: null,
+        current: next,
+      });
+      return next;
     }
     const previous = pool.current();
     // Validate-then-apply inside retune: an illegal patch throws
