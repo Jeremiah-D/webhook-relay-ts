@@ -133,6 +133,18 @@ import type { ReplayEgressConfig, ReplayEgressOptions, ReplayEgressRevision } fr
 import { ReplayApprovalError, type ReplayApprovalDenyReason, type ReplayApprovalOptions } from "./replay-approval.ts";
 import { HttpDeliveryError, parseRetryAfterMs } from "./failure.ts";
 import {
+  assertValidFollowRedirectsConfig,
+  firstHeaderValue,
+  isDowngrade,
+  isRedirectStatus,
+  redirectTargetLabel,
+  resolveFollowRedirectsOptions,
+  resolveRedirectUrl,
+  type FollowRedirectsOptions,
+  type RedirectFollowedInfo,
+  type ResolvedFollowRedirectsOptions,
+} from "./redirects.ts";
+import {
   resolveChaosConfig,
   reviseChaosRulesMap,
   wrapSenderWithChaos,
@@ -1480,6 +1492,32 @@ export interface RelayServerOptions {
    * `RangeError` at startup.
    */
   responseGuard?: Record<string, ResponseGuardConfig>;
+  /**
+   * Outbound 3xx redirect following (WR-484, see `src/redirects.ts`):
+   * per-endpoint opt-in, keyed by exact delivery `targetUrl`. An
+   * opted-in endpoint follows 301/302/307/308 responses with an
+   * `http:`/`https:` `Location` inside the same delivery attempt —
+   * method and body preserved, no retry budget burned, no backoff
+   * recomputed, no circuit verdict recorded. 303 is never followed
+   * (its method semantics change); a missing, unparseable, or
+   * non-HTTP(S) `Location` is not followed and the 3xx fails exactly
+   * as before. `{ maxRedirects?: number; allowDowngrade?: boolean }`:
+   * `maxRedirects` caps the hops per attempt (default 5, ceiling 10);
+   * `allowDowngrade` permits `https:` → `http:` hops (default
+   * `false` — a downgrade is refused and the 3xx fails as before).
+   * Every hop re-runs the SSRF guard, the DNS pin, and the egress
+   * residency gate against the hop URL; a gate refusal fails the
+   * attempt under that gate's own classification. The relay signature
+   * covers body + timestamp and stays valid across hops with no
+   * re-signing; the OAuth2 bearer token is not forwarded across
+   * origins. Each hop is audited as `redirect_followed` (`from`/`to`
+   * carry origin + path only, never the query). Applies to the
+   * HTTP/1.1 and HTTP/2 delivery paths; WebSocket deliveries have no
+   * HTTP redirect semantics and are untouched. Endpoints without an
+   * entry keep the exact current behavior. Invalid values throw
+   * `RangeError` at startup — never mid-delivery.
+   */
+  followRedirects?: Record<string, FollowRedirectsOptions>;
   /**
    * Outbound request header forwarding allowlist (WR-69; see
    * `src/forward-headers.ts`): per-endpoint (exact `targetUrl`) gate on
@@ -3415,7 +3453,22 @@ export function createDefaultSender(
    * CloudEvents (WR-207) and phase-timeout callers that pass
    * `cloudEvents` / `phaseTimeouts` by position.
    */
-  liveDnsLookup?: LookupFunction
+  liveDnsLookup?: LookupFunction,
+  /**
+   * WR-484: per-endpoint 3xx redirect-following opt-in (see
+   * `src/redirects.ts`) — a record of exact `targetUrl` →
+   * `{ maxRedirects?, allowDowngrade? }`. Validated at startup;
+   * `undefined` keeps the pre-WR-484 behavior (every 3xx fails the
+   * attempt). Appended after `liveDnsLookup` so no positional slot
+   * shifts (WR-481).
+   */
+  followRedirects?: Record<string, FollowRedirectsOptions>,
+  /**
+   * WR-484: called once per followed redirect hop. `createRelayServer`
+   * audits these as `redirect_followed`; library users get the hook
+   * directly.
+   */
+  onRedirectFollowed?: (info: RedirectFollowedInfo) => void
 ): PooledSender {
   if (tlsPins !== undefined) {
     for (const [endpoint, pins] of Object.entries(tlsPins)) {
@@ -3738,6 +3791,18 @@ export function createDefaultSender(
     } catch (err) {
       throw new RangeError(
         `createDefaultSender: invalid responseGuard config: ${(err as Error).message}`
+      );
+    }
+  }
+  // WR-484: RangeError on invalid values, at startup — never
+  // mid-delivery. The record is validated once here; the per-attempt
+  // lookup below only reads already-valid entries.
+  if (followRedirects !== undefined) {
+    try {
+      assertValidFollowRedirectsConfig(followRedirects);
+    } catch (err) {
+      throw new RangeError(
+        `createDefaultSender: invalid followRedirects config: ${(err as Error).message}`
       );
     }
   }
@@ -4111,6 +4176,15 @@ export function createDefaultSender(
       oauthToken?: string;
       /** WR-205: a fresh DPoP resource proof for this delivery (`undefined` for non-DPoP endpoints). */
       oauthDpopProof?: string;
+      /**
+       * WR-484: the URL string this request is actually going to — a
+       * redirect hop target, or `undefined` for the configured
+       * endpoint (`item.targetUrl`). Only the SigV4 signature reads
+       * it (the signature covers the host); every other per-endpoint
+       * lookup stays keyed by `item.targetUrl`, the delivery's
+       * configured endpoint.
+       */
+      requestUrl?: string;
     }
   ): {
     headers: Record<string, string | string[]>;
@@ -4362,7 +4436,9 @@ export function createDefaultSender(
       }
       const signed = signAwsSigV4({
         method: "POST",
-        url: item.targetUrl,
+        // WR-484: sign the URL actually requested — a redirect hop is
+        // signed for its own host, not the original endpoint's.
+        url: wireOpts?.requestUrl ?? item.targetUrl,
         body,
         credentials: { accessKeyId: sigv4Cfg.accessKeyId, secretAccessKey: secret },
         region: sigv4Cfg.region,
@@ -4505,7 +4581,15 @@ export function createDefaultSender(
      * every connection serving this endpoint chains to the same trust
      * store.
      */
-    caBundle?: string
+    caBundle?: string,
+    /**
+     * WR-484: the URL string this request is actually going to — a
+     * redirect hop target, or `undefined` for the configured endpoint
+     * (`item.targetUrl`). The SSRF guard binding and the SigV4
+     * signature read it; every other per-endpoint lookup stays keyed
+     * by `item.targetUrl`. Appended last so no positional slot shifts.
+     */
+    requestUrl?: string
   ): Promise<DownstreamResponse | void> => {
     // WR-75: the guarded 415→plaintext fallback needs the compression
     // decision outside the attempt promise. The decision is deterministic
@@ -4561,7 +4645,14 @@ export function createDefaultSender(
         // the same answer the wire builder used — without compressing
         // twice. The byte savings are noted per guarded-compressed
         // dispatch (the sender committed to sending it compressed).
-        const wire = buildWireRequest(item, { forcePlaintext, httpTransport: true, oauthToken, oauthDpopProof });
+        const wire = buildWireRequest(item, {
+          forcePlaintext,
+          httpTransport: true,
+          oauthToken,
+          oauthDpopProof,
+          // WR-484: a redirect hop is signed for its own URL.
+          requestUrl,
+        });
         if (!forcePlaintext && wire.guardedCompressed) {
           guardedApplied = true;
           guardedBytesSaved = wire.guardedBytesSaved;
@@ -4599,8 +4690,11 @@ export function createDefaultSender(
         // exactly the addresses the connection will use. A proxied
         // endpoint audits its skip once here (the tunnel agent never
         // dials the target, so the lookup itself would never fire).
+        // WR-484: a redirect hop binds the hop URL, so the guard
+        // re-judges the hop target (allowlist + proxy skip included);
+        // the first hop binds `item.targetUrl`, exactly as before.
         const ssrfBinding: SsrfGuardAgentBinding | undefined =
-          resolvedSsrfGuard?.bindingFor(item.targetUrl, proxyUrl, dohBinding?.lookup);
+          resolvedSsrfGuard?.bindingFor(requestUrl ?? item.targetUrl, proxyUrl, dohBinding?.lookup);
         const agent =
           pool?.agentFor(
             url,
@@ -4803,10 +4897,14 @@ export function createDefaultSender(
               // code (4xx-except-408/429 → immediate dead letter, never
               // retried) and honors a 429's Retry-After header. The error
               // message keeps the historical shape.
+              // WR-484: a 3xx response carries its `Location` on the
+              // error so the sender's redirect loop can resolve the hop
+              // target; the classifier ignores it.
               reject(
                 new HttpDeliveryError(
                   res.statusCode ?? 0,
-                  parseRetryAfterMs(res.headers["retry-after"])
+                  parseRetryAfterMs(res.headers["retry-after"]),
+                  firstHeaderValue(res.headers["location"])
                 )
               );
             }
@@ -5459,7 +5557,15 @@ export function createDefaultSender(
      * WR-205: a fresh DPoP resource proof for this delivery
      * (`undefined` for non-DPoP endpoints).
      */
-    oauthDpopProof?: string
+    oauthDpopProof?: string,
+    /**
+     * WR-484: the URL string this request is actually going to — a
+     * redirect hop target, or `undefined` for the configured endpoint
+     * (`item.targetUrl`). Same contract as the HTTP/1.1 path: the
+     * SSRF guard binding and the SigV4 signature read it. Appended
+     * last so no positional slot shifts.
+     */
+    requestUrl?: string
   ): Promise<DownstreamResponse> => {
     // WR-75: same guarded 415→plaintext fallback as the HTTP/1.1 path —
     // the resend rides a fresh H2 stream inside the same delivery
@@ -5474,8 +5580,11 @@ export function createDefaultSender(
     // `Http2UnavailableError`), so the dispatcher does not fall back
     // to HTTP/1.1 — the attempt dead-letters `non_retryable`, exactly
     // like the HTTP/1.1 path.
+    // WR-484: a redirect hop binds the hop URL, so the guard
+    // re-judges the hop target; the first hop binds `item.targetUrl`,
+    // exactly as before.
     const ssrfBinding: SsrfGuardAgentBinding | undefined =
-      resolvedSsrfGuard?.bindingFor(item.targetUrl);
+      resolvedSsrfGuard?.bindingFor(requestUrl ?? item.targetUrl);
     const attempt = async (forcePlaintext: boolean): Promise<DownstreamResponse> => {
         // WR-89: the rotation candidates — the session pool keys sessions
         // per certificate identity, so each candidate gets its own
@@ -5523,7 +5632,14 @@ export function createDefaultSender(
           if (sock !== undefined) certExpiryMonitor.observePeerCertificate(sock, item.targetUrl);
         }
         try {
-          const wire = buildWireRequest(item, { forcePlaintext, httpTransport: true, oauthToken, oauthDpopProof });
+          const wire = buildWireRequest(item, {
+            forcePlaintext,
+            httpTransport: true,
+            oauthToken,
+            oauthDpopProof,
+            // WR-484: a redirect hop is signed for its own URL.
+            requestUrl,
+          });
           if (!forcePlaintext && wire.guardedCompressed) {
             guardedApplied = true;
             guardedBytesSaved = wire.guardedBytesSaved;
@@ -5601,7 +5717,13 @@ export function createDefaultSender(
         }
         // Structured failure, same as the HTTP/1.1 path: the retry queue
         // classifies on the status code and honors a 429's Retry-After.
-        throw new HttpDeliveryError(res.statusCode, parseRetryAfterMs(res.headers["retry-after"]));
+        // WR-484: a 3xx response carries its `Location` on the error so
+        // the sender's redirect loop can resolve the hop target.
+        throw new HttpDeliveryError(
+          res.statusCode,
+          parseRetryAfterMs(res.headers["retry-after"]),
+          firstHeaderValue(res.headers["location"])
+        );
       } finally {
         h2pool!.releaseStream(session);
       }
@@ -5803,56 +5925,200 @@ export function createDefaultSender(
       oauthToken: string | undefined,
       oauthDpopProof?: string
     ): Promise<DownstreamResponse | void> => {
-      // WR-374: egress data-residency gate — resolve the target hostname
-      // and check every resolved address's country against the delivery
-      // tenant's allowlist before any connection is opened, on every
-      // transport (HTTP/1.1, HTTP/2, WebSocket). A refusal throws
-      // EgressResidencyBlockedError, which the queue classifies
-      // non_retryable (dead-letter, no retry budget, no breaker touch).
-      // Runs inside the deadline/adaptive-timeout race below, so a slow
-      // resolution cannot outlive the attempt's budget.
-      if (resolvedEgressResidencyGate !== undefined) {
-        await resolvedEgressResidencyGate.check(item.tenantId, item.targetUrl);
-      }
-      // WebSocket (WR-45): ws:/wss: targets ride the pooled RFC 6455 path.
-      // Proxied ws: is rejected above (explicit proxy + non-HTTP(S)
-      // target), same as any other non-HTTP scheme.
-      if (url.protocol === "ws:" || url.protocol === "wss:") {
-        return deliverViaWebSocket(item, url, pins);
-      }
-      // HTTP/2 (WR-42): opt-in per host, never under a proxy — proxied
-      // traffic rides the HTTP/1.1 CONNECT tunnel (see `src/http2.ts`). Any
-      // H2-level failure falls back to the HTTP/1.1 pool below: a delivery
-      // is never lost because of H2.
-      // WR-101: an OCSP-configured endpoint never rides H2 — the H2
-      // session pool owns its own handshake and has no revocation gate,
-      // so H2 would silently skip the check. HTTP/1.1 instead, loudly.
-      // WR-143: a phase-timeout endpoint is likewise kept off H2 — a
-      // multiplexed session has no per-request connect/tls/firstByte
-      // phases to budget, so H2 would silently skip the budgets.
-      // WR-163: a CA-bundle endpoint is likewise kept off H2 — the H2
-      // session pool owns its own handshake and takes no `ca`, so H2
-      // would fail the chain it was configured to trust. HTTP/1.1
-      // instead, where the bundle rides the handshake.
-      if (h2pool !== undefined && proxyUrl === undefined && ocsp === undefined && phaseTimeout === undefined && caBundle === undefined && h2pool.eligibleFor(url)) {
-        return deliverViaHttp2(item, url, pins, clientCert, tlsSni, minTlsVersion, clientCertRotation, oauthToken, oauthDpopProof).catch((err) => {
-          if (err instanceof Http2UnavailableError) {
-            h2pool!.noteFallback();
-            // WR-423: the H2 failure is observable — the operator hook
-            // fires once per fallback (the delivery itself still rides
-            // the HTTP/1.1 pool below, never lost).
-            onHttp2Fallback?.({
+      // WR-484: this endpoint's redirect config, resolved once per
+      // attempt (validated at startup; a missing entry means "never
+      // follow" and the dispatch below is byte-identical to before).
+      const redirectCfg: ResolvedFollowRedirectsOptions | undefined =
+        followRedirects?.[item.targetUrl] !== undefined
+          ? resolveFollowRedirectsOptions(
+              followRedirects[item.targetUrl] as FollowRedirectsOptions
+            )
+          : undefined;
+      // WR-484: the request's current hop — the configured endpoint
+      // first, then each redirect target in turn. `currentUrlString`
+      // is the exact string the hop dials: `item.targetUrl` on the
+      // first hop, so every exact-match lookup (egress gate, SSRF
+      // allowlist) behaves exactly as before when no redirect happens.
+      let currentUrl = url;
+      let currentUrlString = item.targetUrl;
+      let currentToken = oauthToken;
+      let currentProof = oauthDpopProof;
+      let hops = 0;
+      for (;;) {
+        // WR-374: egress data-residency gate — resolve the target hostname
+        // and check every resolved address's country against the delivery
+        // tenant's allowlist before any connection is opened, on every
+        // transport (HTTP/1.1, HTTP/2, WebSocket). A refusal throws
+        // EgressResidencyBlockedError, which the queue classifies
+        // non_retryable (dead-letter, no retry budget, no breaker touch).
+        // Runs inside the deadline/adaptive-timeout race below, so a slow
+        // resolution cannot outlive the attempt's budget.
+        // WR-484: re-run per hop against the hop URL — a redirect into
+        // a disallowed country is refused exactly like a direct one.
+        if (resolvedEgressResidencyGate !== undefined) {
+          await resolvedEgressResidencyGate.check(item.tenantId, currentUrlString);
+        }
+        // WR-484: TLS identity config is the original endpoint's and
+        // travels with the delivery — but it only applies on a hop
+        // whose scheme can carry it. A downgrade hop to plain `http:`
+        // drops pins / client certificates / SNI / floor / CA bundle /
+        // OCSP (otherwise the pin path would wait on a TLS handshake
+        // that never comes and the request would hang until the
+        // deadline budget fires).
+        const hopIsHttps = currentUrl.protocol === "https:";
+        const hopPins =
+          hopIsHttps || currentUrl.protocol === "wss:" ? pins : undefined;
+        const hopClientCert = hopIsHttps ? clientCert : undefined;
+        const hopClientCertRotation = hopIsHttps ? clientCertRotation : undefined;
+        const hopTlsSni = hopIsHttps ? tlsSni : undefined;
+        const hopMinTlsVersion = hopIsHttps ? minTlsVersion : undefined;
+        const hopCaBundle = hopIsHttps ? caBundle : undefined;
+        const hopOcsp = hopIsHttps ? ocsp : undefined;
+        let response: DownstreamResponse | void = undefined;
+        try {
+          // WebSocket (WR-45): ws:/wss: targets ride the pooled RFC 6455 path.
+          // Proxied ws: is rejected above (explicit proxy + non-HTTP(S)
+          // target), same as any other non-HTTP scheme.
+          if (currentUrl.protocol === "ws:" || currentUrl.protocol === "wss:") {
+            response = await deliverViaWebSocket(item, currentUrl, hopPins);
+          } else if (
+            h2pool !== undefined &&
+            proxyUrl === undefined &&
+            hopOcsp === undefined &&
+            phaseTimeout === undefined &&
+            hopCaBundle === undefined &&
+            h2pool.eligibleFor(currentUrl)
+          ) {
+            // HTTP/2 (WR-42): opt-in per host, never under a proxy — proxied
+            // traffic rides the HTTP/1.1 CONNECT tunnel (see `src/http2.ts`). Any
+            // H2-level failure falls back to the HTTP/1.1 pool below: a delivery
+            // is never lost because of H2.
+            // WR-101: an OCSP-configured endpoint never rides H2 — the H2
+            // session pool owns its own handshake and has no revocation gate,
+            // so H2 would silently skip the check. HTTP/1.1 instead, loudly.
+            // WR-143: a phase-timeout endpoint is likewise kept off H2 — a
+            // multiplexed session has no per-request connect/tls/firstByte
+            // phases to budget, so H2 would silently skip the budgets.
+            // WR-163: a CA-bundle endpoint is likewise kept off H2 — the H2
+            // session pool owns its own handshake and takes no `ca`, so H2
+            // would fail the chain it was configured to trust. HTTP/1.1
+            // instead, where the bundle rides the handshake.
+            try {
+              response = await deliverViaHttp2(
+                item,
+                currentUrl,
+                hopPins,
+                hopClientCert,
+                hopTlsSni,
+                hopMinTlsVersion,
+                hopClientCertRotation,
+                currentToken,
+                currentProof,
+                currentUrlString
+              );
+            } catch (err) {
+              if (err instanceof Http2UnavailableError) {
+                h2pool!.noteFallback();
+                // WR-423: the H2 failure is observable — the operator hook
+                // fires once per fallback (the delivery itself still rides
+                // the HTTP/1.1 pool below, never lost).
+                onHttp2Fallback?.({
+                  id: item.id,
+                  ...(item.traceId !== undefined ? { traceId: item.traceId } : {}),
+                  endpoint: item.targetUrl,
+                  error: err.message,
+                });
+                response = await deliverViaHttp1(
+                  item,
+                  currentUrl,
+                  hopPins,
+                  hopClientCert,
+                  proxyUrl,
+                  hopTlsSni,
+                  hopMinTlsVersion,
+                  hopClientCertRotation,
+                  hopOcsp,
+                  currentToken,
+                  currentProof,
+                  phaseTimeout,
+                  callOpts?.signal,
+                  hopCaBundle,
+                  currentUrlString
+                );
+              } else {
+                throw err;
+              }
+            }
+          } else {
+            response = await deliverViaHttp1(
+              item,
+              currentUrl,
+              hopPins,
+              hopClientCert,
+              proxyUrl,
+              hopTlsSni,
+              hopMinTlsVersion,
+              hopClientCertRotation,
+              hopOcsp,
+              currentToken,
+              currentProof,
+              phaseTimeout,
+              callOpts?.signal,
+              hopCaBundle,
+              currentUrlString
+            );
+          }
+        } catch (err) {
+          // WR-484: redirect following — a followable 3xx with a usable
+          // `Location` becomes the next hop inside this same attempt:
+          // no retry budget burned, no backoff recomputed, no circuit
+          // verdict recorded. Anything that fails a rule below throws
+          // the original 3xx error, which the queue classifies
+          // retryable — the normal retry / dead-letter path, exactly
+          // as before this feature existed.
+          if (
+            redirectCfg !== undefined &&
+            err instanceof HttpDeliveryError &&
+            isRedirectStatus(err.statusCode) &&
+            err.location !== undefined
+          ) {
+            const next = resolveRedirectUrl(currentUrl, err.location);
+            if (next === undefined) throw err;
+            if (isDowngrade(currentUrl, next) && !redirectCfg.allowDowngrade) throw err;
+            if (hops >= redirectCfg.maxRedirects) throw err;
+            hops += 1;
+            onRedirectFollowed?.({
               id: item.id,
               ...(item.traceId !== undefined ? { traceId: item.traceId } : {}),
               endpoint: item.targetUrl,
-              error: err.message,
+              from: redirectTargetLabel(currentUrl),
+              to: redirectTargetLabel(next),
+              hops,
+              statusCode: err.statusCode,
             });
-            return deliverViaHttp1(item, url, pins, clientCert, proxyUrl, tlsSni, minTlsVersion, clientCertRotation, ocsp, oauthToken, oauthDpopProof, phaseTimeout, callOpts?.signal, caBundle);
+            // WR-484: credentials never cross origins — a cross-origin
+            // hop drops the bearer token and its DPoP proof; a
+            // same-origin hop keeps the token and rebuilds the DPoP
+            // proof against the hop URL (the proof binds `htu`).
+            if (next.origin !== currentUrl.origin) {
+              currentToken = undefined;
+              currentProof = undefined;
+            } else if (oauthResolved?.dpop !== undefined && currentToken !== undefined) {
+              currentProof = buildDpopProofJwt({
+                dpop: oauthResolved.dpop,
+                htm: "POST",
+                htu: next.href,
+                accessToken: currentToken,
+              });
+            }
+            currentUrl = next;
+            currentUrlString = next.href;
+            continue;
           }
           throw err;
-        });
+        }
+        return response;
       }
-      return deliverViaHttp1(item, url, pins, clientCert, proxyUrl, tlsSni, minTlsVersion, clientCertRotation, ocsp, oauthToken, oauthDpopProof, phaseTimeout, callOpts?.signal, caBundle);
     };
     // WR-129: resolve the bearer value once per delivery attempt
     // (cached); a 401 forces exactly one refresh + redelivery inside the
@@ -11061,6 +11327,25 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     onHttp2FallbackAudit(info);
     operatorHttp2FallbackCallback?.(info);
   };
+  // WR-484: a downstream answered 301/302/307/308 and the relay
+  // followed it inside the same attempt — one audit line per hop
+  // naming the delivery, the original endpoint, and the hop's
+  // origin + path on both ends (never the query, so a `Location`
+  // carrying a token cannot land in the audit trail). Wired into the
+  // main sender below; WR-85 shadow sender copies keep the
+  // pre-existing no-follow behavior.
+  const onRedirectFollowed = (info: RedirectFollowedInfo) => {
+    opts.auditLog.append({
+      event: "redirect_followed",
+      id: info.id,
+      ...(info.traceId !== undefined ? { traceId: info.traceId } : {}),
+      targetUrl: info.endpoint,
+      from: info.from,
+      to: info.to,
+      hops: info.hops,
+      statusCode: info.statusCode,
+    });
+  };
   // WR-194: a pinned hostname's DNS resolution drifted — one audit line
   // per drift naming the hostname, the pinned baseline, the observed
   // addresses, and the pin mode. In "enforce" mode the lookup was
@@ -11547,7 +11832,7 @@ export function createRelayServer(opts: RelayServerOptions): RelayServer {
     );
   const defaultSender =
     opts.sender === undefined
-      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, liveCompressOutbound, opts.outboundHttp2, onHttp2Fallback, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, liveTlsSniOverrides, liveResponseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallback, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, liveAwsSigV4Configs, opts.awsSecretResolver, opts.outboundSchemas, liveOauth2Configs, undefined, opts.compressBrotli, opts.phaseTimeouts, opts.tlsCa, opts.chaos, onChaosInjectedAudit, liveResponseGuard, opts.doh, onDohFallback, proxyHealthMonitor, opts.outboundCredentials, opts.dnsPin, onDnsPinMismatch, liveCloudEvents, opts.outboundSsrfGuard, onOutboundSsrfBlocked, onOutboundSsrfAllowlisted, onOutboundSsrfProxySkipped, opts.egressResidency, onEgressResidencyBlocked, liveDnsLookup)
+      ? createDefaultSender(opts.tlsPins, opts.outboundKeepAlive, opts.outboundSigning, opts.proxies, opts.tlsClientCerts, liveCompressOutbound, opts.outboundHttp2, onHttp2Fallback, opts.outboundIdempotencyKey, undefined, opts.outboundEncryption, liveTlsSniOverrides, liveResponseCompression, opts.forwardHeaders, certExpiryMonitor, opts.minTlsVersions, tlsVersionMonitor, opts.compressThreshold, onGzipFallback, onE2eeKeyRotatedAudit, clientCertRotations, sharedDnsCache, opts.retry?.latencyPhases !== undefined, opts.traceContext ?? opts.retry?.traceContext, opts.tlsOcsp, ocspMonitor, meshSenderOpts, endpointRegistry, opts.payloadTransforms, liveAwsSigV4Configs, opts.awsSecretResolver, opts.outboundSchemas, liveOauth2Configs, undefined, opts.compressBrotli, opts.phaseTimeouts, opts.tlsCa, opts.chaos, onChaosInjectedAudit, liveResponseGuard, opts.doh, onDohFallback, proxyHealthMonitor, opts.outboundCredentials, opts.dnsPin, onDnsPinMismatch, liveCloudEvents, opts.outboundSsrfGuard, onOutboundSsrfBlocked, onOutboundSsrfAllowlisted, onOutboundSsrfProxySkipped, opts.egressResidency, onEgressResidencyBlocked, liveDnsLookup, opts.followRedirects, onRedirectFollowed)
       : undefined;
   // WR-146: tail-latency hedging for outbound attempts (opt-in). The
   // wrapper sits around whichever sender the queue uses — the default

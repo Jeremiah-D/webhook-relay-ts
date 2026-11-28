@@ -202,8 +202,16 @@ export class HttpDeliveryError extends Error {
    * present and parseable.
    */
   readonly retryAfterMs?: number;
+  /**
+   * WR-484: the raw `Location` header of a 3xx response, when the
+   * downstream sent one. Carried so the sender's redirect loop can
+   * resolve the hop target without re-reading the response; ignored by
+   * the failure classifier (only `statusCode` / `retryAfterMs` classify).
+   * Absent on non-3xx responses and on responses without a `Location`.
+   */
+  readonly location?: string;
 
-  constructor(statusCode: number, retryAfterMs?: number) {
+  constructor(statusCode: number, retryAfterMs?: number, location?: string) {
     // Keep the historical message shape so existing log greps and
     // message-matching tests keep working.
     super(`Forward failed with status ${statusCode}`);
@@ -211,6 +219,9 @@ export class HttpDeliveryError extends Error {
     this.statusCode = statusCode;
     if (retryAfterMs !== undefined) {
       this.retryAfterMs = retryAfterMs;
+    }
+    if (location !== undefined) {
+      this.location = location;
     }
   }
 }

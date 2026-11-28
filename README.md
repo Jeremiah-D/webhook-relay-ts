@@ -5621,6 +5621,71 @@ const server = createRelayServer({
   live entry. This is the revision entry point only — WR-168 owns the
   digest-verification mechanism and WR-169 the cap mechanism.
 
+## Outbound redirect following (opt-in)
+
+`followRedirects` lets an endpoint follow a downstream's 301/302/307/308
+answers instead of burning its retry budget on a moved URL — per-endpoint
+opt-in, keyed by exact delivery `targetUrl` (WR-484, see `src/redirects.ts`):
+
+```ts
+const server = createRelayServer({
+  followRedirects: {
+    // Follow up to 5 hops (the default) on this endpoint.
+    "https://api.example/hooks": {},
+    // At most 2 hops, and allow https: -> http: downgrades.
+    "https://legacy.example/callback": { maxRedirects: 2, allowDowngrade: true },
+  },
+});
+```
+
+- **Same attempt, not a retry** — each hop runs inside the one delivery
+  attempt: it consumes no retry budget, recomputes no backoff, and
+  records no circuit verdict. The queue still sees a single attempt
+  (the `delivered` audit's `attempts` stays 1 when the chain lands).
+- **What is followed** — only 301/302/307/308 with an `http:`/`https:`
+  `Location`. 303 is never followed (its method semantics change), and
+  a missing, unparseable, or non-HTTP(S) `Location` is not followed —
+  the original 3xx then fails exactly as before (retryable). Relative
+  locations resolve against the hop source.
+- **Method and body are preserved** on every hop (301/302 keep POST +
+  body here, by documented convention — unlike a browser, which
+  converts them to GET). The relay signature covers body + timestamp
+  and is host-independent, so it stays valid across hops with no
+  re-signing; the `Host` header follows the hop URL, and SigV4, when
+  configured, is re-signed per hop URL.
+- **Every hop re-runs the per-hop gates** against the hop URL: the SSRF
+  guard (allowlist + proxy skip included), the DNS pin, and the egress
+  residency gate. A gate refusal fails the attempt under that gate's own
+  classification (SSRF / egress refusals are `non_retryable` — dead-letter,
+  no retry budget). Known boundary, inherited from the gates themselves:
+  they judge hostnames through the lookup path, and Node dials literal
+  IPs without resolving — so a hop target that is a literal private IP
+  never reaches the guard or the pin, exactly like a direct delivery to
+  a literal IP. Only hostname hop targets are gated.
+- **Downgrades are refused by default** — an `https:` → `http:` hop is
+  refused unless the entry sets `allowDowngrade: true`. Upgrades
+  (`http:` → `https:`) and same-scheme hops are always allowed.
+- **Credentials never cross origins** — a cross-origin hop drops the
+  OAuth2 bearer token and its DPoP proof; a same-origin hop keeps the
+  token and rebuilds the DPoP proof against the hop URL. TLS identity
+  config (pins, SNI override, CA bundle, OCSP, client certificates) is
+  the original endpoint's and travels with the delivery; a cross-host hop
+  whose peer does not match it fails closed.
+- **Cap** — `maxRedirects` (default 5, ceiling 10) bounds the hops per
+  attempt; the response that exceeds the cap fails as the original 3xx
+  (retryable → normal retry / dead-letter path).
+- **Audit** — each hop is audited as `redirect_followed` when the hop is
+  decided (before the hop's gates run, so a hop refused by a gate still
+  leaves the trail of where the relay tried to go). `from`/`to` carry
+  origin + path only — never the query, so a `Location` carrying a token
+  cannot land in the audit trail.
+- Applies to the HTTP/1.1 and HTTP/2 delivery paths. WebSocket
+  deliveries have no HTTP redirect semantics and are untouched.
+  Endpoints without an entry keep the exact current behavior (every 3xx
+  fails the attempt). Invalid values (non-integer or out-of-range
+  `maxRedirects`, non-boolean `allowDowngrade`) throw `RangeError` at
+  startup — never mid-delivery.
+
 ## GeoIP inbound country policy (opt-in)
 
 `geoIp` layers a coarse country filter over the WR-53 IP ACL — a relay
